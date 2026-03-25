@@ -95,7 +95,22 @@ Mode 110 (OR|SHF) is never asserted. Its hardware behaviour depends on how the A
 
 To add new instructions, opcodes must be **reclaimed** from existing encodings. Candidates for sacrifice are listed in Section 3.
 
-### 1.7 Flags Register
+### 1.7 Unmapped SRAM Page (Page 3)
+
+The CY62256 (U47, 32K×8) SRAM address space is paged via two microcode control signals — STK (bit 30) and HL (bit 5) — which drive upper SRAM address lines. The MAR provides A0–A7 (256 bytes per page). Current usage:
+
+| STK | HL | Page | SRAM Addr Bits | Usage |
+|-----|-----|------|---------------|-------|
+| 0 | 0 | 0 | A9=0, A8=0 | Program memory (instruction fetch) |
+| 0 | 1 | 1 | A9=0, A8=1 | Data memory (load/store with register indirect) |
+| 1 | 0 | 2 | A9=1, A8=0 | Stack (load/store with $sp) |
+| **1** | **1** | **3** | **A9=1, A8=1** | **NEVER ACCESSED — unmapped** |
+
+Verified: no microcode step in `microcode.py` ever asserts `STK|HL` simultaneously. Page 3 (256 bytes at SRAM offset 0x300–0x3FF) is physically present but invisible to software.
+
+Additionally, the CY62256 has address lines A10–A14 (5 more bits) that are tied low or floating, leaving **31K of the 32K SRAM permanently inaccessible.** Routing additional address lines to the SRAM would require bodge wires to the DIP-28 socket but could unlock far more memory in the future.
+
+### 1.8 Flags Register
 
 U11 (74HCT173, 4-bit latch) stores CF, ZF, OF, SF — **all 4 bits used, no spare flag positions.** The chip is a 16-pin DIP; there is no pin-compatible 8-bit alternative that fits the same socket.
 
@@ -127,7 +142,33 @@ Several existing opcodes encode register combinations that are useless or redund
 
 **Estimated reclaimable: 10–25 opcodes** depending on how aggressively you sacrifice.
 
-#### 2.1b — Microcode Timing Optimisation
+#### 2.1b — Activate SRAM Page 3
+
+**Goal:** Make the 4th 256-byte SRAM page accessible by asserting `STK|HL` simultaneously in microcode steps.
+
+**Mechanism:**
+- No hardware changes. The STK and HL signals already drive SRAM address lines A9 and A8 respectively. Asserting both in the same microcode step selects page 3 (SRAM 0x300–0x3FF). The hardware will work — it just has never been asked to.
+- Add new load/store microcode sequences that use `STK|HL` in place of `STK` or `HL` alone during the memory-access step.
+- Reclaim opcodes (see Section 3) and assign them as `ld $X, page3` / `st $X, page3` instructions, or repurpose the page implicitly in multi-step microcode.
+
+**Use cases and interaction with other planned improvements:**
+
+1. **Microcode scratch space (synergy with 16-step counter + stack-relative addressing):**
+   The ALU-assisted stack-relative `ld $a, [SP+n]` sequence (proposal 2.3b) needs ~8–10 microcode steps that compute SP+offset, feed the result to MAR, then do the actual load — all without clobbering programmer-visible registers. Currently the only temp storage is the E register (ALU input), which the computation itself needs. Page 3 gives the microcode an invisible scratch area: stash a register value to page 3, use the freed register for the SP+offset computation, do the memory access, then restore from page 3. This avoids the "no spare registers during multi-step microcode" problem that makes stack-relative addressing so step-hungry.
+
+2. **Interrupt context save area (immediate value, no other changes needed):**
+   When an IRQ fires, registers must be saved before the handler runs. Currently this pushes to the stack (page 2), but the stack pointer itself needs saving first — a chicken-and-egg problem. Page 3 at a fixed address (e.g., `STK|HL` + address 0x00) can hold the pre-interrupt SP and register snapshot without touching the stack at all. This is a cleaner, more robust interrupt entry sequence.
+
+3. **Extra data storage (doubles usable variable space):**
+   Programs currently have 256 bytes on page 1 for all non-stack data. Page 3 adds another 256 bytes, accessible via dedicated opcodes. Particularly useful for lookup tables (sin/cos, character maps) that currently compete with variables for space on page 1.
+
+**Hardware cost:** Zero.
+
+**Software cost:** 2–4 reclaimed opcodes for explicit page-3 load/store. Alternatively, 0 opcodes if page 3 is only used internally by multi-step microcode (invisible to the programmer).
+
+**Impact:** Modest on its own, but becomes a critical enabler once the 16-step counter (2.3a) is in place — it unblocks practical stack-relative addressing by solving the scratch storage problem.
+
+#### 2.1c — Microcode Timing Optimisation
 
 Most instructions use 3–5 of the 8 available steps, with remaining steps asserting RST. No speed improvement possible within the current step counter, but if steps are extended to 16 (see Tier 3), complex multi-step instructions become feasible.
 
@@ -266,8 +307,9 @@ Up to **20 more opcodes** reclaimable from the ALU register-register block if th
 | **2** | SWAP $a,$b etc. | Tier 1 | 2–4 (from `or $x,$x` or ALU cross-ops) | Microcode only | Simplifies sorting, register shuffling |
 | **3** | CLR $x | Tier 1 | 1 | Microcode only (SUB $x,$x → $x) | Convenience, compiler codegen |
 | **4** | 16-step counter | Tier 3 | 0 | 5 wires (Q3→A15 on all EEPROMs) | Prerequisite for stack-relative |
-| **5** | Stack-relative LD/ST | Tier 3 | 2–4 | Depends on step counter | Compiler-essential, enables stack frames |
-| **6** | Expose OF/SF to microcode | Tier 3 | 2–4 | 8 bodge wires + 8 GND lifts | Signed comparisons, richer branching |
+| **5** | Activate SRAM page 3 | Tier 1 | 0–4 | Microcode only | Scratch space for stack-relative; interrupt save area |
+| **6** | Stack-relative LD/ST | Tier 3 | 2–4 | Depends on 16-step + page 3 scratch | Compiler-essential, enables stack frames |
+| **7** | Expose OF/SF to microcode | Tier 3 | 2–4 | 8 bodge wires + 8 GND lifts | Signed comparisons, richer branching |
 
 ---
 
