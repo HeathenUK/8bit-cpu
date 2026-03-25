@@ -97,7 +97,7 @@ To add new instructions, opcodes must be **reclaimed** from existing encodings. 
 
 ### 1.7 Flags Register
 
-U11 (74HCT173, 4-bit latch) stores CF, ZF, OF, SF — **all 4 bits used, no spare flag positions** without replacing the chip (e.g., with a 74HCT273 for 8 flag bits).
+U11 (74HCT173, 4-bit latch) stores CF, ZF, OF, SF — **all 4 bits used, no spare flag positions.** The chip is a 16-pin DIP; there is no pin-compatible 8-bit alternative that fits the same socket.
 
 ---
 
@@ -209,25 +209,23 @@ Most instructions use 3–5 of the 8 available steps, with remaining steps asser
 3. Requires ~8–10 microcode steps (hence the need for 16-step counter)
 4. No new hardware beyond the step counter extension
 
-**Mechanism — Option B (dedicated adder):**
-1. Add a 74HCT283 (4-bit adder) or two, wired between SP output and MAR input
-2. The immediate offset feeds the adder's B input from the instruction register or bus
-3. Faster (fewer microcode steps) but more hardware
-
 **Impact:** Transformative for compiler-generated code. Enables proper stack frames, local variables, function parameters by offset. Makes the CPU a viable compiler target.
 
-#### 2.3c — Additional Flags
+*Note: A dedicated adder approach would be faster but requires adding new chips, which is not possible on the existing PCB. Option A (ALU-assisted) is the only viable path.*
 
-**Goal:** Parity flag, half-carry, or other flags for BCD arithmetic or string operations.
+#### 2.3c — Expose Existing Flags to Microcode
+
+**Goal:** Use the existing OF and SF flags (already latched in U11) for conditional branching.
 
 **Mechanism:**
-- Replace U11 (74HCT173, 4-bit) with 74HCT273 (8-bit latch)
-- Connect additional ALU output bits to the new flag inputs
-- Use spare EEPROM address lines (A15–A16) to incorporate new flags into conditional microcode
+- U11 (74HCT173) already latches OF and SF, but these flags are **not connected to the EEPROM address bus** — only CF (→A11) and ZF (→A12) are wired.
+- Bodge wire from U11 OF output → A15 on all 4 EEPROMs (currently tied low)
+- Bodge wire from U11 SF output → A16 on all 4 EEPROMs (currently tied low)
+- Update microcode generator to use 17-bit addressing (step + opcode + CF + ZF + IRQ0 + IRQ1 + OF + SF)
 
-**Hardware cost:** 1 chip swap + bodge wires for new flag sources + EEPROM address rewiring.
+**Hardware cost:** 8 bodge wires (2 flag outputs × 4 EEPROMs) + cut/lift 8 GND ties on A15/A16. Same PCB, same chips.
 
-**Impact:** Enables signed comparison (overflow flag already exists but isn't used for branching), BCD support, etc.
+**Impact:** Enables signed comparison branches (BLT, BGE, BLE, BGT) using the overflow and sign flags the ALU already computes. Currently these flags are latched but wasted.
 
 ---
 
@@ -269,7 +267,7 @@ Up to **20 more opcodes** reclaimable from the ALU register-register block if th
 | **3** | CLR $x | Tier 1 | 1 | Microcode only (SUB $x,$x → $x) | Convenience, compiler codegen |
 | **4** | 16-step counter | Tier 3 | 0 | 5 wires (Q3→A15 on all EEPROMs) | Prerequisite for stack-relative |
 | **5** | Stack-relative LD/ST | Tier 3 | 2–4 | Depends on step counter | Compiler-essential, enables stack frames |
-| **6** | Additional flags/branches | Tier 3 | 2–4 | Chip swap + wiring | Signed comparisons, richer branching |
+| **6** | Expose OF/SF to microcode | Tier 3 | 2–4 | 8 bodge wires + 8 GND lifts | Signed comparisons, richer branching |
 
 ---
 
