@@ -142,63 +142,30 @@ Several existing opcodes encode register combinations that are useless or redund
 
 **Estimated reclaimable: 10–25 opcodes** depending on how aggressively you sacrifice.
 
-#### 2.1b — Activate SRAM Page 3 (Hybrid: System Reserved + Programmer Accessible)
+#### 2.1b — Activate SRAM Page 3 (Programmer Data Page)
 
-**Goal:** Make the 4th 256-byte SRAM page accessible by asserting `STK|HL` simultaneously in microcode steps. Partition it into a small system-reserved region (microcode scratch + interrupt context) and a larger programmer-accessible region.
+**Goal:** Make the 4th 256-byte SRAM page accessible by asserting `STK|HL` simultaneously in microcode steps. The entire page is programmer-owned — no system reservation, no address restrictions.
 
 **Mechanism:**
 - No hardware changes. The STK and HL signals already drive SRAM address lines A9 and A8 respectively. Asserting both in the same microcode step selects page 3 (SRAM 0x300–0x3FF). The hardware will work — it just has never been asked to.
 
-**Page 3 memory map:**
+**Why no system reservation is needed:**
 
-```
-0x00–0x0F  SYSTEM RESERVED (16 bytes)
-  0x00       Microcode scratch: A register save slot
-  0x01       Microcode scratch: temp / second save slot
-  0x02–0x07  Interrupt context: A, B, C, D, SP, flags-proxy
-  0x08–0x0F  Reserved for future system use
+The earlier draft proposed splitting page 3 between microcode scratch and programmer data. This has a fundamental flaw: the microcode scratch would use `SO|MI` (SP's current value as the MAR address), meaning the scratch location *moves* as the stack grows and shrinks. Any programmer data stored at page3[current_SP_value] would be silently corrupted during stack-relative instructions. There is no way to enforce a safe boundary because the "reserved" address is dynamic.
 
-0x10–0xFF  PROGRAMMER ACCESSIBLE (240 bytes)
-  Accessible via ldp3/stp3 instructions (see below)
-  Suitable for lookup tables, extra variables, buffers
-```
+Instead, the two proposed system uses are handled without page 3:
 
-**System reserved region (0x00–0x0F) — internal use, no opcodes consumed:**
-
-1. **Microcode scratch (0x00–0x01) — synergy with 16-step counter + stack-relative addressing:**
-   Stack-relative `ld $reg, [SP+n]` computes SP+offset via the ALU, which requires the A register and E register for the arithmetic. When the destination is not $a (e.g., `ld $b, [SP+n]`), the microcode must save and restore A around the computation. Page 3 provides this scratch space invisibly — the programmer never sees it. The save/restore uses SP as the MAR address into page 3 (SP is already in a register, avoids needing to generate a constant on the bus):
-   ```
-   Step 2:  SO|MI               SP → MAR (scratch address = current SP value)
-   Step 3:  STK|HL|AO|RI        save A → page3[SP]
-   Step 4:  SO|EI               SP → E register
-   Step 5:  PO|MI               point to immediate operand
-   Step 6:  PE|RO|AI            offset → A
-   Step 7:  EO|MI               ALU result (SP+offset) → MAR
-   Step 8:  STK|RO|BI           stack[SP+offset] → B (the actual load)
-   Step 9:  SO|MI               SP → MAR again (same scratch address)
-   Step 10: STK|HL|RO|AI        restore A ← page3[SP]
-   Step 11: RST
-   ```
-   12 steps total — requires 16-step counter. Note: `ld $a, [SP+n]` needs no scratch (A is the destination, no save/restore needed) and fits in the current 8-step counter:
+1. **Stack-relative addressing (see 2.3b):** Restrict to `$a` destination only. `ld $a, [SP+n]` overwrites A anyway — no scratch save/restore needed, no page 3 access:
    ```
    PO|MI, RO|II|PE, SO|EI, PO|MI, PE|RO|AI, EO|MI, STK|RO|AI, RST
    ```
+   8 steps, fits current counter. For other register destinations, the programmer writes two instructions: `ld $a, [SP+n]` followed by `mov $a, $b`. This is one extra instruction but eliminates all invisible state and collision risk.
 
-2. **Interrupt context (0x02–0x07) — clean register save without touching the stack:**
-   When an IRQ fires, registers must be saved before the handler runs. The stack pointer itself needs saving first — a chicken-and-egg problem with the current push-based approach. Page 3 at fixed addresses avoids the stack entirely:
-   ```
-   ; IRQ entry microcode (conceptual, part of conditional fetch override):
-   MI (addr 0x02), STK|HL|AO|RI    ; save A → page3[0x02]
-   MI (addr 0x03), STK|HL|BO|RI    ; save B → page3[0x03]
-   MI (addr 0x04), STK|HL|CO|RI    ; save C → page3[0x04]
-   MI (addr 0x05), STK|HL|DO|RI    ; save D → page3[0x05]
-   MI (addr 0x06), STK|HL|SO|RI    ; save SP → page3[0x06]
-   ```
-   Restoration is the reverse at interrupt return. This requires either the 16-step counter (to fit save + vector jump in one instruction) or a multi-instruction ISR prologue that uses the reserved page 3 addresses.
+2. **Interrupt context save:** Remains software-managed in the ISR prologue (`push $a`, `push $b`, ...). SP is valid at IRQ entry — the microcode just jumps to the handler vector. The push-based approach works because the ISR uses SP *before* anything corrupts it. No fixed-address save area needed.
 
-**Programmer-accessible region (0x10–0xFF) — requires reclaimed opcodes:**
+**Result:** The microcode never asserts `STK|HL`. Only programmer-facing `ldp3`/`stp3` instructions do. Page 3 has no invisible side-effects and needs no reserved regions.
 
-New instructions access the upper 240 bytes as a second data page:
+**Programmer-accessible instructions (requires reclaimed opcodes):**
 
 | Mnemonic | Encoding | Bytes | Steps | Microcode Sequence |
 |----------|----------|-------|-------|-------------------|
@@ -209,13 +176,11 @@ These are identical in structure to existing `load $a, [imm]` / `stor $a, [imm]`
 
 For additional register targets ($b, $c, $d), add more reclaimed opcodes using the same pattern with the appropriate register-in/out signals. Minimum viable: **2 opcodes** ($a only). Full set: **8 opcodes** (load + store × 4 registers).
 
-The assembler should warn if an `ldp3`/`stp3` immediate operand is below 0x10 (system reserved region).
-
 **Hardware cost:** Zero.
 
-**Software cost:** 2–8 reclaimed opcodes for programmer-facing instructions. System-reserved region consumes 0 opcodes (used internally by multi-step microcode only).
+**Software cost:** 2–8 reclaimed opcodes.
 
-**Impact:** Immediately useful as 240 extra bytes of data storage (lookup tables, buffers). Becomes critical once 16-step counter is in place — the scratch region enables stack-relative addressing for non-$a destinations, and the interrupt context area enables clean IRQ entry/exit.
+**Impact:** 256 extra bytes of data storage — doubles usable variable/table space. Particularly useful for lookup tables (sin/cos, character maps, font data) that currently compete with variables for space on page 1. No interaction with or dependency on any other improvement.
 
 #### 2.1c — Microcode Timing Optimisation
 
@@ -289,19 +254,37 @@ Most instructions use 3–5 of the 8 available steps, with remaining steps asser
 
 **Impact:** Enables complex multi-step instructions like stack-relative load/store, multiply, block copy. Essential prerequisite for stack-relative addressing.
 
-#### 2.3b — Stack-Relative Addressing
+#### 2.3b — Stack-Relative Addressing ($a only)
 
 **Goal:** `ld $a, [SP+n]` and `st $a, [SP+n]` — access stack frame variables by offset.
 
-**Mechanism — Option A (ALU-assisted, microcode-heavy):**
+**Restricted to $a destination/source.** Computing SP+offset requires the ALU (E register + A register for the addition). If the destination were $b, the microcode would need to save and restore A somewhere — but there is no safe, invisible scratch location (page 3 scratch was rejected because the address would be SP-dependent and could collide with programmer data; see 2.1b rationale). Restricting to $a avoids this entirely since A is being overwritten anyway.
+
+For other registers, the programmer writes `ld $a, [SP+n]` then `mov $a, $b` — one extra instruction, but no invisible state or collision risk.
+
+**Mechanism (ALU-assisted, $a only):**
 1. Extend step counter to 16 steps (Tier 3a above)
-2. Microcode sequence: load SP into ALU input, load immediate offset into ALU, add them, output result to MAR, then read/write RAM
-3. Requires ~8–10 microcode steps (hence the need for 16-step counter)
+2. **Load** `ld $a, [SP+n]` — straightforward, 8 steps, fits current counter:
+   ```
+   PO|MI, RO|II|PE, SO|EI, PO|MI, PE|RO|AI, EO|MI, STK|RO|AI, RST
+   ```
+   Works because A is being overwritten — loading the offset into A (step 5) doesn't lose anything.
+
+3. **Store** `st $a, [SP+n]` — **hard problem.** Computing SP+offset requires the ALU (`EO` = A + E), so offset must go in A and SP must go in E. But A already holds the value we want to store, and loading the offset into A destroys it. There is no free register or invisible scratch location to save A's value during the computation.
+
+   Possible approaches (all have tradeoffs):
+   - **(a) Don't implement store.** Use `push $a` or adjust SP manually. Simplest, no compromise.
+   - **(b) Clobber B.** Save A→B, do computation, write B→stack[SP+n]. Requires documenting that `st $a, [SP+n]` destroys B — surprising and error-prone.
+   - **(c) Use page 3 scratch.** Save A to page3 at a dynamic address (e.g., page3[SP]), compute, restore. Works but creates a collision risk with programmer data on page 3 (see 2.1b rationale for why this was rejected for loads).
+   - **(d) Compiler workaround.** Emit `mov $a, $b` / `ld $a, [SP+n]` / `st $b, [SP+n]`... but this has the same problem — `st $b` also needs address computation through A.
+
+   **Recommendation:** Implement load only. Stack-relative store is rare in practice — most stack-frame writes are at function entry (pushing arguments) or `push`/`pop` sequences, which already work. The load is the high-value operation (reading local variables and parameters).
+
 4. No new hardware beyond the step counter extension
 
 **Impact:** Transformative for compiler-generated code. Enables proper stack frames, local variables, function parameters by offset. Makes the CPU a viable compiler target.
 
-*Note: A dedicated adder approach would be faster but requires adding new chips, which is not possible on the existing PCB. Option A (ALU-assisted) is the only viable path.*
+*Note: A dedicated adder approach would be faster but requires adding new chips, which is not possible on the existing PCB.*
 
 #### 2.3c — Expose Existing Flags to Microcode
 
@@ -355,9 +338,9 @@ Up to **20 more opcodes** reclaimable from the ALU register-register block if th
 | **1** | INC / DEC | Tier 2 | 2 (from `or $x,$x`) | 1 XOR gate (U24), 3 wires, 1 cut, 1 U76 bit | 36 bytes saved, compiler essential |
 | **2** | SWAP $a,$b etc. | Tier 1 | 2–4 (from `or $x,$x` or ALU cross-ops) | Microcode only | Simplifies sorting, register shuffling |
 | **3** | CLR $x | Tier 1 | 1 | Microcode only (SUB $x,$x → $x) | Convenience, compiler codegen |
-| **4** | 16-step counter | Tier 3 | 0 | 5 wires (Q3→A15 on all EEPROMs) | Prerequisite for stack-relative |
-| **5** | Activate SRAM page 3 (hybrid) | Tier 1 | 2–8 (ldp3/stp3) | Microcode only | 240 bytes data + scratch for stack-relative + IRQ save |
-| **6** | Stack-relative LD/ST | Tier 3 | 2–4 | Depends on 16-step + page 3 scratch | Compiler-essential, enables stack frames |
+| **4** | SRAM page 3 (ldp3/stp3) | Tier 1 | 2–8 | Microcode only | 256 bytes extra data, no dependencies |
+| **5** | 16-step counter | Tier 3 | 0 | 5 wires (Q3→A15 on all EEPROMs) | Prerequisite for stack-relative |
+| **6** | Stack-relative LD ($a only) | Tier 3 | 1–2 | Depends on 16-step counter | Compiler-essential, read stack-frame locals |
 | **7** | Expose OF/SF to microcode | Tier 3 | 2–4 | 8 bodge wires + 8 GND lifts | Signed comparisons, richer branching |
 
 ---
