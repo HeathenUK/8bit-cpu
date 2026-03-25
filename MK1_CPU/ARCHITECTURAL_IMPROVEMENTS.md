@@ -1,437 +1,340 @@
-# MK1 CPU — Architectural Improvements Reference
+# MK1 CPU — Recommended Enhancements
 
-Comprehensive audit of unused resources and actionable improvement proposals.
-
----
-
-## 1. UNUSED RESOURCES INVENTORY
-
-### 1.1 Spare Microcode Output Bits (U76 EEPROM)
-
-The 32-bit microcode word is spread across 4 AM29F040 EEPROMs (U73–U76). U76 carries bits 7–0:
-
-| Bit | Signal | Status |
-|-----|--------|--------|
-| 7 | E0 | Used — External enable 0 |
-| 6 | E1 | Used — External enable 1 |
-| 5 | HL | Used — High/Low address mode |
-| 4 | RGT | Used — Right shift/rotate |
-| **3** | **—** | **UNUSED** — NoConn on PCB trace |
-| **2** | **—** | **UNUSED** — NoConn on PCB trace |
-| **1** | **—** | **UNUSED** — NoConn on PCB trace |
-| 0 | RST | Used — Reset step counter |
-
-**3 spare control signal bits available.** The EEPROM outputs already have traces routed to a location on the PCB (terminating at NoConn markers near coordinates 9200,9850–10050 in control.sch). Bodge wires can tap these traces and route them to new destinations.
-
-### 1.2 Spare Logic Gates
-
-**Confirmed spare XOR gates (critical for INC/DEC):**
-
-| IC | Type | Location | Spare Units | Pins |
-|----|------|----------|-------------|------|
-| U24 | 74HCT86 (Quad XOR) | alu.sch / control.sch | **Units 3, 4** | Unit 3: pins 9,10→8 / Unit 4: pins 12,13→11 |
-
-Note: U21 and U22 (also 74HCT86) have ALL 4 gates used for two's complement inversion. U24 is the only source of spare XOR gates.
-
-**Other confirmed spare gates (selected, most useful):**
-
-| IC | Type | Location | Spare Units | Gate Function |
-|----|------|----------|-------------|---------------|
-| U28 | 74HCT32 | a-register.sch / alu.sch | Multiple | OR |
-| U58 | 74HCT08 | a-register.sch | Multiple | AND |
-| U55 | 74HCT00 | stack-register.sch | Multiple | NAND |
-| U13 | 74HCT02 | alu.sch | Multiple | NOR |
-| U60 | 74HCT04 | control.sch | Multiple | Inverter |
-| U46 | 74HCT00 | ram.sch | Multiple | NAND |
-| U38 | 74HCT139 | output.sch | Unit 2 | 2-to-4 Decoder |
-
-### 1.3 Spare EEPROM Address Lines
-
-Each AM29F040 has 19 address lines (A0–A18). Only 15 are used:
-
-| Address Bits | Width | Function |
-|-------------|-------|----------|
-| A0–A2 | 3 | Step counter (U72 Q0–Q2) |
-| A3–A10 | 8 | Instruction opcode (IR_0–IR_7) |
-| A11 | 1 | Carry Flag (CF) |
-| A12 | 1 | Zero Flag (ZF) |
-| A13 | 1 | IRQ0 |
-| A14 | 1 | IRQ1 |
-| **A15–A18** | **4** | **UNUSED — tied low** |
-
-**4 spare address lines** = potential 16× expansion of microcode space.
-
-### 1.4 Spare Step Counter Bit
-
-U72 (74HCT161, 4-bit counter) only uses Q0–Q2 (3 bits → 8 steps). **Q3 is unconnected (NoConn).** Connecting Q3 to A15 on all EEPROMs would extend instructions from 8 to 16 steps.
-
-### 1.5 Unused ALU Mode
-
-ALU operation is encoded in 3 bits (SUB, OR, SHF):
-
-| Mode | Bits (SUB,OR,SHF) | Function |
-|------|-------------------|----------|
-| 000 | 0,0,0 | ADD |
-| 001 | 1,0,0 | SUB |
-| 010 | 0,1,0 | OR |
-| 011 | 1,1,0 | AND |
-| 100 | 0,0,1 | SHF (shift) |
-| 101 | 1,0,1 | ROT (rotate) |
-| **110** | **0,1,1** | **UNUSED** |
-| 111 | 1,1,1 | NOT |
-
-Mode 110 (OR|SHF) is never asserted. Its hardware behaviour depends on how the ALU decodes these bits — it would need investigation to determine what it actually does on the current hardware before it could be repurposed.
-
-### 1.6 Opcode Space
-
-**All 256 opcodes are used.** The encoding:
-
-| Bits 7–6 | Range | Category | Count |
-|----------|-------|----------|-------|
-| 00 | 0x00–0x3F | MOV (register-register, specials) | 64 |
-| 01 | 0x40–0x7F | LOAD (memory read, bitwise ops) | 64 |
-| 10 | 0x80–0xBF | STORE (memory write, ALU-imm) | 64 |
-| 11 | 0xC0–0xFF | ALU (register-register) | 64 |
-
-To add new instructions, opcodes must be **reclaimed** from existing encodings. Candidates for sacrifice are listed in Section 3.
-
-### 1.7 Unmapped SRAM Page (Page 3)
-
-The CY62256 (U47, 32K×8) SRAM address space is paged via two microcode control signals — STK (bit 30) and HL (bit 5) — which drive upper SRAM address lines. The MAR provides A0–A7 (256 bytes per page). Current usage:
-
-| STK | HL | Page | SRAM Addr Bits | Usage |
-|-----|-----|------|---------------|-------|
-| 0 | 0 | 0 | A9=0, A8=0 | Program memory (instruction fetch) |
-| 0 | 1 | 1 | A9=0, A8=1 | Data memory (load/store with register indirect) |
-| 1 | 0 | 2 | A9=1, A8=0 | Stack (load/store with $sp) |
-| **1** | **1** | **3** | **A9=1, A8=1** | **NEVER ACCESSED — unmapped** |
-
-Verified: no microcode step in `microcode.py` ever asserts `STK|HL` simultaneously. Page 3 (256 bytes at SRAM offset 0x300–0x3FF) is physically present but invisible to software.
-
-Additionally, the CY62256 has address lines A10–A14 (5 more bits) that are tied low or floating, leaving **31K of the 32K SRAM permanently inaccessible.** Routing additional address lines to the SRAM would require bodge wires to the DIP-28 socket but could unlock far more memory in the future.
-
-### 1.8 Flags Register
-
-U11 (74HCT173, 4-bit latch) stores CF, ZF, OF, SF — **all 4 bits used, no spare flag positions.** The chip is a 16-pin DIP; there is no pin-compatible 8-bit alternative that fits the same socket.
+All proposals assume the existing PCB. No chip swaps, no new ICs — only bodge wires, trace cuts, and EEPROM reflashes.
 
 ---
 
-## 2. IMPROVEMENT PROPOSALS
+## 1. CURRENT ARCHITECTURE SUMMARY
 
-### TIER 1: Microcode-Only (zero hardware changes)
+- **CPU:** 8-bit data bus, 8-bit MAR, 8-bit program counter
+- **SRAM:** CY62256 (U47), 32K×8. Only 1K addressable (4 pages × 256 bytes). SRAM A10–A14 are unrouted.
+- **Microcode:** 4× AM29F040 EEPROMs (U73–U76), 32-bit control word, 15-bit addressing (8-bit opcode + 3-bit step + 2 flags + 2 IRQ lines)
+- **ALU:** 74HCT283 adder, XOR inversion for subtract, 8 modes (1 unused)
+- **Registers:** A, B, C, D (general), SP (stack pointer), PC (program counter), E (ALU input), OUT (display)
+- **Flags:** CF, ZF, OF, SF in U11 (74HCT173, 4-bit). Only CF and ZF wired to microcode address bus.
+- **Step counter:** U72 (74HCT161), 3 bits used (8 steps max), Q3 unconnected
+- **Opcodes:** All 256 used. New instructions require reclaiming existing encodings.
 
-These require only reflashing the microcode EEPROMs.
+### Memory Map
 
-#### 2.1a — Reclaim Expendable Opcodes
+| STK | HL | Page | Address Range | Usage |
+|-----|-----|------|--------------|-------|
+| 0 | 0 | 0 | 0x000–0x0FF | Program memory (instruction fetch) |
+| 0 | 1 | 1 | 0x100–0x1FF | Data memory (load/store) |
+| 1 | 0 | 2 | 0x200–0x2FF | Stack |
+| 1 | 1 | 3 | 0x300–0x3FF | **Unmapped — never accessed** |
 
-Several existing opcodes encode register combinations that are useless or redundant:
-
-**MOV range (0x00–0x3F) — candidates for reclamation:**
-- `mov $out, $X` for most X: $out has no output path, so reading from it is meaningless. The slots where $out is the SOURCE (bits `00_110_XXX`) are mostly wasted. That's up to 7 opcodes, though `mov $out, $a` is actually `out` (writes A to display), and similar for other destinations.
-- `mov $pc, $pc`: jumps to current PC+1, functionally a NOP. Could be reclaimed.
-- `mov $sp, $sp`: NOP equivalent. Could be reclaimed.
-
-**LOAD range special slots:**
-- `load $out, [imm]` — loads from memory into the output register. Rarely useful since `out` is typically written from registers. Could be reclaimed.
-
-**STORE range:**
-- Several `stor $X, [$sp]` combinations overlap with push/pop semantics but with different behaviour. Some may be reclaimable.
-
-**ALU range (0xC0–0xFF):**
-- Self-operations like `add $a, $a` (doubles $a), `and $a, $a` (NOP with flags), `or $a, $a` (NOP with flags) are technically useful but `and $X, $X` and `or $X, $X` are redundant with each other — one set could be reclaimed. That's up to **16 opcodes** (4 self-ops × 4 registers for either AND or OR).
-
-**Estimated reclaimable: 10–25 opcodes** depending on how aggressively you sacrifice.
-
-#### 2.1b — Activate SRAM Page 3 (Programmer Data Page)
-
-**Goal:** Make the 4th 256-byte SRAM page accessible by asserting `STK|HL` simultaneously in microcode steps. The entire page is programmer-owned — no system reservation, no address restrictions.
-
-**Mechanism:**
-- No hardware changes. The STK and HL signals already drive SRAM address lines A9 and A8 respectively. Asserting both in the same microcode step selects page 3 (SRAM 0x300–0x3FF). The hardware will work — it just has never been asked to.
-
-**Why no system reservation is needed:**
-
-The earlier draft proposed splitting page 3 between microcode scratch and programmer data. This has a fundamental flaw: the microcode scratch would use `SO|MI` (SP's current value as the MAR address), meaning the scratch location *moves* as the stack grows and shrinks. Any programmer data stored at page3[current_SP_value] would be silently corrupted during stack-relative instructions. There is no way to enforce a safe boundary because the "reserved" address is dynamic.
-
-Instead, the two proposed system uses are handled without page 3:
-
-1. **Stack-relative addressing (see 2.3b):** Restrict to `$a` destination only. `ld $a, [SP+n]` overwrites A anyway — no scratch save/restore needed, no page 3 access:
-   ```
-   PO|MI, RO|II|PE, SO|EI, PO|MI, PE|RO|AI, EO|MI, STK|RO|AI, RST
-   ```
-   8 steps, fits current counter. For other register destinations, the programmer writes two instructions: `ld $a, [SP+n]` followed by `mov $a, $b`. This is one extra instruction but eliminates all invisible state and collision risk.
-
-2. **Interrupt context save:** Remains software-managed in the ISR prologue (`push $a`, `push $b`, ...). SP is valid at IRQ entry — the microcode just jumps to the handler vector. The push-based approach works because the ISR uses SP *before* anything corrupts it. No fixed-address save area needed.
-
-**Result:** The microcode never asserts `STK|HL`. Only programmer-facing `ldp3`/`stp3` instructions do. Page 3 has no invisible side-effects and needs no reserved regions.
-
-**Programmer-accessible instructions (requires reclaimed opcodes):**
-
-| Mnemonic | Encoding | Bytes | Steps | Microcode Sequence |
-|----------|----------|-------|-------|-------------------|
-| `ldp3 $a, [imm]` | reclaimed | 2 | 6 | `PO\|MI, RO\|II\|PE, PO\|MI, PE\|RO\|MI, STK\|HL\|RO\|AI, RST` |
-| `stp3 $a, [imm]` | reclaimed | 2 | 6 | `PO\|MI, RO\|II\|PE, PO\|MI, PE\|RO\|MI, STK\|HL\|AO\|RI, RST` |
-
-These are identical in structure to existing `load $a, [imm]` / `stor $a, [imm]` — the only difference is `STK|HL` in place of `HL` on the memory-access step. They fit in the current 8-step counter with no hardware changes.
-
-For additional register targets ($b, $c, $d), add more reclaimed opcodes using the same pattern with the appropriate register-in/out signals. Minimum viable: **2 opcodes** ($a only). Full set: **8 opcodes** (load + store × 4 registers).
-
-**Hardware cost:** Zero.
-
-**Software cost:** 2–8 reclaimed opcodes.
-
-**Impact:** 256 extra bytes of data storage — doubles usable variable/table space. Particularly useful for lookup tables (sin/cos, character maps, font data) that currently compete with variables for space on page 1. No interaction with or dependency on any other improvement.
-
-#### 2.1c — Microcode Timing Optimisation
-
-Most instructions use 3–5 of the 8 available steps, with remaining steps asserting RST. No speed improvement possible within the current step counter, but if steps are extended to 16 (see Tier 3), complex multi-step instructions become feasible.
+Page selection is hardcoded per microcode step (STK and HL are control signals, not address bits derived from the MAR). The MAR is 8 bits wide. There is no overflow/carry from the MAR into the page select lines. This means **contiguous addressing across pages is not possible** in the current hardware — each page is an independent 256-byte window, and the microcode step determines which page is active.
 
 ---
 
-### TIER 2: Microcode + Bodge Wires (using spare U76 bits and spare gates)
+## 2. UNUSED RESOURCES
 
-#### 2.2a — INC / DEC Instructions
+### 2.1 Spare Microcode Output Bits (U76)
 
-**Goal:** Single-byte `inc` and `dec` that operate on register A (or any register), replacing 2-byte `addi 1` / `subi 1`.
+3 unused output bits on U76 (bits 3, 2, 1). Traces exist on the PCB but terminate at NoConn markers. Bodge wires can route these to any destination.
 
-**Mechanism:**
-- Use **1 spare U76 bit** (e.g., bit 1) as a new control signal: `CINV` (carry invert)
-- Bodge wire from U76 output pin (bit 1) to **U24 unit 3** (spare XOR gate, pins 9,10→8)
-- Connect: `SUB` signal → U24 pin 9, `CINV` → U24 pin 10
-- XOR output (U24 pin 8) replaces the direct SUB→C0 connection on the ALU adder carry-in
-- Cut/lift the existing SUB→C0 trace
+### 2.2 Spare Logic Gates
 
-**Truth table:**
+| IC | Type | Spare Units | Pins | Best Use |
+|----|------|-------------|------|----------|
+| **U24** | **74HCT86 (XOR)** | **Units 3, 4** | **9,10→8 / 12,13→11** | **INC/DEC carry modification** |
+| U28 | 74HCT32 (OR) | Multiple | — | General glue logic |
+| U58 | 74HCT08 (AND) | Multiple | — | General glue logic |
+| U55 | 74HCT00 (NAND) | Multiple | — | General glue logic |
+| U13 | 74HCT02 (NOR) | Multiple | — | General glue logic |
+| U60 | 74HCT04 (INV) | Multiple | — | Signal inversion |
+| U46 | 74HCT00 (NAND) | Multiple | — | General glue logic |
+| U38 | 74HCT139 (2:4 DEC) | Unit 2 | — | Address decode |
 
-| CINV | SUB | Carry-In (XOR) | B inversion | Effect |
-|------|-----|----------------|-------------|--------|
-| 0 | 0 | 0 | No | Normal ADD: A + B |
-| 0 | 1 | 1 | Yes | Normal SUB: A − B |
-| 1 | 0 | 1 | No | A + B + 1 (INC when B=0) |
-| 1 | 1 | 0 | Yes | A + NOT(B) (DEC when B=0: A + 0xFF = A−1) |
+### 2.3 Spare Microcode EEPROM Address Lines
 
-**Hardware cost:** 1 bodge wire from U76 to U24, 1 bodge wire for SUB to U24, 1 wire from U24 output to adder C0, cut 1 trace. Total: **3 wires + 1 cut + 1 spare XOR gate.**
+A15–A18 on all four EEPROMs are tied low. 4 spare lines = up to 16× expansion of microcode address space.
 
-**Software cost:** Reclaim 2+ opcodes for `inc` and `dec`. Microcode asserts CINV (and not SUB for INC, or SUB for DEC) with no register on the bus (bus floats to 0x00 or is explicitly zeroed).
+### 2.4 Spare Step Counter Bit
 
-**Impact:** Saves 25 bytes across existing programs (INC) + 11 bytes (DEC) = **36 bytes total**. Every loop counter, pointer bump, and stack adjustment becomes 1 byte instead of 2.
+U72 Q3 is unconnected. Wiring it to EEPROM A15 doubles instruction length from 8 to 16 steps.
 
-#### 2.2b — Register Swap
+### 2.5 Unused ALU Mode
 
-**Goal:** Swap two registers in a single instruction instead of the current 3-instruction push/mov/pop sequence.
+Mode 110 (OR|SHF asserted together) is never used. Its actual hardware behaviour is untested.
 
-**Mechanism:**
-- Use **1 spare U76 bit** (e.g., bit 2) as `SWAP` control signal
-- This enables a temporary latch or uses a multi-step microcode sequence that reads one register into a temporary hold, reads the other onto the bus, writes the first destination, then outputs the held value
-- Actually: **this can be done with microcode alone** using 4 steps: RegA→EI, RegB→RegA, EO→RegB (using the ALU E register as a temp). No extra hardware needed, just a reclaimed opcode.
+### 2.6 Unmapped SRAM (Page 3 + 31K inaccessible)
 
-**Impact:** Common in sort algorithms (bubble sort, quicksort). Currently requires 3 instructions (6 bytes); swap reduces to 1 instruction (1 byte).
+Page 3 (256 bytes) exists but no microcode step ever asserts STK|HL. Additionally, SRAM A10–A14 are unrouted, leaving 31K of the 32K chip permanently inaccessible.
 
-#### 2.2c — Zero Register / Immediate Zero on Bus
+### 2.7 Wasted Flags
 
-**Goal:** Put 0x00 on the bus without reading from RAM.
+OF and SF are latched in U11 but not wired to the microcode EEPROM address bus. They are computed and stored every ALU operation but never influence instruction behaviour.
 
-**Mechanism:**
-- Use **1 spare U76 bit** (e.g., bit 3) to enable a pull-down network on the bus
-- OR: assert ALU output (EO) with ADD mode and no input — if the ALU outputs 0 when E register contains 0 and no operand is loaded, this may already work
+### 2.8 Reclaimable Opcodes
 
-**Simpler alternative:** Just define a microcode-only `clr $X` instruction that does `XOR $a, $a` (which is `SUB $a, $a` followed by move). This needs no hardware, just a reclaimed opcode.
+**Definitely reclaimable (no functionality lost):**
 
----
+| Opcode | Binary | Current | Why Expendable |
+|--------|--------|---------|----------------|
+| `or $a, $a` | 0xE0 | A OR A → A, sets flags | Identical to `and $a, $a` |
+| `or $b, $b` | 0xE5 | B OR B → B, sets flags | Identical to `and $b, $b` |
+| `or $c, $c` | 0xEA | C OR C → C, sets flags | Identical to `and $c, $c` |
+| `or $d, $d` | 0xEF | D OR D → D, sets flags | Identical to `and $d, $d` |
 
-### TIER 3: Hardware Modifications (bigger bodges or new chips)
+**Probably reclaimable (exotic register combos never used in practice):**
 
-#### 2.3a — Extend Step Counter to 16 Steps
+| Pattern | Count |
+|---------|-------|
+| Self-ops on $c, $d (`add $c,$c`, `sub $d,$d`, etc.) | 4 |
+| OR cross-ops between $c and $d | 8 |
+| AND cross-ops between $c and $d | 8 |
 
-**Goal:** Allow instructions to use up to 16 microcode steps instead of 8.
-
-**Mechanism:**
-- Connect U72 Q3 (currently NoConn) to A15 on all 4 EEPROMs
-- Update microcode generator to use 4-bit step addressing
-- Regenerate and reflash all EEPROMs
-
-**Hardware cost:** 5 bodge wires (Q3 to A15 on each of U73–U76, plus possibly one for the step counter reset logic).
-
-**Impact:** Enables complex multi-step instructions like stack-relative load/store, multiply, block copy. Essential prerequisite for stack-relative addressing.
-
-#### 2.3b — Stack-Relative Addressing ($a only)
-
-**Goal:** `ld $a, [SP+n]` and `st $a, [SP+n]` — access stack frame variables by offset.
-
-**Restricted to $a destination/source.** Computing SP+offset requires the ALU (E register + A register for the addition). If the destination were $b, the microcode would need to save and restore A somewhere — but there is no safe, invisible scratch location (page 3 scratch was rejected because the address would be SP-dependent and could collide with programmer data; see 2.1b rationale). Restricting to $a avoids this entirely since A is being overwritten anyway.
-
-For other registers, the programmer writes `ld $a, [SP+n]` then `mov $a, $b` — one extra instruction, but no invisible state or collision risk.
-
-**Mechanism (ALU-assisted, $a only):**
-1. Extend step counter to 16 steps (Tier 3a above)
-2. **Load** `ld $a, [SP+n]` — straightforward, 8 steps, fits current counter:
-   ```
-   PO|MI, RO|II|PE, SO|EI, PO|MI, PE|RO|AI, EO|MI, STK|RO|AI, RST
-   ```
-   Works because A is being overwritten — loading the offset into A (step 5) doesn't lose anything.
-
-3. **Store** `st $a, [SP+n]` — **hard problem.** Computing SP+offset requires the ALU (`EO` = A + E), so offset must go in A and SP must go in E. But A already holds the value we want to store, and loading the offset into A destroys it. There is no free register or invisible scratch location to save A's value during the computation.
-
-   Possible approaches (all have tradeoffs):
-   - **(a) Don't implement store.** Use `push $a` or adjust SP manually. Simplest, no compromise.
-   - **(b) Clobber B.** Save A→B, do computation, write B→stack[SP+n]. Requires documenting that `st $a, [SP+n]` destroys B — surprising and error-prone.
-   - **(c) Use page 3 scratch.** Save A to page3 at a dynamic address (e.g., page3[SP]), compute, restore. Works but creates a collision risk with programmer data on page 3 (see 2.1b rationale for why this was rejected for loads).
-   - **(d) Compiler workaround.** Emit `mov $a, $b` / `ld $a, [SP+n]` / `st $b, [SP+n]`... but this has the same problem — `st $b` also needs address computation through A.
-
-   **Recommendation:** Implement load only. Stack-relative store is rare in practice — most stack-frame writes are at function entry (pushing arguments) or `push`/`pop` sequences, which already work. The load is the high-value operation (reading local variables and parameters).
-
-4. No new hardware beyond the step counter extension
-
-**Impact:** Transformative for compiler-generated code. Enables proper stack frames, local variables, function parameters by offset. Makes the CPU a viable compiler target.
-
-*Note: A dedicated adder approach would be faster but requires adding new chips, which is not possible on the existing PCB.*
-
-#### 2.3c — Expose Existing Flags to Microcode
-
-**Goal:** Use the existing OF and SF flags (already latched in U11) for conditional branching.
-
-**Mechanism:**
-- U11 (74HCT173) already latches OF and SF, but these flags are **not connected to the EEPROM address bus** — only CF (→A11) and ZF (→A12) are wired.
-- Bodge wire from U11 OF output → A15 on all 4 EEPROMs (currently tied low)
-- Bodge wire from U11 SF output → A16 on all 4 EEPROMs (currently tied low)
-- Update microcode generator to use 17-bit addressing (step + opcode + CF + ZF + IRQ0 + IRQ1 + OF + SF)
-
-**Hardware cost:** 8 bodge wires (2 flag outputs × 4 EEPROMs) + cut/lift 8 GND ties on A15/A16. Same PCB, same chips.
-
-**Impact:** Enables signed comparison branches (BLT, BGE, BLE, BGT) using the overflow and sign flags the ALU already computes. Currently these flags are latched but wasted.
+Estimated total: **4 definite + up to 20 more** depending on how aggressively you sacrifice.
 
 ---
 
-## 3. OPCODE RECLAMATION MAP
+## 3. ENHANCEMENTS
 
-Opcodes that could be sacrificed for new instructions, ordered by expendability:
+Each enhancement is tagged by what it requires:
 
-### Definitely Reclaimable (no real functionality lost)
+- **[HW]** — Hardware change: bodge wires and/or trace cuts on the PCB
+- **[UC]** — Microcode change: reflash all 4 EEPROMs
+- **[ASM]** — Assembler/programmer change: new mnemonics, reclaimed opcodes, or new programming patterns
 
-| Opcode | Binary | Current Function | Why Expendable |
-|--------|--------|-----------------|----------------|
-| `or $a, $a` | 11100000 | A = A OR A (= A, sets flags) | Identical effect to `and $a, $a` |
-| `or $b, $b` | 11100101 | B = B OR B | Identical effect to `and $b, $b` |
-| `or $c, $c` | 11101010 | C = C OR C | Identical effect to `and $c, $c` |
-| `or $d, $d` | 11101111 | D = D OR D | Identical effect to `and $d, $d` |
-
-These 4 opcodes set flags identically to the AND self-ops. Freeing them gives us 4 opcodes for INC/DEC/SWAP/CLR.
-
-### Probably Reclaimable (exotic register combos)
-
-Many ALU operations between unusual register pairs are never used in any existing program and unlikely to be emitted by a compiler (which would use $a as accumulator):
-
-| Pattern | Count | Examples |
-|---------|-------|---------|
-| `add $c, $c` / `sub $c, $c` etc. | 4 | Self-ops on $c, $d |
-| `or $c, $d` / `or $d, $c` etc. | 8 | Cross-ops between $c and $d through OR |
-| `and $c, $d` / `and $d, $c` etc. | 8 | Cross-ops between $c and $d through AND |
-
-Up to **20 more opcodes** reclaimable from the ALU register-register block if the compiler only targets $a as accumulator.
+Every enhancement that adds an instruction requires **[UC] + [ASM]** at minimum (new microcode + new assembler mnemonic). Some also require **[HW]**.
 
 ---
 
-## 4. RECOMMENDED IMPLEMENTATION ORDER
+### 3.1 INC / DEC
 
-| Priority | Change | Type | Opcodes Needed | Hardware | Impact |
-|----------|--------|------|---------------|----------|--------|
-| **1** | INC / DEC | Tier 2 | 2 (from `or $x,$x`) | 1 XOR gate (U24), 3 wires, 1 cut, 1 U76 bit | 36 bytes saved, compiler essential |
-| **2** | SWAP $a,$b etc. | Tier 1 | 2–4 (from `or $x,$x` or ALU cross-ops) | Microcode only | Simplifies sorting, register shuffling |
-| **3** | CLR $x | Tier 1 | 1 | Microcode only (SUB $x,$x → $x) | Convenience, compiler codegen |
-| **4** | SRAM page 3 (ldp3/stp3) | Tier 1 | 2–8 | Microcode only | 256 bytes extra data, no dependencies |
-| **5** | 16-step counter | Tier 3 | 0 | 5 wires (Q3→A15 on all EEPROMs) | Prerequisite for stack-relative |
-| **6** | Stack-relative LD ($a only) | Tier 3 | 1–2 | Depends on 16-step counter | Compiler-essential, read stack-frame locals |
-| **7** | Expose OF/SF to microcode | Tier 3 | 2–4 | 8 bodge wires + 8 GND lifts | Signed comparisons, richer branching |
+> Add `inc` and `dec` instructions that increment/decrement register A by 1 in a single byte.
+
+**What changes:**
+
+**[HW]** Bodge wire from U76 bit 1 output to U24 unit 3 pin 10. Bodge wire from existing SUB signal to U24 unit 3 pin 9. Bodge wire from U24 pin 8 (XOR output) to the ALU adder carry-in (C0). Cut the existing direct SUB→C0 trace. **Total: 3 wires, 1 trace cut, consumes 1 spare U76 bit and 1 spare XOR gate.**
+
+**[UC]** Define new control signal CINV (U76 bit 1). Microcode for `inc`: assert CINV with no B-operand on bus (A + 0 + 1 = A+1). Microcode for `dec`: assert CINV|SUB (A + NOT(0) + 0 = A + 0xFF = A−1). The existing SUB and ADD paths are unchanged (CINV=0 preserves current behaviour).
+
+| CINV | SUB | Carry-In | B Inverted | Effect |
+|------|-----|----------|------------|--------|
+| 0 | 0 | 0 | No | ADD (unchanged) |
+| 0 | 1 | 1 | Yes | SUB (unchanged) |
+| 1 | 0 | 1 | No | INC: A + 0 + 1 |
+| 1 | 1 | 0 | Yes | DEC: A + 0xFF |
+
+**[ASM]** Reclaim 2 opcodes (e.g., `or $a, $a` and `or $b, $b`). New mnemonics: `inc` (1 byte), `dec` (1 byte). Replaces 2-byte `addi 1` / `subi 1` sequences. Saves ~36 bytes across existing programs.
 
 ---
 
-## 5. COMPLETE CONTROL SIGNAL MAP (for reference)
+### 3.2 SWAP
 
-### U73 — Bits 31–24
+> Swap two registers in a single instruction.
+
+**What changes:**
+
+**[UC]** Multi-step microcode using the E register as a temporary: RegA→EI, RegB→RegA, EO→RegB. 5 steps total including fetch, fits in current 8-step counter. No hardware changes.
+
+**[ASM]** Reclaim 2–4 opcodes. New mnemonics: `swap $a, $b`, etc. Replaces the current 3-instruction (6-byte) push/mov/pop sequence with 1 instruction (1 byte).
+
+---
+
+### 3.3 CLR
+
+> Clear a register to zero in a single instruction.
+
+**What changes:**
+
+**[UC]** Microcode performs SUB of the register with itself (e.g., Reg→EI, SUB|EO|FI→Reg). Sets ZF. 5 steps, fits current counter. No hardware changes.
+
+**[ASM]** Reclaim 1 opcode. New mnemonic: `clr $a` (1 byte). Convenience; replaces `mov $a, 0` (2 bytes with immediate).
+
+---
+
+### 3.4 Page 3 Data Access
+
+> Make the unmapped 4th SRAM page available as 256 bytes of additional data storage.
+
+Page 3 cannot be presented as a contiguous extension of the existing data page. The MAR is 8 bits wide and drives SRAM A0–A7 only. The page select signals (STK, HL) are hardcoded in each microcode step — they are not derived from the address value and there is no carry/overflow from the MAR into the page select. A contiguous 512-byte data space would require either a 9th address bit routed from the MAR to the SRAM (hardware change to the address path, not just a bodge wire) or conditional page-switching within a single microcode sequence (the microcode has no branch capability). Neither is feasible on this PCB. **The separate opcode is a hardware constraint, not an assembler limitation.**
+
+**What changes:**
+
+**[UC]** New microcode sequences identical to existing `load $a, [imm]` / `stor $a, [imm]` but asserting `STK|HL` instead of `HL` alone on the memory-access step:
+
+```
+ldp3:  PO|MI, RO|II|PE, PO|MI, PE|RO|MI, STK|HL|RO|AI, RST     (6 steps)
+stp3:  PO|MI, RO|II|PE, PO|MI, PE|RO|MI, STK|HL|AO|RI, RST     (6 steps)
+```
+
+Fits current 8-step counter. No hardware changes.
+
+**[ASM]** Reclaim 2 opcodes minimum ($a only), up to 8 for all four GP registers. New mnemonics: `ldp3 $a, [imm]` / `stp3 $a, [imm]` (2 bytes each). The programmer must use these explicitly — existing `load`/`stor` instructions continue to access page 1.
+
+**Use cases:** Lookup tables (sin/cos, font data, character maps), extra variable storage, double-buffering. Doubles usable data space from 256 to 512 bytes.
+
+---
+
+### 3.5 Extend Step Counter to 16 Steps
+
+> Allow instructions to use up to 16 microcode steps instead of 8.
+
+**What changes:**
+
+**[HW]** Bodge wire from U72 Q3 (currently NoConn) to A15 on each of U73–U76. Cut/lift A15 GND ties on all 4 EEPROMs. Possibly adjust reset logic if RST doesn't already clear Q3. **Total: 5 bodge wires + 4 GND lifts.**
+
+Note: this consumes EEPROM address line A15. If enhancement 3.7 (expose OF/SF) also needs A15, these two compete for the same resource. **Only one of {3.5, 3.7} can use A15 unless A16 is used for the other.** With both, A15 = Q3 (step bit 3) and A16 = OF (or SF). This is feasible — there are 4 spare address lines (A15–A18).
+
+**[UC]** Update `microcode.py` to use 4-bit step addressing. All existing instructions work unchanged (steps 8–15 just assert RST). New complex instructions can use up to 16 steps.
+
+**[ASM]** No change to existing programs. Enables future instructions that need more than 8 steps (prerequisite for 3.6).
+
+---
+
+### 3.6 Stack-Relative Load ($a only)
+
+> `ld $a, [SP+n]` — read a value from a stack frame by offset.
+
+**Restricted to $a as destination.** Computing SP+offset requires the ALU: SP goes into E, the immediate offset goes into A, and EO (the ALU result) goes to the MAR. This works when A is the destination because it's being overwritten anyway. For other registers, the programmer writes two instructions: `ld $a, [SP+n]` then `mov $a, $b`.
+
+Stack-relative **store** (`st $a, [SP+n]`) has a fundamental register pressure problem: computing the address requires A for the ALU addition, but A also holds the value to be stored. There is no invisible scratch location to save it. Recommendation: **load only.** Stack writes use `push` or manual SP adjustment.
+
+**What changes:**
+
+**[HW]** Requires 3.5 (16-step counter) for the store variant if it were implemented, but the load variant fits in 8 steps with the current counter:
+
+```
+PO|MI, RO|II|PE, SO|EI, PO|MI, PE|RO|AI, EO|MI, STK|RO|AI, RST
+```
+
+If only implementing the load, **no hardware change beyond what 3.5 already provides** — and the load actually fits in 8 steps even without 3.5.
+
+**[UC]** New microcode sequence (see above). The ALU is in ADD mode (default). EO outputs SP + offset. The final step reads from the stack page at the computed address.
+
+**[ASM]** Reclaim 1–2 opcodes. New mnemonic: `ld $a, [SP+n]` (2 bytes: opcode + offset). Enables compiler-generated code to access local variables and function parameters by stack frame offset.
+
+---
+
+### 3.7 Expose OF/SF to Microcode
+
+> Use the existing overflow and sign flags for conditional branching.
+
+**What changes:**
+
+**[HW]** Bodge wire from U11 OF output to A15 (or A16) on all 4 EEPROMs. Bodge wire from U11 SF output to A16 (or A17) on all 4 EEPROMs. Cut/lift the corresponding GND ties. **Total: 8 bodge wires + 8 GND lifts.** Must coordinate with 3.5 if both are implemented (see 3.5 note on address line sharing).
+
+**[UC]** Expand microcode generator addressing to include OF and SF. Add conditional branch variants that activate on flag combinations:
+
+| Condition | Flags Tested | Use |
+|-----------|-------------|-----|
+| BLT (branch less than, signed) | SF ≠ OF | Signed < |
+| BGE (branch greater/equal, signed) | SF = OF | Signed ≥ |
+| BLE (signed ≤) | ZF=1 or SF≠OF | Signed ≤ |
+| BGT (signed >) | ZF=0 and SF=OF | Signed > |
+
+**[ASM]** Reclaim 2–4 opcodes for new branch mnemonics. Enables signed arithmetic comparisons — currently the CPU can only branch on zero/carry (unsigned).
+
+---
+
+## 4. IMPLEMENTATION ORDER
+
+| # | Enhancement | Tags | Opcodes | Hardware | Dependencies |
+|---|-------------|------|---------|----------|-------------|
+| 1 | INC / DEC | HW, UC, ASM | 2 | 3 wires, 1 cut, 1 XOR gate, 1 U76 bit | None |
+| 2 | SWAP | UC, ASM | 2–4 | None | None |
+| 3 | CLR | UC, ASM | 1 | None | None |
+| 4 | Page 3 data (ldp3/stp3) | UC, ASM | 2–8 | None | None |
+| 5 | 16-step counter | HW, UC | 0 | 5 wires, 4 GND lifts | None |
+| 6 | Stack-relative LD | UC, ASM | 1–2 | None | None (fits 8 steps) |
+| 7 | Expose OF/SF | HW, UC, ASM | 2–4 | 8 wires, 8 GND lifts | Coordinate A15–A18 with #5 |
+
+**Total opcode budget:** 10–21 opcodes. Available from reclamation: 4 definite + up to 20 probable = 24 max.
+
+**Total spare U76 bits consumed:** 1 (CINV for INC/DEC). 2 remaining for future use.
+
+**EEPROM address line allocation** (if all enhancements implemented):
+
+```
+A15:  Step counter Q3 (enhancement #5)
+A16:  Overflow Flag (enhancement #7)
+A17:  Sign Flag (enhancement #7)
+A18:  Spare
+```
+
+---
+
+## 5. REFERENCE
+
+### Control Signal Map
+
+**U73 — Bits 31–24:**
 
 | Bit | Signal | Function |
 |-----|--------|----------|
 | 31 | HLT | Halt clock |
-| 30 | STK | Stack memory address space |
-| 29 | PE | Program counter enable (increment) |
-| 28 | RegIn[2] | Register input select (3-bit muxed with 27,26) |
-| 27 | RegIn[1] | AI=001, BI=010, CI=011, DI=100, SI=101, EI=110, PI=111 |
-| 26 | RegIn[0] | Decoded by 74HCT138 (U77) |
+| 30 | STK | Stack page select (SRAM A9) |
+| 29 | PE | Program counter increment |
+| 28–26 | RegIn[2:0] | Register input select (decoded by U77 74HCT138) |
 | 25 | MI | Memory address register in |
 | 24 | RI | RAM data in |
 
-### U74 — Bits 23–16
+**U74 — Bits 23–16:**
 
 | Bit | Signal | Function |
 |-----|--------|----------|
 | 23 | II | Instruction register in |
 | 22 | OI | Output register in |
 | 21 | XI | External interface in |
-| 20 | RegOut[2] | Register output select (3-bit muxed with 19,18) |
-| 19 | RegOut[1] | AO=001, BO=010, CO=011, DO=100, PO=101, SO=110, EO=111 |
-| 18 | RegOut[0] | Decoded by 74HCT238 (U78/U79) |
+| 20–18 | RegOut[2:0] | Register output select (decoded by U78/U79 74HCT238) |
 | 17 | RO | RAM data out |
-| 16 | IO | Instruction register out (immediate data) |
+| 16 | IO | Instruction register out (immediate) |
 
-### U75 — Bits 15–8
+**U75 — Bits 15–8:**
 
 | Bit | Signal | Function |
 |-----|--------|----------|
 | 15 | SUB | ALU mode bit 2 |
 | 14 | OR | ALU mode bit 1 |
 | 13 | SHF | ALU mode bit 0 |
-| 12 | FI | Flags register in (latch ALU flags) |
-| 11 | SU | Stack pointer count UP |
-| 10 | SD | Stack pointer count DOWN |
+| 12 | FI | Flags register in |
+| 11 | SU | Stack pointer count up |
+| 10 | SD | Stack pointer count down |
 | 9 | U0 | External user signal 0 |
 | 8 | U1 | External user signal 1 |
 
-### U76 — Bits 7–0
+**U76 — Bits 7–0:**
 
 | Bit | Signal | Function |
 |-----|--------|----------|
 | 7 | E0 | External enable 0 |
 | 6 | E1 | External enable 1 |
-| 5 | HL | High/Low address mode |
+| 5 | HL | Data page select (SRAM A8) |
 | 4 | RGT | Right shift/rotate direction |
 | 3 | — | **AVAILABLE** |
 | 2 | — | **AVAILABLE** |
-| 1 | — | **AVAILABLE** |
+| 1 | — | **AVAILABLE** (proposed: CINV) |
 | 0 | RST | Reset step counter |
 
----
+### Register Select Encoding
 
-## 6. KEY HARDWARE REFERENCE
+| Code | Register In | Register Out |
+|------|------------|-------------|
+| 000 | (none) | (none) |
+| 001 | AI | AO |
+| 010 | BI | BO |
+| 011 | CI | CO |
+| 100 | DI | DO |
+| 101 | SI | PO |
+| 110 | EI | SO |
+| 111 | PI | EO |
 
-### Microcode EEPROM Addressing
+### Microcode EEPROM Addressing (current)
 
 ```
-A18–A15:  unused (tied low)
 A14:      IRQ1
 A13:      IRQ0
 A12:      Zero Flag
 A11:      Carry Flag
 A10–A3:   Instruction opcode (IR_7–IR_0)
-A2–A0:    Step counter (0–7)
+A2–A0:    Step counter (Q0–Q2)
+A15–A18:  Tied low (available)
 ```
-
-Total effective address: 15 bits → 32K locations per EEPROM.
-4 EEPROMs × 8 bits each = 32-bit microcode word.
-
-### Step Counter
-
-- U72 (74HCT161): Q0–Q2 used (8 steps), Q3 unconnected
-- RST (microcode bit 0) resets counter to 0
-- Every instruction starts with 2 fetch steps: `PO|MI` then `PE|II|RO`
 
 ### ALU Carry-In Path
 
-- SUB signal currently drives carry-in (C0) on the 74HCT283 adder(s) directly
-- SUB also drives the XOR gates (U21/U22) for B-operand inversion
-- INC/DEC modification intercepts only the C0 path, leaving B-inversion intact
-
-### Register Select Decoders
-
-- U77 (74HCT138): 3-to-8 decoder for register INPUT select (active-low outputs)
-- U78/U79 (74HCT238): 3-to-8 decoders for register OUTPUT select
-- Bits 28–26 (input) and 20–18 (output) encode register number 0–7
+SUB drives both the XOR inversion gates (U21/U22, B-operand inversion) and the adder carry-in (C0) directly. The INC/DEC modification (enhancement 3.1) interposes a XOR gate on the C0 path only, leaving B-inversion intact.
