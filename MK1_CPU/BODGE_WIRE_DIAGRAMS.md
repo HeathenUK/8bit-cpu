@@ -1,272 +1,346 @@
 # MK1 CPU — Bodge Wire Diagrams
 
-Pin-level wiring diagrams for all hardware enhancements. Verify physical pin numbers against manufacturer datasheets before soldering.
+Physical pin locations for all hardware enhancements. Pin numbers from standard manufacturer datasheets.
+
+**Verify against YOUR specific chip markings before soldering.** PLCC-32 pins count counterclockwise from the notch.
 
 ---
 
-## Enhancement 1: INC/DEC — ALU Carry-In Modification
+## Enhancement 1: INC/DEC — Components Involved
 
-```mermaid
-graph LR
-    subgraph U76["U76 (AM29F040 EEPROM) — PLCC-32"]
-        U76_DQ1["DQ1 output<br/>(bit 1 — currently NoConn)"]
-    end
+### U24 — 74HCT86 (Quad 2-Input XOR) — DIP-14
 
-    subgraph U24["U24 (74HCT86 Quad XOR) — DIP-14"]
-        U24_9["Pin 9 (Gate 3 Input A)"]
-        U24_10["Pin 10 (Gate 3 Input B)"]
-        U24_8["Pin 8 (Gate 3 Output)"]
-    end
+Gate 3 is spare. **Inputs: pins 9, 10. Output: pin 8.**
 
-    subgraph U15["U15 (74HCT283 Adder) — DIP-16"]
-        U15_7["Pin 7 (C0 Carry-In)"]
-    end
-
-    SUB_NET["Existing SUB net<br/>(tap BEFORE trace cut)"]
-
-    U76_DQ1 -- "Wire 1: CINV signal" --> U24_9
-    SUB_NET -- "Wire 2: SUB signal" --> U24_10
-    U24_8 -- "Wire 3: CINV XOR SUB" --> U15_7
-
-    style U76 fill:#4a6,color:#fff
-    style U24 fill:#46a,color:#fff
-    style U15 fill:#a64,color:#fff
+```
+                 ┌────U────┐
+       1A  [1]  ─┤         ├─  [14] VCC
+       1B  [2]  ─┤         ├─  [13] 4B
+       1Y  [3]  ─┤         ├─  [12] 4A
+       2A  [4]  ─┤  74HC   ├─  [11] 4Y
+       2B  [5]  ─┤  T86    ├─  [10] 3B ◄── WIRE 1: CINV from U76 DQ1
+       2Y  [6]  ─┤         ├─  [ 9] 3A ◄── WIRE 2: SUB signal (tap before cut)
+      GND  [7]  ─┤         ├─  [ 8] 3Y ◄── WIRE 3: Output → U15 pin 7
+                 └─────────┘
 ```
 
-### Trace Cut
-```mermaid
-graph LR
-    SUB_SOURCE["SUB signal source"] -. "CUT HERE" .-> U15_C0["U15 Pin 7 (C0)"]
-    SUB_SOURCE -- "Keep intact" --> XOR_GATES["U21/U22 XOR gates<br/>(B-operand inversion)"]
+### U15 — 74HCT283 (4-Bit Adder, Low Nibble) — DIP-16
 
-    style SUB_SOURCE fill:#666,color:#fff
-    style U15_C0 fill:#a33,color:#fff
-    style XOR_GATES fill:#363,color:#fff
+**Pin 7 = C0 (Carry-In).** Cut existing SUB trace to this pin. Reconnect via U24 gate 3 output.
+
+```
+                 ┌────U────┐
+       Σ2  [1]  ─┤         ├─  [16] VCC
+       B2  [2]  ─┤         ├─  [15] B3
+       A2  [3]  ─┤         ├─  [14] A3
+       Σ1  [4]  ─┤  74HC   ├─  [13] Σ3
+       A1  [5]  ─┤  T283   ├─  [12] Σ4
+       B1  [6]  ─┤         ├─  [11] C4 (carry out)
+   ►►  C0  [7]  ─┤         ├─  [10] A4
+      GND  [8]  ─┤         ├─  [ 9] B4
+                 └─────────┘
+
+       ►► = CUT existing SUB → pin 7 trace
+            WIRE 3 from U24 pin 8 connects here
 ```
 
-> **Critical:** The SUB net splits to (a) XOR gates U21/U22 for B-operand inversion and (b) U15 C0 carry-in. Cut ONLY the branch to C0. Verify the split point on your PCB before cutting.
+### U76 — AM29F040 (Microcode EEPROM, Byte 0) — PLCC-32
 
----
+**DQ1 (pin 14) = control word bit 1 = CINV signal (currently NoConn).**
 
-## Enhancement 5: Display Mode Control
+```
+              ┌─── notch ───┐
+              │  9  8  7  6 │ 5
+           10─┤             ├─4  A12
+        A2 11─┤             ├─3  A15 (spare)
+        A1 12─┤             ├─2  A16 ◄── Enhancement 6 (OF)
+        A0 13─┤   AM29F040 ├─1  A18 (spare)
+   ►►  DQ0 14─┤   (U76)    ├─32 VCC
+       DQ1 15─┤             ├─31 ~WE
+      GND  16─┤             ├─30 A17 ◄── Enhancement 6 (SF)
+       DQ2 17─┤             ├─29 A14
+              │ 18 19 20 21 │ 22 ~CE
+              └─────────────┘
+                         23 A10
 
-### U71 Flip-Flop (Mode Bit 0)
-
-```mermaid
-graph LR
-    subgraph U76_2["U76 (AM29F040)"]
-        DQ2["DQ2 output<br/>(bit 2 — currently NoConn)"]
-    end
-
-    subgraph U60["U60 (74HCT04 Inverter) — DIP-14<br/>Use any spare inverter"]
-        U60_IN["Input (spare)"]
-        U60_OUT["Output (spare)"]
-    end
-
-    subgraph U71["U71 (74HCT107 Dual JK FF) — DIP-14<br/>Flip-Flop 2 only"]
-        U71_8["Pin 8 (2J)"]
-        U71_11["Pin 11 (2K)"]
-        U71_9["Pin 9 (2CLK)"]
-        U71_10["Pin 10 (2~CLR)"]
-        U71_6["Pin 6 (2Q) — OUTPUT"]
-    end
-
-    subgraph U36["U36 (28C64 Display EEPROM) — DIP-28"]
-        U36_23["Pin 23 (A11)"]
-    end
-
-    BUS_0["BUS_0<br/>(data bus bit 0)"]
-    RESET["System ~CLR net"]
-
-    DQ2 -- "Wire 1: DM clock" --> U71_9
-    BUS_0 -- "Wire 2" --> U71_8
-    BUS_0 --> U60_IN
-    U60_OUT -- "Wire 3: NOT BUS_0" --> U71_11
-    RESET -- "Wire 4" --> U71_10
-    U71_6 -- "Wire 5" --> U36_23
-
-    style U76_2 fill:#4a6,color:#fff
-    style U71 fill:#a64,color:#fff
-    style U36 fill:#64a,color:#fff
-    style U60 fill:#46a,color:#fff
+       ►► DQ1 (pin 15) = CINV signal → Wire 1 to U24 pin 10
+          DQ2 (pin 17) = DM signal  → Enhancement 5, Wire 1 to U71 pin 9
 ```
 
-### SR Latch (Mode Bit 1)
+**IMPORTANT:** The DQ-to-bit mapping (DQ0=bit 0, DQ1=bit 1, etc.) assumes standard wiring. Verify on your PCB by probing the existing RST signal (bit 0) — it should appear on DQ0 (pin 14). If the bit ordering is swapped, trace the actual DQ pin for bits 1 and 2.
 
-```mermaid
-graph LR
-    subgraph U58["U58 (74HCT08 AND) — DIP-14<br/>2 spare gates"]
-        U58_G1_OUT["Gate X Output:<br/>DM AND BUS_1"]
-        U58_G2_OUT["Gate Y Output:<br/>DM AND NOT(BUS_1)"]
-    end
+### Wiring Summary — Enhancement 1
 
-    subgraph U60b["U60 (74HCT04 Inverter)"]
-        U60b_OUT["NOT(BUS_1)"]
-    end
-
-    subgraph U55["U55 (74HCT00 NAND) — DIP-14<br/>2 spare gates forming SR latch"]
-        U55_S["S input (NAND gate 1)"]
-        U55_R["R input (NAND gate 2)"]
-        U55_Q["Q output"]
-    end
-
-    subgraph U36b["U36 (28C64)"]
-        U36b_2["Pin 2 (A12)"]
-    end
-
-    DM_SIGNAL["DM signal<br/>(from U76 bit 2)"]
-    BUS_1["BUS_1<br/>(data bus bit 1)"]
-
-    DM_SIGNAL --> U58_G1_OUT
-    BUS_1 --> U58_G1_OUT
-    DM_SIGNAL --> U58_G2_OUT
-    BUS_1 --> U60b_OUT
-    U60b_OUT --> U58_G2_OUT
-    U58_G1_OUT -- "Wire 6: Set" --> U55_S
-    U58_G2_OUT -- "Wire 7: Reset" --> U55_R
-    U55_Q -- "Wire 8" --> U36b_2
-
-    style U58 fill:#46a,color:#fff
-    style U55 fill:#a64,color:#fff
-    style U36b fill:#64a,color:#fff
-    style U60b fill:#46a,color:#fff
 ```
+  U76 pin 15 (DQ1) ────────────────────── U24 pin 10 (3B)   WIRE 1: CINV
+  SUB net (tap before cut) ────────────── U24 pin  9 (3A)   WIRE 2: SUB
+  U24 pin 8 (3Y) ──────────────────────── U15 pin  7 (C0)   WIRE 3: modified carry-in
 
-### Trace Cuts for Enhancement 5
-```mermaid
-graph TD
-    CUT1["CUT 1: IRQ1 clock source → U71 Pin 9"]
-    CUT2["CUT 2: IRQ1 J/K inputs → U71 Pins 8, 11"]
-    CUT3["CUT 3: SW6 DIP switch → U36 Pin 23 (A11)"]
-    CUT4["CUT 4: SW6 DIP switch → U36 Pin 2 (A12)"]
-
-    style CUT1 fill:#a33,color:#fff
-    style CUT2 fill:#a33,color:#fff
-    style CUT3 fill:#a33,color:#fff
-    style CUT4 fill:#a33,color:#fff
+  TRACE CUT: existing SUB → U15 pin 7 (C0 direct connection)
+  DO NOT CUT: SUB → U21/U22 XOR gates (B-operand inversion path)
 ```
 
 ---
 
-## Enhancement 6: OF/SF Flags — EEPROM Address Wiring
+## Enhancement 5: Display Mode Control — Components Involved
 
-```mermaid
-graph LR
-    subgraph U11["U11 (74HCT173 Flag Register) — DIP-16"]
-        U11_5["Pin 5 (Q2 = OF)<br/>Currently NoConn"]
-        U11_6["Pin 6 (Q3 = SF)<br/>Currently NoConn"]
-    end
+### U71 — 74HCT107 (Dual JK Flip-Flop, Neg-Edge) — DIP-14
 
-    subgraph EEPROMS["Microcode EEPROMs (AM29F040) — PLCC-32 × 4"]
-        subgraph U73["U73"]
-            U73_A16["A16 — lift GND first"]
-            U73_A17["A17 — lift GND first"]
-        end
-        subgraph U74["U74"]
-            U74_A16["A16 — lift GND first"]
-            U74_A17["A17 — lift GND first"]
-        end
-        subgraph U75["U75"]
-            U75_A16["A16 — lift GND first"]
-            U75_A17["A17 — lift GND first"]
-        end
-        subgraph U76e["U76"]
-            U76_A16["A16 — lift GND first"]
-            U76_A17["A17 — lift GND first"]
-        end
-    end
+**FF2 is repurposed. FF1 (IRQ0) is untouched.**
 
-    U11_5 -- "Wire 1" --> U73_A16
-    U11_5 -- "Wire 2" --> U74_A16
-    U11_5 -- "Wire 3" --> U75_A16
-    U11_5 -- "Wire 4" --> U76_A16
+```
+                 ┌────U────┐
+    ░░  1J  [1]  ─┤         ├─  [14] VCC        ░░ = FF1, do NOT
+    ░░ 1~Q  [2]  ─┤         ├─  [13] 1~CLR  ░░      disturb
+    ░░  1Q  [3]  ─┤         ├─  [12] 1K     ░░
+    ░░ 1CLK [4]  ─┤  74HC   ├─  [11] 2K  ◄── WIRE 3: NOT(BUS_0) via U60
+       2~Q  [5]  ─┤  T107   ├─  [10] 2~CLR◄── WIRE 4: system ~CLR
+   ►►  2Q   [6]  ─┤         ├─  [ 9] 2CLK ◄── WIRE 1: DM from U76 DQ2
+      GND   [7]  ─┤         ├─  [ 8] 2J   ◄── WIRE 2: BUS_0
+                 └─────────┘
 
-    U11_6 -- "Wire 5" --> U73_A17
-    U11_6 -- "Wire 6" --> U74_A17
-    U11_6 -- "Wire 7" --> U75_A17
-    U11_6 -- "Wire 8" --> U76_A17
+       ►► pin 6 (2Q) = mode bit 0 output → Wire 5 to U36 pin 23 (A11)
 
-    style U11 fill:#a64,color:#fff
-    style U73 fill:#4a6,color:#fff
-    style U74 fill:#4a6,color:#fff
-    style U75 fill:#4a6,color:#fff
-    style U76e fill:#4a6,color:#fff
+  TRACE CUTS: existing IRQ1 logic → pins 8, 9, 10, 11
+              (disconnect FF2 from interrupt circuitry)
 ```
 
-### GND Lifts for Enhancement 6
-```mermaid
-graph TD
-    subgraph LIFTS["Lift/cut GND traces BEFORE wiring"]
-        L1["U73 A16 — lift from GND"]
-        L2["U73 A17 — lift from GND"]
-        L3["U74 A16 — lift from GND"]
-        L4["U74 A17 — lift from GND"]
-        L5["U75 A16 — lift from GND"]
-        L6["U75 A17 — lift from GND"]
-        L7["U76 A16 — lift from GND"]
-        L8["U76 A17 — lift from GND"]
-    end
+### U36 — 28C64 (Display Decode EEPROM) — DIP-28
 
-    style L1 fill:#a33,color:#fff
-    style L2 fill:#a33,color:#fff
-    style L3 fill:#a33,color:#fff
-    style L4 fill:#a33,color:#fff
-    style L5 fill:#a33,color:#fff
-    style L6 fill:#a33,color:#fff
-    style L7 fill:#a33,color:#fff
-    style L8 fill:#a33,color:#fff
+**A11 (pin 23) and A12 (pin 2) receive the mode bits. Cut SW6 traces to both.**
+
+```
+                 ┌────U────┐
+       NC   [1]  ─┤         ├─  [28] VCC
+   ►►  A12  [2]  ─┤         ├─  [27] ~WE
+       A7   [3]  ─┤         ├─  [26] NC
+       A6   [4]  ─┤         ├─  [25] A8
+       A5   [5]  ─┤         ├─  [24] A9
+       A4   [6]  ─┤  28C64  ├─  [23] A11 ◄── WIRE 5: U71 pin 6 (2Q)
+       A3   [7]  ─┤  (U36)  ├─  [22] ~OE
+       A2   [8]  ─┤         ├─  [21] A10
+       A1   [9]  ─┤         ├─  [20] ~CE
+       A0  [10]  ─┤         ├─  [19] I/O7
+      O0   [11]  ─┤         ├─  [18] I/O6
+      O1   [12]  ─┤         ├─  [17] I/O5
+      O2   [13]  ─┤         ├─  [16] I/O4
+      GND  [14]  ─┤         ├─  [15] I/O3
+                 └─────────┘
+
+       ►► pin 2  (A12) = mode bit 1 ← Wire 8 from SR latch Q output
+          pin 23 (A11) = mode bit 0 ← Wire 5 from U71 pin 6
+
+  TRACE CUTS: SW6 → pin 2  (disconnect DIP switch from A12)
+              SW6 → pin 23 (disconnect DIP switch from A11)
 ```
 
-> **PLCC-32 pin numbers for A16 and A17:** Consult the AM29F040B datasheet for your specific chip revision. These pins are typically on the top edge of the PLCC-32 package near pin 1. All four EEPROMs (U73–U76) use the same pinout.
+### SR Latch for Mode Bit 1 — Built from U55/U58/U60
 
-> **Pre-check:** Probe U11 pins 5 and 6 with a scope during ALU operations to confirm they carry distinct OF and SF signals before committing to any GND lifts.
+```
+  BUS_1 ──────┬────────────── U58 gate X input A ─┐
+              │                                     ├── U58 gate X out ── U55 NAND latch S
+  DM signal ──┼────────────── U58 gate X input B ─┘
+              │
+              └── U60 inv ── U58 gate Y input A ─┐
+                                                   ├── U58 gate Y out ── U55 NAND latch R
+  DM signal ──────────────── U58 gate Y input B ─┘
+
+  U55 NAND cross-coupled latch Q output ──────────── U36 pin 2 (A12)
+```
+
+**U58 (74HCT08 Quad AND) and U55 (74HCT00 Quad NAND) share the same DIP-14 pin pattern:**
+
+```
+                 ┌────U────┐
+       1A  [1]  ─┤         ├─  [14] VCC
+       1B  [2]  ─┤  74HC   ├─  [13] 4B
+       1Y  [3]  ─┤  T08    ├─  [12] 4A
+       2A  [4]  ─┤  or     ├─  [11] 4Y
+       2B  [5]  ─┤  T00    ├─  [10] 3B
+       2Y  [6]  ─┤         ├─  [ 9] 3A
+      GND  [7]  ─┤         ├─  [ 8] 3Y
+                 └─────────┘
+
+  Which specific gates are spare depends on your board.
+  Probe each gate's pins to confirm they're unconnected before using.
+```
+
+**U60 (74HCT04 Hex Inverter) — DIP-14:**
+
+```
+                 ┌────U────┐
+       1A  [1]  ─┤         ├─  [14] VCC
+       1Y  [2]  ─┤         ├─  [13] 6A
+       2A  [3]  ─┤  74HC   ├─  [12] 6Y
+       2Y  [4]  ─┤  T04    ├─  [11] 5A
+       3A  [5]  ─┤         ├─  [10] 5Y
+       3Y  [6]  ─┤         ├─  [ 9] 4A
+      GND  [7]  ─┤         ├─  [ 8] 4Y
+                 └─────────┘
+
+  Need 2 spare inverters: one for NOT(BUS_0), one for NOT(BUS_1).
+  Probe to find which are unconnected.
+```
 
 ---
 
-## All Hardware Changes — Summary
+## Enhancement 6: OF/SF Flags — Components Involved
 
-```mermaid
-graph TD
-    subgraph HW_ENH1["Enhancement 1: INC/DEC<br/>3 wires, 1 trace cut"]
-        E1W1["U76 DQ1 → U24 Pin 9"]
-        E1W2["SUB net → U24 Pin 10"]
-        E1W3["U24 Pin 8 → U15 Pin 7"]
-        E1C1["CUT: SUB → U15 Pin 7"]
-    end
+### U11 — 74HCT173 (4-Bit D Register, Flags) — DIP-16
 
-    subgraph HW_ENH5["Enhancement 5: Display Mode<br/>~8 wires, ~3 trace cuts"]
-        E5W1["U76 DQ2 → U71 Pin 9"]
-        E5W2["BUS_0 → U71 Pin 8"]
-        E5W3["NOT BUS_0 → U71 Pin 11"]
-        E5W4["~CLR → U71 Pin 10"]
-        E5W5["U71 Pin 6 → U36 Pin 23"]
-        E5W6["DM+BUS_1 → U55 SR Set"]
-        E5W7["DM+NOT BUS_1 → U55 SR Reset"]
-        E5W8["U55 Q → U36 Pin 2"]
-        E5C1["CUT: IRQ1 → U71"]
-        E5C2["CUT: SW6 → U36 A11"]
-        E5C3["CUT: SW6 → U36 A12"]
-    end
+**Pins 5 and 6 are the flag outputs we need. Currently NoConn.**
 
-    subgraph HW_ENH6["Enhancement 6: OF/SF Flags<br/>8 wires, 8 GND lifts"]
-        E6W1["U11 Pin 5 → U73–U76 A16 (×4)"]
-        E6W2["U11 Pin 6 → U73–U76 A17 (×4)"]
-        E6L1["Lift GND: A16 on U73–U76 (×4)"]
-        E6L2["Lift GND: A17 on U73–U76 (×4)"]
-    end
+```
+                 ┌────U────┐
+      OE1  [1]  ─┤         ├─  [16] VCC
+      OE2  [2]  ─┤         ├─  [15] CLR
+  ░░   Q0  [3]  ─┤         ├─  [14] D0        ░░ = CF, ZF already
+  ░░   Q1  [4]  ─┤  74HC   ├─  [13] D1   ░░       wired to EEPROMs
+   ►►  Q2  [5]  ─┤  T173   ├─  [12] D2
+   ►►  Q3  [6]  ─┤  (U11)  ├─  [11] D3
+      CLK  [7]  ─┤         ├─  [10] E2
+      GND  [8]  ─┤         ├─  [ 9] E1
+                 └─────────┘
 
-    subgraph NO_HW["Enhancements 2,3,4,7,8,9,10,11,12<br/>MICROCODE ONLY — no hardware"]
-        NONE["Page 3 · CLR · SWAP · Stack LD<br/>XOR · NEG · Cond Set · Nswap · ABS"]
-    end
+       ►► pin 5 (Q2) = Overflow Flag → Wires 1–4 to U73–U76 pin 2 (A16)
+       ►► pin 6 (Q3) = Sign Flag    → Wires 5–8 to U73–U76 pin 30 (A17)
 
-    style HW_ENH1 fill:#264,color:#fff
-    style HW_ENH5 fill:#246,color:#fff
-    style HW_ENH6 fill:#642,color:#fff
-    style NO_HW fill:#333,color:#aaa
-    style E1C1 fill:#a33,color:#fff
-    style E5C1 fill:#a33,color:#fff
-    style E5C2 fill:#a33,color:#fff
-    style E5C3 fill:#a33,color:#fff
+  PRE-CHECK: Probe pins 5 and 6 during ALU operations before committing.
 ```
 
-> **Total physical work:** ~19 bodge wires + 4 trace cuts + 8 GND lifts. Nine of the twelve enhancements require zero hardware changes.
+### U73, U74, U75, U76 — AM29F040 (PLCC-32) — All 4 EEPROMs
+
+**A16 = PLCC pin 2, A17 = PLCC pin 30. Lift GND from both on all 4 chips.**
+
+```
+        pin 1
+          ↓
+              ┌─── notch ───┐
+              │  9  8  7  6 │ 5
+           10─┤             ├─4  A12
+        A2 11─┤             ├─3  A15 (spare)
+        A1 12─┤             ├─2  A16 ◄◄ LIFT GND, wire to U11 pin 5 (OF)
+        A0 13─┤   AM29F040 ├─1  A18 (spare)
+       DQ0 14─┤             ├─32 VCC
+       DQ1 15─┤             ├─31 ~WE
+      GND  16─┤             ├─30 A17 ◄◄ LIFT GND, wire to U11 pin 6 (SF)
+       DQ2 17─┤             ├─29 A14
+              │ 18 19 20 21 │ 22 ~CE
+              └─────────────┘
+                   ↑       ↑
+                DQ4-DQ7   23 A10
+
+  ◄◄ = Lift GND trace FIRST, then solder bodge wire.
+
+  Repeat on all 4 EEPROMs: U73, U74, U75, U76.
+  Total: 8 GND lifts + 8 bodge wires.
+
+  Pin 2  (A16) and pin 30 (A17) are on ADJACENT EDGES
+  of the PLCC package — A16 is top edge, A17 is left edge,
+  both near pin 1 (top-left corner).
+```
+
+---
+
+## Complete Wiring Checklist
+
+### Enhancement 1: INC/DEC (3 wires, 1 cut)
+
+```
+  [ ] WIRE 1: U76 pin 15 (DQ1) ───── U24 pin 10 (gate 3 input B)
+  [ ] WIRE 2: SUB net (tap) ───────── U24 pin  9 (gate 3 input A)
+  [ ] WIRE 3: U24 pin  8 (gate 3 Y)── U15 pin  7 (C0)
+  [ ] CUT:    SUB trace → U15 pin 7   (keep SUB → U21/U22 intact)
+```
+
+### Enhancement 5: Display Mode (~11 wires, ~3 cuts)
+
+```
+  FF2 repurpose:
+  [ ] CUT:    IRQ1 clock → U71 pin 9
+  [ ] CUT:    IRQ1 J/K → U71 pins 8, 11
+  [ ] WIRE 1: U76 pin 17 (DQ2) ───── U71 pin  9 (2CLK)
+  [ ] WIRE 2: BUS_0 ──────────────── U71 pin  8 (2J)
+  [ ] WIRE 3: U60 spare inv out ──── U71 pin 11 (2K)
+              (U60 spare inv in ← BUS_0)
+  [ ] WIRE 4: System ~CLR ────────── U71 pin 10 (2~CLR)
+  [ ] WIRE 5: U71 pin 6 (2Q) ─────── U36 pin 23 (A11)
+
+  SR latch:
+  [ ] WIRE 6: U58 spare AND out ──── U55 NAND latch S input
+              (U58 inputs ← DM signal + BUS_1)
+  [ ] WIRE 7: U58 spare AND out ──── U55 NAND latch R input
+              (U58 inputs ← DM signal + NOT(BUS_1) via U60)
+  [ ] WIRE 8: U55 latch Q out ────── U36 pin  2 (A12)
+
+  Display EEPROM:
+  [ ] CUT:    SW6 → U36 pin 23 (A11)
+  [ ] CUT:    SW6 → U36 pin  2 (A12)
+```
+
+### Enhancement 6: OF/SF Flags (8 wires, 8 GND lifts)
+
+```
+  Overflow Flag (OF):
+  [ ] LIFT:   U73 pin  2 (A16) from GND
+  [ ] LIFT:   U74 pin  2 (A16) from GND
+  [ ] LIFT:   U75 pin  2 (A16) from GND
+  [ ] LIFT:   U76 pin  2 (A16) from GND
+  [ ] WIRE 1: U11 pin 5 (Q2) ─── U73 pin  2 (A16)
+  [ ] WIRE 2: U11 pin 5 (Q2) ─── U74 pin  2 (A16)
+  [ ] WIRE 3: U11 pin 5 (Q2) ─── U75 pin  2 (A16)
+  [ ] WIRE 4: U11 pin 5 (Q2) ─── U76 pin  2 (A16)
+
+  Sign Flag (SF):
+  [ ] LIFT:   U73 pin 30 (A17) from GND
+  [ ] LIFT:   U74 pin 30 (A17) from GND
+  [ ] LIFT:   U75 pin 30 (A17) from GND
+  [ ] LIFT:   U76 pin 30 (A17) from GND
+  [ ] WIRE 5: U11 pin 6 (Q3) ─── U73 pin 30 (A17)
+  [ ] WIRE 6: U11 pin 6 (Q3) ─── U74 pin 30 (A17)
+  [ ] WIRE 7: U11 pin 6 (Q3) ─── U75 pin 30 (A17)
+  [ ] WIRE 8: U11 pin 6 (Q3) ─── U76 pin 30 (A17)
+
+  PRE-CHECK:
+  [ ] Probe U11 pin 5 during ALU ops — confirm OF signal
+  [ ] Probe U11 pin 6 during ALU ops — confirm SF signal
+```
+
+---
+
+## PLCC-32 Pin Location Guide
+
+For the 4 microcode EEPROMs (U73–U76). View from above, notch at top-left.
+
+```
+                        notch
+                        ↓
+            ┌───────────█───────────┐
+            │ 1   2   3   4   5    │
+            │A18 A16 A15 A12  A7   │
+         32─┤                      ├─6  A6
+     VCC    │                      │    A5
+         31─┤                      ├─7
+     ~WE    │                      │    A4
+     ►►A17──┤                      ├─8
+         30 │      AM29F040        │
+         29─┤      (top view)      ├─9  A3
+     A14    │                      │    A2
+         28─┤                      ├─10
+     A13    │                      │    A1
+         27─┤                      ├─11
+      A8    │                      │    A0
+         26─┤                      ├─12
+      A9    │                      │
+            │ 25  24  23  22  21   │
+            │A11  ~OE A10 ~CE DQ7  │
+            └──────────────────────┘
+                  17  18  19  20
+                 DQ3  DQ4 DQ5 DQ6
+
+         13=DQ0  14=DQ1  15=DQ2  16=GND
+
+  ►► A16 (pin 2)  = OF target — top edge, 2nd from left
+  ►► A17 (pin 30) = SF target — left edge, 3rd from top
+  Both near the pin 1 corner. Adjacent edges.
+```
