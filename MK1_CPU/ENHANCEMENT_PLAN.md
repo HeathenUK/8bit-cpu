@@ -351,3 +351,182 @@ All 8 enhancements have been checked for mutual compatibility:
 - **Page 3 vs stack-relative LD:** Different page select signals (STK|HL vs STK). Different SRAM pages.
 - **Display mode vs remaining external device:** Device slot 0 kept intact. E0, U0, U1, IRQ0 all unaffected.
 - **All enhancements share the same 4 microcode EEPROMs:** No conflict — reflash once with all changes.
+
+---
+
+## Bodge Wire Reference — Component and Signal Map
+
+**Important: Physical pin numbers below are from standard manufacturer datasheets. Verify against your specific IC date codes / manufacturers before soldering. PLCC-32 pin numbering is counterclockwise from the notch.**
+
+### Enhancement 1: INC/DEC — Bodge Wires
+
+| # | From | To | Signal | Notes |
+|---|------|----|--------|-------|
+| 1 | **U76** data output for bit 1 (verify which PLCC DQ pin carries bit 1 — trace from U76 to its downstream latch/buffer) | **U24** spare gate input A | CINV | New control signal. U76 bit 1 is currently NoConn. |
+| 2 | Existing **SUB** net (trace from where SUB currently reaches U15 C0) | **U24** same spare gate input B | SUB | Tap the existing SUB signal before the trace cut. |
+| 3 | **U24** spare gate output | **U15** pin 7 (C0, carry-in) | CINV XOR SUB | This is the modified carry-in. |
+
+| # | Trace Cut | Notes |
+|---|-----------|-------|
+| 1 | Cut existing **SUB → U15 pin 7** (C0) trace | SUB must still reach the XOR gates (U21/U22) for B-operand inversion. Only cut the branch that goes to C0. Verify the SUB net splits to (a) XOR inversion gates and (b) C0 — cut at (b) only. |
+
+**U24 (74HCT86, Quad 2-input XOR, DIP-14) — Standard pinout:**
+
+| Pin | Function |
+|-----|----------|
+| 1 | 1A (Gate 1 input) |
+| 2 | 1B (Gate 1 input) |
+| 3 | 1Y (Gate 1 output) |
+| 4 | 2A (Gate 2 input) |
+| 5 | 2B (Gate 2 input) |
+| 6 | 2Y (Gate 2 output) |
+| 7 | GND |
+| 8 | 3Y (Gate 3 output) |
+| 9 | 3A (Gate 3 input) |
+| 10 | 3B (Gate 3 input) |
+| 11 | 4Y (Gate 4 output) |
+| 12 | 4A (Gate 4 input) |
+| 13 | 4B (Gate 4 input) |
+| 14 | VCC |
+
+Architectural analysis identifies U24 gates 3 and 4 as spare. If using gate 3: inputs = pins 9, 10; output = pin 8. **Verify on your board that U24 pins 8, 9, 10 are unconnected before using.**
+
+**U15 (74HCT283, 4-bit Adder, DIP-16) — C0 is pin 7.**
+
+---
+
+### Enhancement 5: Display Mode — Bodge Wires
+
+**U71 (74HCT107, Dual JK Negative-Edge-Triggered Flip-Flop, DIP-14) — Standard pinout:**
+
+| Pin | Function |
+|-----|----------|
+| 1 | 1J |
+| 2 | 1~Q |
+| 3 | 1Q |
+| 4 | 1CLK |
+| 5 | 2~Q |
+| 6 | 2Q |
+| 7 | GND |
+| 8 | 2J |
+| 9 | 2CLK |
+| 10 | 2~CLR |
+| 11 | 2K |
+| 12 | 1K |
+| 13 | 1~CLR |
+| 14 | VCC |
+
+**Flip-flop 1** (pins 1–4, 12, 13) is used for IRQ0 — **do not disturb.**
+**Flip-flop 2** (pins 5, 6, 8–11) is the one to repurpose for display mode bit 0.
+
+| # | From | To | Signal | Notes |
+|---|------|----|--------|-------|
+| 1 | **U76** data output for bit 2 | **U71 pin 9** (2CLK) | DM (display mode latch clock) | Cut existing trace from IRQ1 clock source to pin 9 first. |
+| 2 | **BUS_0** (tap from any convenient bus point) | **U71 pin 8** (2J) | Data bit 0 | Cut existing trace to pin 8 first. |
+| 3 | **BUS_0** via spare **U60** inverter | **U71 pin 11** (2K) | ~Data bit 0 | J=D, K=~D makes JK act as D-latch. |
+| 4 | System **~CLR** net | **U71 pin 10** (2~CLR) | Reset | Defaults mode to 0 on power-up. May already be connected — check. |
+| 5 | **U71 pin 6** (2Q) | **U36 pin 23** (A11) | Mode bit 0 | Cut existing SW6 trace to U36 pin 23. |
+
+For mode bit 1 (SR latch from spare NAND gates):
+
+| # | From | To | Signal | Notes |
+|---|------|----|--------|-------|
+| 6 | DM signal AND BUS_1 → spare **U58** AND gate | Spare **U55** NAND gate (SR latch S input) | Set | DM high + BUS_1 high = set mode bit 1 |
+| 7 | DM signal AND ~BUS_1 → spare **U60** inv + spare **U58** AND gate | Spare **U55** NAND gate (SR latch R input) | Reset | DM high + BUS_1 low = clear mode bit 1 |
+| 8 | **U55** SR latch Q output | **U36 pin 2** (A12) | Mode bit 1 | Cut existing SW6 trace to U36 pin 2. |
+
+**U36 (28C64, 8K×8 EEPROM, DIP-28) — Relevant address pins:**
+
+| Pin | Function |
+|-----|----------|
+| 2 | A12 |
+| 21 | A10 |
+| 23 | A11 |
+
+**U60 (74HCT04, Hex Inverter, DIP-14) — Standard pinout:**
+
+| Pin | Function |
+|-----|----------|
+| 1 | 1A (inv 1 input) |
+| 2 | 1Y (inv 1 output) |
+| 3 | 2A |
+| 4 | 2Y |
+| 5 | 3A |
+| 6 | 3Y |
+| 7 | GND |
+| 8 | 4Y |
+| 9 | 4A |
+| 10 | 5Y |
+| 11 | 5A |
+| 12 | 6Y |
+| 13 | 6A |
+| 14 | VCC |
+
+**Verify which U60 inverters are spare on your board before using.**
+
+**U58 (74HCT08, Quad 2-input AND, DIP-14) and U55 (74HCT00, Quad 2-input NAND, DIP-14)** follow the same pin pattern as U24 (pins 1,2→3; 4,5→6; 9,10→8; 12,13→11; pin 7=GND; pin 14=VCC). **Verify which gates are spare before using.**
+
+---
+
+### Enhancement 6: OF/SF Flags — Bodge Wires
+
+**U11 (74HCT173, 4-bit D Register, DIP-16) — Relevant output pins:**
+
+| Pin | Function | Current Status |
+|-----|----------|----------------|
+| 3 | Q0 (CF) | Connected — routed to EEPROM address bus |
+| 4 | Q1 (ZF) | Connected — routed to EEPROM address bus |
+| 5 | Q2 (OF) | **NoConn** — confirmed in schematic |
+| 6 | Q3 (SF) | **NoConn** — confirmed in schematic |
+
+**Pre-check:** Probe U11 pins 5 and 6 during ALU operations to confirm they carry distinct OF and SF signals before proceeding.
+
+| # | From | To | Signal | Notes |
+|---|------|----|--------|-------|
+| 1–4 | **U11 pin 5** (Q2, OF) | **U73 A16**, **U74 A16**, **U75 A16**, **U76 A16** | Overflow Flag | Lift A16 GND on each EEPROM first. |
+| 5–8 | **U11 pin 6** (Q3, SF) | **U73 A17**, **U74 A17**, **U75 A17**, **U76 A17** | Sign Flag | Lift A17 GND on each EEPROM first. |
+
+**AM29F040 (PLCC-32) — Address pin locations:**
+
+Consult the AM29F040B datasheet for your specific PLCC-32 pin mapping. The pins you need are:
+
+| Signal | Description |
+|--------|-------------|
+| A15 | Used by Enhancement 8 (16-step counter) |
+| A16 | Used by Enhancement 6 (OF) |
+| A17 | Used by Enhancement 6 (SF) |
+
+**These are typically on the top edge of the PLCC-32 package (pins 1–8 area) but the exact pin numbers vary by manufacturer revision. Check the datasheet for YOUR specific chips (U73–U76). All four EEPROMs share the same pinout.**
+
+GND lifts: each EEPROM has A15, A16, A17 tied to ground via PCB traces. You must cut/lift each trace before bodge-wiring the new signal. That's **4 EEPROMs × 2 pins = 8 GND lifts** for OF/SF, plus **4 × 1 = 4 GND lifts** if also doing Enhancement 8.
+
+---
+
+### Enhancement 8: 16-Step Counter — Bodge Wires
+
+**U72 (74HCT161, 4-bit Counter, DIP-16) — Standard pinout:**
+
+| Pin | Function |
+|-----|----------|
+| 11 | QA (Q0, LSB) |
+| 12 | QB (Q1) |
+| 13 | QC (Q2) |
+| 14 | **QD (Q3, MSB)** — currently unconnected |
+
+| # | From | To | Signal | Notes |
+|---|------|----|--------|-------|
+| 1–4 | **U72 pin 14** (Q3) | **U73 A15**, **U74 A15**, **U75 A15**, **U76 A15** | Step bit 3 | Lift A15 GND on each EEPROM first. |
+
+Also verify that the system reset properly clears Q3. The 74HCT161's ~CLR (pin 1) should already be connected to the system reset net — confirm this on your board.
+
+---
+
+### Notes on PLCC-32 Access
+
+The AM29F040 EEPROMs (U73–U76) are in PLCC-32 sockets. The address pins A15–A17 are on the package but soldered to GND traces on the PCB. To bodge:
+
+1. **Identify the correct PLCC pin** from the AM29F040B datasheet for your revision
+2. **Lift the pin** from the socket pad (or cut the PCB trace to that pad) to disconnect from GND
+3. **Solder the bodge wire** to the lifted pin or to the socket contact
+
+If the EEPROMs are socketed (PLCC sockets, not soldered directly), you may be able to intercept the pin at the socket rather than the chip. This is much easier to reverse if something goes wrong.
