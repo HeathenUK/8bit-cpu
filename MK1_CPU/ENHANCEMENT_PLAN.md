@@ -1,6 +1,6 @@
 # MK1 CPU Enhancement Plan
 
-7 enhancements for improving the MK1 8-bit CPU via bodge wires, trace cuts, and microcode changes only. No new ICs.
+12 enhancements for improving the MK1 8-bit CPU via bodge wires, trace cuts, and microcode changes only. No new ICs.
 
 ---
 
@@ -270,7 +270,139 @@ Restricted to $a as destination (ALU constraint). FI deliberately NOT asserted �
 
 ## ~~Enhancement 8: 16-Step Counter~~ — DROPPED
 
-Removed from the plan. All 7 enhancements fit within the existing 8-step counter. No concrete instruction has been identified that requires >8 steps. The hardware option remains available (U72 Q3 is unconnected, EEPROM A15 is spare) if a future need arises, but the 5 bodge wires and 4 GND lifts are not justified today.
+Removed from the plan. All enhancements fit within the existing 8-step counter. No concrete instruction has been identified that requires >8 steps. The hardware option remains available (U72 Q3 is unconnected, EEPROM A15 is spare) if a future need arises, but the 5 bodge wires and 4 GND lifts are not justified today.
+
+---
+
+## Enhancement 8 (New): XOR
+
+**What it achieves:** Hardware XOR in a single 1-byte instruction. Replaces the `eor` subroutine in `mk1_std.asm` which currently takes ~20 instructions, clobbers C, D, and two memory locations.
+
+**Hardware:** None. Pure microcode.
+
+**Key insight:** XOR(A, B) = (A OR B) - (A AND B). This identity works bitwise because for each bit position, OR ≥ AND, so the 8-bit subtraction never generates a borrow across bit boundaries. The ALU already has OR, AND, and SUB modes.
+
+**Microcode (xor $b $a — XOR B into A):**
+
+```
+xor $b $a:  [MI|PO, RO|II|PE, BO|EI, AND|EO|DI, OR|EO|AI, DO|EI, SUB|EO|AI|FI, RST]
+```
+
+Step-by-step:
+- Step 2: `BO|EI` — B → E
+- Step 3: `AND|EO|DI` — ALU outputs A AND B → **D** (A is preserved because we write to D, not A)
+- Step 4: `OR|EO|AI` — ALU outputs A OR B → A (E still = B, unchanged)
+- Step 5: `DO|EI` — D (holding A AND B) → E
+- Step 6: `SUB|EO|AI|FI` — A = (A OR B) - (A AND B) = A XOR B, flags set
+
+**Verification:** A=0xF0, B=0x55: AND=0x50, OR=0xF5, 0xF5-0x50 = 0xA5 = 0xF0 XOR 0x55 ✓
+
+**Side effect: Clobbers register D.** D is used as scratch for the intermediate AND result. This must be documented. The programmer must save D before XOR if its value is needed. This is still vastly better than the current software routine which clobbers C, D, and two memory locations.
+
+**Opcodes consumed:** 2–4 (depending on which register pair combinations: `xor $b $a`, `xor $c $a`, `xor $d $a`, and/or an immediate variant `xori imm $a`).
+
+For the immediate variant `xori imm $a`:
+```
+xori imm $a:  [MI|PO, RO|II|PE, PO|MI, PE|RO|EI, AND|EO|DI, OR|EO|AI, DO|EI, SUB|EO|AI|FI]
+```
+This is 8 steps with no room for RST as a separate step. If RST can be combined with step 7 (`SUB|EO|AI|FI|RST`), it fits. If not, the immediate variant needs the 16-step counter or must be dropped. The register variants fit cleanly.
+
+---
+
+## Enhancement 9: NEG (Two's Complement Negate)
+
+**What it achieves:** Computes -A (NOT(A) + 1) in a single 1-byte instruction. Natural companion to OF/SF flags for signed arithmetic.
+
+**Hardware:** None. Uses existing NOT mode + CINV from Enhancement 1.
+
+**Microcode:**
+
+```
+neg:  [MI|PO, RO|II|PE, AO|EI, NOT|EO|AI, EI, CINV|EO|AI|FI, RST, RST]
+```
+
+Step-by-step:
+- Step 2: `AO|EI` — A → E
+- Step 3: `NOT|EO|AI` — NOT(E) → A (NOT mode ignores A input, outputs NOT(E))
+- Step 4: `EI` — Load 0 into E (bus pull-downs, same mechanism as INC)
+- Step 5: `CINV|EO|AI|FI` — A + 0 + 1 = NOT(original_A) + 1 = -A, flags set
+
+**Opcodes consumed:** 1.
+
+**Dependency:** Enhancement 1 (INC/DEC) must be implemented first for the CINV signal.
+
+---
+
+## Enhancement 10: Conditional Set (setz, setc)
+
+**What it achieves:** Sets A to 1 if a flag condition is true, 0 if false. Converts flag state to a computable value in a single 1-byte instruction.
+
+Currently this pattern takes 5–7 bytes:
+```asm
+ldi $a 0
+jz .skip
+ldi $a 1
+.skip:
+```
+
+**Hardware:** None. Uses flag-dependent microcode (same mechanism as conditional jumps) + CINV from Enhancement 1.
+
+**Microcode (setz — set A=1 if ZF, A=0 if not):**
+
+```
+setz (when ZF=1):  [MI|PO, RO|II|PE, EI, CINV|EO|AI, RST, RST, RST, RST]
+setz (when ZF=0):  [MI|PO, RO|II|PE, AI, RST, RST, RST, RST, RST]
+```
+
+When flag is set: load 0 into E (bus pull-downs), then CINV gives 0 + 0 + 1 = 1 → A.
+When flag is clear: load 0 into A (bus pull-downs). Done.
+
+Same pattern works for `setc` (carry flag). If Enhancement 6 (OF/SF) is implemented, signed variants `setlt` (set if less than, SF≠OF) and `setge` (set if greater/equal, SF=OF) become available.
+
+**Opcodes consumed:** 2 minimum (setz, setc), up to 4 with signed variants.
+
+**Dependency:** Enhancement 1 (INC/DEC) for CINV signal.
+
+---
+
+## Enhancement 11: Nibble Swap
+
+**What it achieves:** Swaps the high and low nibbles of A (equivalent to rotate left by 4). Useful for hex digit extraction, BCD packing/unpacking. Replaces 4 separate `rll` instructions (4 bytes) with 1 byte.
+
+**Hardware:** None.
+
+**Microcode:**
+
+```
+nswap:  [MI|PO, RO|II|PE, ROT|AI, ROT|AI, ROT|AI, ROT|AI, RST, RST]
+```
+
+Four consecutive 1-bit left rotations = rotate by 4 = nibble swap. Each step the rotate hardware shifts A by one position and AI latches the result back.
+
+**Verification:** A=0xF3: after 4 left rotates → 0x3F ✓
+
+**Opcodes consumed:** 1.
+
+---
+
+## Enhancement 12: ABS (Absolute Value)
+
+**What it achieves:** Computes |A| in a single 1-byte instruction. If A is negative (SF=1), negates it; if positive, leaves it alone. Natural companion to signed arithmetic.
+
+**Hardware:** None. Uses flag-dependent microcode + NEG sequence from Enhancement 9.
+
+**Microcode:**
+
+```
+abs (when SF=1):  [MI|PO, RO|II|PE, AO|EI, NOT|EO|AI, EI, CINV|EO|AI|FI, RST, RST]
+abs (when SF=0):  [MI|PO, RO|II|PE, RST, RST, RST, RST, RST, RST]
+```
+
+The SF=1 case is the NEG sequence. The SF=0 case is a no-op after fetch.
+
+**Opcodes consumed:** 1.
+
+**Dependencies:** Enhancement 1 (CINV), Enhancement 6 (OF/SF flags — SF must be wired to microcode EEPROM for the flag-dependent behaviour).
 
 ---
 
@@ -280,7 +412,7 @@ Removed from the plan. All 7 enhancements fit within the existing 8-step counter
 |----------|-------|------|-----------|
 | U76 spare bits (1, 2, 3) | 3 | 2 (CINV + DM) | **1 (bit 3)** |
 | EEPROM address lines (A15–A18) | 4 | 2 (OF + SF on A16, A17) | **2 (A15, A18)** |
-| Reclaimable opcodes | ~30 | 11–24 | **6–19** |
+| Reclaimable opcodes | ~30 | 18–34 | **0–12** |
 | External device slots | 2 | 1 sacrificed for display mode | **1** |
 | U71 flip-flops | 2 | 1 for IRQ0, 1 for display mode | **0** |
 | Step counter Q3 (U72 pin 14) | 1 | 0 | **1 (available if needed later)** |
@@ -294,9 +426,12 @@ Removed from the plan. All 7 enhancements fit within the existing 8-step counter
 | Data memory | 256 bytes | **512 bytes** |
 | Code density | `addi 1` = 2 bytes, `ldi $a 0` = 2 bytes | `inc` = 1 byte, `clr` = 1 byte (~15% savings) |
 | Register swap | 3 instructions / 6 bytes | **1 instruction / 1 byte** |
-| Signed arithmetic | Software hack via `andi 128` | **Native signed branches (BLT, BGE)** |
+| XOR | 20-instruction software subroutine | **1 instruction / 1 byte (clobbers D)** |
+| Signed arithmetic | Software hack via `andi 128` | **Native NEG, ABS, signed branches (BLT, BGE), conditional set (setlt, setge)** |
+| Unsigned conditionals | Branch only | **Conditional set: setz, setc (flag → register value)** |
 | Display mode | Physical DIP switch | **Software-controlled at runtime** |
 | Stack access | Pop-only | **Direct offset read: `ld $a, [SP+n]`** |
+| Nibble operations | 4 separate rotate instructions | **1 instruction nibble swap** |
 | Spare EEPROM address lines | 0 | **2 (A15, A18) for future use** |
 
 ---
@@ -312,8 +447,13 @@ Removed from the plan. All 7 enhancements fit within the existing 8-step counter
 | 5 | Display Mode | ~11 wires, ~3 cuts | Yes + display EEPROM | Sacrifice device slot 1 |
 | 6 | OF/SF flags | 8 wires, 8 lifts | Yes | Verify U11 D2/D3 on hardware |
 | 7 | Stack-relative LD | None | Yes | None |
+| 8 | XOR | None | Yes | None |
+| 9 | NEG | None | Yes | Enhancement 1 (CINV) |
+| 10 | Conditional set | None | Yes | Enhancement 1 (CINV); Enhancement 6 for signed variants |
+| 11 | Nibble swap | None | Yes | None |
+| 12 | ABS | None | Yes | Enhancements 1 (CINV) + 6 (OF/SF) |
 
-Enhancements 1–4 and 7 are microcode-only or near-microcode-only and can be done first. Enhancement 5 requires the most bodge wiring but is independent of the others. Enhancement 6 requires physical verification before committing.
+Enhancements 1–4, 7–9, and 11 are microcode-only or near-microcode-only and can be done first. Enhancement 5 requires the most bodge wiring but is independent of the others. Enhancement 6 requires physical verification before committing. Enhancements 10 (signed variants) and 12 depend on Enhancement 6.
 
 All 4 microcode EEPROMs should be reflashed once at the end after all microcode changes are made in `microcode.py`.
 
@@ -330,17 +470,22 @@ All 4 microcode EEPROMs should be reflashed once at the end after all microcode 
 | Stack-rel LD | Address computation would set wrong flags | Low | FI not asserted |
 | OF/SF | U11 D2/D3 wiring unconfirmed from schematics | Low | Probe on physical hardware before committing |
 | Opcodes | Self-OR reclamation could break user programs | Low | Document; no sample programs use self-OR |
+| XOR | Clobbers register D | Low | Documented side effect; save D before XOR if needed |
+| XOR imm | May not fit in 8 steps (RST combined with active signals) | Moderate | Register variants work cleanly; drop immediate variant if RST can't combine |
 
 ---
 
 ## Cross-Enhancement Compatibility
 
-All 7 enhancements have been checked for mutual compatibility:
+All 12 enhancements have been checked for mutual compatibility:
 
 - **INC/DEC vs all ALU enhancements:** CINV only affects carry-in path. When CINV=0, existing ADD/SUB behaviour is unchanged.
+- **XOR:** Uses OR, AND, SUB modes sequentially within microcode. Does not conflict with other ALU enhancements — these are mode selections per step, not persistent state. Clobbers D but no enhancement depends on D being preserved during a single instruction.
+- **NEG, ABS, conditional set:** All depend on CINV (Enhancement 1). NEG and ABS also use NOT mode. No conflict — these are different instructions with different opcodes.
 - **Page 3 vs stack-relative LD:** Different page select signals (STK|HL vs STK). Different SRAM pages.
 - **Display mode vs remaining external device:** Device slot 0 kept intact. E0, U0, U1, IRQ0 all unaffected.
-- **OF/SF:** Uses EEPROM address lines A16/A17 only. A15 and A18 remain spare.
+- **OF/SF:** Uses EEPROM address lines A16/A17 only. A15 and A18 remain spare. Required by ABS and signed conditional set variants.
+- **Nibble swap:** Uses only ROT|AI repeatedly. No interaction with any other enhancement.
 - **All enhancements share the same 4 microcode EEPROMs:** No conflict — reflash once with all changes.
 
 ---
