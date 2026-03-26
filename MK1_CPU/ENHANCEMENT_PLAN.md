@@ -1,6 +1,6 @@
 # MK1 CPU Enhancement Plan
 
-Comprehensive plan for improving the MK1 8-bit CPU via bodge wires, trace cuts, and microcode changes only. No new ICs.
+7 enhancements for improving the MK1 8-bit CPU via bodge wires, trace cuts, and microcode changes only. No new ICs.
 
 ---
 
@@ -268,18 +268,9 @@ Restricted to $a as destination (ALU constraint). FI deliberately NOT asserted �
 
 ---
 
-## Enhancement 8: 16-Step Counter
+## ~~Enhancement 8: 16-Step Counter~~ — DROPPED
 
-**What it achieves:** Doubles maximum instruction complexity from 8 to 16 micro-steps. Pure future-proofing — all proposed enhancements fit in 8 steps.
-
-**Hardware (5 bodge wires, 4 GND lifts):**
-- Wire U72 Q3 (currently unconnected) to EEPROM address line A15 on all 4 EEPROMs
-- Cut/lift A15 GND ties on each EEPROM
-- Verify system reset clears Q3
-
-**Microcode:** Update `microcode.py` to 4-bit step addressing. Existing instructions unchanged (steps 8–15 assert RST).
-
-**Opcodes consumed:** 0.
+Removed from the plan. All 7 enhancements fit within the existing 8-step counter. No concrete instruction has been identified that requires >8 steps. The hardware option remains available (U72 Q3 is unconnected, EEPROM A15 is spare) if a future need arises, but the 5 bodge wires and 4 GND lifts are not justified today.
 
 ---
 
@@ -288,10 +279,11 @@ Restricted to $a as destination (ALU constraint). FI deliberately NOT asserted �
 | Resource | Total | Used | Remaining |
 |----------|-------|------|-----------|
 | U76 spare bits (1, 2, 3) | 3 | 2 (CINV + DM) | **1 (bit 3)** |
-| EEPROM address lines (A15–A18) | 4 | 3 (Q3 + OF + SF) | **1 (A18)** |
+| EEPROM address lines (A15–A18) | 4 | 2 (OF + SF on A16, A17) | **2 (A15, A18)** |
 | Reclaimable opcodes | ~30 | 11–24 | **6–19** |
 | External device slots | 2 | 1 sacrificed for display mode | **1** |
 | U71 flip-flops | 2 | 1 for IRQ0, 1 for display mode | **0** |
+| Step counter Q3 (U72 pin 14) | 1 | 0 | **1 (available if needed later)** |
 
 ---
 
@@ -305,7 +297,7 @@ Restricted to $a as destination (ALU constraint). FI deliberately NOT asserted �
 | Signed arithmetic | Software hack via `andi 128` | **Native signed branches (BLT, BGE)** |
 | Display mode | Physical DIP switch | **Software-controlled at runtime** |
 | Stack access | Pop-only | **Direct offset read: `ld $a, [SP+n]`** |
-| Instruction complexity ceiling | 8 micro-steps | **16 micro-steps** |
+| Spare EEPROM address lines | 0 | **2 (A15, A18) for future use** |
 
 ---
 
@@ -320,9 +312,8 @@ Restricted to $a as destination (ALU constraint). FI deliberately NOT asserted �
 | 5 | Display Mode | ~11 wires, ~3 cuts | Yes + display EEPROM | Sacrifice device slot 1 |
 | 6 | OF/SF flags | 8 wires, 8 lifts | Yes | Verify U11 D2/D3 on hardware |
 | 7 | Stack-relative LD | None | Yes | None |
-| 8 | 16-step counter | 5 wires, 4 lifts | Yes | None |
 
-Enhancements 1–4 and 7 are microcode-only or near-microcode-only and can be done first. Enhancement 5 requires the most bodge wiring but is independent of the others. Enhancement 6 requires physical verification before committing. Enhancement 8 is optional future-proofing.
+Enhancements 1–4 and 7 are microcode-only or near-microcode-only and can be done first. Enhancement 5 requires the most bodge wiring but is independent of the others. Enhancement 6 requires physical verification before committing.
 
 All 4 microcode EEPROMs should be reflashed once at the end after all microcode changes are made in `microcode.py`.
 
@@ -344,12 +335,12 @@ All 4 microcode EEPROMs should be reflashed once at the end after all microcode 
 
 ## Cross-Enhancement Compatibility
 
-All 8 enhancements have been checked for mutual compatibility:
+All 7 enhancements have been checked for mutual compatibility:
 
 - **INC/DEC vs all ALU enhancements:** CINV only affects carry-in path. When CINV=0, existing ADD/SUB behaviour is unchanged.
-- **OF/SF vs 16-step counter:** Use different EEPROM address lines (A15 for Q3, A16 for OF, A17 for SF). No conflict.
 - **Page 3 vs stack-relative LD:** Different page select signals (STK|HL vs STK). Different SRAM pages.
 - **Display mode vs remaining external device:** Device slot 0 kept intact. E0, U0, U1, IRQ0 all unaffected.
+- **OF/SF:** Uses EEPROM address lines A16/A17 only. A15 and A18 remain spare.
 - **All enhancements share the same 4 microcode EEPROMs:** No conflict — reflash once with all changes.
 
 ---
@@ -492,32 +483,14 @@ Consult the AM29F040B datasheet for your specific PLCC-32 pin mapping. The pins 
 
 | Signal | Description |
 |--------|-------------|
-| A15 | Used by Enhancement 8 (16-step counter) |
 | A16 | Used by Enhancement 6 (OF) |
 | A17 | Used by Enhancement 6 (SF) |
+| A15 | Spare |
+| A18 | Spare |
 
 **These are typically on the top edge of the PLCC-32 package (pins 1–8 area) but the exact pin numbers vary by manufacturer revision. Check the datasheet for YOUR specific chips (U73–U76). All four EEPROMs share the same pinout.**
 
-GND lifts: each EEPROM has A15, A16, A17 tied to ground via PCB traces. You must cut/lift each trace before bodge-wiring the new signal. That's **4 EEPROMs × 2 pins = 8 GND lifts** for OF/SF, plus **4 × 1 = 4 GND lifts** if also doing Enhancement 8.
-
----
-
-### Enhancement 8: 16-Step Counter — Bodge Wires
-
-**U72 (74HCT161, 4-bit Counter, DIP-16) — Standard pinout:**
-
-| Pin | Function |
-|-----|----------|
-| 11 | QA (Q0, LSB) |
-| 12 | QB (Q1) |
-| 13 | QC (Q2) |
-| 14 | **QD (Q3, MSB)** — currently unconnected |
-
-| # | From | To | Signal | Notes |
-|---|------|----|--------|-------|
-| 1–4 | **U72 pin 14** (Q3) | **U73 A15**, **U74 A15**, **U75 A15**, **U76 A15** | Step bit 3 | Lift A15 GND on each EEPROM first. |
-
-Also verify that the system reset properly clears Q3. The 74HCT161's ~CLR (pin 1) should already be connected to the system reset net — confirm this on your board.
+GND lifts: each EEPROM has A16 and A17 tied to ground via PCB traces. You must cut/lift each trace before bodge-wiring the new signal. That's **4 EEPROMs × 2 pins = 8 GND lifts** for OF/SF.
 
 ---
 
