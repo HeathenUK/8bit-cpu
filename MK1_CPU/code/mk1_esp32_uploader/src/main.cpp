@@ -10,7 +10,8 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
-#include <LittleFS.h>
+#include <ESPmDNS.h>
+#include <FFat.h>
 #include "assembler.h"
 #include "web_ui.h"
 
@@ -30,6 +31,14 @@ static const int BUS_PINS[8] = { D2, D3, D4, D5, D6, D7, D8, D9 };
 // ── WiFi / Web ───────────────────────────────────────────────────────
 
 static const char* AP_SSID = "MK1-CPU";
+static const char* MDNS_HOST = "mk1";
+static const char* WIFI_CONFIG_PATH = "/wifi.cfg";
+
+// WiFi config: first line = SSID, second line = password
+static char staSSID[64] = "";
+static char staPSK[64] = "";
+static bool staMode = false;  // true if connected to existing network
+
 WebServer server(80);
 MK1Assembler assembler;
 
@@ -211,6 +220,7 @@ static uint8_t singleStep() {
 // ── Web handlers ─────────────────────────────────────────────────────
 
 static void handleRoot() {
+    server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
     server.send(200, "text/html", WEB_PAGE);
 }
 
@@ -351,7 +361,7 @@ static void handleSave() {
         server.send(400, "application/json", "{\"ok\":false}");
         return;
     }
-    File f = LittleFS.open(SAVE_PATH, "w");
+    File f = FFat.open(SAVE_PATH, "w");
     if (!f) {
         server.send(500, "application/json", "{\"ok\":false,\"error\":\"Flash write failed\"}");
         return;
@@ -362,7 +372,7 @@ static void handleSave() {
 }
 
 static void handleLoad() {
-    File f = LittleFS.open(SAVE_PATH, "r");
+    File f = FFat.open(SAVE_PATH, "r");
     if (!f) {
         server.send(200, "text/plain", "");
         return;
@@ -370,6 +380,109 @@ static void handleLoad() {
     String content = f.readString();
     f.close();
     server.send(200, "text/plain", content);
+}
+
+// ── WiFi configuration ───────────────────────────────────────────────
+
+static void loadWifiConfig() {
+    File f = FFat.open(WIFI_CONFIG_PATH, "r");
+    if (!f) return;
+    String ssid = f.readStringUntil('\n'); ssid.trim();
+    String psk = f.readStringUntil('\n'); psk.trim();
+    f.close();
+    if (ssid.length() > 0) {
+        strncpy(staSSID, ssid.c_str(), sizeof(staSSID) - 1);
+        strncpy(staPSK, psk.c_str(), sizeof(staPSK) - 1);
+    }
+}
+
+static void handleWifiGet() {
+    String json = "{\"mode\":\"" + String(staMode ? "sta" : "ap") + "\"";
+    json += ",\"ssid\":\"" + String(staMode ? staSSID : AP_SSID) + "\"";
+    if (staMode)
+        json += ",\"ip\":\"" + WiFi.localIP().toString() + "\"";
+    else
+        json += ",\"ip\":\"" + WiFi.softAPIP().toString() + "\"";
+    json += "}";
+    server.send(200, "application/json", json);
+}
+
+static void handleWifiPost() {
+    String body = server.arg("plain");
+    if (body.length() == 0) {
+        // Try form args
+        if (server.hasArg("ssid")) {
+            body = "{\"ssid\":\"" + server.arg("ssid") + "\",\"psk\":\"" + server.arg("psk") + "\"}";
+        } else {
+            server.send(400, "application/json", "{\"ok\":false,\"error\":\"no body\"}");
+            return;
+        }
+    }
+
+    // Extract ssid and psk from JSON
+    int si = body.indexOf("\"ssid\"");
+    int pi = body.indexOf("\"psk\"");
+    if (si < 0) {
+        server.send(400, "application/json", "{\"ok\":false,\"error\":\"no ssid\"}");
+        return;
+    }
+
+    auto extractVal = [](const String& s, int start) -> String {
+        int colon = s.indexOf(':', start);
+        if (colon < 0) return "";
+        int q1 = s.indexOf('"', colon + 1);
+        if (q1 < 0) return "";
+        int q2 = s.indexOf('"', q1 + 1);
+        if (q2 < 0) return "";
+        return s.substring(q1 + 1, q2);
+    };
+
+    String newSSID = extractVal(body, si);
+    String newPSK = pi >= 0 ? extractVal(body, pi) : "";
+
+    if (newSSID.length() == 0) {
+        server.send(400, "application/json", "{\"ok\":false,\"error\":\"empty ssid\"}");
+        return;
+    }
+
+    File f = FFat.open(WIFI_CONFIG_PATH, "w");
+    if (!f) {
+        server.send(500, "application/json", "{\"ok\":false,\"error\":\"write failed\"}");
+        return;
+    }
+    f.println(newSSID);
+    f.println(newPSK);
+    f.close();
+
+    server.send(200, "application/json", "{\"ok\":true,\"ssid\":\"" + newSSID + "\",\"message\":\"Reset ESP32 to connect\"}");
+}
+
+static bool connectToWifi() {
+    if (staSSID[0] == 0) return false;
+
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(staSSID, staPSK);
+
+    // Wait up to 10 seconds
+    int tries = 0;
+    while (WiFi.status() != WL_CONNECTED && tries < 20) {
+        delay(500);
+        tries++;
+    }
+
+    if (WiFi.status() == WL_CONNECTED) {
+        staMode = true;
+        return true;
+    }
+
+    WiFi.disconnect();
+    return false;
+}
+
+static void startAP() {
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP(AP_SSID);
+    staMode = false;
 }
 
 // ── Serial upload (legacy protocol) ──────────────────────────────────
@@ -406,9 +519,19 @@ void setup() {
     pinMode(PIN_CLK_SENSE, INPUT);
     busSetOutput();
 
-    LittleFS.begin(true);
+    if (!FFat.begin(false)) {
+        FFat.format();
+        FFat.begin(true);
+    }
+    loadWifiConfig();
 
-    WiFi.softAP(AP_SSID);
+    // Try STA mode first, fall back to AP
+    if (!connectToWifi()) {
+        startAP();
+    }
+
+    MDNS.begin(MDNS_HOST);  // mk1.local
+
     server.on("/", HTTP_GET, handleRoot);
     server.on("/assemble", HTTP_POST, handleAssemble);
     server.on("/upload", HTTP_POST, handleUpload);
@@ -419,7 +542,11 @@ void setup() {
     server.on("/status", HTTP_GET, handleStatus);
     server.on("/save", HTTP_POST, handleSave);
     server.on("/load", HTTP_GET, handleLoad);
+    server.on("/wifi", HTTP_GET, handleWifiGet);
+    server.on("/wifi", HTTP_POST, handleWifiPost);
     server.begin();
+
+    MDNS.addService("http", "tcp", 80);
 
     startClkMonitor();
 }

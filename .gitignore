@@ -32,3 +32,4 @@ MK1_CPU/mk1_newkicad/
 
 # PlatformIO build artifacts
 .pio/
+MK1_CPU/code/test*.c

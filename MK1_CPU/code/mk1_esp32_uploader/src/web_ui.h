@@ -11,8 +11,8 @@ static const char WEB_PAGE[] PROGMEM = R"rawliteral(
 <title>MK1 CPU</title>
 <style>
 * { box-sizing: border-box; margin: 0; padding: 0; }
-body { font-family: -apple-system, 'Segoe UI', sans-serif; background: #1a1a2e; color: #e0e0e0; height: 100vh; display: flex; flex-direction: column; }
-header { background: #16213e; padding: 10px 16px; display: flex; align-items: center; gap: 8px; border-bottom: 1px solid #0f3460; flex-wrap: wrap; }
+body { font-family: -apple-system, 'Segoe UI', sans-serif; background: #1a1a2e; color: #e0e0e0; height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
+header { background: #16213e; padding: 6px 12px; display: flex; align-items: center; gap: 6px; border-bottom: 1px solid #0f3460; flex-shrink: 0; overflow-x: auto; }
 header h1 { font-size: 16px; color: #e94560; font-weight: 700; letter-spacing: 1px; }
 header select { background: #0f3460; color: #e0e0e0; border: 1px solid #e94560; border-radius: 4px; padding: 4px 8px; font-size: 13px; }
 .btn { border: none; border-radius: 4px; padding: 6px 12px; font-size: 13px; font-weight: 600; cursor: pointer; }
@@ -27,15 +27,15 @@ header select { background: #0f3460; color: #e0e0e0; border: 1px solid #e94560; 
 #status { font-size: 12px; color: #888; }
 .btn-step { background: #1a5c3a; color: #4ecca3; border: 1px solid #2a7a4a; }
 .btn-step:hover { background: #2a7a4a; }
-#cpubar { background: #0d0d1a; border-bottom: 1px solid #0f3460; padding: 6px 16px; font-family: monospace; font-size: 12px; display: flex; gap: 20px; align-items: center; }
+#cpubar { background: #0d0d1a; border-bottom: 1px solid #0f3460; padding: 4px 12px; font-family: monospace; font-size: 11px; display: flex; gap: 16px; align-items: center; flex-shrink: 0; }
 #cpubar .lbl { color: #666; }
 #cpubar .val { color: #4ecca3; }
 #cpubar .val.off { color: #e94560; }
-main { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
-.editor-wrap { flex: 1; display: flex; overflow: hidden; }
+main { flex: 1; display: flex; flex-direction: column; overflow: hidden; min-height: 0; }
+.editor-wrap { flex: 1; display: flex; overflow: hidden; min-height: 0; }
 #lines { width: 38px; background: #0d0d1a; color: #555; border: none; padding: 12px 4px 12px 0; font-family: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace; font-size: 14px; line-height: 1.6; text-align: right; overflow: hidden; user-select: none; -webkit-user-select: none; }
-#editor { flex: 1; background: #0a0a1a; color: #a8d8a8; border: none; outline: none; padding: 12px 12px 12px 8px; font-family: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace; font-size: 14px; line-height: 1.6; resize: none; tab-size: 2; white-space: pre; overflow-wrap: normal; overflow-x: auto; }
-#output { background: #0d0d1a; border-top: 1px solid #0f3460; padding: 8px 12px; font-family: monospace; font-size: 12px; max-height: 120px; overflow-y: auto; white-space: pre-wrap; }
+#editor { flex: 1; background: #0a0a1a; color: #a8d8a8; border: none; outline: none; padding: 12px 12px 12px 8px; font-family: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace; font-size: 14px; line-height: 1.6; resize: none; tab-size: 2; white-space: pre; overflow-wrap: normal; overflow: auto; }
+#output { background: #0d0d1a; border-top: 1px solid #0f3460; padding: 6px 12px; font-family: monospace; font-size: 11px; min-height: 24px; max-height: 120px; overflow-y: auto; white-space: pre-wrap; flex-shrink: 0; }
 .err { color: #e94560; }
 .ok { color: #4ecca3; }
 .info { color: #888; }
