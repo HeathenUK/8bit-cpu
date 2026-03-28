@@ -592,7 +592,18 @@ private:
                 int rs = findRegister(tok1);
                 int rd = findRegister(tok2);
                 if (rs >= 0 && rs < 4 && rd >= 0 && rd < 4) {
-                    emitCode((0b11 << 6) | (op << 4) | (rs << 2) | rd, pass1);
+                    uint8_t opc = (0b11 << 6) | (op << 4) | (rs << 2) | rd;
+                    // Check for reclaimed opcodes that are now special instructions
+                    static const uint8_t reclaimed[] = {0xC3,0xC7,0xD3,0xD7,0xDB,0xDE,0xE3,0xE7,0xF3,0xF7,0};
+                    bool collision = false;
+                    for (int i = 0; reclaimed[i]; i++) {
+                        if (opc == reclaimed[i]) { collision = true; break; }
+                    }
+                    if (collision) {
+                        addError(lineNum, "ALU combo reclaimed for special instruction");
+                        return;
+                    }
+                    emitCode(opc, pass1);
                     return;
                 }
                 addError(lineNum, "ALU: operands must be $a-$d");

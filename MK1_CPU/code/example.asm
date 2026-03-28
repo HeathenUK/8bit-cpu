@@ -1,7 +1,8 @@
-#bank ".instr"
+	section code
+	j _main
+	hlt
 _max:
-	ldsp 3
-	mov $a $b
+	ldsp_b 3	; param -> B (clobbers A)
 	ldsp 2
 	cmp $b
 	jnc .L4
@@ -14,98 +15,91 @@ _max:
 	ret
 
 _count_above:
-	ldi $a 0
-	st $a 0
-	ldsp 3
-	mov $a $b
+	; allocate 1 locals on stack
+	push_imm 0
+	ldi $a,0
+	stsp 1
+	ldsp_b 3	; param -> B (clobbers A)
 	ldsp 4
 	cmp $b
 	jz .L8
 	jnc .L8
 .L7:
-	ldsp 0
+	ldsp 1
 	inc
-	st $a 0
+	stsp 1
 .L8:
-	ldsp 3
-	mov $a $b
+	ldsp_b 3	; param -> B (clobbers A)
 	ldsp 5
 	cmp $b
 	jz .L10
 	jnc .L10
 .L9:
-	ldsp 0
+	ldsp 1
 	inc
-	st $a 0
+	stsp 1
 .L10:
-	ldsp 3
-	mov $a $b
+	ldsp_b 3	; param -> B (clobbers A)
 	ldsp 6
 	cmp $b
 	jz .L12
 	jnc .L12
 .L11:
-	ldsp 0
+	ldsp 1
 	inc
-	st $a 0
+	stsp 1
 .L12:
-	ldsp 3
-	mov $a $b
+	ldsp_b 3	; param -> B (clobbers A)
 	ldsp 7
 	cmp $b
 	jz .L14
 	jnc .L14
 .L13:
-	ldsp 0
+	ldsp 1
 	inc
-	st $a 0
+	stsp 1
 .L14:
-	ldsp 0
+	ldsp 1
 .L5:
+	pop $d
 	ret
 
 _main:
-	ldi $a 10
-	push $a
-	ldi $a 25
-	push $a
+	; allocate 1 locals on stack
+	push_imm 0
+	push_imm 25
+	push_imm 10
 	jal _max
 	pop $d
 	pop $d
-	st $a 0
+	stsp 1
 	out
 
-	ldi $a 200
-	push $a
-	ldi $a 150
-	push $a
+	push_imm 150
+	push_imm 200
 	jal _max
 	pop $d
 	pop $d
-	st $a 0
+	stsp 1
 	out
 
-	ldi $a 50
-	push $a
-	ldi $a 20
-	push $a
-	ldi $a 75
-	push $a
-	ldi $a 100
-	push $a
-	ldi $a 30
-	push $a
+	push_imm 30
+	push_imm 100
+	push_imm 75
+	push_imm 20
+	push_imm 50
 	jal _count_above
 	pop $d
 	pop $d
 	pop $d
 	pop $d
 	pop $d
-	st $a 0
+	stsp 1
 	out
 
 	hlt
 
 .L15:
+	pop $d
 	ret
 

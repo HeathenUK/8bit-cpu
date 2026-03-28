@@ -57,6 +57,8 @@ main { flex: 1; display: flex; flex-direction: column; overflow: hidden; min-hei
     <option value="stackrel">Stack-relative (C-style calls)</option>
   </select>
   <button class="btn btn-sec" onclick="save()">Save</button>
+  <button class="btn btn-sec" onclick="document.getElementById('fileIn').click()">Open</button>
+  <input type="file" id="fileIn" accept=".asm,.s,.c,.txt" style="display:none" onchange="openFile(event)">
   <div class="spacer"></div>
   <span id="status"></span>
   <button class="btn btn-step" onclick="mk1step()">Step</button>
@@ -225,6 +227,19 @@ async function pollStatus() {
 }
 
 setInterval(pollStatus, 1000);
+
+function openFile(e) {
+  const file = e.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = function(ev) {
+    ed.value = ev.target.result;
+    updateLines();
+    log('Opened ' + file.name, 'ok');
+  };
+  reader.readAsText(file);
+  e.target.value = '';  // reset so same file can be reopened
+}
 
 async function save() {
   try {

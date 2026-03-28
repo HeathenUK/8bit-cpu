@@ -93,6 +93,16 @@ static const FixedInstr FIXED_INSTRUCTIONS[] = {
     { "ldp3",    0xEA,  ARGS_IMM  },  // A = page3[imm]
     { "stp3",    0xEF,  ARGS_IMM  },  // page3[imm] = A
     { "ldsp",    0xEB,  ARGS_IMM  },  // A = stack[SP + imm]
+    { "stsp",    0xDB,  ARGS_IMM  },  // stack[SP + imm] = A (clobbers D)
+    { "deref",   0xC3,  ARGS_NONE },  // A = data[A] (indirect load)
+    { "ideref",  0xC7,  ARGS_NONE },  // data[B] = A (indirect store)
+    { "setz",    0xD3,  ARGS_NONE },  // A = (ZF ? 1 : 0)
+    { "setnz",   0xD7,  ARGS_NONE },  // A = (ZF ? 0 : 1)
+    { "setc",    0xDE,  ARGS_NONE },  // A = (CF ? 1 : 0)
+    { "setnc",   0xE3,  ARGS_NONE },  // A = (CF ? 0 : 1)
+    { "push_imm",0xE7,  ARGS_IMM  },  // push N, A = N
+    { "ldsp_b",  0xF3,  ARGS_IMM  },  // B = stack[SP + imm]
+    { "dispmode",0xF7,  ARGS_IMM  },  // display mode (future hw)
     { "swap",    0xEE,  ARGS_NONE },  // swap A and B
     { "inc",     0xFB,  ARGS_NONE },  // A = A + 1
     { "dec",     0xFE,  ARGS_NONE },  // A = A - 1

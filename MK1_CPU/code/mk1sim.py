@@ -802,6 +802,131 @@ def run_tests():
 
     results.append(run_test("C-style max(10,25)=25, max(200,150)=200", code, [25, 200]))
 
+    # ── Test: STSP (stack-relative store, clobbers D) ──
+    STSP_OP = 0xDB
+    code = assemble_simple([
+        (decode['move imm, $a'], 77),
+        0x84,                          # push 77
+        (decode['move imm, $a'], 88),
+        0x84,                          # push 88
+        (decode['move imm, $a'], 99),
+        (STSP_OP, 2),                  # stsp 2: overwrite 77 with 99
+        (decode['ldsp'], 2),
+        decode['move $a, $out'],
+        decode['hlt'],
+    ])
+    results.append(run_test("STSP: write then read", code, [99]))
+
+    code = assemble_simple([
+        (decode['move imm, $a'], 0),
+        0x84,                          # push 0 (local n)
+        (decode['ldsp'], 1),           # A = n
+        decode['inc'],                 # A++
+        (STSP_OP, 1),                  # stsp 1: n = 1
+        (decode['ldsp'], 1),           # A = n
+        decode['inc'],                 # A++
+        (STSP_OP, 1),                  # stsp 1: n = 2
+        (decode['ldsp'], 1),           # A = n
+        decode['move $a, $out'],
+        decode['hlt'],
+    ])
+    results.append(run_test("STSP: local variable increment", code, [2]))
+
+    # ── Test: DEREF (indirect load from data page) ──
+    code = bytearray(256)
+    dpage = bytearray(256)
+    dpage[5] = 42
+    code[0] = 0x38; code[1] = 5  # ldi $a,5
+    code[2] = 0xC3; code[3] = 0  # deref + pad
+    code[4] = 0x06; code[5] = 0  # out + pad
+    code[6] = 0x7F               # hlt
+    cpu = MK1()
+    cpu.load_program(code, dpage)
+    cpu.run(500)
+    ok = cpu.output_history == [42]
+    print(f"  [{'PASS' if ok else 'FAIL'}] DEREF: A=data[A] (got {cpu.output_history})")
+    results.append(ok)
+
+    # ── Test: IDEREF (indirect store to data page) ──
+    code2 = assemble_simple([
+        (decode['move imm, $a'], 3),
+        decode['move $a, $b'],
+        (decode['move imm, $a'], 99),
+        0xC7,
+        (decode['move imm, $a'], 3),
+        0xC3,
+        decode['move $a, $out'],
+        decode['hlt'],
+    ])
+    results.append(run_test("IDEREF: data[B]=A + deref readback", code2, [99]))
+
+    # ── Test: PUSH_IMM ──
+    code3 = assemble_simple([
+        (0xE7, 42), (0xE7, 99),
+        (decode['ldsp'], 1), decode['move $a, $out'],
+        (decode['ldsp'], 2), decode['move $a, $out'],
+        decode['hlt'],
+    ])
+    results.append(run_test("PUSH_IMM: push 42,99", code3, [99, 42]))
+
+    # ── Test: LDSP_B ──
+    code4 = assemble_simple([
+        (0xE7, 77), (0xF3, 1),
+        (decode['move imm, $a'], 10),
+        decode['add $b, $a'],
+        decode['move $a, $out'],
+        decode['hlt'],
+    ])
+    results.append(run_test("LDSP_B: B=stack[SP+1]", code4, [87]))
+
+    # ── Test: SETZ ──
+    code5 = assemble_simple([
+        (decode['move imm, $a'], 5), (decode['cmp imm'], 5),
+        0xD3, decode['move $a, $out'],
+        (decode['move imm, $a'], 5), (decode['cmp imm'], 3),
+        0xD3, decode['move $a, $out'],
+        decode['hlt'],
+    ])
+    results.append(run_test("SETZ: eq→1, neq→0", code5, [1, 0]))
+
+    # ── Test: SETNZ ──
+    code6 = assemble_simple([
+        (decode['move imm, $a'], 5), (decode['cmp imm'], 3),
+        0xD7, decode['move $a, $out'],
+        (decode['move imm, $a'], 5), (decode['cmp imm'], 5),
+        0xD7, decode['move $a, $out'],
+        decode['hlt'],
+    ])
+    results.append(run_test("SETNZ: neq→1, eq→0", code6, [1, 0]))
+
+    # ── Test: SETC ──
+    code7 = assemble_simple([
+        (decode['move imm, $a'], 200),
+        (decode['cmp imm'], 100),       # 200 >= 100, CF=1
+        0xDE,                           # setc → A = 1
+        decode['move $a, $out'],
+        (decode['move imm, $a'], 50),
+        (decode['cmp imm'], 100),       # 50 < 100, CF=0
+        0xDE,                           # setc → A = 0
+        decode['move $a, $out'],
+        decode['hlt'],
+    ])
+    results.append(run_test("SETC: ge→1, lt→0", code7, [1, 0]))
+
+    # ── Test: SETNC ──
+    code8 = assemble_simple([
+        (decode['move imm, $a'], 50),
+        (decode['cmp imm'], 100),       # 50 < 100, CF=0
+        0xE3,                           # setnc → A = 1
+        decode['move $a, $out'],
+        (decode['move imm, $a'], 200),
+        (decode['cmp imm'], 100),       # 200 >= 100, CF=1
+        0xE3,                           # setnc → A = 0
+        decode['move $a, $out'],
+        decode['hlt'],
+    ])
+    results.append(run_test("SETNC: lt→1, ge→0", code8, [1, 0]))
+
     # ── Summary ──
     print()
     passed = sum(results)

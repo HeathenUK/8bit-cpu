@@ -297,6 +297,55 @@ static void handleUpload() {
     server.send(200, "application/json", "{\"ok\":true}");
 }
 
+// Assemble + upload in one request. Accepts assembly text in POST body.
+static void handleRun() {
+    if (!server.hasArg("plain")) {
+        server.send(400, "application/json", "{\"ok\":false,\"error\":\"No source\"}");
+        return;
+    }
+
+    String source = server.arg("plain");
+    assembler.assemble(source.c_str());
+    const AsmResult& r = assembler.result;
+
+    if (r.error_count > 0) {
+        String json = "{\"ok\":false,\"errors\":[";
+        for (int i = 0; i < r.error_count; i++) {
+            if (i > 0) json += ",";
+            json += "{\"line\":" + String(r.errors[i].line) + ",\"message\":\"";
+            for (const char* p = r.errors[i].message; *p; p++) {
+                if (*p == '"') json += "\\\"";
+                else if (*p == '\\') json += "\\\\";
+                else json += *p;
+            }
+            json += "\"}";
+        }
+        json += "]}";
+        server.send(400, "application/json", json);
+        return;
+    }
+
+    uploadSize = 0;
+    int codeBytes = r.code_size < CODE_SIZE ? r.code_size : CODE_SIZE;
+    int dataBytes = r.data_size < DATA_SIZE ? r.data_size : DATA_SIZE;
+
+    memcpy(uploadBuf, r.code, codeBytes);
+    memset(uploadBuf + codeBytes, 0, CODE_SIZE - codeBytes);
+    uploadSize = CODE_SIZE;
+
+    if (dataBytes > 0) {
+        memcpy(uploadBuf + CODE_SIZE, r.data, dataBytes);
+        memset(uploadBuf + CODE_SIZE + dataBytes, 0, DATA_SIZE - dataBytes);
+        uploadSize = CODE_SIZE + DATA_SIZE;
+    }
+
+    uploadToMK1(uploadBuf, uploadSize);
+
+    String json = "{\"ok\":true,\"code_size\":" + String(codeBytes) +
+                  ",\"data_size\":" + String(dataBytes) + "}";
+    server.send(200, "application/json", json);
+}
+
 static void handleHalt() {
     enableClock();  // hold CLK high = freeze
     cpuState = CPU_HALTED;
