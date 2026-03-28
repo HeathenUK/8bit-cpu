@@ -45,9 +45,11 @@ U1  = 0b00000000000000000000000100000000  # X-USR sig 1
 E0  = 0b00000000000000000000000010000000  # X-Enable 0
 E1  = 0b00000000000000000000000001000000  # X-Enable 1
 HL  = 0b00000000000000000000000000100000  # HL address mode
+CINV= 0b00000000000000000000000000000010  # Carry invert (INC/DEC) — U76 D1
+SETPG=0b00000000000000000000000000000100  # Code page toggle — U76 D2 (reserved for code banking)
 RST = 0b00000000000000000000000000000001  # Reset step counter
 
-signals = {HLT : "HLT", STK: "STK", PE: "PE" , AI: "AI", BI: "BI", CI: "CI", DI: "DI", SI: "SI", EI: "EI", PI: "PI", MI: "MI", RI: "RI", II: "II", OI: "OI", XI: "XI", AO: "AO", BO: "BO", CO: "CO", DO: "DO", PO: "PO", SO: "SO", EO: "EO", RO: "RO", _IO: "IO", SUB: "SUB", OR: "OR", AND: "AND", SHF: "SHF", ROT: "SHF", RGT: "RGT", NOT: "NOT", FI: "FI", SU: "SU", SD: "SD", U0: "U0", U1: "U1", E0: "E0", E1: "E1", HL: "HL", RST: "RST"}
+signals = {HLT : "HLT", STK: "STK", PE: "PE" , AI: "AI", BI: "BI", CI: "CI", DI: "DI", SI: "SI", EI: "EI", PI: "PI", MI: "MI", RI: "RI", II: "II", OI: "OI", XI: "XI", AO: "AO", BO: "BO", CO: "CO", DO: "DO", PO: "PO", SO: "SO", EO: "EO", RO: "RO", _IO: "IO", SUB: "SUB", OR: "OR", AND: "AND", SHF: "SHF", ROT: "SHF", RGT: "RGT", NOT: "NOT", FI: "FI", SU: "SU", SD: "SD", U0: "U0", U1: "U1", E0: "E0", E1: "E1", HL: "HL", SETPG: "SETPG", CINV: "CINV", RST: "RST"}
 
 register_map = {0: ('$a', AI, AO),
                 1: ('$b', BI, BO),
@@ -167,6 +169,59 @@ ucode_template[0b00101111] = ('je1', [MI|PO, RO|II|PE, PE, RST, RST, RST, RST, R
 ucode_template[0b00110111] = ('jcf', [MI|PO, RO|II|PE, PE, RST, RST, RST, RST, RST], False)
 ucode_template[0b00111111] = ('jzf', [MI|PO, RO|II|PE, PE, RST, RST, RST, RST, RST], False)
 
+# ── Phase 1 new instructions (reclaim redundant self-OR and exotic C/D opcodes) ──
+
+# XOR: A = A XOR B (clobbers D)
+# XOR(A,B) = (A OR B) - (A AND B)
+# Step 2: E=B, Step 3: D=A AND B, Step 4: A=A OR B, Step 5: E=D, Step 6: A=(A OR B)-(A AND B)
+ucode_template[0xE0] = ('xor', [MI|PO, RO|II|PE, BO|EI, DI|EO|AND, AI|EO|OR, DO|EI, AI|EO|SUB|FI, RST], False)
+
+# NEG: A = -A (two's complement negate)
+# Step 2: E=A, Step 3: A=A-A=0, Step 4: A=0-E=-A_orig
+ucode_template[0xE5] = ('neg', [MI|PO, RO|II|PE, AO|EI, SUB|EO|AI, SUB|EO|AI|FI, RST, RST, RST], False)
+
+# LDP3: A = page3[imm] (load from page 3 data)
+# Step 2: MAR=PC, Step 3: PC++, MAR=mem[PC] (address), Step 4: A=SRAM[STK|HL|addr]
+ucode_template[0xEA] = ('ldp3', [MI|PO, RO|II|PE, PO|MI, PE|RO|MI, STK|HL|RO|AI, RST, RST, RST], True)
+
+# STP3: page3[imm] = A (store to page 3 data)
+ucode_template[0xEF] = ('stp3', [MI|PO, RO|II|PE, PO|MI, PE|RO|MI, STK|HL|AO|RI, RST, RST, RST], True)
+
+# LDSP: A = stack[SP + imm] (stack-relative load)
+# Step 2: E=SP, Step 3: MAR=PC, Step 4: A=offset+PC++, Step 5: MAR=A+E=SP+offset, Step 6: A=stack[addr]
+ucode_template[0xEB] = ('ldsp', [MI|PO, RO|II|PE, SO|EI, PO|MI, PE|RO|AI, EO|MI, STK|RO|AI, RST], True)
+
+# INC: A = A + 1 (single byte, sets flags)
+# CINV=1, SUB=0: carry-in XOR'd to 1, B not inverted. A + 0 + 1 = A + 1.
+# E must be 0: we use SUB to compute A-A=0 into E first, then add with CINV.
+# Step 2: AO|EI (E=A), Step 3: SUB|EO|EI (E=A-A=0), Step 4: CINV|EO|AI|FI (A=A+0+1)
+ucode_template[0xFB] = ('inc', [MI|PO, RO|II|PE, AO|EI, SUB|EO|EI, CINV|EO|AI|FI, RST, RST, RST], False)
+
+# DEC: A = A - 1 (single byte, sets flags)
+# CINV=1, SUB=1: carry-in XOR'd to 0, B inverted. A + 0xFF + 0 = A - 1.
+# E must be 0 (same trick), then SUB inverts it to 0xFF with carry=0.
+ucode_template[0xFE] = ('dec', [MI|PO, RO|II|PE, AO|EI, SUB|EO|EI, CINV|SUB|EO|AI|FI, RST, RST, RST], False)
+
+# JNC: jump if NOT carry (base template = take jump, patched to skip when CF=1)
+ucode_template[0xCA] = ('jnc', [MI|PO, RO|II|PE, PO|MI, RO|PI, RST, RST, RST, RST], True)
+
+# JNZ: jump if NOT zero (base template = take jump, patched to skip when ZF=1)
+ucode_template[0xCE] = ('jnz', [MI|PO, RO|II|PE, PO|MI, RO|PI, RST, RST, RST, RST], True)
+
+# SETJMP: toggle code page and jump (forward-compatible — NOP on current hardware)
+# On current hardware SETPG goes to floating U76 D2, so this is just a regular jump.
+# When code banking flip-flop is wired to D2, this toggles the code page.
+ucode_template[0xCB] = ('setjmp', [MI|PO, RO|II|PE, PO|MI, RO|PI|SETPG, RST, RST, RST, RST], True)
+
+# SETRET: toggle code page and return (forward-compatible — NOP on current hardware)
+# Step 5 PE is required: jal pushes PC+1, ret needs to advance to PC+2 (past jal's immediate)
+ucode_template[0xCF] = ('setret', [MI|PO, RO|II|PE, SETPG|SU, SO|MI, STK|RO|PI, PE, RST, RST], False)
+
+# SWAP: swap A and B (using stack as scratch)
+# Step 2: MAR=SP, Step 3: push A (SP--), Step 4: A=B, Step 5: SP++, Step 6: MAR=SP, Step 7: B=pop
+# Uses all 8 steps (no RST needed — counter wraps naturally)
+ucode_template[0xEE] = ('swap', [MI|PO, RO|II|PE, SO|MI, STK|SD|AO|RI, BO|AI, SU, SO|MI, STK|RO|BI], False)
+
 def checkUCode():
     for op, code in ucode_template.items():
         if len(code) < 3 or len(code[1]) != 8:
@@ -203,6 +258,8 @@ def initUCode():
     J1 = instruction_decode['je1']#je1 = move $pc imm
     JC = instruction_decode['jcf']#jcf = move $spp imm
     JZ = instruction_decode['jzf']#jzf = move $imm imm
+    JNC = instruction_decode['jnc']
+    JNZ = instruction_decode['jnz']
 
     #ZF = 0, CF = 0, IRQ0 = 0, IRQ1 = 0
     ucode[FLAGS_IRQ00IRQ10Z0C0] = deepcopy(ucode_template)
@@ -223,64 +280,80 @@ def initUCode():
     #ZF = 0, CF = 1, IRQ0 = 0, IRQ1 = 0
     ucode[FLAGS_IRQ00IRQ10Z0C1] =  deepcopy(ucode_template)
     ucode[FLAGS_IRQ00IRQ10Z0C1][JC][1][2:4] = [PO|MI, RO|PI];
+    ucode[FLAGS_IRQ00IRQ10Z0C1][JNC][1][2:4] = [PE, RST];  # CF=1: skip
 
     #ZF = 0, CF = 1, IRQ0 = 0, IRQ1 = 1
     ucode[FLAGS_IRQ00IRQ11Z0C1] =  deepcopy(ucode_template)
     ucode[FLAGS_IRQ00IRQ11Z0C1][JC][1][2:4] = [PO|MI, RO|PI];
+    ucode[FLAGS_IRQ00IRQ11Z0C1][JNC][1][2:4] = [PE, RST];  # CF=1: skip
     ucode[FLAGS_IRQ00IRQ11Z0C1][J1][1][2:4] = [PO|MI, RO|PI];
 
     #ZF = 0, CF = 1, IRQ0 = 1, IRQ1 = 0
     ucode[FLAGS_IRQ01IRQ10Z0C1] =  deepcopy(ucode_template)
     ucode[FLAGS_IRQ01IRQ10Z0C1][JC][1][2:4] = [PO|MI, RO|PI];
+    ucode[FLAGS_IRQ01IRQ10Z0C1][JNC][1][2:4] = [PE, RST];  # CF=1: skip
     ucode[FLAGS_IRQ01IRQ10Z0C1][J0][1][2:4] = [PO|MI, RO|PI];
 
     #ZF = 0, CF = 1, IRQ0 = 1, IRQ1 = 1
     ucode[FLAGS_IRQ01IRQ11Z0C1] =  deepcopy(ucode_template)
     ucode[FLAGS_IRQ01IRQ11Z0C1][JC][1][2:4] = [PO|MI, RO|PI];
+    ucode[FLAGS_IRQ01IRQ11Z0C1][JNC][1][2:4] = [PE, RST];  # CF=1: skip
     ucode[FLAGS_IRQ01IRQ11Z0C1][J0][1][2:4] = [PO|MI, RO|PI];
     ucode[FLAGS_IRQ01IRQ11Z0C1][J1][1][2:4] = [PO|MI, RO|PI];
 
     #ZF = 1, CF = 0, IRQ0 = 0, IRQ1 = 0
     ucode[FLAGS_IRQ00IRQ10Z1C0] =  deepcopy(ucode_template)
     ucode[FLAGS_IRQ00IRQ10Z1C0][JZ][1][2:4] = [PO|MI, RO|PI];
+    ucode[FLAGS_IRQ00IRQ10Z1C0][JNZ][1][2:4] = [PE, RST];  # ZF=1: skip
 
     #ZF = 1, CF = 0, IRQ0 = 0, IRQ1 = 1
     ucode[FLAGS_IRQ00IRQ11Z1C0] =  deepcopy(ucode_template)
     ucode[FLAGS_IRQ00IRQ11Z1C0][JZ][1][2:4] = [PO|MI, RO|PI];
+    ucode[FLAGS_IRQ00IRQ11Z1C0][JNZ][1][2:4] = [PE, RST];  # ZF=1: skip
     ucode[FLAGS_IRQ00IRQ11Z1C0][J1][1][2:4] = [PO|MI, RO|PI];
 
     #ZF = 1, CF = 0, IRQ0 = 1, IRQ1 = 0
     ucode[FLAGS_IRQ01IRQ10Z1C0] =  deepcopy(ucode_template)
     ucode[FLAGS_IRQ01IRQ10Z1C0][JZ][1][2:4] = [PO|MI, RO|PI];
+    ucode[FLAGS_IRQ01IRQ10Z1C0][JNZ][1][2:4] = [PE, RST];  # ZF=1: skip
     ucode[FLAGS_IRQ01IRQ10Z1C0][J0][1][2:4] = [PO|MI, RO|PI];
 
     #ZF = 1, CF = 0, IRQ0 = 1, IRQ1 = 1
     ucode[FLAGS_IRQ01IRQ11Z1C0] =  deepcopy(ucode_template)
     ucode[FLAGS_IRQ01IRQ11Z1C0][JZ][1][2:4] = [PO|MI, RO|PI];
+    ucode[FLAGS_IRQ01IRQ11Z1C0][JNZ][1][2:4] = [PE, RST];  # ZF=1: skip
     ucode[FLAGS_IRQ01IRQ11Z1C0][J0][1][2:4] = [PO|MI, RO|PI];
     ucode[FLAGS_IRQ01IRQ11Z1C0][J1][1][2:4] = [PO|MI, RO|PI];
 
     #ZF = 1, CF = 1, IRQ0 = 0, IRQ1 = 0
     ucode[FLAGS_IRQ00IRQ10Z1C1] =  deepcopy(ucode_template)
     ucode[FLAGS_IRQ00IRQ10Z1C1][JC][1][2:4] = [PO|MI, RO|PI];
+    ucode[FLAGS_IRQ00IRQ10Z1C1][JNC][1][2:4] = [PE, RST];  # CF=1: skip
     ucode[FLAGS_IRQ00IRQ10Z1C1][JZ][1][2:4] = [PO|MI, RO|PI];
+    ucode[FLAGS_IRQ00IRQ10Z1C1][JNZ][1][2:4] = [PE, RST];  # ZF=1: skip
 
     #ZF = 1, CF = 1, IRQ0 = 0, IRQ1 = 1
     ucode[FLAGS_IRQ00IRQ11Z1C1] =  deepcopy(ucode_template)
     ucode[FLAGS_IRQ00IRQ11Z1C1][JC][1][2:4] = [PO|MI, RO|PI];
+    ucode[FLAGS_IRQ00IRQ11Z1C1][JNC][1][2:4] = [PE, RST];  # CF=1: skip
     ucode[FLAGS_IRQ00IRQ11Z1C1][JZ][1][2:4] = [PO|MI, RO|PI];
+    ucode[FLAGS_IRQ00IRQ11Z1C1][JNZ][1][2:4] = [PE, RST];  # ZF=1: skip
     ucode[FLAGS_IRQ00IRQ11Z1C1][J1][1][2:4] = [PO|MI, RO|PI];
 
     #ZF = 1, CF = 1, IRQ0 = 1, IRQ1 = 0
     ucode[FLAGS_IRQ01IRQ10Z1C1] =  deepcopy(ucode_template)
     ucode[FLAGS_IRQ01IRQ10Z1C1][JC][1][2:4] = [PO|MI, RO|PI];
+    ucode[FLAGS_IRQ01IRQ10Z1C1][JNC][1][2:4] = [PE, RST];  # CF=1: skip
     ucode[FLAGS_IRQ01IRQ10Z1C1][JZ][1][2:4] = [PO|MI, RO|PI];
+    ucode[FLAGS_IRQ01IRQ10Z1C1][JNZ][1][2:4] = [PE, RST];  # ZF=1: skip
     ucode[FLAGS_IRQ01IRQ10Z1C1][J0][1][2:4] = [PO|MI, RO|PI];
 
     #ZF = 1, CF = 1, IRQ0 = 1, IRQ1 = 1
     ucode[FLAGS_IRQ01IRQ11Z1C1] =  deepcopy(ucode_template)
     ucode[FLAGS_IRQ01IRQ11Z1C1][JC][1][2:4] = [PO|MI, RO|PI];
+    ucode[FLAGS_IRQ01IRQ11Z1C1][JNC][1][2:4] = [PE, RST];  # CF=1: skip
     ucode[FLAGS_IRQ01IRQ11Z1C1][JZ][1][2:4] = [PO|MI, RO|PI];
+    ucode[FLAGS_IRQ01IRQ11Z1C1][JNZ][1][2:4] = [PE, RST];  # ZF=1: skip
     ucode[FLAGS_IRQ01IRQ11Z1C1][J0][1][2:4] = [PO|MI, RO|PI];
     ucode[FLAGS_IRQ01IRQ11Z1C1][J1][1][2:4] = [PO|MI, RO|PI];
 

@@ -91,6 +91,24 @@
 
     je0	{address: u8} -> { assert(address <= 0xff), 0b00100111 @ address }
     je1	{address: u8} -> { assert(address <= 0xff), 0b00101111 @ address }
+
+    ; Phase 1 new instructions
+    xor  -> 0xE0                                                    ; A = A XOR B (clobbers D)
+    neg  -> 0xE5                                                    ; A = -A (two's complement)
+    ldp3 {address: u8} -> { assert(address <= 0xff), 0xEA @ address }  ; A = page3[imm]
+    stp3 {address: u8} -> { assert(address <= 0xff), 0xEF @ address }  ; page3[imm] = A
+    ldsp {offset: u8} -> { assert(offset <= 0xff), 0xEB @ offset }    ; A = stack[SP + offset]
+    swap -> 0xEE                                                      ; swap A and B
+
+    ; Phase 2 new instructions (hardware mod: INC/DEC)
+    inc  -> 0xFB                                                      ; A = A + 1
+    dec  -> 0xFE                                                      ; A = A - 1
+
+    ; Aliases for existing instructions (no microcode change)
+    clr $a -> 0xD0                                                    ; A = 0 (sub $a, $a), sets ZF
+    clr $b -> 0xD5                                                    ; B = 0 (sub $b, $b), sets ZF
+    clr $c -> 0xDA                                                    ; C = 0 (sub $c, $c), sets ZF
+    clr $d -> 0xDF                                                    ; D = 0 (sub $d, $d), sets ZF
 }
 
 #bank ".instr"
