@@ -8,6 +8,7 @@
 // Also supports serial upload with "MK" magic header for uploader.py.
 
 #include <Arduino.h>
+#include <Wire.h>
 #include <WiFi.h>
 #include <WebServer.h>
 #include <ESPmDNS.h>
@@ -25,6 +26,9 @@ static const int PIN_CLK   = A0;
 static const int PIN_RST   = A1;
 static const int PIN_CU_EN = A2;
 static const int PIN_CLK_SENSE = A3;  // bodge wire to TP2 — reads actual system clock
+static const int PIN_STK   = A4;     // bodge wire to STK — page 2/3 select
+static const int PIN_DIR   = A5;     // bodge wire to U59 pin 1 (DIR) — bus transceiver direction
+static const int PIN_RO    = A6;     // bodge wire to TP20 (~RO) — RAM output enable (active low)
 
 static const int BUS_PINS[8] = { D2, D3, D4, D5, D6, D7, D8, D9 };
 
@@ -43,8 +47,11 @@ WebServer server(80);
 MK1Assembler assembler;
 
 // Last assembled binary, ready for upload
-static uint8_t uploadBuf[512];
+static uint8_t uploadBuf[1024];  // 256 code + 256 data + 256 stack + 256 page3
 static int uploadSize = 0;
+
+// Forward declarations
+static void autoSaveSource(const String& source);
 
 // ── Clock measurement ────────────────────────────────────────────────
 
@@ -130,13 +137,19 @@ static void resetPulse() {
     pinMode(PIN_RST, INPUT);
 }
 
+static int customClkHz = 0;
+static const int CLK_LEDC_CHANNEL = 0;
+static void stopCustomClock();  // forward declaration
+
 static void enableClock() {
+    if (customClkHz > 0) stopCustomClock();
     stopClkMonitor();
     pinMode(PIN_CLK, OUTPUT);
     digitalWrite(PIN_CLK, HIGH);
 }
 
 static void disableClock() {
+    if (customClkHz > 0) stopCustomClock();
     stopClkMonitor();
     pinMode(PIN_CLK, OUTPUT);
     digitalWrite(PIN_CLK, LOW);
@@ -147,11 +160,53 @@ static void disableClock() {
 static void disableCU() { digitalWrite(PIN_CU_EN, HIGH); }
 static void enableCU()  { digitalWrite(PIN_CU_EN, LOW);  }
 
+// ── Programmable clock ──────────────────────────────────────────────
+
+static hw_timer_t* clkTimer = NULL;
+static volatile bool clkTimerState = false;
+
+static void IRAM_ATTR onClkTimer() {
+    clkTimerState = !clkTimerState;
+    digitalWrite(PIN_CLK, clkTimerState);
+}
+
+static bool usingLEDC = false;
+
+static void startCustomClock(int hz) {
+    stopClkMonitor();
+    customClkHz = hz;
+    pinMode(PIN_CLK, OUTPUT);
+
+    if (hz < 150) hz = 150;  // LEDC prescaler can't go lower than ~150Hz
+
+    uint8_t resolution = 8;  // 8-bit: good up to 312kHz
+    if ((long long)hz * 256 > 80000000LL) resolution = 1;
+    uint32_t duty = (1 << resolution) / 2;  // 50% duty
+
+    ledcSetup(CLK_LEDC_CHANNEL, hz, resolution);
+    ledcAttachPin(PIN_CLK, CLK_LEDC_CHANNEL);
+    ledcWrite(CLK_LEDC_CHANNEL, duty);
+}
+
+static void stopCustomClock() {
+    ledcWrite(CLK_LEDC_CHANNEL, 0);
+    ledcDetachPin(PIN_CLK);
+    customClkHz = 0;
+    pinMode(PIN_CLK, INPUT);
+    startClkMonitor();
+}
+
+
 static void enableOutput()  { digitalWrite(PIN_EN, HIGH); }
 static void disableOutput() { digitalWrite(PIN_EN, LOW);  }
 
 static void setAddress(unsigned int address) {
-    digitalWrite(PIN_HL, address > 0xFF);
+    // Page select: address 0x000-0x0FF = page 0 (code),  STK=0 HL=0
+    //              address 0x100-0x1FF = page 1 (data),  STK=0 HL=1
+    //              address 0x200-0x2FF = page 2 (stack), STK=1 HL=0
+    //              address 0x300-0x3FF = page 3 (extra),  STK=1 HL=1
+    digitalWrite(PIN_HL,  (address & 0x100) ? HIGH : LOW);
+    digitalWrite(PIN_STK, (address & 0x200) ? HIGH : LOW);
     putOut(address & 0xFF);
     delayMicroseconds(2);
     enableOutput();
@@ -174,12 +229,14 @@ static void writeInstruction(uint8_t instr) {
 }
 
 static void uploadToMK1(const uint8_t* buf, int size) {
+    int savedClkHz = customClkHz;  // save custom clock state
+
     stopClkMonitor();
     busSetOutput();
     resetPulse();
     disableCU();
     delayMicroseconds(2);
-    enableClock();
+    enableClock();  // static HIGH for writes (kills custom clock if running)
     delayMicroseconds(2);
 
     for (int i = 0; i < size; i++) {
@@ -189,12 +246,18 @@ static void uploadToMK1(const uint8_t* buf, int size) {
         delayMicroseconds(2);
     }
 
-    disableClock();  // also restarts clock monitor
+    disableClock();
     digitalWrite(PIN_HL, LOW);
+    digitalWrite(PIN_STK, LOW);
     resetPulse();
     enableCU();
     totalCycles = 0;
     cpuState = CPU_RUNNING;
+
+    // Restore custom clock if one was running before upload
+    if (savedClkHz > 0) {
+        startCustomClock(savedClkHz);
+    }
 }
 
 // ── Single step ──────────────────────────────────────────────────────
@@ -202,9 +265,14 @@ static void uploadToMK1(const uint8_t* buf, int size) {
 static uint8_t singleStep() {
     // Pulse CLK manually, read bus value after rising edge
     stopClkMonitor();
+
+    // Flip to read mode so we can see the bus
     busSetInput();
     disableOutput();
+    digitalWrite(PIN_DIR, LOW);       // B→A = bus→ESP32
+    enableOutput();
 
+    // Clock pulse
     pinMode(PIN_CLK, OUTPUT);
     digitalWrite(PIN_CLK, HIGH);
     delayMicroseconds(5);
@@ -213,8 +281,259 @@ static uint8_t singleStep() {
     delayMicroseconds(5);
     pinMode(PIN_CLK, INPUT);
 
+    // Restore write mode
+    disableOutput();
+    digitalWrite(PIN_DIR, HIGH);
+    busSetOutput();
+
     totalCycles++;
     return busVal;
+}
+
+// ── Opcode info table (auto-generated from microcode.py) ────────────
+// Low 4 bits = total step count, bit 4 = has_immediate
+static const uint8_t OPCODE_INFO[256] = {
+    0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03,
+    0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03,
+    0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03,  // 0x20-0x2F
+    0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x14, 0x14, 0x14, 0x14, 0x14, 0x14, 0x14, 0x03,  // 0x30-0x3F (original)
+    0x04, 0x04, 0x04, 0x04, 0x05, 0x04, 0x04, 0x15, 0x04, 0x04, 0x04, 0x04, 0x05, 0x04, 0x04, 0x15,
+    0x04, 0x04, 0x04, 0x04, 0x05, 0x04, 0x04, 0x15, 0x04, 0x04, 0x04, 0x04, 0x05, 0x04, 0x04, 0x15,
+    0x04, 0x04, 0x04, 0x04, 0x05, 0x04, 0x04, 0x15, 0x04, 0x04, 0x04, 0x04, 0x06, 0x04, 0x04, 0x15,
+    0x04, 0x04, 0x04, 0x04, 0x05, 0x04, 0x04, 0x15, 0x03, 0x03, 0x05, 0x03, 0x03, 0x03, 0x03, 0x03,
+    0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x05, 0x15, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x03, 0x15,
+    0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x03, 0x15, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x03, 0x15,
+    0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x03, 0x15, 0x04, 0x04, 0x04, 0x04, 0x06, 0x04, 0x04, 0x15,
+    0x15, 0x15, 0x15, 0x15, 0x15, 0x15, 0x15, 0x15, 0x15, 0x15, 0x15, 0x15, 0x15, 0x15, 0x15, 0x15,
+    0x04, 0x04, 0x04, 0x04, 0x04, 0x05, 0x05, 0x04, 0x04, 0x04, 0x14, 0x14, 0x04, 0x04, 0x14, 0x06,
+    0x04, 0x14, 0x08, 0x04, 0x04, 0x14, 0x04, 0x06, 0x04, 0x04, 0x14, 0x18, 0x04, 0x04, 0x04, 0x18,
+    0x07, 0x15, 0x04, 0x06, 0x04, 0x05, 0x04, 0x16, 0x04, 0x04, 0x15, 0x17, 0x04, 0x04, 0x08, 0x15,
+    0x04, 0x04, 0x04, 0x17, 0x04, 0x04, 0x04, 0x14, 0x04, 0x04, 0x04, 0x05, 0x04, 0x04, 0x05, 0x15,
+};
+
+// ── Clock pulse (no bus read) ────────────────────────────────────────
+
+static void clockPulse() {
+    pinMode(PIN_CLK, OUTPUT);
+    digitalWrite(PIN_CLK, HIGH);
+    delayMicroseconds(5);
+    digitalWrite(PIN_CLK, LOW);
+    delayMicroseconds(5);
+    pinMode(PIN_CLK, INPUT);
+}
+
+// ── RAM read ────────────────────────────────────────────────────────
+
+static uint8_t readByte(unsigned int address) {
+    // Set address via MAR (same as write path)
+    busSetOutput();
+    setAddress(address);
+    delayMicroseconds(2);
+
+    // Switch bus to input, assert ~RO to read RAM onto bus
+    busSetInput();
+    disableOutput();
+    digitalWrite(PIN_RO, LOW);   // ~RO active = RAM drives bus
+    delayMicroseconds(2);
+    uint8_t val = busRead();
+    digitalWrite(PIN_RO, HIGH);  // release ~RO
+    delayMicroseconds(2);
+    return val;
+}
+
+static void readMemory(unsigned int startAddr, unsigned int count, uint8_t* dest) {
+    // Read RAM by stepping from reset and capturing bus at each step.
+    // Step 0 of each instruction: MI|PO → bus = PC (address)
+    // Step 1 of each instruction: RO|II|PE → bus = RAM[PC] (data byte)
+    // We step many cycles, capturing (address, data) pairs, then extract
+    // the bytes for the requested address range.
+    // Requires SW3 in manual (no internal oscillator).
+    // Limitation: only reads sequential bytes from PC=0 onwards — startAddr
+    // must be 0 for code page reads. Data page not accessible this way.
+
+    stopClkMonitor();
+
+    uint8_t mem[256];
+    memset(mem, 0xFF, 256);
+
+    // Reset CPU — PC=0, step counter=0
+    resetPulse();
+    delayMicroseconds(10);
+
+    // Step every cycle, capture all bus values. Post-process:
+    // When bus value matches expected next PC, it's step 0 (address).
+    // The next step is always step 1 (data byte from RAM).
+    // For 2-byte instructions, steps 2 and 3 also show addr+1 and immediate.
+    unsigned int maxSteps = 16384;
+    uint8_t lastVal = 0xFF;
+    bool lastWasAddr = false;
+    uint8_t nextExpectedPC = 0;
+
+    for (unsigned int s = 0; s < maxSteps; s++) {
+        uint8_t val = singleStep();
+
+        if (lastWasAddr) {
+            // Previous step was address, this step is data byte (step 1)
+            uint8_t addr = lastVal;
+            uint8_t opcode = val;
+            mem[addr] = opcode;
+
+            uint8_t info = OPCODE_INFO[opcode];
+            bool hasImm = (info & 0x10) != 0;
+            int totalSteps = info & 0x0F;
+
+            if (hasImm) {
+                // Step 2: addr+1 on bus (PO|MI)
+                singleStep(); s++;
+                // Step 3: immediate byte on bus (PE|RO|...)
+                uint8_t immVal = singleStep(); s++;
+                mem[(addr + 1) & 0xFF] = immVal;
+                // Skip remaining execution steps (4 through totalSteps-1)
+                for (int r = 4; r < totalSteps; r++) { clockPulse(); s++; }
+                nextExpectedPC = (addr + 2) & 0xFF;
+            } else {
+                // Skip remaining execution steps (2 through totalSteps-1)
+                for (int r = 2; r < totalSteps; r++) { clockPulse(); s++; }
+                nextExpectedPC = (addr + 1) & 0xFF;
+            }
+            lastWasAddr = false;
+        } else if (val == nextExpectedPC) {
+            // Matches expected next address (or wildcard after jump) — this is step 0
+            lastWasAddr = true;
+        } else {
+            lastWasAddr = false;
+        }
+
+        lastVal = val;
+
+        // Early exit if we have all bytes
+        if (s > 100 && s % 64 == 0) {
+            bool complete = true;
+            for (unsigned int i = 0; i < count; i++) {
+                if (mem[(startAddr + i) & 0xFF] == 0xFF) { complete = false; break; }
+            }
+            if (complete) break;
+        }
+    }
+
+    memcpy(dest, mem + startAddr, count);
+
+    resetPulse();
+    startClkMonitor();
+}
+
+// ── Bus debug ───────────────────────────────────────────────────────
+
+// GET /bussniff — read raw bus value without touching CU or address
+// Tests whether U59 read mode works at all
+static void handleBusSniff() {
+    busSetInput();
+    disableOutput();                  // disable U59
+    digitalWrite(PIN_DIR, LOW);       // B→A read mode
+    enableOutput();                   // re-enable U59 in read mode
+    delayMicroseconds(10);
+    uint8_t val1 = busRead();         // read bus (whatever CPU left on it)
+
+    // Now also try with ~RO asserted
+    pinMode(PIN_RO, OUTPUT);
+    digitalWrite(PIN_RO, LOW);
+    delayMicroseconds(10);
+    uint8_t val2 = busRead();
+    digitalWrite(PIN_RO, HIGH);
+    pinMode(PIN_RO, INPUT);
+
+    // Restore write mode
+    disableOutput();
+    digitalWrite(PIN_DIR, HIGH);
+    busSetOutput();
+
+    String json = "{\"bus_no_ro\":" + String(val1) +
+                  ",\"bus_with_ro\":" + String(val2) + "}";
+    server.send(200, "application/json", json);
+}
+
+// GET /stepn?n=16 — single-step N times, return bus value at each step
+static void handleStepN() {
+    int n = 8;
+    if (server.hasArg("n")) n = server.arg("n").toInt();
+    if (n > 256) n = 256;
+    if (n < 1) n = 1;
+
+    String json = "{\"steps\":[";
+    for (int i = 0; i < n; i++) {
+        uint8_t val = singleStep();
+        if (i > 0) json += ",";
+        char hex[8];
+        snprintf(hex, sizeof(hex), "\"0x%02X\"", val);
+        json += hex;
+    }
+    json += "],\"total_cycles\":" + String(totalCycles) + "}";
+    server.send(200, "application/json", json);
+}
+
+// GET /probe — disables CU, holds ~RO LOW and DIR in read mode for 10 seconds
+static void handleProbe() {
+    stopClkMonitor();
+    busSetOutput();
+    disableCU();                      // EEPROMs go high-Z — safe to drive ~RO
+    enableClock();
+    delayMicroseconds(5);
+
+    // Set address 0 so we read a known location
+    setAddress(0);
+    delayMicroseconds(2);
+
+    busSetInput();
+    disableOutput();
+    digitalWrite(PIN_DIR, LOW);       // read mode
+    enableOutput();
+    pinMode(PIN_RO, OUTPUT);
+    digitalWrite(PIN_RO, LOW);        // ~RO asserted
+    delayMicroseconds(10);
+
+    uint8_t val = busRead();
+
+    server.send(200, "application/json",
+        "{\"status\":\"probing 10s — measure A6, TP20, U49 pin 19, bus pins\",\"bus\":" + String(val) + "}");
+
+    delay(10000);                     // hold for 10 seconds
+
+    digitalWrite(PIN_RO, HIGH);
+    pinMode(PIN_RO, INPUT);
+    disableOutput();
+    digitalWrite(PIN_DIR, HIGH);
+    busSetOutput();
+    disableClock();
+    digitalWrite(PIN_HL, LOW);
+    digitalWrite(PIN_STK, LOW);
+    enableCU();
+}
+
+// ── ESP32 direct I2C scan (bypasses MK1, uses Wire library) ─────────
+// Connect display SDA/SCL directly to ESP32 A6/A7 for this test
+static void handleI2CScan() {
+    Wire.begin(A6, A7);  // SDA=A6, SCL=A7
+    Wire.setClock(100000);  // 100kHz standard mode
+
+    String json = "{\"found\":[";
+    bool first = true;
+    for (uint8_t addr = 1; addr < 127; addr++) {
+        Wire.beginTransmission(addr);
+        uint8_t err = Wire.endTransmission();
+        if (err == 0) {
+            if (!first) json += ",";
+            json += String(addr);
+            first = false;
+        }
+    }
+    json += "]}";
+
+    Wire.end();
+    // Restore A6/A7 to their normal functions
+    pinMode(A6, INPUT);   // ~RO: high-Z
+    pinMode(A7, INPUT);
+
+    server.send(200, "application/json", json);
 }
 
 // ── Web handlers ─────────────────────────────────────────────────────
@@ -256,14 +575,24 @@ static void handleAssemble() {
         int codeBytes = r.code_size < CODE_SIZE ? r.code_size : CODE_SIZE;
         int dataBytes = r.data_size < DATA_SIZE ? r.data_size : DATA_SIZE;
 
+        int p3Bytes = r.page3_size < DATA_SIZE ? r.page3_size : DATA_SIZE;
+
         memcpy(uploadBuf, r.code, codeBytes);
         memset(uploadBuf + codeBytes, 0, CODE_SIZE - codeBytes);
         uploadSize = CODE_SIZE;
 
-        if (dataBytes > 0) {
+        if (dataBytes > 0 || p3Bytes > 0) {
             memcpy(uploadBuf + CODE_SIZE, r.data, dataBytes);
             memset(uploadBuf + CODE_SIZE + dataBytes, 0, DATA_SIZE - dataBytes);
             uploadSize = CODE_SIZE + DATA_SIZE;
+        }
+
+        if (p3Bytes > 0) {
+            // Skip page 2 (stack), write page 3 at offset 768
+            memset(uploadBuf + CODE_SIZE + DATA_SIZE, 0, DATA_SIZE);  // page 2 = zeros
+            memcpy(uploadBuf + CODE_SIZE + DATA_SIZE + DATA_SIZE, r.page3, p3Bytes);
+            memset(uploadBuf + CODE_SIZE + DATA_SIZE + DATA_SIZE + p3Bytes, 0, DATA_SIZE - p3Bytes);
+            uploadSize = CODE_SIZE + DATA_SIZE + DATA_SIZE + DATA_SIZE;  // 1024
         }
 
         // Add hex dump of code bytes to response
@@ -297,6 +626,20 @@ static void handleUpload() {
     server.send(200, "application/json", "{\"ok\":true}");
 }
 
+// Parse #clock directive from source. Returns 0 if not found.
+static int parseClockDirective(const String& source) {
+    int idx = source.indexOf("#clock");
+    if (idx < 0) return 0;
+    idx += 6;  // skip "#clock"
+    while (idx < (int)source.length() && source[idx] == ' ') idx++;
+    int hz = 0;
+    while (idx < (int)source.length() && source[idx] >= '0' && source[idx] <= '9') {
+        hz = hz * 10 + (source[idx] - '0');
+        idx++;
+    }
+    return hz;
+}
+
 // Assemble + upload in one request. Accepts assembly text in POST body.
 static void handleRun() {
     if (!server.hasArg("plain")) {
@@ -305,6 +648,7 @@ static void handleRun() {
     }
 
     String source = server.arg("plain");
+    int clockDirective = parseClockDirective(source);
     assembler.assemble(source.c_str());
     const AsmResult& r = assembler.result;
 
@@ -328,18 +672,32 @@ static void handleRun() {
     uploadSize = 0;
     int codeBytes = r.code_size < CODE_SIZE ? r.code_size : CODE_SIZE;
     int dataBytes = r.data_size < DATA_SIZE ? r.data_size : DATA_SIZE;
+    int p3Bytes = r.page3_size < DATA_SIZE ? r.page3_size : DATA_SIZE;
 
     memcpy(uploadBuf, r.code, codeBytes);
     memset(uploadBuf + codeBytes, 0, CODE_SIZE - codeBytes);
     uploadSize = CODE_SIZE;
 
-    if (dataBytes > 0) {
+    if (dataBytes > 0 || p3Bytes > 0) {
         memcpy(uploadBuf + CODE_SIZE, r.data, dataBytes);
         memset(uploadBuf + CODE_SIZE + dataBytes, 0, DATA_SIZE - dataBytes);
         uploadSize = CODE_SIZE + DATA_SIZE;
     }
 
+    if (p3Bytes > 0) {
+        memset(uploadBuf + CODE_SIZE + DATA_SIZE, 0, DATA_SIZE);
+        memcpy(uploadBuf + CODE_SIZE + DATA_SIZE + DATA_SIZE, r.page3, p3Bytes);
+        memset(uploadBuf + CODE_SIZE + DATA_SIZE + DATA_SIZE + p3Bytes, 0, DATA_SIZE - p3Bytes);
+        uploadSize = CODE_SIZE + DATA_SIZE + DATA_SIZE + DATA_SIZE;
+    }
+
     uploadToMK1(uploadBuf, uploadSize);
+    autoSaveSource(source);
+
+    // Apply #clock directive if present and ESP32 clock is active (SW3 manual)
+    if (clockDirective > 0) {
+        startCustomClock(clockDirective);
+    }
 
     String json = "{\"ok\":true,\"code_size\":" + String(codeBytes) +
                   ",\"data_size\":" + String(dataBytes) + "}";
@@ -384,6 +742,40 @@ static void handleResume() {
     server.send(200, "application/json", "{\"ok\":true}");
 }
 
+// POST /clock?hz=1000 — set ESP32-generated clock speed (SW3 must be in manual)
+// POST /clock?hz=0    — stop ESP32 clock, return to monitoring
+// GET  /clock         — return current setting
+static void handleClock() {
+    if (server.hasArg("hz")) {
+        int hz = server.arg("hz").toInt();
+        if (hz <= 0) {
+            stopCustomClock();
+            server.send(200, "application/json", "{\"ok\":true,\"hz\":0,\"mode\":\"monitor\"}");
+        } else {
+            // Refuse if external clock is running (SW3 on auto)
+            updateClkMeasurement();
+            if (measuredClkHz > 10 && customClkHz == 0) {
+                server.send(409, "application/json",
+                    "{\"ok\":false,\"error\":\"External clock detected at " +
+                    String(measuredClkHz, 0) + " Hz. Switch SW3 to manual first.\"}");
+                return;
+            }
+            if (hz > 500000) hz = 500000;  // cap at 500kHz (board fails at ~600kHz)
+            startCustomClock(hz);
+            cpuState = CPU_RUNNING;
+            server.send(200, "application/json",
+                "{\"ok\":true,\"hz\":" + String(hz) + ",\"mode\":\"esp32_clock\"}");
+        }
+    } else {
+        // GET: return current state
+        String mode = customClkHz > 0 ? "esp32_clock" : "external";
+        String json = "{\"hz\":" + String(customClkHz) +
+                      ",\"mode\":\"" + mode +
+                      "\",\"measured_hz\":" + String(measuredClkHz, 1) + "}";
+        server.send(200, "application/json", json);
+    }
+}
+
 static void handleStatus() {
     updateClkMeasurement();
 
@@ -398,19 +790,107 @@ static void handleStatus() {
 
     String json = "{\"state\":\"" + String(stateStr) +
                   "\",\"clock_hz\":" + String(measuredClkHz, 1) +
+                  ",\"custom_clock_hz\":" + String(customClkHz) +
                   ",\"bus\":" + String(busVal) +
                   ",\"cycles\":" + String(totalCycles) + "}";
     server.send(200, "application/json", json);
 }
 
-static const char* SAVE_PATH = "/program.asm";
+// GET /readtest — debug: read addr 0 and addr 3 individually
+static void handleReadTest() {
+    stopClkMonitor();
+    digitalWrite(PIN_DIR, HIGH);
+    busSetOutput();
 
+    // Read address 0
+    resetPulse();
+    delayMicroseconds(5);
+    clockPulse();  // step 0: MAR=PC=0
+    delayMicroseconds(2);
+    // Don't overwrite MAR — just read what step 1 gives us
+    uint8_t val0 = singleStep();  // step 1: bus = RAM[0]
+
+    // Read address 3 — new approach:
+    // 1. Reset (step=0), disable CU
+    // 2. Set address (MAR=3) while CU disabled
+    // 3. Clock once with CU disabled (step counter 0→1, no register effects)
+    // 4. Re-enable CU (now at step 1 = RO|II|PE, MAR still holds 3)
+    // 5. Clock once — RO asserts, bus = RAM[3]
+    resetPulse();
+    delayMicroseconds(5);
+    disableCU();
+    delayMicroseconds(2);
+    setAddress(3);
+    delayMicroseconds(2);
+    clockPulse();  // advance step counter 0→1 with CU disabled (no side effects)
+    delayMicroseconds(2);
+    enableCU();
+    delayMicroseconds(2);
+    uint8_t val3 = singleStep();  // step 1: RO|II|PE, bus = RAM[3]
+
+    resetPulse();
+    startClkMonitor();
+
+    String json = "{\"addr0\":" + String(val0) + ",\"addr3\":" + String(val3) +
+                  ",\"expect0\":\"0xD1\",\"expect3\":\"0x63\"}";
+    server.send(200, "application/json", json);
+}
+
+// GET /read?addr=0&count=256  — read RAM bytes, returns hex dump
+// addr: 10-bit address (0x000-0x3FF covering all 4 pages)
+// count: number of bytes (default 256, max 1024)
+static void handleRead() {
+    unsigned int addr = 0;
+    unsigned int count = 256;
+    if (server.hasArg("addr")) addr = server.arg("addr").toInt();
+    if (server.hasArg("count")) count = server.arg("count").toInt();
+    if (count > 1024) count = 1024;
+    if (addr + count > 1024) count = 1024 - addr;
+
+    uint8_t buf[1024];
+    readMemory(addr, count, buf);
+
+    String json = "{\"addr\":" + String(addr) + ",\"count\":" + String(count) + ",\"hex\":\"";
+    for (unsigned int i = 0; i < count; i++) {
+        char hex[4];
+        snprintf(hex, sizeof(hex), "%02X", buf[i]);
+        json += hex;
+        if (i < count - 1) json += " ";
+    }
+    json += "\",\"debug_pc\":" + String(buf[255 < count ? 255 : 0]) + "}";
+    server.send(200, "application/json", json);
+}
+
+static const char* AUTOSAVE_PATH = "/last.asm";
+static const char* PROGRAMS_DIR = "/programs";
+
+static void ensureProgramsDir() {
+    if (!FFat.exists(PROGRAMS_DIR)) {
+        FFat.mkdir(PROGRAMS_DIR);
+    }
+}
+
+static void autoSaveSource(const String& source) {
+    File f = FFat.open(AUTOSAVE_PATH, "w");
+    if (f) { f.print(source); f.close(); }
+}
+
+// Save named program
 static void handleSave() {
-    if (!server.hasArg("plain")) {
-        server.send(400, "application/json", "{\"ok\":false}");
+    if (!server.hasArg("name") || !server.hasArg("plain")) {
+        server.send(400, "application/json", "{\"ok\":false,\"error\":\"Need name and source\"}");
         return;
     }
-    File f = FFat.open(SAVE_PATH, "w");
+    ensureProgramsDir();
+    String name = server.arg("name");
+    name.replace("/", "");  // sanitise
+    name.replace("..", "");
+    if (name.length() == 0 || name.length() > 32) {
+        server.send(400, "application/json", "{\"ok\":false,\"error\":\"Invalid name\"}");
+        return;
+    }
+    String path = String(PROGRAMS_DIR) + "/" + name + ".asm";
+    File f = FFat.open(path, "w");
     if (!f) {
         server.send(500, "application/json", "{\"ok\":false,\"error\":\"Flash write failed\"}");
         return;
@@ -420,15 +900,69 @@ static void handleSave() {
     server.send(200, "application/json", "{\"ok\":true}");
 }
 
+// Load named program
 static void handleLoad() {
-    File f = FFat.open(SAVE_PATH, "r");
+    if (!server.hasArg("name")) {
+        // Legacy: load autosaved program (for boot restore of editor)
+        File f = FFat.open(AUTOSAVE_PATH, "r");
+        if (!f) { server.send(200, "text/plain", ""); return; }
+        String content = f.readString();
+        f.close();
+        server.send(200, "text/plain", content);
+        return;
+    }
+    String name = server.arg("name");
+    String path = String(PROGRAMS_DIR) + "/" + name + ".asm";
+    File f = FFat.open(path, "r");
     if (!f) {
-        server.send(200, "text/plain", "");
+        server.send(404, "application/json", "{\"ok\":false,\"error\":\"Not found\"}");
         return;
     }
     String content = f.readString();
     f.close();
     server.send(200, "text/plain", content);
+}
+
+// List saved programs
+static void handleProgramList() {
+    ensureProgramsDir();
+    String json = "[";
+    File dir = FFat.open(PROGRAMS_DIR);
+    bool first = true;
+    if (dir && dir.isDirectory()) {
+        File entry = dir.openNextFile();
+        while (entry) {
+            String fname = entry.name();
+            // Strip path prefix and .asm extension
+            int lastSlash = fname.lastIndexOf('/');
+            if (lastSlash >= 0) fname = fname.substring(lastSlash + 1);
+            if (fname.endsWith(".asm")) {
+                fname = fname.substring(0, fname.length() - 4);
+                if (!first) json += ",";
+                json += "\"" + fname + "\"";
+                first = false;
+            }
+            entry = dir.openNextFile();
+        }
+    }
+    json += "]";
+    server.send(200, "application/json", json);
+}
+
+// Delete named program
+static void handleProgramDelete() {
+    if (!server.hasArg("name")) {
+        server.send(400, "application/json", "{\"ok\":false,\"error\":\"Need name\"}");
+        return;
+    }
+    String name = server.arg("name");
+    String path = String(PROGRAMS_DIR) + "/" + name + ".asm";
+    if (!FFat.exists(path)) {
+        server.send(404, "application/json", "{\"ok\":false,\"error\":\"Not found\"}");
+        return;
+    }
+    FFat.remove(path);
+    server.send(200, "application/json", "{\"ok\":true}");
 }
 
 // ── WiFi configuration ───────────────────────────────────────────────
@@ -562,8 +1096,14 @@ void setup() {
     pinMode(PIN_HL, OUTPUT);
     pinMode(PIN_RI, OUTPUT);
     pinMode(PIN_EN, OUTPUT);
+    pinMode(PIN_STK, OUTPUT);
+    digitalWrite(PIN_STK, LOW);
+    pinMode(PIN_DIR, OUTPUT);
+    digitalWrite(PIN_DIR, HIGH);  // U59 DIR: HIGH = A→B = ESP32→bus (write mode)
+    pinMode(PIN_RO, INPUT);       // ~RO: high-Z by default (EEPROM drives this line during normal operation)
+    pinMode(PIN_RST, OUTPUT);
+    digitalWrite(PIN_RST, HIGH);  // hold MK1 in reset immediately — prevents garbage execution during boot
     pinMode(PIN_CLK, INPUT);
-    pinMode(PIN_RST, INPUT);
     pinMode(PIN_CU_EN, OUTPUT);
     pinMode(PIN_CLK_SENSE, INPUT);
     busSetOutput();
@@ -573,6 +1113,37 @@ void setup() {
         FFat.begin(true);
     }
     loadWifiConfig();
+
+    // Restore last program from flash (or upload HLT as safe default)
+    {
+        bool restored = false;
+        File f = FFat.open(AUTOSAVE_PATH, "r");
+        if (f) {
+            String source = f.readString();
+            f.close();
+            if (source.length() > 0) {
+                int clockDirective = parseClockDirective(source);
+                assembler.assemble(source.c_str());
+                const AsmResult& r = assembler.result;
+                if (r.error_count == 0 && r.code_size > 0) {
+                    int codeBytes = r.code_size < CODE_SIZE ? r.code_size : CODE_SIZE;
+                    memcpy(uploadBuf, r.code, codeBytes);
+                    memset(uploadBuf + codeBytes, 0, CODE_SIZE - codeBytes);
+                    uploadSize = CODE_SIZE;
+                    uploadToMK1(uploadBuf, uploadSize);
+                    if (clockDirective > 0) startCustomClock(clockDirective);
+                    Serial.printf("Restored program from flash (%d bytes, clock %d Hz)\n", codeBytes, clockDirective);
+                    restored = true;
+                }
+            }
+        }
+        if (!restored) {
+            uploadBuf[0] = 0x7F;  // HLT
+            uploadSize = 1;
+            uploadToMK1(uploadBuf, uploadSize);
+            Serial.println("No saved program — uploaded HLT");
+        }
+    }
 
     // Try STA mode first, fall back to AP
     if (!connectToWifi()) {
@@ -589,8 +1160,18 @@ void setup() {
     server.on("/step", HTTP_POST, handleStep);
     server.on("/resume", HTTP_POST, handleResume);
     server.on("/status", HTTP_GET, handleStatus);
+    server.on("/clock", HTTP_GET, handleClock);
+    server.on("/clock", HTTP_POST, handleClock);
     server.on("/save", HTTP_POST, handleSave);
     server.on("/load", HTTP_GET, handleLoad);
+    server.on("/programs", HTTP_GET, handleProgramList);
+    server.on("/programs/delete", HTTP_POST, handleProgramDelete);
+    server.on("/read", HTTP_GET, handleRead);
+    server.on("/bussniff", HTTP_GET, handleBusSniff);
+    server.on("/i2cscan", HTTP_GET, handleI2CScan);
+    server.on("/readtest", HTTP_GET, handleReadTest);
+    server.on("/stepn", HTTP_GET, handleStepN);
+    server.on("/probe", HTTP_GET, handleProbe);
     server.on("/wifi", HTTP_GET, handleWifiGet);
     server.on("/wifi", HTTP_POST, handleWifiPost);
     server.begin();

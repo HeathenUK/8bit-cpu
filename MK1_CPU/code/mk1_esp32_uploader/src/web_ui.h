@@ -39,6 +39,20 @@ main { flex: 1; display: flex; flex-direction: column; overflow: hidden; min-hei
 .err { color: #e94560; }
 .ok { color: #4ecca3; }
 .info { color: #888; }
+.modal-bg { display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.7); z-index:100; justify-content:center; align-items:center; }
+.modal-bg.show { display:flex; }
+.modal { background:#16213e; border:1px solid #0f3460; border-radius:8px; padding:16px; min-width:300px; max-width:90vw; max-height:70vh; display:flex; flex-direction:column; }
+.modal h2 { font-size:15px; color:#e94560; margin-bottom:12px; }
+.modal-list { flex:1; overflow-y:auto; margin-bottom:12px; }
+.modal-list .prog-item { display:flex; align-items:center; gap:8px; padding:6px 8px; border-radius:4px; cursor:pointer; }
+.modal-list .prog-item:hover { background:#0f3460; }
+.modal-list .prog-item .prog-name { flex:1; font-size:13px; }
+.modal-list .prog-item .prog-del { color:#e94560; cursor:pointer; font-size:15px; font-weight:bold; border:none; background:none; padding:2px 6px; }
+.modal-list .prog-item .prog-del:hover { color:#ff6b80; }
+.modal-input { display:flex; gap:8px; margin-bottom:12px; }
+.modal-input input { flex:1; background:#0a0a1a; border:1px solid #335; border-radius:4px; padding:6px 8px; color:#e0e0e0; font-size:13px; }
+.modal-close { align-self:flex-end; }
+.empty-msg { color:#555; font-size:13px; padding:8px; }
 </style>
 </head>
 <body>
@@ -55,16 +69,28 @@ main { flex: 1; display: flex; flex-direction: column; overflow: hidden; min-hei
     <option value="page3">Page 3 test</option>
     <option value="incdec">INC/DEC + JNZ</option>
     <option value="stackrel">Stack-relative (C-style calls)</option>
+    <option value="stresstest">Stress test (clock speed)</option>
   </select>
-  <button class="btn btn-sec" onclick="save()">Save</button>
-  <button class="btn btn-sec" onclick="document.getElementById('fileIn').click()">Open</button>
-  <input type="file" id="fileIn" accept=".asm,.s,.c,.txt" style="display:none" onchange="openFile(event)">
+  <button class="btn btn-sec" onclick="showPrograms()">Programs</button>
+  <button class="btn btn-sec" onclick="downloadAsm()">&#x2B07;</button>
   <div class="spacer"></div>
   <span id="status"></span>
   <button class="btn btn-step" onclick="mk1step()">Step</button>
   <button class="btn btn-sec" onclick="mk1resume()">Resume</button>
   <button class="btn btn-warn" onclick="mk1reset()">Reset</button>
   <button class="btn btn-warn" onclick="mk1halt()">Halt</button>
+  <select id="clksel" onchange="setClk()" title="ESP32 clock (SW3 must be manual)">
+    <option value="">Clock...</option>
+    <option value="0">Off (monitor)</option>
+    <option value="150">150 Hz (min)</option>
+    <option value="500">500 Hz</option>
+    <option value="1000">1 kHz</option>
+    <option value="10000">10 kHz</option>
+    <option value="50000">50 kHz</option>
+    <option value="100000">100 kHz</option>
+    <option value="250000">250 kHz</option>
+    <option value="500000">500 kHz (max)</option>
+  </select>
   <button class="btn btn-run" onclick="asmRun()">Assemble &amp; Run</button>
 </header>
 <div id="cpubar">
@@ -80,6 +106,17 @@ main { flex: 1; display: flex; flex-direction: column; overflow: hidden; min-hei
   </div>
   <div id="output"><span class="info">Ready. Connect to MK1 and press Assemble &amp; Run.</span></div>
 </main>
+<div class="modal-bg" id="progModal" onclick="if(event.target===this)closePrograms()">
+  <div class="modal">
+    <h2>Programs</h2>
+    <div class="modal-input">
+      <input id="progName" placeholder="Program name" onkeydown="if(event.key==='Enter')saveProgram()">
+      <button class="btn btn-run" onclick="saveProgram()">Save</button>
+    </div>
+    <div class="modal-list" id="progList"><span class="empty-msg">Loading...</span></div>
+    <button class="btn btn-sec modal-close" onclick="closePrograms()">Close</button>
+  </div>
+</div>
 <script>
 const examples = {
   counter: '; Simple counter (uses inc)\nmain:\n  inc\n  out\n  j main\n',
@@ -91,6 +128,7 @@ const examples = {
   page3: '; Page 3 test: store/load from page 3\n; Stores 42 to page 3 addr 0, reads it back\n  ldi $a 42\n  stp3 0\n  ldi $a 0\n  out $a       ; display 0\n  ldp3 0\n  out $a       ; should display 42\n  hlt\n',
   incdec: '; INC/DEC test\n; Count up to 5, then down to 0, repeat\n  ldi $a 0\n\nup:\n  inc\n  out\n  cmp 5\n  jnz up         ; keep going if A != 5\n\ndown:\n  dec\n  out\n  cmp 0\n  jnz down       ; keep going if A != 0\n  j up\n',
   stackrel: '; Stack-relative load demo\n; Shows C-style function calls with arguments\n; max(a,b) accesses args via ldsp\n;\n; Expected output: 25, 200\n\n  ; max(10, 25)\n  ldi $a 10\n  push $a          ; arg1\n  ldi $a 25\n  push $a          ; arg2\n  jal max\n  pop $d           ; clean arg2\n  pop $d           ; clean arg1\n  out              ; display 25\n\n  ; max(200, 150)\n  ldi $a 200\n  push $a          ; arg1\n  ldi $a 150\n  push $a          ; arg2\n  jal max\n  pop $d           ; clean arg2\n  pop $d           ; clean arg1\n  out              ; display 200\n  hlt\n\n; max(arg1, arg2) -> $a\n; Stack: [SP+1]=ret, [SP+2]=arg2, [SP+3]=arg1\nmax:\n  ldsp 3           ; A = arg1\n  mov $a $b        ; B = arg1\n  ldsp 2           ; A = arg2\n  cmp $b           ; arg2 vs arg1\n  jc .done         ; CF=1: arg2 >= arg1, keep A\n  mov $b $a        ; arg1 was bigger\n.done:\n  ret\n',
+  stresstest: '; Clock speed stress test\n; Exercises ALU, stack, RAM, jumps, flags\n; Expected final output: 161\n; If you see a different number, the clock is too fast!\n; Board tested reliable up to ~550kHz, fails at ~600kHz\n;\n; Computes: sum of (i XOR 0xAA) for i=0..9\n; Uses function calls, stack args, XOR, INC, CMP\n\n  ldi $a 0\n  push $a           ; accumulator on stack\n  ldi $b 0          ; counter\n\n.loop:\n  ; compute (counter XOR 0xAA)\n  mov $b $a\n  push $a           ; save counter\n  ldi $b 0xAA\n  xor               ; A = counter XOR 0xAA\n  mov $a $c         ; C = xor result\n\n  ; add to accumulator\n  ldsp 2            ; A = accumulator\n  add $c $a         ; A = accum + xor_result\n  stsp 2            ; store back\n\n  ; restore counter and increment\n  pop $a            ; A = counter\n  mov $a $b         ; B = counter\n  inc               ; A = counter + 1\n  mov $a $b         ; B = new counter\n\n  ; loop if counter < 10\n  cmp 10\n  jnz .loop\n\n  ; output result\n  ldsp 1            ; A = final accumulator\n  pop $d            ; clean stack\n  out               ; should display 161\n  hlt\n',
 };
 
 const ed = document.getElementById('editor');
@@ -205,6 +243,23 @@ async function mk1resume() {
   document.getElementById('status').textContent = 'Running';
 }
 
+async function setClk() {
+  const sel = document.getElementById('clksel');
+  if (sel.value === '') return;
+  try {
+    const r = await fetch('/clock?hz=' + sel.value, { method: 'POST' });
+    const j = await r.json();
+    if (j.ok) {
+      log('Clock set to ' + (j.hz > 0 ? formatClk(j.hz) : 'off (monitoring)'), 'ok');
+    } else {
+      log('Clock refused: ' + j.error, 'err');
+    }
+  } catch(e) {
+    log('Clock error: ' + e.message, 'err');
+  }
+  sel.value = '';
+}
+
 // Status polling
 function formatClk(hz) {
   if (hz < 1) return 'stopped';
@@ -220,7 +275,10 @@ async function pollStatus() {
     const stEl = document.getElementById('cpu-state');
     stEl.textContent = s.state.toUpperCase();
     stEl.className = 'val' + (s.state === 'halted' ? ' off' : '');
-    document.getElementById('cpu-clk').textContent = formatClk(s.clock_hz);
+    const clkText = s.custom_clock_hz > 0
+      ? formatClk(s.custom_clock_hz) + ' (ESP32)'
+      : formatClk(s.clock_hz);
+    document.getElementById('cpu-clk').textContent = clkText;
     document.getElementById('cpu-bus').textContent = s.bus + ' (0x' + s.bus.toString(16).toUpperCase().padStart(2,'0') + ')';
     document.getElementById('cpu-cycles').textContent = s.cycles;
   } catch(e) {}
@@ -228,26 +286,81 @@ async function pollStatus() {
 
 setInterval(pollStatus, 1000);
 
-function openFile(e) {
-  const file = e.target.files[0];
-  if (!file) return;
-  const reader = new FileReader();
-  reader.onload = function(ev) {
-    ed.value = ev.target.result;
-    updateLines();
-    log('Opened ' + file.name, 'ok');
-  };
-  reader.readAsText(file);
-  e.target.value = '';  // reset so same file can be reopened
+async function showPrograms() {
+  document.getElementById('progModal').classList.add('show');
+  document.getElementById('progName').value = '';
+  await refreshProgramList();
 }
 
-async function save() {
+function closePrograms() {
+  document.getElementById('progModal').classList.remove('show');
+}
+
+async function refreshProgramList() {
+  const list = document.getElementById('progList');
   try {
-    await fetch('/save', {
+    const r = await fetch('/programs');
+    const programs = await r.json();
+    if (programs.length === 0) {
+      list.innerHTML = '<span class="empty-msg">No saved programs</span>';
+      return;
+    }
+    list.innerHTML = '';
+    programs.forEach(name => {
+      const item = document.createElement('div');
+      item.className = 'prog-item';
+      item.innerHTML = '<span class="prog-name">' + esc(name) + '</span>' +
+        '<button class="prog-del" title="Delete">&times;</button>';
+      item.querySelector('.prog-name').onclick = () => loadProgram(name);
+      item.querySelector('.prog-del').onclick = (e) => { e.stopPropagation(); deleteProgram(name); };
+      list.appendChild(item);
+    });
+  } catch(e) {
+    list.innerHTML = '<span class="err">Failed to load list</span>';
+  }
+}
+
+async function saveProgram() {
+  const name = document.getElementById('progName').value.trim();
+  if (!name) { log('Enter a program name', 'err'); return; }
+  try {
+    const r = await fetch('/save?name=' + encodeURIComponent(name), {
       method: 'POST', headers: {'Content-Type': 'text/plain'}, body: ed.value
     });
-    log('Saved to flash', 'ok');
+    const j = await r.json();
+    if (j.ok) {
+      log('Saved: ' + name, 'ok');
+      await refreshProgramList();
+      document.getElementById('progName').value = '';
+    } else {
+      log('Save failed: ' + (j.error || 'unknown'), 'err');
+    }
   } catch(e) { log('Save failed: ' + e.message, 'err'); }
+}
+
+async function loadProgram(name) {
+  try {
+    const r = await fetch('/load?name=' + encodeURIComponent(name));
+    if (r.ok) {
+      const text = await r.text();
+      ed.value = text;
+      updateLines();
+      closePrograms();
+      log('Loaded: ' + name, 'ok');
+    }
+  } catch(e) { log('Load failed: ' + e.message, 'err'); }
+}
+
+async function deleteProgram(name) {
+  if (!confirm('Delete "' + name + '"?')) return;
+  try {
+    const r = await fetch('/programs/delete?name=' + encodeURIComponent(name), { method: 'POST' });
+    const j = await r.json();
+    if (j.ok) {
+      log('Deleted: ' + name, 'ok');
+      await refreshProgramList();
+    }
+  } catch(e) { log('Delete failed: ' + e.message, 'err'); }
 }
 
 async function loadSaved() {
@@ -260,8 +373,27 @@ async function loadSaved() {
   } catch(e) {}
 }
 
-// Tab key inserts spaces
+function downloadAsm() {
+  const blob = new Blob([ed.value], {type: 'text/plain'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'program.asm';
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+// Keyboard shortcuts + tab handling
 ed.addEventListener('keydown', function(e) {
+  if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+    e.preventDefault();
+    asmRun();
+    return;
+  }
+  if ((e.ctrlKey || e.metaKey) && e.key === 's') {
+    e.preventDefault();
+    showPrograms();
+    return;
+  }
   if (e.key === 'Tab') {
     e.preventDefault();
     const s = this.selectionStart;
