@@ -156,7 +156,7 @@ ucode_template[0b00001111] = ('exw 0 1', [MI|PO, RO|II|PE, AO|E0|U0, RST, RST, R
 ucode_template[0b10001110] = ('exw 0 2', [MI|PO, RO|II|PE, AO|E0|U1, RST, RST, RST, RST, RST], False)
 ucode_template[0b10010110] = ('exw 0 3', [MI|PO, RO|II|PE, AO|E0|U1|U0, RST, RST, RST, RST, RST], False)
 ucode_template[0b00010111] = ('exw 1 0', [MI|PO, RO|II|PE, AO|E1, RST, RST, RST, RST, RST], False)
-ucode_template[0b00011111] = ('exw 1 1', [MI|PO, RO|II|PE, AO|E1|U0, RST, RST, RST, RST, RST], False)
+ucode_template[0b00011111] = ('exw 1 1', [MI|PO, RO|II|PE, AO|E1, AO|E1|E0, RST, RST, RST, RST], False)
 ucode_template[0b10011110] = ('exw 1 2', [MI|PO, RO|II|PE, AO|E1|U1, RST, RST, RST, RST, RST], False)
 ucode_template[0b10100110] = ('exw 1 3', [MI|PO, RO|II|PE, AO|E1|U1|U0, RST, RST, RST, RST, RST], False)
 
@@ -252,9 +252,53 @@ ucode_template[0xE7] = ('push_imm', [MI|PO, RO|II|PE, PO|MI, PE|RO|AI, SO|MI, ST
 # LDSP_B N: B = stack[SP+N] (clobbers A with offset temporarily)
 ucode_template[0xF3] = ('ldsp_b', [MI|PO, RO|II|PE, SO|EI, PO|MI, PE|RO|AI, EO|MI, STK|RO|BI, RST], True)
 
-# DISPMODE N: set display mode (forward-compatible — NOP until display hardware mod)
-# Reads immediate onto bus and asserts DISP signal for hardware latch
-ucode_template[0xF7] = ('dispmode', [MI|PO, RO|II|PE, PO|MI, PE|RO|DISP, RST, RST, RST, RST], True)
+# IDEREFP3: page3[B] = A — indirect store to page 3
+ucode_template[0xF7] = ('iderefp3', [MI|PO, RO|II|PE, BO|MI, STK|HL|AO|RI, RST, RST, RST, RST], True)
+
+# GPIO_READ: Read B-side of 652 daughter board back into A register.
+# U1 asserted → OEAB HIGH (B outputs float), NOT(U1) → OEBA LOW (B→A transparent).
+# E1 enables U70 transceiver, XI sets direction to input.
+# Uses E1 (same as exw 1 1) so E0 remains free as a spare J4 control signal.
+# Result in A: bit 0 = SDA state. Mask other bits (latch residue).
+# Reclaims 0xC5 (was i2c_start, direct I2C abandoned in favour of daughter board)
+ucode_template[0xC5] = ('gpio_read', [MI|PO, RO|II|PE, XI|E1|AI|U1, RST, RST, RST, RST, RST], False)
+
+# 0xC6: NOP — was i2c_stop, reclaimed. Available for future use.
+ucode_template[0xC6] = ('nop_c6', [MI|PO, RO|II|PE, RST, RST, RST, RST, RST, RST], False)
+
+# 0xD2: NOP — was i2c2bit, reclaimed. Available for future use.
+ucode_template[0xD2] = ('nop_d2', [MI|PO, RO|II|PE, RST, RST, RST, RST, RST, RST], False)
+
+# DEREFP3: A = page3[A] — indirect read from page 3
+ucode_template[0xD5] = ('derefp3', [MI|PO, RO|II|PE, AO|MI, STK|HL|RO|AI, RST, RST, RST, RST], True)
+
+# ISTC: code[B] = A — indirect store to code page (no HL, no STK)
+ucode_template[0xDA] = ('istc', [MI|PO, RO|II|PE, BO|MI, AO|RI, RST, RST, RST, RST], True)
+
+# OCALL N: overlay call — push return address, A = N, jump to address 0
+# Step 3: read immediate into A (NO PE — ret adds 1, so push addr_of_imm)
+# Step 4-5: push return address (PC = addr of immediate)
+# Step 6: E = A (save index), Step 7: PC = A - E = 0 (A unchanged)
+# Counter wraps 7→0, next fetch from PC=0 (overlay loader)
+ucode_template[0xDF] = ('ocall', [MI|PO, RO|II|PE, PO|MI, RO|AI, SO|MI, STK|SD|PO|RI, AO|EI, SUB|EO|PI], True)
+
+# OUT_IMM N: output immediate to display without touching A
+ucode_template[0xD1] = ('out_imm', [MI|PO, RO|II|PE, PO|MI, PE|RO|OI, RST, RST, RST, RST], True)
+
+# JAL_R: indirect call — push return address, jump to address in A
+ucode_template[0xE1] = ('jal_r', [MI|PO, RO|II|PE, SO|MI, STK|SD|PO|RI, AO|PI, RST, RST, RST], True)
+
+# ADC: A = A + B + CF — add with carry (flag-dependent: CINV when CF=1)
+# Base template (CF=0): normal ADD. initUCode patches CF=1 to add CINV.
+ucode_template[0xC1] = ('adc', [MI|PO, RO|II|PE, BO|EI, EO|AI|FI, RST, RST, RST, RST], False)
+
+# SBC: A = A - B - !CF — subtract with borrow (flag-dependent: CINV when CF=0)
+# Base template (CF=0): SUB+CINV (borrow). initUCode patches CF=1 to normal SUB.
+ucode_template[0xC2] = ('sbc', [MI|PO, RO|II|PE, BO|EI, SUB|CINV|EO|AI|FI, RST, RST, RST, RST], False)
+
+# TST N: test bits — sets ZF based on A AND immediate, does NOT modify A
+# Loads immediate into E, computes AND for flags only (no AI)
+ucode_template[0xFF] = ('tst', [MI|PO, RO|II|PE, PO|MI, PE|RO|EI, AND|FI, RST, RST, RST], True)
 
 # SWAP: swap A and B (using stack as scratch)
 # Step 2: MAR=SP, Step 3: push A (SP--), Step 4: A=B, Step 5: SP++, Step 6: MAR=SP, Step 7: B=pop
@@ -303,6 +347,8 @@ def initUCode():
     SETNZ_OP = instruction_decode['setnz']
     SETC_OP = instruction_decode['setc']
     SETNC_OP = instruction_decode['setnc']
+    ADC_OP = instruction_decode['adc']
+    SBC_OP = instruction_decode['sbc']
     # setz/setnz/setc/setnc: "set to 1" = clear A then inc
     _SET1 = [AO|EI, SUB|EO|AI, AO|EI, CINV|EO|AI, RST, RST]
     # "set to 0" = just clear A
@@ -330,6 +376,8 @@ def initUCode():
     ucode[FLAGS_IRQ00IRQ10Z0C1][JNC][1][2:4] = [PE, RST];  # CF=1: skip
     ucode[FLAGS_IRQ00IRQ10Z0C1][SETC_OP][1][2:8] = _SET1  # CF=1: set A=1
     ucode[FLAGS_IRQ00IRQ10Z0C1][SETNC_OP][1][2:8] = _SET0  # CF=1: setnc → A=0
+    ucode[FLAGS_IRQ00IRQ10Z0C1][ADC_OP][1][3] = CINV|EO|AI|FI  # CF=1: add with carry
+    ucode[FLAGS_IRQ00IRQ10Z0C1][SBC_OP][1][3] = SUB|EO|AI|FI   # CF=1: normal sub (no borrow)
 
     #ZF = 0, CF = 1, IRQ0 = 0, IRQ1 = 1
     ucode[FLAGS_IRQ00IRQ11Z0C1] =  deepcopy(ucode_template)
@@ -337,6 +385,8 @@ def initUCode():
     ucode[FLAGS_IRQ00IRQ11Z0C1][JNC][1][2:4] = [PE, RST];  # CF=1: skip
     ucode[FLAGS_IRQ00IRQ11Z0C1][SETC_OP][1][2:8] = _SET1  # CF=1: set A=1
     ucode[FLAGS_IRQ00IRQ11Z0C1][SETNC_OP][1][2:8] = _SET0  # CF=1: setnc → A=0
+    ucode[FLAGS_IRQ00IRQ11Z0C1][ADC_OP][1][3] = CINV|EO|AI|FI  # CF=1: add with carry
+    ucode[FLAGS_IRQ00IRQ11Z0C1][SBC_OP][1][3] = SUB|EO|AI|FI   # CF=1: normal sub (no borrow)
     ucode[FLAGS_IRQ00IRQ11Z0C1][J1][1][2:4] = [PO|MI, RO|PI];
 
     #ZF = 0, CF = 1, IRQ0 = 1, IRQ1 = 0
@@ -345,6 +395,8 @@ def initUCode():
     ucode[FLAGS_IRQ01IRQ10Z0C1][JNC][1][2:4] = [PE, RST];  # CF=1: skip
     ucode[FLAGS_IRQ01IRQ10Z0C1][SETC_OP][1][2:8] = _SET1  # CF=1: set A=1
     ucode[FLAGS_IRQ01IRQ10Z0C1][SETNC_OP][1][2:8] = _SET0  # CF=1: setnc → A=0
+    ucode[FLAGS_IRQ01IRQ10Z0C1][ADC_OP][1][3] = CINV|EO|AI|FI  # CF=1: add with carry
+    ucode[FLAGS_IRQ01IRQ10Z0C1][SBC_OP][1][3] = SUB|EO|AI|FI   # CF=1: normal sub (no borrow)
     ucode[FLAGS_IRQ01IRQ10Z0C1][J0][1][2:4] = [PO|MI, RO|PI];
 
     #ZF = 0, CF = 1, IRQ0 = 1, IRQ1 = 1
@@ -353,6 +405,8 @@ def initUCode():
     ucode[FLAGS_IRQ01IRQ11Z0C1][JNC][1][2:4] = [PE, RST];  # CF=1: skip
     ucode[FLAGS_IRQ01IRQ11Z0C1][SETC_OP][1][2:8] = _SET1  # CF=1: set A=1
     ucode[FLAGS_IRQ01IRQ11Z0C1][SETNC_OP][1][2:8] = _SET0  # CF=1: setnc → A=0
+    ucode[FLAGS_IRQ01IRQ11Z0C1][ADC_OP][1][3] = CINV|EO|AI|FI  # CF=1: add with carry
+    ucode[FLAGS_IRQ01IRQ11Z0C1][SBC_OP][1][3] = SUB|EO|AI|FI   # CF=1: normal sub (no borrow)
     ucode[FLAGS_IRQ01IRQ11Z0C1][J0][1][2:4] = [PO|MI, RO|PI];
     ucode[FLAGS_IRQ01IRQ11Z0C1][J1][1][2:4] = [PO|MI, RO|PI];
 
@@ -394,6 +448,8 @@ def initUCode():
     ucode[FLAGS_IRQ00IRQ10Z1C1][JNC][1][2:4] = [PE, RST];  # CF=1: skip
     ucode[FLAGS_IRQ00IRQ10Z1C1][SETC_OP][1][2:8] = _SET1  # CF=1: set A=1
     ucode[FLAGS_IRQ00IRQ10Z1C1][SETNC_OP][1][2:8] = _SET0  # CF=1: setnc → A=0
+    ucode[FLAGS_IRQ00IRQ10Z1C1][ADC_OP][1][3] = CINV|EO|AI|FI  # CF=1: add with carry
+    ucode[FLAGS_IRQ00IRQ10Z1C1][SBC_OP][1][3] = SUB|EO|AI|FI   # CF=1: normal sub (no borrow)
     ucode[FLAGS_IRQ00IRQ10Z1C1][JZ][1][2:4] = [PO|MI, RO|PI];
     ucode[FLAGS_IRQ00IRQ10Z1C1][JNZ][1][2:4] = [PE, RST];  # ZF=1: skip
     ucode[FLAGS_IRQ00IRQ10Z1C1][SETZ_OP][1][2:8] = _SET1  # ZF=1: set A=1
@@ -405,6 +461,8 @@ def initUCode():
     ucode[FLAGS_IRQ00IRQ11Z1C1][JNC][1][2:4] = [PE, RST];  # CF=1: skip
     ucode[FLAGS_IRQ00IRQ11Z1C1][SETC_OP][1][2:8] = _SET1  # CF=1: set A=1
     ucode[FLAGS_IRQ00IRQ11Z1C1][SETNC_OP][1][2:8] = _SET0  # CF=1: setnc → A=0
+    ucode[FLAGS_IRQ00IRQ11Z1C1][ADC_OP][1][3] = CINV|EO|AI|FI  # CF=1: add with carry
+    ucode[FLAGS_IRQ00IRQ11Z1C1][SBC_OP][1][3] = SUB|EO|AI|FI   # CF=1: normal sub (no borrow)
     ucode[FLAGS_IRQ00IRQ11Z1C1][JZ][1][2:4] = [PO|MI, RO|PI];
     ucode[FLAGS_IRQ00IRQ11Z1C1][JNZ][1][2:4] = [PE, RST];  # ZF=1: skip
     ucode[FLAGS_IRQ00IRQ11Z1C1][SETZ_OP][1][2:8] = _SET1  # ZF=1: set A=1
@@ -417,6 +475,8 @@ def initUCode():
     ucode[FLAGS_IRQ01IRQ10Z1C1][JNC][1][2:4] = [PE, RST];  # CF=1: skip
     ucode[FLAGS_IRQ01IRQ10Z1C1][SETC_OP][1][2:8] = _SET1  # CF=1: set A=1
     ucode[FLAGS_IRQ01IRQ10Z1C1][SETNC_OP][1][2:8] = _SET0  # CF=1: setnc → A=0
+    ucode[FLAGS_IRQ01IRQ10Z1C1][ADC_OP][1][3] = CINV|EO|AI|FI  # CF=1: add with carry
+    ucode[FLAGS_IRQ01IRQ10Z1C1][SBC_OP][1][3] = SUB|EO|AI|FI   # CF=1: normal sub (no borrow)
     ucode[FLAGS_IRQ01IRQ10Z1C1][JZ][1][2:4] = [PO|MI, RO|PI];
     ucode[FLAGS_IRQ01IRQ10Z1C1][JNZ][1][2:4] = [PE, RST];  # ZF=1: skip
     ucode[FLAGS_IRQ01IRQ10Z1C1][SETZ_OP][1][2:8] = _SET1  # ZF=1: set A=1
@@ -429,6 +489,8 @@ def initUCode():
     ucode[FLAGS_IRQ01IRQ11Z1C1][JNC][1][2:4] = [PE, RST];  # CF=1: skip
     ucode[FLAGS_IRQ01IRQ11Z1C1][SETC_OP][1][2:8] = _SET1  # CF=1: set A=1
     ucode[FLAGS_IRQ01IRQ11Z1C1][SETNC_OP][1][2:8] = _SET0  # CF=1: setnc → A=0
+    ucode[FLAGS_IRQ01IRQ11Z1C1][ADC_OP][1][3] = CINV|EO|AI|FI  # CF=1: add with carry
+    ucode[FLAGS_IRQ01IRQ11Z1C1][SBC_OP][1][3] = SUB|EO|AI|FI   # CF=1: normal sub (no borrow)
     ucode[FLAGS_IRQ01IRQ11Z1C1][JZ][1][2:4] = [PO|MI, RO|PI];
     ucode[FLAGS_IRQ01IRQ11Z1C1][JNZ][1][2:4] = [PE, RST];  # ZF=1: skip
     ucode[FLAGS_IRQ01IRQ11Z1C1][SETZ_OP][1][2:8] = _SET1  # ZF=1: set A=1

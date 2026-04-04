@@ -119,8 +119,8 @@
     push_imm {val: u8} -> { assert(val <= 0xff), 0xE7 @ val }          ; push immediate, A = val
     ldsp_b {offset: u8} -> { assert(offset <= 0xff), 0xF3 @ offset }   ; B = stack[SP + offset], clobbers A
 
-    ; Display mode (forward-compatible, NOP until hardware mod)
-    dispmode {mode: u8} -> { assert(mode <= 0xff), 0xF7 @ mode }       ; set display mode
+    ; Indirect page 3 store
+    iderefp3 -> 0xF7                                                      ; page3[B] = A
 
     ; Conditional jumps (inverse)
     jnc {address: u8} -> { assert(address <= 0xff), 0xCA @ address }    ; jump if not carry
@@ -130,11 +130,28 @@
     setjmp {address: u8} -> { assert(address <= 0xff), 0xCB @ address } ; cross-page jump
     setret -> 0xCF                                                      ; cross-page return
 
+    ; Overlay system
+    derefp3  -> 0xD5                                                      ; A = page3[A] (indirect read)
+    istc     -> 0xDA                                                      ; code[B] = A (store to code page)
+    ocall {index: u8} -> { assert(index <= 0xff), 0xDF @ index }          ; overlay call
+
+    ; 16-bit arithmetic
+    adc  -> 0xC1                                                          ; A = A + B + CF
+    sbc  -> 0xC2                                                          ; A = A - B - !CF
+
+    ; Non-destructive bit test
+    tst {mask: u8} -> { assert(mask <= 0xff), 0xFF @ mask }               ; set ZF from A AND mask
+
+    ; Utility
+    out_imm {value: u8} -> { assert(value <= 0xff), 0xD1 @ value }    ; output immediate, A unchanged
+    jal_r -> 0xE1                                                      ; indirect call: push ret, PC = A
+    ; GPIO daughter board (652 bidirectional transceiver)
+    gpio_read -> 0xC5                                                  ; read 652 B-side into A (U1=float outputs, XI=input, E0=enable)
+
     ; Aliases for existing instructions (no microcode change)
+    ; NOTE: Only clr $a works (A = A - A = 0). The ALU always uses A as
+    ; one operand, so sub $X,$X computes X = A - X, NOT X = 0.
     clr $a -> 0xD0                                                    ; A = 0 (sub $a, $a), sets ZF
-    clr $b -> 0xD5                                                    ; B = 0 (sub $b, $b), sets ZF
-    clr $c -> 0xDA                                                    ; C = 0 (sub $c, $c), sets ZF
-    clr $d -> 0xDF                                                    ; D = 0 (sub $d, $d), sets ZF
 }
 
 #bank ".instr"

@@ -927,6 +927,159 @@ def run_tests():
     ])
     results.append(run_test("SETNC: lt→1, ge→0", code8, [1, 0]))
 
+    # ── Test: DEREFP3 (indirect read from page 3) ──
+    cpu = MK1()
+    cpu.mem[3][10] = 77  # page3[10] = 77
+    code_dp3 = bytearray(256)
+    code_dp3[0] = 0x38; code_dp3[1] = 10    # ldi $a, 10
+    code_dp3[2] = 0xD5; code_dp3[3] = 0     # derefp3 (A = page3[A] = page3[10] = 77)
+    code_dp3[4] = 0x06; code_dp3[5] = 0     # out
+    code_dp3[6] = 0x7F; code_dp3[7] = 0     # hlt
+    cpu.load_program(code_dp3)
+    cpu.run()
+    results.append(cpu.output_history == [77])
+    print(f"  [{'PASS' if results[-1] else 'FAIL'}] DEREFP3: A=page3[A] (got {cpu.output_history})")
+
+    # ── Test: ISTC (indirect store to code page) ──
+    cpu2 = MK1()
+    code_istc = bytearray(256)
+    code_istc[0] = 0x38; code_istc[1] = 42     # ldi $a, 42
+    code_istc[2] = 0x39; code_istc[3] = 200     # ldi $b, 200
+    code_istc[4] = 0xDA; code_istc[5] = 0       # istc (code[B] = code[200] = A = 42)
+    code_istc[6] = 0x47; code_istc[7] = 200     # ld $a, 200 — wait, ld reads from data page
+    # Instead: read code page byte back by jumping to it and having it output
+    # Simpler: check memory directly
+    code_istc[6] = 0x7F; code_istc[7] = 0       # hlt
+    cpu2.load_program(code_istc)
+    cpu2.run()
+    ok_istc = cpu2.mem[0][200] == 42
+    results.append(ok_istc)
+    print(f"  [{'PASS' if ok_istc else 'FAIL'}] ISTC: code[B]=A (code[200]={cpu2.mem[0][200]}, expect 42)")
+
+    # ── Test: ADC (add with carry) ──
+    # 200 + 100 = 300 → A=44, CF=1. Then ADC 0 → 44 + 0 + CF(1) = 45
+    code_adc = bytearray(256)
+    code_adc[0] = 0x38; code_adc[1] = 200     # ldi $a, 200
+    code_adc[2] = 0x39; code_adc[3] = 100     # ldi $b, 100
+    code_adc[4] = 0xC4; code_adc[5] = 0       # add $b,$a (A=44, CF=1)
+    code_adc[6] = 0x06; code_adc[7] = 0       # out (44)
+    code_adc[8] = 0x39; code_adc[9] = 0       # ldi $b, 0
+    code_adc[10] = 0xC1; code_adc[11] = 0     # adc (A = 44 + 0 + CF(1) = 45)
+    code_adc[12] = 0x06; code_adc[13] = 0     # out (45)
+    code_adc[14] = 0x7F; code_adc[15] = 0     # hlt
+    results.append(run_test("ADC: 200+100=44(CF=1), then ADC 0 = 45", code_adc, [44, 45]))
+
+    # ── Test: SBC (subtract with borrow) ──
+    # 50 - 100 = 206 (CF=0, borrow). Then SBC 0 → 206 - 0 - !CF(1) = 205
+    code_sbc = bytearray(256)
+    code_sbc[0] = 0x38; code_sbc[1] = 50      # ldi $a, 50
+    code_sbc[2] = 0x39; code_sbc[3] = 100     # ldi $b, 100
+    code_sbc[4] = 0xD4; code_sbc[5] = 0       # sub $b,$a (A=206, CF=0)
+    code_sbc[6] = 0x06; code_sbc[7] = 0       # out (206)
+    code_sbc[8] = 0x39; code_sbc[9] = 0       # ldi $b, 0
+    code_sbc[10] = 0xC2; code_sbc[11] = 0     # sbc (A = 206 - 0 - 1 = 205)
+    code_sbc[12] = 0x06; code_sbc[13] = 0     # out (205)
+    code_sbc[14] = 0x7F; code_sbc[15] = 0     # hlt
+    results.append(run_test("SBC: 50-100=206(CF=0), then SBC 0 = 205", code_sbc, [206, 205]))
+
+    # ── Test: TST (non-destructive bit test) ──
+    code_tst = bytearray(256)
+    code_tst[0] = 0x38; code_tst[1] = 0xA5    # ldi $a, 0xA5 (10100101)
+    code_tst[2] = 0xFF; code_tst[3] = 0x80    # tst 128 (test bit 7 — set, ZF=0)
+    code_tst[4] = 0x06; code_tst[5] = 0       # out (A should still be 0xA5 = 165)
+    code_tst[6] = 0xFF; code_tst[7] = 0x02    # tst 2 (test bit 1 — clear, ZF=1)
+    # After tst 2: A AND 2 = 0xA5 & 0x02 = 0. ZF=1. A still 0xA5.
+    code_tst[8] = 0x06; code_tst[9] = 0       # out (still 165)
+    code_tst[10] = 0x7F; code_tst[11] = 0     # hlt
+    results.append(run_test("TST: non-destructive bit test (A preserved)", code_tst, [165, 165]))
+
+    # ── Test: OUT_IMM (output immediate without touching A) ──
+    code_oi = bytearray(256)
+    code_oi[0] = 0x38; code_oi[1] = 99        # ldi $a, 99
+    code_oi[2] = 0xD1; code_oi[3] = 42        # out_imm 42 (displays 42, A stays 99)
+    code_oi[4] = 0x06; code_oi[5] = 0         # out (displays A = 99)
+    code_oi[6] = 0x7F; code_oi[7] = 0         # hlt
+    results.append(run_test("OUT_IMM: output 42 then A(99)", code_oi, [42, 99]))
+
+    # ── Test: JAL_R (indirect call via register A) ──
+    # Program: ldi $a, 10; jal_r (calls address 10); hlt
+    # Address 10: ldi $a, 77; out; ret
+    code_jr = bytearray(256)
+    code_jr[0] = 0x38; code_jr[1] = 10        # ldi $a, 10
+    code_jr[2] = 0xE1; code_jr[3] = 0         # jal_r (push ret, PC = A = 10)
+    code_jr[4] = 0x7F; code_jr[5] = 0         # hlt (return lands here)
+    # Subroutine at address 10:
+    code_jr[10] = 0x38; code_jr[11] = 77      # ldi $a, 77
+    code_jr[12] = 0x06; code_jr[13] = 0       # out
+    code_jr[14] = 0x6C; code_jr[15] = 0       # ret
+    results.append(run_test("JAL_R: indirect call to addr 10, outputs 77", code_jr, [77]))
+
+    # ── Test: IDEREFP3 (indirect store to page 3) ──
+    cpu_ip3 = MK1()
+    code_ip3 = bytearray(256)
+    code_ip3[0] = 0x38; code_ip3[1] = 99       # ldi $a, 99
+    code_ip3[2] = 0x39; code_ip3[3] = 50       # ldi $b, 50
+    code_ip3[4] = 0xF7; code_ip3[5] = 0        # iderefp3 (page3[B] = page3[50] = A = 99)
+    code_ip3[6] = 0x38; code_ip3[7] = 50       # ldi $a, 50
+    code_ip3[8] = 0xD5; code_ip3[9] = 0        # derefp3 (A = page3[50] = 99)
+    code_ip3[10] = 0x06; code_ip3[11] = 0      # out
+    code_ip3[12] = 0x7F; code_ip3[13] = 0      # hlt
+    cpu_ip3.load_program(code_ip3)
+    cpu_ip3.run()
+    ok_ip3 = cpu_ip3.output_history == [99]
+    results.append(ok_ip3)
+    print(f"  [{'PASS' if ok_ip3 else 'FAIL'}] IDEREFP3: page3[B]=A, readback via derefp3 (got {cpu_ip3.output_history})")
+
+    # ── Test: EXW 1 1 timing fix (setup step before U0 latch) ──
+    # exw 1 1 = opcode 0x1F. Now has 4 steps: fetch(2) + AO|E1 + AO|E1|U0.
+    # In sim, external signals are ignored, but A must be preserved (AO only, no AI).
+    cpu_ew = MK1()
+    code_ew = bytearray(256)
+    code_ew[0] = 0x38; code_ew[1] = 0x42    # ldi $a, 0x42
+    code_ew[2] = 0x1F; code_ew[3] = 0       # exw 1 1 (A drives bus, external latch)
+    code_ew[4] = 0x06; code_ew[5] = 0       # out (A should still be 0x42)
+    code_ew[6] = 0x7F; code_ew[7] = 0       # hlt
+    cpu_ew.load_program(code_ew)
+    cpu_ew.run()
+    ok_ew = cpu_ew.output_history == [0x42] and cpu_ew.A == 0x42
+    results.append(ok_ew)
+    print(f"  [{'PASS' if ok_ew else 'FAIL'}] EXW 1 1: A=0x42 preserved after exw, A=0x{cpu_ew.A:02X} (expect 0x42)")
+
+    # ── Test: GPIO_READ (reads external bus into A) ──
+    # gpio_read = opcode 0xC5. Microcode: XI|E0|AI|U1.
+    # In sim, no external hardware — bus is undriven (0x00). Just verify it executes
+    # and modifies A (loads bus value), and doesn't crash.
+    cpu_gr = MK1()
+    code_gr = bytearray(256)
+    code_gr[0] = 0x38; code_gr[1] = 0xFF    # ldi $a, 0xFF
+    code_gr[2] = 0xC5; code_gr[3] = 0       # gpio_read (A = bus value, 0 in sim)
+    code_gr[4] = 0x06; code_gr[5] = 0       # out
+    code_gr[6] = 0x7F; code_gr[7] = 0       # hlt
+    cpu_gr.load_program(code_gr)
+    cpu_gr.run()
+    # A was 0xFF, gpio_read overwrites it. Bus undriven in sim = 0x00.
+    ok_gr = cpu_gr.A != 0xFF  # A must have changed from the pre-loaded 0xFF
+    results.append(ok_gr)
+    print(f"  [{'PASS' if ok_gr else 'FAIL'}] GPIO_READ: A overwritten by bus read, A=0x{cpu_gr.A:02X} (expect != 0xFF)")
+
+    # ── Test: OCALL (overlay call — jumps to address 0 with A=index) ──
+    # Address 0: overlay loader stub — just output A (the index) and return
+    code_oc = bytearray(256)
+    # Overlay loader at addr 0: out A, ret
+    code_oc[0] = 0x06; code_oc[1] = 0         # out (A = overlay index)
+    code_oc[2] = 0x6C; code_oc[3] = 0         # ret
+    # Main program at addr 10:
+    code_oc[10] = 0xDF; code_oc[11] = 5       # ocall 5 (A=5, push ret, PC=0)
+    code_oc[12] = 0x06; code_oc[13] = 0       # out (A after return — should be 5)
+    code_oc[14] = 0x7F; code_oc[15] = 0       # hlt
+    cpu_oc = MK1()
+    cpu_oc.load_program(code_oc)
+    cpu_oc.PC = 10  # start execution from addr 10
+    cpu_oc.run()
+    ok_oc = cpu_oc.output_history == [5, 5]
+    results.append(ok_oc)
+    print(f"  [{'PASS' if ok_oc else 'FAIL'}] OCALL: overlay call A=5, return (got {cpu_oc.output_history})")
+
     # ── Summary ──
     print()
     passed = sum(results)
