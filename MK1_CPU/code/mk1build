@@ -20,7 +20,7 @@ fi
 echo "=== MK1 Build: $INPUT ==="
 
 # Step 1: C → Assembly (vbcc)
-"$TOOLDIR/vbccmk1" "$INPUT" -o="$ASM" 2>&1 | grep -v "^vbcc"
+"$TOOLDIR/vbccmk1" -O=1 "$INPUT" -o="$ASM" 2>&1 | grep -v "^vbcc"
 if [ ${PIPESTATUS[0]} -ne 0 ]; then echo "Compile failed."; exit 1; fi
 
 # Step 2: Assembly → Object (vasm)  

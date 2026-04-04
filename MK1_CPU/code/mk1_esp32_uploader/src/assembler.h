@@ -13,6 +13,7 @@
 #pragma once
 #include <Arduino.h>
 #include "isa.h"
+#include "stdlib_asm.h"
 
 static const int CODE_SIZE = 256;
 static const int DATA_SIZE = 256;
@@ -40,8 +41,10 @@ struct AsmError {
 struct AsmResult {
     uint8_t code[CODE_SIZE];
     uint8_t data[DATA_SIZE];
+    uint8_t page3[DATA_SIZE];
     int code_size;
     int data_size;
+    int page3_size;
     AsmError errors[MAX_ERRORS];
     int error_count;
 };
@@ -68,11 +71,16 @@ static bool isIdentChar(char c) {
 
 static int parseToken(const char* p, char* out, int maxLen) {
     int i = 0;
-    while (*p && isIdentChar(*p) && i < maxLen - 1) {
+    while (*p && *p != ',' && isIdentChar(*p) && i < maxLen - 1) {
         out[i++] = *p++;
     }
     out[i] = 0;
     return i;
+}
+
+static void skipSep(const char*& p) {
+    /* Skip whitespace and commas between operands */
+    while (*p == ' ' || *p == '\t' || *p == ',') p++;
 }
 
 static int findRegister(const char* name) {
@@ -191,6 +199,68 @@ private:
         return -1;
     }
 
+    // Evaluate a simple expression: supports +, -, * with integer operands/constants
+    int evalExpr(const char* p, int line, bool pass1) {
+        skipWs(p);
+        // Parse first term
+        int result = evalTerm(p, line, pass1);
+        skipWs(p);
+        while (*p == '+' || *p == '-') {
+            char op = *p++;
+            skipWs(p);
+            int rhs = evalTerm(p, line, pass1);
+            if (op == '+') result += rhs;
+            else result -= rhs;
+            skipWs(p);
+        }
+        return result;
+    }
+
+    int evalTerm(const char*& p, int line, bool pass1) {
+        skipWs(p);
+        bool neg = false;
+        if (*p == '-') { neg = true; p++; skipWs(p); }
+
+        int val = 0;
+        bool ok;
+        if (isdigit(*p) || (*p == '0' && (p[1] == 'x' || p[1] == 'b'))) {
+            val = parseNumber(p, ok);
+            // Advance past the number
+            if (*p == '0' && (p[1] == 'x' || p[1] == 'X')) { p += 2; while (isxdigit(*p)) p++; }
+            else if (*p == '0' && (p[1] == 'b' || p[1] == 'B')) { p += 2; while (*p == '0' || *p == '1') p++; }
+            else { while (isdigit(*p)) p++; }
+        } else if (isalpha(*p) || *p == '_') {
+            char tok[32];
+            int len = parseToken(p, tok, sizeof(tok));
+            p += len;
+            int c = findConstant(tok);
+            if (c >= 0) val = c;
+            else {
+                int l = findLabel(tok);
+                if (l >= 0) val = l;
+            }
+        } else if (*p == '(') {
+            p++;
+            val = evalExpr(p, line, pass1);
+            if (*p == ')') p++;
+        }
+
+        skipWs(p);
+        // Handle * (higher precedence)
+        while (*p == '*') {
+            p++; skipWs(p);
+            int rhs = 0;
+            if (isdigit(*p)) {
+                rhs = parseNumber(p, ok);
+                while (isdigit(*p)) p++;
+            }
+            val *= rhs;
+            skipWs(p);
+        }
+
+        return neg ? -val : val;
+    }
+
     // Resolve an operand that could be a number, label, or constant
     int resolveValue(const char* tok, int line, bool pass1) {
         bool ok;
@@ -213,7 +283,14 @@ private:
         return 0;
     }
 
+    int codeEmitTarget = 0;  // 0 = page 0 (normal), 3 = page 3 (overlay code)
+    int overlayBaseAddr = 0; // virtual base address for overlay code labels
+
     void emitCode(uint8_t byte, bool pass1) {
+        if (codeEmitTarget == 3) {
+            emitPage3(byte, pass1);
+            return;
+        }
         if (!pass1 && result.code_size < CODE_SIZE)
             result.code[result.code_size] = byte;
         result.code_size++;
@@ -225,13 +302,27 @@ private:
         result.data_size++;
     }
 
-    void pass(const char* source, bool pass1) {
-        if (!pass1) {
+    void emitPage3(uint8_t byte, bool pass1) {
+        if (!pass1 && result.page3_size < DATA_SIZE)
+            result.page3[result.page3_size] = byte;
+        result.page3_size++;
+    }
+
+    // Emit to whichever bank is active (used for data directives)
+    void emitBank(uint8_t byte, bool pass1, int bank) {
+        if (bank == 3) emitPage3(byte, pass1);
+        else if (bank == 1) emitData(byte, pass1);
+        else emitCode(byte, pass1);
+    }
+
+    void pass(const char* source, bool pass1, bool isInclude = false) {
+        if (!pass1 && !isInclude) {
             result.code_size = 0;
             result.data_size = 0;
+            result.page3_size = 0;
         }
 
-        bool in_data_bank = false;
+        int bank = 0;  // 0=code, 1=data, 3=page3
         int lineNum = 0;
 
         const char* p = source;
@@ -261,35 +352,64 @@ private:
             skipWs(lp);
             if (!*lp) continue;  // empty line
 
+            // Handle "section" directive
+            if (startsWith(lp, "section")) {
+                if (strstr(lp, "page3_code")) {
+                    // Overlay code: assembled as instructions but stored in page 3
+                    bank = 0;  // parse as code (instructions)
+                    codeEmitTarget = 3;  // but emit bytes to page 3
+                } else if (strstr(lp, "page3")) {
+                    bank = 3;  // raw data in page 3
+                    codeEmitTarget = 0;
+                } else if (strstr(lp, "data")) {
+                    bank = 1;
+                    codeEmitTarget = 0;
+                } else {
+                    bank = 0;
+                    codeEmitTarget = 0;
+                }
+                continue;
+            }
+
             // Handle directives
             if (*lp == '#') {
                 lp++;
-                if (startsWith(lp, "include")) continue;  // skip includes
+                if (startsWith(lp, "include")) {
+                    // Check if it's the standard library
+                    if (strstr(lp, "mk1_std") || strstr(lp, "mk1std")) {
+                        // Recursively assemble the embedded standard library
+                        pass(MK1_STDLIB_ASM, pass1, true);
+                    }
+                    // Skip other includes (mk1.cpu is ISA definition, not needed)
+                    continue;
+                }
                 if (startsWith(lp, "bank")) {
-                    in_data_bank = strstr(lp, ".data") != nullptr;
+                    if (strstr(lp, "page3") || strstr(lp, ".page3")) bank = 3;
+                    else if (strstr(lp, ".data")) bank = 1;
+                    else bank = 0;
                     continue;
                 }
                 if (startsWith(lp, "d8") || startsWith(lp, "res") || startsWith(lp, "str")) {
-                    // Data directives
+                    // Data directives — emit to current bank
                     if (startsWith(lp, "d8")) {
                         lp += 2; skipWs(lp);
                         char tok[32];
                         parseToken(lp, tok, sizeof(tok));
                         int v = resolveValue(tok, lineNum, pass1);
-                        emitData(v & 0xFF, pass1);
+                        emitBank(v & 0xFF, pass1, bank);
                     } else if (startsWith(lp, "res")) {
                         lp += 3; skipWs(lp);
                         bool ok; int count = parseNumber(lp, ok);
-                        if (ok) for (int i = 0; i < count; i++) emitData(0, pass1);
+                        if (ok) for (int i = 0; i < count; i++) emitBank(0, pass1, bank);
                     } else if (startsWith(lp, "str")) {
                         lp += 3; skipWs(lp);
                         if (*lp == '"') {
                             lp++;
                             while (*lp && *lp != '"') {
                                 if (*lp == '\\' && lp[1] == '0') {
-                                    emitData(0, pass1); lp += 2;
+                                    emitBank(0, pass1, bank); lp += 2;
                                 } else {
-                                    emitData(*lp, pass1); lp++;
+                                    emitBank(*lp, pass1, bank); lp++;
                                 }
                             }
                         }
@@ -299,27 +419,46 @@ private:
                 continue;  // unknown directive
             }
 
-            // Check for constant definition: NAME = value
+            // Handle vasm-style data directives (without # prefix)
+            if (startsWith(lp, "byte ") || startsWith(lp, "byte\t")) {
+                lp += 4; skipWs(lp);
+                char tok[32]; parseToken(lp, tok, sizeof(tok));
+                int v = resolveValue(tok, lineNum, pass1);
+                emitBank(v & 0xFF, pass1, bank);
+                continue;
+            }
+            if (startsWith(lp, "ds ") || startsWith(lp, "ds\t")) {
+                lp += 2; skipWs(lp);
+                bool ok; int count = parseNumber(lp, ok);
+                if (ok) for (int j = 0; j < count; j++) emitBank(0, pass1, bank);
+                continue;
+            }
+            if (startsWith(lp, "org ") || startsWith(lp, "org\t")) {
+                continue;  // ignore org directives
+            }
+
+            // Check for constant definition: NAME = expr
             {
                 const char* eq = strchr(lp, '=');
-                if (eq) {
-                    // Check it's not inside a label definition
-                    const char* colon = strchr(lp, ':');
-                    if (!colon || eq < colon) {
-                        char name[32];
-                        const char* np = lp;
-                        int ni = 0;
-                        while (np < eq && ni < 31) {
-                            if (!isWhitespace(*np)) name[ni++] = *np;
-                            np++;
+                if (eq && *(eq-1) != '<' && *(eq-1) != '>' && *(eq-1) != '!') {
+                    // Check it's not == or inside a label definition
+                    if (*(eq+1) != '=') {
+                        const char* colon = strchr(lp, ':');
+                        if (!colon || eq < colon) {
+                            char name[32];
+                            const char* np = lp;
+                            int ni = 0;
+                            while (np < eq && ni < 31) {
+                                if (!isWhitespace(*np)) name[ni++] = *np;
+                                np++;
+                            }
+                            name[ni] = 0;
+                            const char* vp = eq + 1;
+                            skipWs(vp);
+                            int val = evalExpr(vp, lineNum, pass1);
+                            if (pass1) addConstant(name, val);
+                            continue;
                         }
-                        name[ni] = 0;
-                        const char* vp = eq + 1;
-                        skipWs(vp);
-                        bool ok;
-                        int val = parseNumber(vp, ok);
-                        if (ok && pass1) addConstant(name, val);
-                        continue;
                     }
                 }
             }
@@ -337,8 +476,9 @@ private:
                     }
                     labelName[li] = 0;
 
-                    uint16_t addr = in_data_bank ? result.data_size : result.code_size;
-                    if (pass1) addLabel(labelName, addr, in_data_bank);
+                    uint16_t addr = (bank == 1) ? result.data_size :
+                                    (bank == 3) ? result.page3_size : result.code_size;
+                    if (pass1) addLabel(labelName, addr, bank != 0);
                     if (labelName[0] != '.') {
                         strncpy(lastGlobalLabel, labelName, sizeof(lastGlobalLabel) - 1);
                     }
@@ -350,13 +490,35 @@ private:
             }
 
             // Parse instruction
-            if (in_data_bank) {
-                // In data bank, bare lines are data bytes
-                if (*lp == '#') continue;  // handled above
+            if (bank != 0) {
+                // In data/page3 bank — handle directives after labels and bare data
+                if (*lp == '#') {
+                    const char* dp = lp + 1;
+                    if (startsWith(dp, "d8")) {
+                        dp += 2; skipWs(dp);
+                        char tok[32]; parseToken(dp, tok, sizeof(tok));
+                        int v = resolveValue(tok, lineNum, pass1);
+                        emitBank(v & 0xFF, pass1, bank);
+                    } else if (startsWith(dp, "res")) {
+                        dp += 3; skipWs(dp);
+                        bool ok; int count = parseNumber(dp, ok);
+                        if (ok) for (int i = 0; i < count; i++) emitBank(0, pass1, bank);
+                    } else if (startsWith(dp, "str")) {
+                        dp += 3; skipWs(dp);
+                        if (*dp == '"') {
+                            dp++;
+                            while (*dp && *dp != '"') {
+                                if (*dp == '\\' && dp[1] == '0') { emitBank(0, pass1, bank); dp += 2; }
+                                else { emitBank(*dp, pass1, bank); dp++; }
+                            }
+                        }
+                    }
+                    continue;
+                }
                 char tok[32];
                 parseToken(lp, tok, sizeof(tok));
                 int v = resolveValue(tok, lineNum, pass1);
-                emitData(v & 0xFF, pass1);
+                emitBank(v & 0xFF, pass1, bank);
                 continue;
             }
 
@@ -474,7 +636,7 @@ private:
         if (strcasecmp(mnemonic, "mov") == 0) {
             char tok1[32], tok2[32];
             int n1 = parseToken(args, tok1, sizeof(tok1));
-            args += n1; skipWs(args);
+            args += n1; skipSep(args);
             parseToken(args, tok2, sizeof(tok2));
             int src = findRegister(tok1);
             int dst = findRegister(tok2);
@@ -490,7 +652,7 @@ private:
         if (strcasecmp(mnemonic, "ldi") == 0) {
             char tok1[32], tok2[32];
             int n1 = parseToken(args, tok1, sizeof(tok1));
-            args += n1; skipWs(args);
+            args += n1; skipSep(args);
             parseToken(args, tok2, sizeof(tok2));
             int reg = findRegister(tok1);
             if (reg >= 0) {
@@ -507,7 +669,7 @@ private:
         if (strcasecmp(mnemonic, "ld") == 0) {
             char tok1[32], tok2[32];
             int n1 = parseToken(args, tok1, sizeof(tok1));
-            args += n1; skipWs(args);
+            args += n1; skipSep(args);
 
             int dst = findRegister(tok1);
             if (dst < 0) { addError(lineNum, "ld: expected destination register"); return; }
@@ -534,7 +696,7 @@ private:
         if (strcasecmp(mnemonic, "st") == 0) {
             char tok1[32], tok2[32];
             int n1 = parseToken(args, tok1, sizeof(tok1));
-            args += n1; skipWs(args);
+            args += n1; skipSep(args);
 
             int src = findRegister(tok1);
             if (src < 0) { addError(lineNum, "st: expected source register"); return; }
@@ -566,7 +728,7 @@ private:
                 if (op >= 0) {
                     char tok1[32], tok2[32];
                     int n1 = parseToken(args, tok1, sizeof(tok1));
-                    args += n1; skipWs(args);
+                    args += n1; skipSep(args);
                     parseToken(args, tok2, sizeof(tok2));
                     int imm = resolveValue(tok1, lineNum, pass1);
                     int dst = findRegister(tok2);
@@ -587,14 +749,14 @@ private:
             if (op >= 0) {
                 char tok1[32], tok2[32];
                 int n1 = parseToken(args, tok1, sizeof(tok1));
-                args += n1; skipWs(args);
+                args += n1; skipSep(args);
                 parseToken(args, tok2, sizeof(tok2));
                 int rs = findRegister(tok1);
                 int rd = findRegister(tok2);
                 if (rs >= 0 && rs < 4 && rd >= 0 && rd < 4) {
                     uint8_t opc = (0b11 << 6) | (op << 4) | (rs << 2) | rd;
                     // Check for reclaimed opcodes that are now special instructions
-                    static const uint8_t reclaimed[] = {0xC3,0xC7,0xD3,0xD7,0xDB,0xDE,0xE3,0xE7,0xF3,0xF7,0};
+                    static const uint8_t reclaimed[] = {0xC1,0xC2,0xC3,0xC5,0xC6,0xC7,0xD1,0xD2,0xD3,0xD5,0xD7,0xDA,0xDB,0xDE,0xDF,0xE1,0xE3,0xE7,0xF3,0xF7,0xFF,0};
                     bool collision = false;
                     for (int i = 0; reclaimed[i]; i++) {
                         if (opc == reclaimed[i]) { collision = true; break; }

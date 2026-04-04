@@ -31,19 +31,19 @@ def main():
             write(value + 768, 0, out)
 
         print("Programming ones place (twos complement)")
-        for value in range(-128, 127):
+        for value in range(-128, 128):
             write(byte(value) + 1024, digits[abs(value) % 10], out)
 
         print("Programming tens place (twos complement)")
-        for value in range(-128, 127):
-            write(byte(value) + 1280, digits[abs(value // 10) % 10], out)
+        for value in range(-128, 128):
+            write(byte(value) + 1280, digits[(abs(value) // 10) % 10], out)
 
         print("Programming hundreds place (twos complement)")
-        for value in range(-128, 127):
-            write(byte(value) + 1536, digits[abs(value // 100) % 10], out)
+        for value in range(-128, 128):
+            write(byte(value) + 1536, digits[(abs(value) // 100) % 10], out)
 
         print("Programming sign (twos complement)")
-        for value in range(-128, 127):
+        for value in range(-128, 128):
             if value < 0:
                 write(byte(value) + 1792, 0x01, out)
             else:

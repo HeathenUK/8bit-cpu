@@ -102,7 +102,7 @@ static const FixedInstr FIXED_INSTRUCTIONS[] = {
     { "setnc",   0xE3,  ARGS_NONE },  // A = (CF ? 0 : 1)
     { "push_imm",0xE7,  ARGS_IMM  },  // push N, A = N
     { "ldsp_b",  0xF3,  ARGS_IMM  },  // B = stack[SP + imm]
-    { "dispmode",0xF7,  ARGS_IMM  },  // display mode (future hw)
+    { "iderefp3",0xF7,  ARGS_NONE },  // page3[B] = A (indirect store to page 3)
     { "swap",    0xEE,  ARGS_NONE },  // swap A and B
     { "inc",     0xFB,  ARGS_NONE },  // A = A + 1
     { "dec",     0xFE,  ARGS_NONE },  // A = A - 1
@@ -111,11 +111,27 @@ static const FixedInstr FIXED_INSTRUCTIONS[] = {
     { "setjmp",  0xCB,  ARGS_IMM  },  // cross-page jump (future)
     { "setret",  0xCF,  ARGS_NONE },  // cross-page return (future)
 
-    // ── Aliases for existing instructions (CLR = self-subtract) ──
-    { "clr $a",  0xD0,  ARGS_NONE },  // A = 0
-    { "clr $b",  0xD5,  ARGS_NONE },  // B = 0
-    { "clr $c",  0xDA,  ARGS_NONE },  // C = 0
-    { "clr $d",  0xDF,  ARGS_NONE },  // D = 0
+    // ── Overlay system ──
+    { "derefp3", 0xD5,  ARGS_NONE },  // A = page3[A] (indirect page 3 read)
+    { "istc",    0xDA,  ARGS_NONE },  // code[B] = A (indirect store to code page)
+    { "ocall",   0xDF,  ARGS_IMM  },  // overlay call: push ret, A=N, PC=0
+
+    // ── 16-bit arithmetic ──
+    { "adc",     0xC1,  ARGS_NONE },  // A = A + B + CF (add with carry)
+    { "sbc",     0xC2,  ARGS_NONE },  // A = A - B - !CF (subtract with borrow)
+
+    // ── Non-destructive test ──
+    { "tst",     0xFF,  ARGS_IMM  },  // set ZF from A AND imm, A unchanged
+
+    // ── Utility ──
+    { "out_imm", 0xD1,  ARGS_IMM  },  // output immediate to display, A unchanged
+    { "jal_r",   0xE1,  ARGS_NONE },  // indirect call: push ret, PC = A
+    { "i2c2bit",   0xD2,  ARGS_NONE },  // I2C: clock 2 bits from MSB + trailing shift
+    { "i2c_start", 0xC5,  ARGS_NONE },  // I2C START: SDA falls while SCL HIGH (needs A=0x80)
+    { "i2c_stop",  0xC6,  ARGS_NONE },  // I2C STOP: SDA rises while SCL HIGH (needs A=0x00)
+
+    // ── Aliases ──
+    { "clr $a",  0xD0,  ARGS_NONE },  // A = 0 (sub $a,$a)
 
     // ── External interface ──
     { "exr 0",   0x78,  ARGS_NONE },

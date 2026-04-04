@@ -2,64 +2,74 @@
 	j _main
 	hlt
 _max:
-	ldsp_b 3	; param -> B (clobbers A)
+	ldsp 3
+	mov $a,$b
 	ldsp 2
+	mov $b,$a
+	mov $a,$b
 	cmp $b
 	jnc .L4
 .L3:
-	ldsp 2
 	j .L1
 .L4:
-	ldsp 3
+	mov $b,$a
 .L1:
 	ret
 
 _count_above:
 	; allocate 1 locals on stack
 	push_imm 0
-	ldi $a,0
-	stsp 1
-	ldsp_b 3	; param -> B (clobbers A)
 	ldsp 4
+	mov $a,$d
+	ldsp 3
+	mov $a,$c
+	ldi $a,0
+	mov $a,$b
+	mov $c,$a
+	mov $a,$b
+	mov $d,$a
 	cmp $b
 	jz .L8
 	jnc .L8
 .L7:
-	ldsp 1
+	mov $b,$a
 	inc
-	stsp 1
+	mov $a,$b
 .L8:
-	ldsp_b 3	; param -> B (clobbers A)
+	mov $c,$a
+	mov $a,$b
 	ldsp 5
 	cmp $b
 	jz .L10
 	jnc .L10
 .L9:
-	ldsp 1
+	mov $b,$a
 	inc
-	stsp 1
+	mov $a,$b
 .L10:
-	ldsp_b 3	; param -> B (clobbers A)
+	mov $c,$a
+	mov $a,$b
 	ldsp 6
 	cmp $b
 	jz .L12
 	jnc .L12
 .L11:
-	ldsp 1
+	mov $b,$a
 	inc
-	stsp 1
+	mov $a,$b
 .L12:
-	ldsp_b 3	; param -> B (clobbers A)
+	mov $c,$a
+	mov $a,$b
 	ldsp 7
 	cmp $b
 	jz .L14
 	jnc .L14
 .L13:
-	ldsp 1
+	mov $b,$a
 	inc
-	stsp 1
+	mov $a,$b
 .L14:
-	ldsp 1
+	mov $b,$a
 .L5:
 	pop $d
 	ret
@@ -73,6 +83,7 @@ _main:
 	pop $d
 	pop $d
 	stsp 1
+	ldsp 1
 	out
 
 	push_imm 150
@@ -81,6 +92,7 @@ _main:
 	pop $d
 	pop $d
 	stsp 1
+	ldsp 1
 	out
 
 	push_imm 30
@@ -95,6 +107,7 @@ _main:
 	pop $d
 	pop $d
 	stsp 1
+	ldsp 1
 	out
 
 	hlt
