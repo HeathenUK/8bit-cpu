@@ -76,8 +76,11 @@
     jc	{address: u8} -> { assert(address <= 0xff), 0b00110111 @ address }
     jz	{address: u8} -> { assert(address <= 0xff), 0b00111111 @ address }
 
-    exr 0	-> 0b01111000
-    exr 1	-> 0b01111001
+    exr 0 0	-> 0b01111000
+    exr 1 0	-> 0b01111001
+    exr 1 1	-> 0xC5
+    exr 1 2	-> 0xC6
+    exr 1 3	-> 0xD2
 
     exw 0 0	-> 0b00000111
     exw 0 1	-> 0b00001111
@@ -145,8 +148,9 @@
     ; Utility
     out_imm {value: u8} -> { assert(value <= 0xff), 0xD1 @ value }    ; output immediate, A unchanged
     jal_r -> 0xE1                                                      ; indirect call: push ret, PC = A
-    ; GPIO daughter board (652 bidirectional transceiver)
-    gpio_read -> 0xC5                                                  ; read 652 B-side into A (U1=float outputs, XI=input, E0=enable)
+    ; 82C55 PPI extended reads (stretched: XI setup step before E1/~RD assertion)
+    ; exr 1 0 (Port A) is at 0x79 above
+    ; exr 1 1, 1 2, 1 3 are at 0xC5, 0xC6, 0xD2 above
 
     ; Aliases for existing instructions (no microcode change)
     ; NOTE: Only clr $a works (A = A - A = 0). The ALU always uses A as

@@ -1,0 +1,3043 @@
+#!/usr/bin/env python3
+"""MK1 C Compiler v2 — purpose-built for MK1 hardware.
+
+Knows every MK1 constraint:
+- A is the only ALU operand. All arithmetic goes through A.
+- stsp clobbers D and A. ldsp_b clobbers A.
+- push_imm sets A = pushed value.
+- deref/ideref for indirect memory access.
+- setz/setnz/setc/setnc for boolean evaluation.
+- Variable-length instructions (1 or 2 bytes).
+
+Usage: python3 mk1cc2.py input.c [-o output.asm] [-O]
+"""
+
+import sys, re, argparse
+
+# ── Tokenizer (from mk1cc.py) ────────────────────────────────────────
+
+TOKEN_PATTERNS = [
+    ('MCOMMENT', r'/\*[\s\S]*?\*/'),
+    ('COMMENT',  r'//[^\n]*'),
+    ('CHAR',     r"'(?:[^'\\]|\\[nrt0\\'])'"),  # character literals
+    ('NUMBER',   r'0[xX][0-9a-fA-F]+|0[bB][01]+|\d+'),
+    ('STRING',   r'"(?:[^"\\]|\\.)*"'),
+    ('IDENT',    r'[a-zA-Z_]\w*'),
+    ('OP2',      r'&&|\|\||[+\-&|^]=|==|!=|<=|>=|<<|>>|\+\+|\-\-'),
+    ('OP1',      r'[+\-*/%&|^~!<>=(){},;\[\]?:]'),
+    ('SKIP',     r'[ \t]+'),
+    ('NEWLINE',  r'\n'),
+    ('MISMATCH', r'.'),
+]
+KEYWORDS = {'if', 'else', 'while', 'for', 'do', 'return', 'unsigned', 'char',
+            'void', 'int', 'switch', 'case', 'default', 'break', 'continue'}
+
+class Token:
+    def __init__(self, type, value, line):
+        self.type, self.value, self.line = type, value, line
+
+def tokenize(source):
+    tokens = []
+    line = 1
+    pat = '|'.join(f'(?P<{n}>{p})' for n, p in TOKEN_PATTERNS)
+    for m in re.finditer(pat, source):
+        kind, value = m.lastgroup, m.group()
+        if kind == 'NEWLINE': line += 1
+        elif kind in ('SKIP', 'COMMENT', 'MCOMMENT'): line += value.count('\n')
+        elif kind == 'MISMATCH': raise SyntaxError(f'Line {line}: unexpected {value!r}')
+        elif kind == 'STRING': tokens.append(Token('STRING', value, line))
+        elif kind == 'CHAR':
+            # Convert character literal to integer
+            ch = value[1:-1]  # strip quotes
+            if ch.startswith('\\'):
+                esc = {'n': 10, 'r': 13, 't': 9, '0': 0, '\\': 92, "'": 39}
+                tokens.append(Token('NUMBER', esc.get(ch[1], ord(ch[1])), line))
+            else:
+                tokens.append(Token('NUMBER', ord(ch), line))
+        elif kind == 'IDENT' and value in KEYWORDS: tokens.append(Token(value, value, line))
+        elif kind == 'NUMBER': tokens.append(Token('NUMBER', int(value, 0), line))
+        else: tokens.append(Token(kind, value, line))
+    tokens.append(Token('EOF', '', line))
+    return tokens
+
+# ── Parser ────────────────────────────────────────────────────────────
+
+class Parser:
+    def __init__(self, tokens):
+        self.tokens, self.pos = tokens, 0
+
+    def peek(self): return self.tokens[self.pos]
+    def advance(self):
+        t = self.tokens[self.pos]; self.pos += 1; return t
+    def expect(self, tv):
+        t = self.peek()
+        if t.type == tv or t.value == tv: return self.advance()
+        raise SyntaxError(f'Line {t.line}: expected {tv!r}, got {t.value!r}')
+    def match(self, tv):
+        t = self.peek()
+        if t.type == tv or t.value == tv: return self.advance()
+        return None
+
+    def parse_program(self):
+        functions, globals_ = [], []
+        while self.peek().type != 'EOF':
+            typ = self.parse_type()
+            name = self.expect('IDENT').value
+            if self.match('('):
+                fn = self.parse_function(typ, name)
+                if fn: functions.append(fn)
+            elif self.match('='):
+                val = self.expect('NUMBER').value; self.expect(';')
+                globals_.append((name, val))
+            elif self.match('['):
+                size = self.expect('NUMBER').value; self.expect(']'); self.expect(';')
+                globals_.append((name, [0]*size))
+            elif self.match(';'):
+                globals_.append((name, 0))
+            else: raise SyntaxError(f'Line {self.peek().line}: unexpected after {name}')
+        return globals_, functions
+
+    def parse_type(self):
+        if self.match('void'): return 'void'
+        if self.match('unsigned'):
+            if self.match('char'): return 'u8'
+            if self.match('int'): return 'u16'
+            return 'u8'  # bare 'unsigned' = unsigned char
+        if self.match('char'): return 'u8'
+        if self.match('int'): return 'u16'
+        raise SyntaxError(f'Line {self.peek().line}: expected type')
+
+    def parse_function(self, ret_type, name):
+        params = []
+        if not self.match(')'):
+            # Handle (void) parameter list
+            if self.peek().value == 'void':
+                self.advance(); self.expect(')')
+            else:
+                while True:
+                    ptype = self.parse_type(); pname = self.expect('IDENT').value
+                    params.append(pname)
+                    if not self.match(','): break
+                self.expect(')')
+        # Handle inline asm declarations: void f(void) = "...";
+        if self.match('='):
+            self.advance()  # skip string literal
+            self.expect(';')
+            return None  # signal to skip
+        # Forward declaration: type name(params);
+        if self.match(';'):
+            return None  # prototype, skip
+        body = self.parse_block()
+        return (name, params, body, ret_type)
+
+    def parse_block(self):
+        self.expect('{'); stmts = []
+        while not self.match('}'): stmts.append(self.parse_statement())
+        return ('block', stmts)
+
+    def parse_statement(self):
+        t = self.peek()
+        if t.value == 'if': return self.parse_if()
+        if t.value == 'while': return self.parse_while()
+        if t.value == 'for': return self.parse_for()
+        if t.value == 'do': return self.parse_do_while()
+        if t.value == 'switch': return self.parse_switch()
+        if t.value == 'break': self.advance(); self.expect(';'); return ('break',)
+        if t.value == 'continue': self.advance(); self.expect(';'); return ('continue',)
+        if t.value == 'return':
+            self.advance()
+            if self.match(';'): return ('return', None)
+            e = self.parse_expr(); self.expect(';'); return ('return', e)
+        if t.value in ('unsigned', 'char', 'int'): return self.parse_local_decl()
+        if t.value == '{': return self.parse_block()
+        e = self.parse_expr(); self.expect(';'); return ('expr_stmt', e)
+
+    def parse_do_while(self):
+        self.expect('do')
+        body = self.parse_statement()
+        self.expect('while'); self.expect('('); c = self.parse_expr(); self.expect(')')
+        self.expect(';')
+        return ('do_while', body, c)
+
+    def parse_switch(self):
+        self.expect('switch'); self.expect('('); expr = self.parse_expr(); self.expect(')')
+        self.expect('{')
+        cases = []
+        default = None
+        while not self.match('}'):
+            if self.match('case'):
+                val = self.expect('NUMBER').value
+                self.expect(':')
+                stmts = []
+                while self.peek().value not in ('case', 'default', '}'):
+                    stmts.append(self.parse_statement())
+                cases.append((val, ('block', stmts)))
+            elif self.match('default'):
+                self.expect(':')
+                stmts = []
+                while self.peek().value not in ('case', '}'):
+                    stmts.append(self.parse_statement())
+                default = ('block', stmts)
+        return ('switch', expr, cases, default)
+
+    def parse_if(self):
+        self.expect('if'); self.expect('('); c = self.parse_expr(); self.expect(')')
+        then = self.parse_statement()
+        els = self.parse_statement() if self.match('else') else None
+        return ('if', c, then, els)
+
+    def parse_while(self):
+        self.expect('while'); self.expect('('); c = self.parse_expr(); self.expect(')')
+        return ('while', c, self.parse_statement())
+
+    def parse_for(self):
+        self.expect('for'); self.expect('(')
+        init = self.parse_statement() if self.peek().value != ';' else None
+        if init is None: self.expect(';')
+        cond = self.parse_expr() if self.peek().value != ';' else ('num', 1)
+        self.expect(';')
+        update = self.parse_expr() if self.peek().value != ')' else None
+        self.expect(')')
+        return ('for', init, cond, update, self.parse_statement())
+
+    def parse_local_decl(self):
+        typ = self.parse_type(); name = self.expect('IDENT').value
+        if self.match('['):
+            size = self.expect('NUMBER').value; self.expect(']')
+            init_vals = None
+            if self.match('='):
+                self.expect('{')
+                init_vals = []
+                while self.peek().value != '}':
+                    init_vals.append(self.parse_expr())
+                    if not self.match(','): break
+                self.expect('}')
+            self.expect(';')
+            return ('local_arr', name, size, init_vals)
+        init = self.parse_expr() if self.match('=') else None
+        self.expect(';'); return ('local', name, init, typ)
+
+    def parse_expr(self): return self.parse_assign()
+    def parse_assign(self):
+        left = self.parse_ternary()
+        if self.peek().value in ('=','+=','-=','&=','|=','^='):
+            op = self.advance().value; right = self.parse_assign()
+            return ('assign', op, left, right)
+        return left
+    def parse_ternary(self):
+        cond = self.parse_log_or()
+        if self.match('?'):
+            then = self.parse_expr()
+            self.expect(':')
+            els = self.parse_ternary()
+            return ('ternary', cond, then, els)
+        return cond
+    def parse_log_or(self):
+        left = self.parse_log_and()
+        while self.peek().value == '||':
+            self.advance(); left = ('log_or', left, self.parse_log_and())
+        return left
+    def parse_log_and(self):
+        left = self.parse_bit_or()
+        while self.peek().value == '&&':
+            self.advance(); left = ('log_and', left, self.parse_bit_or())
+        return left
+    def parse_bit_or(self):
+        left = self.parse_xor()
+        while self.peek().value == '|':
+            self.advance(); left = ('binop', '|', left, self.parse_xor())
+        return left
+    def parse_xor(self):
+        left = self.parse_bit_and()
+        while self.peek().value == '^':
+            self.advance(); left = ('binop', '^', left, self.parse_bit_and())
+        return left
+    def parse_bit_and(self):
+        left = self.parse_cmp()
+        while self.peek().value == '&':
+            self.advance(); left = ('binop', '&', left, self.parse_cmp())
+        return left
+    def parse_cmp(self):
+        left = self.parse_shift()
+        if self.peek().value in ('==','!=','<','>','<=','>='):
+            op = self.advance().value; return ('binop', op, left, self.parse_shift())
+        return left
+    def parse_shift(self):
+        left = self.parse_add()
+        while self.peek().value in ('<<', '>>'):
+            op = self.advance().value; left = ('binop', op, left, self.parse_add())
+        return left
+    def parse_add(self):
+        left = self.parse_mul()
+        while self.peek().value in ('+','-'):
+            op = self.advance().value; left = ('binop', op, left, self.parse_mul())
+        return left
+    def parse_mul(self):
+        left = self.parse_unary()
+        while self.peek().value in ('*','/',  '%'):
+            op = self.advance().value; left = ('binop', op, left, self.parse_unary())
+        return left
+    def parse_unary(self):
+        if self.peek().value == '~': self.advance(); return ('unop', '~', self.parse_unary())
+        if self.peek().value == '!': self.advance(); return ('unop', '!', self.parse_unary())
+        if self.peek().value == '-': self.advance(); return ('unop', '-', self.parse_unary())
+        if self.peek().value == '++':
+            self.advance(); e = self.parse_unary(); return ('preinc', e)
+        if self.peek().value == '--':
+            self.advance(); e = self.parse_unary(); return ('predec', e)
+        return self.parse_postfix()
+    def parse_postfix(self):
+        e = self.parse_primary()
+        while True:
+            if self.peek().value == '[':
+                self.advance(); idx = self.parse_expr(); self.expect(']')
+                e = ('index', e, idx)
+            elif self.peek().value == '++':
+                self.advance(); e = ('postinc', e)
+            elif self.peek().value == '--':
+                self.advance(); e = ('postdec', e)
+            else: break
+        return e
+    def parse_primary(self):
+        t = self.peek()
+        if t.type == 'NUMBER': self.advance(); return ('num', t.value)
+        if t.type == 'IDENT':
+            name = self.advance().value
+            if self.match('('):
+                args = []
+                if not self.match(')'):
+                    while True:
+                        args.append(self.parse_expr())
+                        if not self.match(','): break
+                    self.expect(')')
+                return ('call', name, args)
+            return ('var', name)
+        if self.match('('): e = self.parse_expr(); self.expect(')'); return e
+        raise SyntaxError(f'Line {t.line}: unexpected {t.value!r}')
+
+# ── Code Generator ───────────────────────────────────────────────────
+
+class MK1CodeGen:
+    """Generates MK1 assembly with full knowledge of hardware constraints.
+
+    Optimizations:
+    - Dead variable elimination: vars that are written but never read are skipped
+    - Comparison swap: > and <= become single-jump via operand swap
+    - Local+assign merge: "type x; x = expr;" becomes "type x = expr;"
+    - push_imm for constant initializers
+    - Peephole: register tracking, dead code, redundant load elimination
+    """
+
+    def __init__(self, optimize=False):
+        self.code = []
+        self.globals = {}
+        self.data_alloc = 0
+        self.label_id = 0
+        self.optimize = optimize
+        self.b_expr = None  # AST expr currently in B, for cache reuse
+
+    def label(self, prefix='L'):
+        self.label_id += 1
+        return f'.{prefix}{self.label_id}'
+
+    def emit(self, line):
+        self.code.append(line)
+        # Invalidate B cache on B-modifying instructions
+        s = line.strip()
+        if (',$b' in s and s.startswith('mov')) or s.startswith('pop $b') or s == 'swap' or s.startswith('jal'):
+            self.b_expr = None
+
+    # ── Dead variable analysis ───────────────────────────────────────
+
+    def _collect_reads(self, node, reads):
+        """Walk AST node, collect all variable names that are READ."""
+        if not isinstance(node, tuple) or len(node) == 0:
+            return
+        kind = node[0]
+        if kind == 'var':
+            reads.add(node[1])
+        elif kind == 'assign':
+            # LHS is written, not read (unless compound assign)
+            op, left, right = node[1], node[2], node[3]
+            if op != '=':
+                self._collect_reads(left, reads)  # compound: also reads
+            if left[0] == 'index':
+                self._collect_reads(left, reads)  # index target is read
+            self._collect_reads(right, reads)
+        elif kind == 'postinc' or kind == 'postdec':
+            self._collect_reads(node[1], reads)  # reads old value
+        elif kind in ('block',):
+            for s in node[1]:
+                self._collect_reads(s, reads)
+        elif kind == 'local':
+            if node[2]:
+                self._collect_reads(node[2], reads)
+        else:
+            for child in node[1:]:
+                if isinstance(child, tuple):
+                    self._collect_reads(child, reads)
+                elif isinstance(child, list):
+                    for item in child:
+                        if isinstance(item, tuple):
+                            self._collect_reads(item, reads)
+
+    def _find_dead_locals(self, body, params):
+        """Find local variables that are assigned but never read."""
+        reads = set()
+        self._collect_reads(body, reads)
+        return reads  # return the SET of read vars (dead = declared - reads)
+
+    BUILTINS = {'out', 'halt', 'nop', 'exw', 'exr', 'exrw', 'clr_irq0', 'clr_irq1',
+                'irq0', 'irq1', 'exr_port_a', 'exr_port_b', 'exr_port_c',
+                'via_read_porta', 'via_read_portb',
+                'i2c_start', 'i2c_stop',
+                'peek3', 'poke3'}
+    # NOTE: i2c_send_byte, lcd_cmd, lcd_char, lcd_init are NOT builtins —
+    # they use jal to subroutines that clobber B, C, D. The register
+    # allocator must treat them as user function calls.
+
+    def _has_calls(self, node):
+        """Check if AST node contains any non-builtin function calls (jal)."""
+        if not isinstance(node, tuple) or len(node) == 0:
+            return False
+        if node[0] == 'call' and node[1] not in self.BUILTINS:
+            return True
+        for child in node[1:]:
+            if isinstance(child, tuple) and self._has_calls(child):
+                return True
+            elif isinstance(child, list):
+                for item in child:
+                    if isinstance(item, tuple) and self._has_calls(item):
+                        return True
+        return False
+
+    def _has_stsp(self, node):
+        """Check if AST node would generate any stsp (stack store) instructions.
+        stsp clobbers D, so D register allocation is unsafe if stsp occurs."""
+        if not isinstance(node, tuple) or len(node) == 0:
+            return False
+        if node[0] == 'assign' and node[2][0] == 'var':
+            # Check if target is a stack local (would need stsp)
+            name = node[2][1]
+            if name in self.locals and self.locals[name][0] == 'local':
+                return True
+        if node[0] in ('postinc', 'postdec'):
+            if node[1][0] == 'var' and node[1][1] in self.locals:
+                if self.locals[node[1][1]][0] == 'local':
+                    return True
+        for child in node[1:]:
+            if isinstance(child, tuple) and self._has_stsp(child):
+                return True
+            elif isinstance(child, list):
+                for item in child:
+                    if isinstance(item, tuple) and self._has_stsp(item):
+                        return True
+        return False
+
+    def _collect_reg_candidates(self, stmts, candidates, depth=0):
+        """Recursively collect register allocation candidates.
+        Deeper-nested variables get higher priority (negative depth for sorting)."""
+        for i, s in enumerate(stmts):
+            name = None
+            if s[0] == 'local':
+                name = s[1]
+            elif (i + 1 < len(stmts) and s[0] == 'local' and s[2] is None
+                  and stmts[i+1][0] == 'expr_stmt'
+                  and stmts[i+1][1][0] == 'assign' and stmts[i+1][1][1] == '='
+                  and stmts[i+1][1][2] == ('var', s[1])):
+                name = s[1]
+
+            if name and name in self.read_vars:
+                has_call = any(self._has_calls(stmts[j]) for j in range(i + 1, len(stmts)))
+                if not has_call:
+                    candidates.append((-depth, name))  # deeper = more negative = sorted first
+
+            # Recurse into inner blocks that have NO user function calls
+            inner_stmts = None
+            if s[0] == 'for' and s[4] and s[4][0] == 'block':
+                inner_stmts = s[4][1]
+            elif s[0] == 'while' and s[2] and s[2][0] == 'block':
+                inner_stmts = s[2][1]
+            elif s[0] == 'do_while' and s[1] and s[1][0] == 'block':
+                inner_stmts = s[1][1]
+            elif s[0] == 'block':
+                inner_stmts = s[1]
+            elif s[0] == 'if':
+                # Check then/else branches
+                if s[2] and s[2][0] == 'block':
+                    self._collect_reg_candidates(s[2][1], candidates)
+                if s[3] and s[3][0] == 'block':
+                    self._collect_reg_candidates(s[3][1], candidates)
+
+            if inner_stmts is not None:
+                has_inner_calls = any(self._has_calls(st) for st in inner_stmts)
+                if not has_inner_calls:
+                    self._collect_reg_candidates(inner_stmts, candidates, depth + 1)
+
+    def _find_reg_candidates(self, stmts):
+        """Find locals eligible for register allocation.
+        Returns (c_var, d_var) — names for C and D registers, or None.
+        C: safe if no function calls after declaration.
+        D: safe if no function calls AND no stsp after declaration.
+        Also searches inner blocks (for/while/do-while bodies) when
+        the inner scope has no user function calls."""
+        c_var = None
+        d_var = None
+        candidates = []
+        self._collect_reg_candidates(stmts, candidates)
+        # Sort by depth (deepest first), remove duplicates
+        candidates.sort()  # (-depth, name): most negative depth first
+        seen = set()
+        unique = []
+        for _, name in candidates:
+            if name not in seen:
+                seen.add(name)
+                unique.append(name)
+        for name in unique:
+            if not c_var:
+                c_var = name
+            elif not d_var:
+                d_var = name
+                break
+
+        return c_var, d_var
+
+    # ── Compilation ──────────────────────────────────────────────────
+
+    def compile(self, source):
+        tokens = tokenize(source)
+        parser = Parser(tokens)
+        globals_, functions = parser.parse_program()
+
+        self.page3_globals = {}  # name → page 3 address (for overflow arrays)
+        self.page3_alloc = 0
+
+        for name, init in globals_:
+            size = len(init) if isinstance(init, list) else 1
+            if self.data_alloc + size <= 256:
+                self.globals[name] = self.data_alloc
+                self.data_alloc += size
+            else:
+                # Overflow to page 3
+                self.page3_globals[name] = self.page3_alloc
+                self.page3_alloc += size
+
+        # Pre-pass: record param counts and bodies for optimization
+        self.func_params = {}
+        self.func_bodies = {}  # for compile-time evaluation of pure functions
+        for name, params, body, ret_type in functions:
+            self.func_params[name] = len(params)
+            self.func_bodies[name] = (params, body)
+
+        # Compile main first (starts at address 0, no j _main jump needed)
+        # Then compile other functions after main
+        main_fn = None
+        other_fns = []
+        for fn in functions:
+            if fn[0] == 'main':
+                main_fn = fn
+            else:
+                other_fns.append(fn)
+
+        if main_fn:
+            self.compile_function(*main_fn)
+        for fn in other_fns:
+            self.compile_function(*fn)
+
+        # Emit I2C/LCD helper functions if used
+        self._emit_i2c_helpers()
+
+        # Dead function elimination: remove functions that are never called
+        self._eliminate_dead_functions()
+
+        # Overlay partitioning: if code exceeds 256 bytes, move cold functions to page 3
+        self._overlay_partition()
+
+        # Emit page 1 globals
+        page1_vars = [(n, i) for n, i in globals_ if n in self.globals]
+        if page1_vars:
+            self.emit('\tsection data')
+            for name, init in page1_vars:
+                self.emit(f'_{name}:')
+                if isinstance(init, list):
+                    for v in init:
+                        self.emit(f'\tbyte {v}')
+                else:
+                    self.emit(f'\tbyte {init}')
+            self.emit('\tsection code')
+
+        # Emit page 3 globals
+        page3_vars = [(n, i) for n, i in globals_ if n in self.page3_globals]
+        if page3_vars:
+            self.emit('\tsection page3')
+            for name, init in page3_vars:
+                self.emit(f'_{name}:')
+                if isinstance(init, list):
+                    for v in init:
+                        self.emit(f'\tbyte {v}')
+                else:
+                    self.emit(f'\tbyte {init}')
+            self.emit('\tsection code')
+
+        return '\n'.join(self.code)
+
+    def _eliminate_dead_functions(self):
+        """Remove function bodies that are never referenced."""
+        # Find all call/jump targets in emitted code
+        refs = set()
+        for line in self.code:
+            s = line.strip()
+            for prefix in ('jal ', 'j ', 'ocall '):
+                if s.startswith(prefix):
+                    target = s.split()[1]
+                    refs.add(target)
+
+        # Identify function body ranges (global label to next global label)
+        funcs = []  # (start, end, name)
+        i = 0
+        while i < len(self.code):
+            line = self.code[i]
+            s = line.strip()
+            if s.endswith(':') and not s.startswith('.') and s.startswith('_'):
+                name = s[:-1]  # remove colon
+                start = i
+                i += 1
+                while i < len(self.code):
+                    ns = self.code[i].strip()
+                    if ns.endswith(':') and not ns.startswith('.') and ns.startswith('_'):
+                        break
+                    i += 1
+                funcs.append((start, i, name))
+            else:
+                i += 1
+
+        if not funcs:
+            return
+
+        # Rebuild code keeping only referenced functions and non-function code
+        dead_ranges = set()
+        for start, end, name in funcs:
+            if name not in refs and name != '_main':
+                dead_ranges.add((start, end))
+
+        if not dead_ranges:
+            return
+
+        new_code = []
+        i = 0
+        while i < len(self.code):
+            skip = False
+            for start, end in dead_ranges:
+                if start <= i < end:
+                    i = end
+                    skip = True
+                    break
+            if not skip:
+                new_code.append(self.code[i])
+                i += 1
+
+        self.code = new_code
+
+    def _emit_i2c_helpers(self):
+        """Emit I2C/LCD helper subroutines if any lcd_cmd/lcd_char builtins were used."""
+        helpers = getattr(self, '_lcd_helpers', set())
+        if not helpers:
+            return
+
+        # Always emit __i2c_sb (send byte, B=byte, C=counter) — shared by all helpers
+        self.emit('__i2c_sb:')
+        self.emit('\tmov $a,$b')
+        self.emit('\tldi $a,8')
+        self.emit('\tmov $a,$c')
+        lbl_s = self.label('isb')
+        lbl_h = self.label('isbh')
+        lbl_n = self.label('isbn')
+        self.emit(f'{lbl_s}:')
+        self.emit('\tmov $b,$a')
+        self.emit('\ttst 0x80')
+        self.emit(f'\tjnz {lbl_h}')
+        self.emit('\tldi $a,0x03')
+        self.emit('\texw 0 2')
+        self.emit('\tldi $a,0x01')
+        self.emit('\texw 0 2')
+        self.emit('\tldi $a,0x03')
+        self.emit('\texw 0 2')
+        self.emit(f'\tj {lbl_n}')
+        self.emit(f'{lbl_h}:')
+        self.emit('\tldi $a,0x02')
+        self.emit('\texw 0 2')
+        self.emit('\tldi $a,0x00')
+        self.emit('\texw 0 2')
+        self.emit('\tldi $a,0x02')
+        self.emit('\texw 0 2')
+        self.emit(f'{lbl_n}:')
+        self.emit('\tmov $b,$a')
+        self.emit('\tsll')
+        self.emit('\tmov $a,$b')
+        self.emit('\tmov $c,$a')
+        self.emit('\tdec')
+        self.emit('\tmov $a,$c')
+        self.emit(f'\tjnz {lbl_s}')
+        # ACK clock with settling NOPs (required for reliable scan)
+        self.emit('\tldi $a,0x02')   # SDA released, SCL LOW
+        self.emit('\texw 0 2')
+        self.emit('\tnop')           # wait for SDA pull-up
+        self.emit('\tnop')
+        self.emit('\tnop')
+        self.emit('\tnop')
+        self.emit('\tnop')
+        self.emit('\tldi $a,0x00')   # SDA released, SCL HIGH (ACK clock)
+        self.emit('\texw 0 2')
+        self.emit('\tnop')           # wait for slave ACK
+        self.emit('\tnop')
+        self.emit('\tnop')
+        self.emit('\tnop')
+        self.emit('\tnop')
+        self.emit('\texrw 0')        # A = port B (bit 0 = SDA = ACK)
+        self.emit('\tpush $a')       # save ACK value
+        self.emit('\tldi $a,0x02')   # SCL LOW
+        self.emit('\texw 0 2')
+        self.emit('\tpop $a')        # A = ACK value (returned to caller)
+        self.emit('\tret')
+
+        # __i2c_st_only: just START (no address)
+        if '__i2c_st_only' in helpers:
+            self.emit('__i2c_st_only:')
+            self.emit('\texrw 2')
+            self.emit('\tldi $a,0x01')
+            self.emit('\texw 0 2')
+            self.emit('\tldi $a,0x03')
+            self.emit('\texw 0 2')
+            self.emit('\tret')
+
+        # __i2c_st: START + send address 0x4E
+        self.emit('__i2c_st:')
+        self.emit('\texrw 2')
+        self.emit('\tldi $a,0x01')
+        self.emit('\texw 0 2')
+        self.emit('\tldi $a,0x03')
+        self.emit('\texw 0 2')
+        self.emit('\tldi $a,0x4E')
+        self.emit('\tjal __i2c_sb')
+        self.emit('\tret')
+
+        # __i2c_sp: STOP
+        self.emit('__i2c_sp:')
+        self.emit('\tldi $a,0x03')
+        self.emit('\texw 0 2')
+        self.emit('\tldi $a,0x01')
+        self.emit('\texw 0 2')
+        self.emit('\tldi $a,0x00')
+        self.emit('\texw 0 2')
+        self.emit('\tret')
+
+        if '__lcd_init' in helpers:
+            self.emit('__lcd_init:')
+            # Reset PCF8574
+            self.emit('\tjal __i2c_st')
+            self.emit('\tldi $a,0x00')
+            self.emit('\tjal __i2c_sb')
+            self.emit('\tjal __i2c_sp')
+            # Nibble 0x03 x3 (no BL during init)
+            for _ in range(3):
+                self.emit('\tjal __i2c_st')
+                self.emit('\tldi $a,0x34')
+                self.emit('\tjal __i2c_sb')
+                self.emit('\tldi $a,0x30')
+                self.emit('\tjal __i2c_sb')
+                self.emit('\tjal __i2c_sp')
+            # Nibble 0x02 (4-bit mode)
+            self.emit('\tjal __i2c_st')
+            self.emit('\tldi $a,0x24')
+            self.emit('\tjal __i2c_sb')
+            self.emit('\tldi $a,0x20')
+            self.emit('\tjal __i2c_sb')
+            self.emit('\tjal __i2c_sp')
+            # Commands: 0x28, 0x0C, 0x01, 0x06
+            for cmd in [0x28, 0x0C, 0x01, 0x06]:
+                self.emit(f'\tldi $d,{cmd}')
+                self.emit('\tjal __lcd_cmd')
+            # Backlight on
+            self.emit('\tjal __i2c_st')
+            self.emit('\tldi $a,0x08')
+            self.emit('\tjal __i2c_sb')
+            self.emit('\tjal __i2c_sp')
+            self.emit('\tret')
+            # Force __lcd_cmd to be emitted
+            helpers.add('__lcd_cmd')
+
+        # Merged __lcd_cmd / __lcd_chr — differ only in flags (EN vs EN+RS+BL)
+        if '__lcd_chr' in helpers:
+            self.emit('__lcd_chr:')
+            self.emit('\tpush $a')        # save caller's A (will be discarded)
+            self.emit('\tldi $a,0x09')    # flags: RS + BL
+            self.emit('\tj __lcd_send')
+
+        if '__lcd_cmd' in helpers:
+            self.emit('__lcd_cmd:')
+            self.emit('\tpush $a')
+            self.emit('\tldi $a,0x00')    # flags: none
+
+        if '__lcd_cmd' in helpers or '__lcd_chr' in helpers:
+            self.emit('__lcd_send:')
+            self.emit('\tpush $a')        # push flags to stack
+            self.emit('\tjal __i2c_st')   # START + addr
+            # High nibble + EN
+            self.emit('\tmov $d,$a')
+            self.emit('\tandi 0xF0,$a')
+            self.emit('\tpop $b')         # B = flags
+            self.emit('\tpush $b')
+            self.emit('\tor $b,$a')
+            self.emit('\tori 0x04,$a')    # + EN
+            self.emit('\tjal __i2c_sb')
+            # High nibble - EN
+            self.emit('\tmov $d,$a')
+            self.emit('\tandi 0xF0,$a')
+            self.emit('\tpop $b')
+            self.emit('\tpush $b')
+            self.emit('\tor $b,$a')
+            self.emit('\tjal __i2c_sb')
+            # Low nibble + EN
+            self.emit('\tmov $d,$a')
+            self.emit('\tsll')
+            self.emit('\tsll')
+            self.emit('\tsll')
+            self.emit('\tsll')
+            self.emit('\tandi 0xF0,$a')
+            self.emit('\tpop $b')
+            self.emit('\tpush $b')
+            self.emit('\tor $b,$a')
+            self.emit('\tori 0x04,$a')
+            self.emit('\tjal __i2c_sb')
+            # Low nibble - EN
+            self.emit('\tmov $d,$a')
+            self.emit('\tsll')
+            self.emit('\tsll')
+            self.emit('\tsll')
+            self.emit('\tsll')
+            self.emit('\tandi 0xF0,$a')
+            self.emit('\tpop $b')
+            self.emit('\tor $b,$a')
+            self.emit('\tjal __i2c_sb')
+            self.emit('\tjal __i2c_sp')
+            self.emit('\tpop $a')         # balance the push at entry
+            self.emit('\tret')
+
+    def _overlay_partition(self):
+        """If code exceeds page 0 capacity, move cold functions to page 3.
+        Generates overlay loader at the start and rewrite calls to use ocall."""
+        # Estimate total code size
+        two_byte = {'ldsp','stsp','push_imm','jal','jc','jz','jnc','jnz','j','ldi',
+                    'cmp','addi','subi','andi','ori','ld','st','ldsp_b','ldp3','stp3',
+                    'setjmp','ocall','tst','out_imm'}
+        size = 0
+        for line in self.code:
+            s = line.strip()
+            if not s or s.endswith(':'):
+                continue
+            mn = s.split()[0]
+            if mn == 'cmp':
+                parts = s.split()
+                size += 1 if (len(parts) > 1 and parts[1].startswith('$')) else 2
+            elif mn in two_byte:
+                size += 2
+            else:
+                size += 1
+
+        # Only partition if code exceeds 240 bytes (leaving room for overlay loader)
+        if size <= 240:
+            return
+
+        # Find functions and their sizes (exclude _main)
+        funcs = []
+        i = 0
+        while i < len(self.code):
+            line = self.code[i]
+            s = line.strip()
+            if s.endswith(':') and not s.startswith('.') and s.startswith('_') and s != '_main:':
+                name = s[:-1]
+                start = i
+                func_size = 0
+                i += 1
+                while i < len(self.code):
+                    ns = self.code[i].strip()
+                    if ns.endswith(':') and not ns.startswith('.') and ns.startswith('_'):
+                        break
+                    if ns and not ns.endswith(':'):
+                        mn = ns.split()[0]
+                        if mn == 'cmp':
+                            parts = ns.split()
+                            func_size += 1 if (len(parts) > 1 and parts[1].startswith('$')) else 2
+                        elif mn in two_byte:
+                            func_size += 2
+                        else:
+                            func_size += 1
+                    i += 1
+                funcs.append((name, start, i, func_size))
+            else:
+                i += 1
+
+        if not funcs:
+            return
+
+        # Sort by size descending — move largest functions to overlay first
+        funcs.sort(key=lambda f: -f[3])
+
+        # Move functions to page 3 until code fits in 220 bytes (room for loader)
+        overlay_funcs = []
+        remaining_size = size
+        overlay_loader_size = 20  # approximate
+
+        for name, start, end, fsize in funcs:
+            if remaining_size <= (240 - overlay_loader_size):
+                break
+            overlay_funcs.append((name, start, end, fsize))
+            remaining_size -= fsize
+
+        if not overlay_funcs:
+            return
+
+        # ── Overlay system ──
+        # Overlay functions are assembled at OVERLAY_REGION in page 0 (so
+        # internal labels resolve correctly). The assembler's page3_code
+        # section stores instruction bytes in page 3.
+        # At runtime, the overlay loader copies them to OVERLAY_REGION
+        # and calls via jal_r.
+        #
+        # Page 3 layout: [metadata: 3 bytes/overlay] [code bytes]
+
+        OVERLAY_REGION = 200
+        META_SIZE = 3
+
+        overlay_meta = []
+        overlay_asm_blocks = []
+
+        for idx, (name, start, end, fsize) in enumerate(overlay_funcs):
+            overlay_asm_blocks.append((name, self.code[start:end], fsize))
+            overlay_meta.append((idx, name, fsize))
+
+        # Remove overlay functions and rewrite calls to ocall
+        remove_ranges = {(start, end) for _, start, end, _ in overlay_funcs}
+        new_code = []
+        i = 0
+        while i < len(self.code):
+            skip = False
+            for rs, re in remove_ranges:
+                if rs <= i < re:
+                    i = re
+                    skip = True
+                    break
+            if not skip:
+                line = self.code[i]
+                s = line.strip()
+                rewritten = False
+                for idx, name, _ in overlay_meta:
+                    if s == f'jal {name}':
+                        new_code.append(f'	ocall {idx}')
+                        rewritten = True
+                        break
+                if not rewritten:
+                    new_code.append(line)
+                i += 1
+
+        # ── Optimized overlay loader ──
+        # Metadata: 2 bytes per overlay (src_offset, length). Entry is always
+        # OVERLAY_REGION. Index*2 instead of index*3 for metadata lookup.
+        # Loop uses cmp $c to check dst against precomputed end address,
+        # eliminating the separate counter register.
+        META_SIZE = 2
+
+        loader = [
+            '; ── Overlay loader ──',
+            '_overlay_load:',
+            '\tsll',                        # A = index * 2 = metadata offset
+            '\tpush $a',                    # save meta_offset
+            '\tderefp3',                    # A = page3[offset] = src_offset
+            '\tmov $a,$d',                  # D = src (read pointer)
+            '\tpop $a',                     # A = meta_offset
+            '\tinc',
+            '\tderefp3',                    # A = page3[offset+1] = length
+            f'\taddi {OVERLAY_REGION},$a',  # A = OVERLAY_REGION + length = end addr
+            '\tmov $a,$c',                  # C = end address
+            f'\tldi $b,{OVERLAY_REGION}',   # B = dst (write pointer)
+            '.copy:',
+            '\tmov $d,$a',                  # A = src
+            '\tderefp3',                    # A = page3[src]
+            '\tistc',                       # code[B] = A
+            '\tmov $d,$a',
+            '\tinc',
+            '\tmov $a,$d',                  # D++ (src)
+            '\tmov $b,$a',
+            '\tinc',
+            '\tmov $a,$b',                  # B++ (dst)
+            '\tcmp $c',                     # dst == end?
+            '\tjnz .copy',                  # no: keep copying
+            f'\tldi $a,{OVERLAY_REGION}',
+            '\tjal_r',                      # call overlay function
+            '\tret',                        # return to original caller
+        ]
+
+        self.code = loader + new_code
+
+        # ── Page 3: metadata (2 bytes/overlay) + overlay code ──
+        meta_table_size = len(overlay_meta) * META_SIZE
+        p3_offset = meta_table_size
+
+        self.code.append('\tsection page3')
+        for idx, name, fsize in overlay_meta:
+            self.code.append(f'\tbyte {p3_offset}')   # src offset in page 3
+            self.code.append(f'\tbyte {fsize}')        # length
+            p3_offset += fsize
+
+        # Overlay code assembled into page 3 via page3_code section
+        for name, asm_lines, fsize in overlay_asm_blocks:
+            self.code.append('\tsection page3_code')
+            self.code.extend(asm_lines)
+
+        self.code.append('\tsection code')
+
+    def _use_regcall(self, nparams):
+        """Always pass first 2 args in A/B (hybrid register calling).
+        Functions with >2 params: first 2 in A/B, rest on stack."""
+        return nparams > 0  # all functions with params use regcall
+
+    def compile_function(self, name, params, body, ret_type):
+        self.current_func = name
+        self.locals = {}
+        self.local_count = 0
+        self.param_count = len(params)
+        self.read_vars = self._find_dead_locals(body, params)
+        # Register allocation: try to put locals in C and D
+        if body[0] == 'block':
+            self.reg_c_var, self.reg_d_var = self._find_reg_candidates(body[1])
+        else:
+            self.reg_c_var = self.reg_d_var = None
+
+        self.regcall = self._use_regcall(len(params))
+
+        if self.regcall:
+            # Hybrid register calling: first 2 in A/B, rest on stack
+            # Param 0 (A) is fragile — A gets clobbered by almost everything.
+            # Save to D at entry if param 0 is used and D is available.
+            # Param 1 (B) is safer — only clobbered by explicit mov/pop to B.
+            # Only save A→D if function has locals or complex expressions that
+            # will clobber A between uses of param 0. Simple heuristic: save
+            # if function body declares any local variables.
+            has_locals = any(s[0] == 'local' for s in body[1]) if body[0] == 'block' else False
+            save_a_to_d = (len(params) >= 1
+                           and params[0] in self.read_vars
+                           and self.reg_d_var is None
+                           and (has_locals or len(params) > 2
+                                or self._has_calls(body)))
+            for i, pname in enumerate(params):
+                if i == 0:
+                    if save_a_to_d:
+                        self.locals[pname] = ('reg', 'd')  # will be saved at entry
+                    else:
+                        self.locals[pname] = ('regparam', 'a')
+                elif i == 1:
+                    self.locals[pname] = ('regparam', 'b')
+                else:
+                    self.locals[pname] = ('param', i - 2)
+        else:
+            for i, pname in enumerate(params):
+                self.locals[pname] = ('param', i)
+
+        # Constant propagation: track variables with known constant values
+        self.const_vars = {}
+
+        self.emit(f'_{name}:')
+
+        # Save regparam A to D if needed
+        if self.regcall and len(params) >= 1:
+            loc = self.locals[params[0]]
+            if loc == ('reg', 'd'):
+                self.emit('\tmov $a,$d')  # save param 0 before A gets clobbered
+
+        self.compile_stmt(body)
+
+        for _ in range(self.local_count):
+            self.emit('\tpop $d')
+        self.emit('\tret')
+
+    def _sp_offset(self, name):
+        kind, idx = self.locals[name]
+        if kind == 'param':
+            return self.local_count + 2 + idx
+        else:
+            return self.local_count - idx
+
+    def _sp_offset_raw(self, name, byte_idx=0):
+        """Get ldsp/stsp offset for a variable. byte_idx=0 for low, 1 for high (u16)."""
+        kind, idx = self.locals[name][:2]
+        if kind == 'param':
+            return self.local_count + 2 + idx + byte_idx
+        elif kind == 'local16':
+            # local16 occupies 2 slots: idx = low byte, idx+1 = high byte
+            return self.local_count - idx - byte_idx
+        else:
+            return self.local_count - idx
+
+    def _is_dead(self, name):
+        """True if this variable is never read (only written)."""
+        return name not in self.read_vars
+
+    def compile_stmt(self, stmt):
+        if stmt is None:
+            return
+        kind = stmt[0]
+
+        if kind == 'block':
+            saved = self.local_count
+            stmts = stmt[1]
+            i = 0
+            while i < len(stmts):
+                s = stmts[i]
+                # Merge "type x; x = expr;" into "type x = expr;"
+                if (s[0] == 'local' and s[2] is None
+                        and i + 1 < len(stmts) and stmts[i+1][0] == 'expr_stmt'
+                        and stmts[i+1][1][0] == 'assign' and stmts[i+1][1][1] == '='
+                        and stmts[i+1][1][2] == ('var', s[1])):
+                    init_val = stmts[i+1][1][3]
+                    merge_typ = s[3] if len(s) > 3 else 'u8'
+                    self.compile_stmt(('local', s[1], init_val, merge_typ))
+                    i += 2
+                    continue
+                self.compile_stmt(s)
+                i += 1
+            while self.local_count > saved:
+                self.emit('\tpop $d')
+                self.local_count -= 1
+
+        elif kind == 'local':
+            name = stmt[1]
+            init = stmt[2]
+            typ = stmt[3] if len(stmt) > 3 else 'u8'
+
+            # Register allocation: put in C or D register (no stack slot)
+            # 16-bit vars can't be register-allocated (registers are 8-bit)
+            reg = None
+            if typ != 'u16':
+                if name == self.reg_c_var:
+                    reg = 'c'
+                elif name == self.reg_d_var:
+                    reg = 'd'
+            if reg:
+                # Use ldi $reg, N directly — 2 bytes, preserves A
+                c = self._const_eval(init) if init else 0
+                if c is not None:
+                    self.emit(f'\tldi ${reg},{c & 0xFF}')
+                    self.const_vars[name] = c & 0xFF
+                else:
+                    self.gen_expr(init)
+                    self.emit(f'\tmov $a,${reg}')
+                self.locals[name] = ('reg', reg)
+                return  # no stack slot, no local_count increment
+
+            # Dead variable: no stack slot needed if no other locals depend on offset
+            if self._is_dead(name):
+                if init and init[0] != 'num':
+                    self.gen_expr(init)  # compute for side effects (function calls)
+                    # Don't push — keep A for subsequent use (e.g., out())
+                else:
+                    pass  # no side effects, skip entirely
+                self.locals[name] = ('dead', 0)
+                return  # no stack slot
+
+            if typ == 'u16':
+                # 16-bit local: 2 stack slots (high byte pushed first, then low)
+                c = self._const_eval(init) if init else 0
+                if c is not None:
+                    self.emit(f'\tpush_imm {(c >> 8) & 0xFF}')  # high byte
+                    self.emit(f'\tpush_imm {c & 0xFF}')          # low byte
+                    self.const_vars[name] = c & 0xFFFF
+                else:
+                    # For non-constant 16-bit init, gen_expr returns low byte in A
+                    # TODO: 16-bit expression evaluation
+                    self.gen_expr(init)
+                    self.emit('\tpush $a')       # low byte
+                    self.emit('\tpush_imm 0')    # high byte = 0 for now
+                self.local_count += 2
+                self.locals[name] = ('local16', self.local_count - 2)
+            else:
+                c = self._const_eval(init) if init else 0
+                if c is not None:
+                    self.emit(f'\tpush_imm {c & 0xFF}')
+                    self.const_vars[name] = c & 0xFF
+                elif init:
+                    self.gen_expr(init)
+                    self.emit('\tpush $a')
+                else:
+                    self.emit('\tpush_imm 0')
+                    self.const_vars[name] = 0
+                self.local_count += 1
+                self.locals[name] = ('local', self.local_count - 1)
+
+        elif kind == 'local_arr':
+            name = stmt[1]; size = stmt[2]
+            init_vals = stmt[3] if len(stmt) > 3 else None
+            self.globals[name] = self.data_alloc
+            self.data_alloc += size
+            if init_vals:
+                for idx, val_expr in enumerate(init_vals):
+                    if idx >= size: break
+                    # Generate: arr[idx] = val
+                    self.gen_expr(val_expr)
+                    self.emit(f'\tldi $b,{self.globals[name] + idx}')
+                    self.emit('\tideref')
+
+        elif kind == 'expr_stmt':
+            # Track constant assignments for propagation
+            e = stmt[1]
+            if e[0] == 'assign' and e[1] == '=' and e[2][0] == 'var':
+                c = self._const_eval(e[3])
+                if c is not None:
+                    self.const_vars[e[2][1]] = c
+                else:
+                    self.const_vars.pop(e[2][1], None)
+            elif e[0] == 'assign' and e[1] in ('+=','-=','*=','&=','|=','^=') and e[2][0] == 'var':
+                self.const_vars.pop(e[2][1], None)  # compound assign invalidates
+            elif e[0] in ('postinc','postdec','preinc','predec') and e[1][0] == 'var':
+                self.const_vars.pop(e[1][1], None)
+            self.gen_expr(stmt[1], discard=True)
+
+        elif kind == 'return':
+            # Tail call optimization: return f(x) → pop locals, then j f
+            if (stmt[1] and stmt[1][0] == 'call'
+                    and stmt[1][1] not in ('out', 'halt')
+                    and self.local_count == 0):
+                # No locals to pop — can tail-call directly
+                call = stmt[1]
+                name = call[1]
+                args = call[2]
+                nparams = self.func_params.get(name, len(args))
+                if self._use_regcall(nparams) and len(args) == nparams and len(args) <= 2:
+                    # Tail call with register args: load args, then j (not jal)
+                    if len(args) >= 2:
+                        if args[1][0] == 'num':
+                            self.emit(f'\tldi $b,{args[1][1] & 0xFF}')
+                        else:
+                            self.gen_expr(args[1])
+                            self.emit('\tmov $a,$b')
+                    if len(args) >= 1:
+                        if args[0][0] == 'num':
+                            self.emit(f'\tldi $a,{args[0][1] & 0xFF}')
+                        else:
+                            self.gen_expr(args[0])
+                    self.emit(f'\tj _{name}')  # jump, not jal — reuse caller's return addr
+                    return
+            if stmt[1]:
+                self.gen_expr(stmt[1])
+            for _ in range(self.local_count):
+                self.emit('\tpop $d')
+            self.emit('\tret')
+
+        elif kind == 'if':
+            _, cond, then, els = stmt
+            # Invalidate const_vars after branches (conservative)
+            saved_consts = dict(self.const_vars)
+            if els:
+                else_l, end_l = self.label('else'), self.label('endif')
+                self.gen_branch_false(cond, else_l)
+                self.compile_stmt(then)
+                self.emit(f'\tj {end_l}')
+                self.emit(f'{else_l}:')
+                self.compile_stmt(els)
+                self.emit(f'{end_l}:')
+            else:
+                end_l = self.label('endif')
+                self.gen_branch_false(cond, end_l)
+                self.compile_stmt(then)
+                self.emit(f'{end_l}:')
+            self.const_vars = saved_consts  # invalidate changes from branches
+
+        elif kind == 'while':
+            _, cond, body = stmt
+            loop_l, end_l = self.label('while'), self.label('endwhile')
+            saved_break = getattr(self, '_break_label', None)
+            saved_cont = getattr(self, '_continue_label', None)
+            self._break_label = end_l
+            self._continue_label = loop_l
+            # Invalidate const_vars at loop header — variables change across iterations
+            saved_consts = dict(self.const_vars)
+            self.const_vars.clear()
+            self.emit(f'{loop_l}:')
+            self.gen_branch_false(cond, end_l)
+            self.compile_stmt(body)
+            self.emit(f'\tj {loop_l}')
+            self.emit(f'{end_l}:')
+            self._break_label = saved_break
+            self._continue_label = saved_cont
+
+        elif kind == 'for':
+            _, init, cond, update, body = stmt
+            loop_l, end_l = self.label('for'), self.label('endfor')
+            cont_l = self.label('for_cont')
+            saved_break = getattr(self, '_break_label', None)
+            saved_cont = getattr(self, '_continue_label', None)
+            self._break_label = end_l
+            self._continue_label = cont_l
+            if init:
+                self.compile_stmt(init)
+            # Invalidate all const_vars at loop header — variables modified in the
+            # body/update aren't constant across iterations. Without this, the
+            # condition gets folded using initial values and the branch is eliminated.
+            saved_consts = dict(self.const_vars)
+            self.const_vars.clear()
+            self.emit(f'{loop_l}:')
+            self.gen_branch_false(cond, end_l)
+            self.compile_stmt(body)
+            self.emit(f'{cont_l}:')
+            if update:
+                self.gen_expr(update, discard=True)
+            self.emit(f'\tj {loop_l}')
+            self.emit(f'{end_l}:')
+            self._break_label = saved_break
+            self._continue_label = saved_cont
+
+        elif kind == 'do_while':
+            _, body, cond = stmt
+            loop_l = self.label('dowhile')
+            end_l = self.label('dowhile_end')
+            saved_break = getattr(self, '_break_label', None)
+            saved_cont = getattr(self, '_continue_label', None)
+            self._break_label = end_l
+            self._continue_label = loop_l  # continue goes to condition check
+            # Invalidate const_vars — variables change across iterations
+            saved_consts = dict(self.const_vars)
+            self.const_vars.clear()
+            self.emit(f'{loop_l}:')
+            self.compile_stmt(body)
+            # Use gen_branch_true to jump BACK to loop (1 jump, not 2)
+            self.gen_branch_true(cond, loop_l)
+            self.emit(f'{end_l}:')
+            self._break_label = saved_break
+            self._continue_label = saved_cont
+
+        elif kind == 'break':
+            if hasattr(self, '_break_label') and self._break_label:
+                self.emit(f'\tj {self._break_label}')
+
+        elif kind == 'continue':
+            if hasattr(self, '_continue_label') and self._continue_label:
+                self.emit(f'\tj {self._continue_label}')
+
+        elif kind == 'switch':
+            _, expr, cases, default = stmt
+            self.gen_expr(expr)
+            end_l = self.label('endswitch')
+            saved_break = getattr(self, '_break_label', None)
+            self._break_label = end_l
+            for val, body in cases:
+                skip_l = self.label('case_skip')
+                self.emit(f'\tcmp {val}')
+                self.emit(f'\tjnz {skip_l}')
+                self.compile_stmt(body)
+                self.emit(f'\tj {end_l}')
+                self.emit(f'{skip_l}:')
+            if default:
+                self.compile_stmt(default)
+            self.emit(f'{end_l}:')
+            self._break_label = saved_break
+
+    def _const_eval(self, expr):
+        """Try to evaluate expr as a compile-time constant. Returns int or None.
+        Values are NOT masked — callers mask to 0xFF or 0xFFFF as appropriate."""
+        if expr[0] == 'num':
+            return expr[1]
+        if expr[0] == 'var' and hasattr(self, 'const_vars') and expr[1] in self.const_vars:
+            return self.const_vars[expr[1]]
+        if expr[0] == 'binop':
+            l = self._const_eval(expr[2])
+            r = self._const_eval(expr[3])
+            if l is not None and r is not None:
+                op = expr[1]
+                if op == '+': return (l + r) & 0xFFFF
+                if op == '-': return (l - r) & 0xFFFF
+                if op == '*': return (l * r) & 0xFFFF
+                if op == '/' and r != 0: return (l // r) & 0xFFFF
+                if op == '%' and r != 0: return (l % r) & 0xFFFF
+                if op == '&': return l & r
+                if op == '|': return l | r
+                if op == '^': return l ^ r
+                if op == '<<': return (l << r) & 0xFFFF
+                if op == '>>': return (l >> r) & 0xFFFF
+                if op == '==': return 1 if l == r else 0
+                if op == '!=': return 1 if l != r else 0
+                if op == '<': return 1 if (l & 0xFFFF) < (r & 0xFFFF) else 0
+                if op == '>': return 1 if (l & 0xFFFF) > (r & 0xFFFF) else 0
+                if op == '<=': return 1 if (l & 0xFFFF) <= (r & 0xFFFF) else 0
+                if op == '>=': return 1 if (l & 0xFFFF) >= (r & 0xFFFF) else 0
+        if expr[0] == 'log_and':
+            l = self._const_eval(expr[1])
+            r = self._const_eval(expr[2])
+            if l is not None and r is not None:
+                return 1 if (l and r) else 0
+        if expr[0] == 'log_or':
+            l = self._const_eval(expr[1])
+            r = self._const_eval(expr[2])
+            if l is not None and r is not None:
+                return 1 if (l or r) else 0
+        if expr[0] == 'ternary':
+            c = self._const_eval(expr[1])
+            if c is not None:
+                return self._const_eval(expr[2]) if c else self._const_eval(expr[3])
+        if expr[0] == 'unop':
+            v = self._const_eval(expr[2])
+            if v is not None:
+                if expr[1] == '-': return (-v) & 0xFFFF
+                if expr[1] == '~': return (~v) & 0xFFFF
+                if expr[1] == '!': return 1 if v == 0 else 0
+        if expr[0] == 'call':
+            # Inline-evaluate pure functions with constant args
+            name = expr[1]
+            args = expr[2]
+            if all(self._const_eval(a) is not None for a in args):
+                result = self._try_inline_eval(name, [self._const_eval(a) for a in args])
+                if result is not None:
+                    return result & 0xFFFF
+        return None
+
+    def _has_runtime_deps(self, node):
+        """Check if AST node depends on runtime state (arrays, globals, I/O)."""
+        if not isinstance(node, tuple) or len(node) == 0:
+            return False
+        if node[0] == 'index':
+            return True
+        if node[0] == 'switch':
+            return True  # interpreter can't handle switch yet
+        if node[0] == 'do_while':
+            # Check if body/cond have deps
+            if self._has_runtime_deps(node[1]) or self._has_runtime_deps(node[2]):
+                return True
+        if node[0] == 'call' and node[1] in ('out', 'halt', 'exw', 'exr'):
+            return True
+        if node[0] == 'var' and (node[1] in self.globals or node[1] in self.page3_globals):
+            return True
+        for child in node[1:]:
+            if isinstance(child, tuple) and self._has_runtime_deps(child):
+                return True
+            if isinstance(child, list):
+                for item in child:
+                    if isinstance(item, tuple) and self._has_runtime_deps(item):
+                        return True
+        return False
+
+    _CANT_EVAL = object()  # sentinel: interpreter can't evaluate this
+
+    def _try_inline_eval(self, name, const_args):
+        """Try to evaluate a function call with constant args at compile time."""
+        if name not in self.func_bodies:
+            return None
+        params, body = self.func_bodies[name]
+        if len(params) != len(const_args):
+            return None
+        if self._has_runtime_deps(body):
+            return None  # depends on runtime state, can't fold
+        env = {params[i]: const_args[i] for i in range(len(params))}
+        result = self._interpret(body, env)
+        if result is self._CANT_EVAL:
+            return None
+        return result
+
+    def _interpret(self, stmt, env):
+        """Interpret an AST node with constant environment. Returns value or None."""
+        if stmt is None:
+            return self._CANT_EVAL
+        kind = stmt[0]
+        if kind == 'block':
+            for s in stmt[1]:
+                r = self._interpret(s, env)
+                if r is self._CANT_EVAL:
+                    return self._CANT_EVAL  # propagate failure
+                if r is not None:
+                    return r
+            return None
+        if kind == 'return':
+            if stmt[1]:
+                return self._eval_const_expr(stmt[1], env)
+            return 0
+        if kind == 'if':
+            _, cond, then, els = stmt
+            c = self._eval_const_expr(cond, env)
+            if c is None:
+                return self._CANT_EVAL
+            if c:
+                return self._interpret(then, env)
+            elif els:
+                return self._interpret(els, env)
+            return None
+        if kind == 'local':
+            name = stmt[1]
+            init = stmt[2] if len(stmt) > 2 else None
+            if init:
+                v = self._eval_const_expr(init, env)
+                if v is None:
+                    return self._CANT_EVAL
+                env[name] = v
+            else:
+                env[name] = 0
+            return None
+        if kind == 'expr_stmt':
+            e = stmt[1]
+            if e[0] == 'assign' and e[2][0] == 'var':
+                name = e[2][1]
+                op = e[1]
+                if op == '=':
+                    v = self._eval_const_expr(e[3], env)
+                    if v is None:
+                        return self._CANT_EVAL
+                    env[name] = v & 0xFFFF
+                    return None
+                elif op in ('+=', '-=', '*=', '&=', '|=', '^='):
+                    cur = env.get(name)
+                    rhs = self._eval_const_expr(e[3], env)
+                    if cur is None or rhs is None:
+                        return self._CANT_EVAL
+                    base_op = op[0]
+                    ops = {'+': lambda a,b: a+b, '-': lambda a,b: a-b,
+                           '*': lambda a,b: a*b, '&': lambda a,b: a&b,
+                           '|': lambda a,b: a|b, '^': lambda a,b: a^b}
+                    env[name] = ops[base_op](cur, rhs) & 0xFFFF
+                    return None
+            if e[0] in ('postinc', 'preinc') and e[1][0] == 'var':
+                name = e[1][1]
+                if name in env:
+                    env[name] = (env[name] + 1) & 0xFFFF
+                    return None
+            if e[0] in ('postdec', 'predec') and e[1][0] == 'var':
+                name = e[1][1]
+                if name in env:
+                    env[name] = (env[name] - 1) & 0xFFFF
+                    return None
+            return None
+        if kind == 'break':
+            return ('__break__',)  # sentinel
+        if kind == 'continue':
+            return ('__continue__',)  # sentinel
+        if kind == 'while':
+            _, cond, body = stmt
+            for _ in range(1000):
+                c = self._eval_const_expr(cond, env)
+                if c is None:
+                    return self._CANT_EVAL
+                if not c:
+                    return None
+                r = self._interpret(body, env)
+                if r is not None:
+                    if isinstance(r, tuple) and r[0] == '__break__':
+                        return None  # break exits loop
+                    if isinstance(r, tuple) and r[0] == '__continue__':
+                        continue
+                    return r  # real return value
+            return None
+        if kind == 'do_while':
+            _, body, cond = stmt
+            for _ in range(1000):
+                r = self._interpret(body, env)
+                if r is not None:
+                    if isinstance(r, tuple) and r[0] == '__break__':
+                        return None
+                    if isinstance(r, tuple) and r[0] == '__continue__':
+                        pass  # continue to condition check
+                    else:
+                        return r
+                c = self._eval_const_expr(cond, env)
+                if c is None:
+                    return self._CANT_EVAL
+                if not c:
+                    return None
+            return None
+        if kind == 'for':
+            _, init, cond, update, body = stmt
+            if init:
+                r = self._interpret(init, env)
+                if r is not None:
+                    return r
+            for _ in range(1000):  # safety limit
+                c = self._eval_const_expr(cond, env)
+                if c is None:
+                    return self._CANT_EVAL
+                if not c:
+                    return None
+                r = self._interpret(body, env)
+                if r is not None:
+                    if isinstance(r, tuple) and r[0] == '__break__':
+                        return None  # break exits loop
+                    if isinstance(r, tuple) and r[0] == '__continue__':
+                        pass  # continue skips to update
+                    else:
+                        return r  # real return value
+                if update:
+                    # Handle all update expressions: assign, compound, pre/post inc/dec
+                    if update[0] == 'assign' and update[2][0] == 'var':
+                        op = update[1]
+                        name = update[2][1]
+                        rhs = self._eval_const_expr(update[3], env)
+                        if rhs is None:
+                            return self._CANT_EVAL
+                        if op == '=':
+                            env[name] = rhs & 0xFFFF
+                        elif op in ('+=','-=','*=','&=','|=','^='):
+                            cur = env.get(name, 0)
+                            ops = {'+':lambda a,b:a+b, '-':lambda a,b:a-b,
+                                   '*':lambda a,b:a*b, '&':lambda a,b:a&b,
+                                   '|':lambda a,b:a|b, '^':lambda a,b:a^b}
+                            env[name] = ops[op[0]](cur, rhs) & 0xFFFF
+                    else:
+                        v = self._eval_const_expr(update, env)
+                        if v is None:
+                            return self._CANT_EVAL
+            return None
+        return None
+
+    def _eval_const_expr(self, expr, env):
+        """Evaluate expression with variable environment. 16-bit intermediate values."""
+        if expr[0] == 'num':
+            return expr[1]
+        if expr[0] == 'var':
+            return env.get(expr[1])
+        if expr[0] == 'binop':
+            l = self._eval_const_expr(expr[2], env)
+            r = self._eval_const_expr(expr[3], env)
+            if l is None or r is None:
+                return self._CANT_EVAL
+            op = expr[1]
+            if op == '+': return (l + r) & 0xFFFF
+            if op == '-': return (l - r) & 0xFFFF
+            if op == '*': return (l * r) & 0xFFFF
+            if op == '/' and r != 0: return (l // r) & 0xFFFF
+            if op == '%' and r != 0: return (l % r) & 0xFFFF
+            if op == '&': return l & r
+            if op == '|': return l | r
+            if op == '^': return l ^ r
+            if op == '<<': return (l << r) & 0xFFFF
+            if op == '>>': return (l >> r) & 0xFFFF
+            if op == '==': return 1 if l == r else 0
+            if op == '!=': return 1 if l != r else 0
+            if op == '<': return 1 if (l & 0xFFFF) < (r & 0xFFFF) else 0
+            if op == '>': return 1 if (l & 0xFFFF) > (r & 0xFFFF) else 0
+            if op == '<=': return 1 if (l & 0xFFFF) <= (r & 0xFFFF) else 0
+            if op == '>=': return 1 if (l & 0xFFFF) >= (r & 0xFFFF) else 0
+        if expr[0] == 'unop':
+            v = self._eval_const_expr(expr[2], env)
+            if v is None:
+                return self._CANT_EVAL
+            if expr[1] == '-': return (-v) & 0xFFFF
+            if expr[1] == '~': return (~v) & 0xFFFF
+            if expr[1] == '!': return 1 if v == 0 else 0
+        if expr[0] == 'log_and':
+            l = self._eval_const_expr(expr[1], env)
+            if l is not None and not l:
+                return 0  # short-circuit
+            r = self._eval_const_expr(expr[2], env)
+            if l is not None and r is not None:
+                return 1 if (l and r) else 0
+            return None
+        if expr[0] == 'log_or':
+            l = self._eval_const_expr(expr[1], env)
+            if l is not None and l:
+                return 1  # short-circuit
+            r = self._eval_const_expr(expr[2], env)
+            if l is not None and r is not None:
+                return 1 if (l or r) else 0
+            return None
+        if expr[0] == 'ternary':
+            c = self._eval_const_expr(expr[1], env)
+            if c is not None:
+                return self._eval_const_expr(expr[2] if c else expr[3], env)
+            return None
+        if expr[0] == 'postinc' and expr[1][0] == 'var' and expr[1][1] in env:
+            old = env[expr[1][1]]
+            env[expr[1][1]] = (old + 1) & 0xFFFF
+            return old
+        if expr[0] == 'postdec' and expr[1][0] == 'var' and expr[1][1] in env:
+            old = env[expr[1][1]]
+            env[expr[1][1]] = (old - 1) & 0xFFFF
+            return old
+        if expr[0] == 'preinc' and expr[1][0] == 'var' and expr[1][1] in env:
+            env[expr[1][1]] = (env[expr[1][1]] + 1) & 0xFFFF
+            return env[expr[1][1]]
+        if expr[0] == 'predec' and expr[1][0] == 'var' and expr[1][1] in env:
+            env[expr[1][1]] = (env[expr[1][1]] - 1) & 0xFFFF
+            return env[expr[1][1]]
+        if expr[0] == 'call':
+            # Recursive compile-time evaluation
+            name = expr[1]
+            args = expr[2]
+            const_args = [self._eval_const_expr(a, env) for a in args]
+            if all(v is not None for v in const_args):
+                result = self._try_inline_eval(name, const_args)
+                if result is not None:
+                    return result & 0xFFFF
+        return None
+
+    def _expr_type(self, expr):
+        """Infer expression type: 'u8' or 'u16'."""
+        if expr[0] == 'num':
+            return 'u16' if expr[1] > 255 else 'u8'
+        if expr[0] == 'var':
+            name = expr[1]
+            if name in self.locals and self.locals[name][0] == 'local16':
+                return 'u16'
+            if hasattr(self, 'const_vars') and name in self.const_vars:
+                return 'u16' if self.const_vars[name] > 255 else 'u8'
+            return 'u8'
+        if expr[0] == 'binop':
+            lt = self._expr_type(expr[2])
+            rt = self._expr_type(expr[3])
+            op = expr[1]
+            # Shift right by constant >= 8 produces u8
+            if op == '>>' and expr[3][0] == 'num' and expr[3][1] >= 8:
+                return 'u8'
+            return 'u16' if (lt == 'u16' or rt == 'u16') else 'u8'
+        if expr[0] == 'call':
+            # Check return type of function
+            name = expr[1]
+            if name in self.func_bodies:
+                params, body = self.func_bodies[name]
+                # Simple: check if function was declared with u16 return
+                # For now, infer from function name convention or default u8
+            return 'u8'
+        return 'u8'
+
+    def _gen_expr16(self, expr):
+        """Generate 16-bit expression. Result: A=low byte, B=high byte."""
+        kind = expr[0]
+
+        # Constant folding
+        const = self._const_eval(expr)
+        if const is not None:
+            val = const & 0xFFFF
+            self.emit(f'\tldi $a,{val & 0xFF}')
+            self.emit(f'\tldi $b,{(val >> 8) & 0xFF}')
+            return
+
+        if kind == 'num':
+            val = expr[1] & 0xFFFF
+            self.emit(f'\tldi $a,{val & 0xFF}')
+            self.emit(f'\tldi $b,{(val >> 8) & 0xFF}')
+
+        elif kind == 'var':
+            name = expr[1]
+            if name in self.locals and self.locals[name][0] == 'local16':
+                off_lo = self._sp_offset_raw(name, 0)
+                off_hi = self._sp_offset_raw(name, 1)
+                self.emit(f'\tldsp_b {off_hi}')  # B = hi (clobbers A)
+                self.emit(f'\tldsp {off_lo}')     # A = lo
+
+        elif kind == 'binop':
+            op = expr[1]
+            left, right = expr[2], expr[3]
+
+            if op in ('+', '-'):
+                # Evaluate right, push both bytes
+                self._gen_expr16(right)
+                self.emit('\tpush $b')      # right_hi
+                self.emit('\tpush $a')      # right_lo
+                self.local_count += 2
+
+                # Evaluate left
+                self._gen_expr16(left)      # A=left_lo, B=left_hi
+
+                # Add/sub low bytes
+                self.emit('\tmov $b,$d')    # D = left_hi (save, preserves CF)
+                self.emit('\tpop $b')       # B = right_lo
+                self.local_count -= 1
+                if op == '+':
+                    self.emit('\tadd $b,$a')   # A = left_lo + right_lo, CF set
+                else:
+                    self.emit('\tsub $b,$a')   # A = left_lo - right_lo, CF set
+
+                self.emit('\tmov $a,$c')    # C = result_lo (preserves CF)
+
+                # Add/sub high bytes with carry
+                self.emit('\tpop $a')       # A = right_hi (preserves CF!)
+                self.local_count -= 1
+                self.emit('\tmov $d,$b')    # B = left_hi (preserves CF!)
+                # For add: adc does A = A + B + CF. But we want left_hi + right_hi + CF.
+                # A = right_hi, B = left_hi. adc → A = right_hi + left_hi + CF. ✓
+                # For sub: sbc does A = A - B - !CF.
+                # A = right_hi... wait, we want left_hi - right_hi - borrow.
+                # Need A = left_hi, B = right_hi for sbc.
+                if op == '+':
+                    self.emit('\tadc')      # A = right_hi + left_hi + CF
+                else:
+                    # For subtraction: swap so A=left_hi, B=right_hi
+                    self.emit('\tswap')     # A = left_hi, B = right_hi
+                    self.emit('\tsbc')      # A = left_hi - right_hi - !CF
+
+                self.emit('\tmov $a,$b')    # B = result_hi
+                self.emit('\tmov $c,$a')    # A = result_lo
+
+            elif op == '>>' and right[0] == 'num':
+                # Shift right by constant — common for byte extraction
+                shift = right[1]
+                self._gen_expr16(left)
+                if shift >= 8:
+                    # High byte becomes low, shift remaining
+                    self.emit('\tmov $b,$a')  # A = hi byte
+                    for _ in range(shift - 8):
+                        self.emit('\tslr')
+                    self.emit('\tldi $b,0')   # B = 0
+                else:
+                    for _ in range(shift):
+                        # Shift B:A right by 1: B>>1 carry into A
+                        # This is complex without a rotate-through-carry
+                        # Simplify: for small shifts, use paired shift
+                        self.emit('\tslr')    # A >>= 1 (simplified, loses cross-byte carry)
+                    # TODO: proper 16-bit shift with carry between bytes
+
+            elif op == '<<' and right[0] == 'num':
+                shift = right[1]
+                self._gen_expr16(left)
+                if shift >= 8:
+                    # Low byte becomes high, clear low
+                    self.emit('\tmov $a,$b')    # B = old low byte
+                    for _ in range(shift - 8):
+                        self.emit('\tsll')      # shift B left... actually B isn't in A
+                    # Need to shift B. Move to A, shift, move back
+                    if shift > 8:
+                        self.emit('\tmov $b,$a')
+                        for _ in range(shift - 8):
+                            self.emit('\tsll')
+                        self.emit('\tmov $a,$b')
+                    self.emit('\tclr $a')       # A = 0 (low byte is 0)
+                else:
+                    for _ in range(shift):
+                        # 16-bit left shift: shift A left, carry into B
+                        self.emit('\tsll')       # A <<= 1, CF = old MSB
+                        # TODO: proper carry into B
+                    # Simplified: for small shifts just shift A
+                    # B handling deferred
+
+            elif op == '&' and right[0] == 'num' and right[1] == 0xFF:
+                self._gen_expr16(left)
+                self.emit('\tldi $b,0')
+
+            else:
+                # Can't handle this 16-bit op — evaluate 8-bit and zero-extend
+                # Use the 8-bit gen_expr path WITHOUT the 16-bit dispatch
+                self._gen_expr_8bit(expr)
+                self.emit('\tldi $b,0')
+
+    def _gen_expr_8bit(self, expr):
+        """Force 8-bit evaluation, bypassing 16-bit dispatch."""
+        # Save and temporarily clear the 16-bit override
+        saved = self._expr_type
+        self._expr_type = lambda e: 'u8'
+        self.gen_expr(expr)
+        self._expr_type = saved
+
+    def gen_expr(self, expr, discard=False):
+        """Generate code to evaluate expr, result in A."""
+        kind = expr[0]
+
+        # Check if this is a 16-bit expression that should use _gen_expr16
+        if self._expr_type(expr) == 'u16':
+            const = self._const_eval(expr)
+            if const is not None:
+                # 16-bit constant — emit as 8-bit (low byte) for 8-bit context
+                self.emit(f'\tldi $a,{const & 0xFF}')
+                return
+            # For 16-bit in 8-bit context, evaluate full 16-bit (A=lo, B=hi)
+            self._gen_expr16(expr)
+            return
+
+        # Constant folding: evaluate at compile time if possible
+        const = self._const_eval(expr)
+        if const is not None and kind != 'num':  # avoid double-emit for literals
+            if const == 0:
+                self.emit('\tclr $a')
+            else:
+                self.emit(f'\tldi $a,{const & 0xFF}')
+            return
+
+        if kind == 'num':
+            if expr[1] == 0:
+                self.emit('\tclr $a')
+            else:
+                self.emit(f'\tldi $a,{expr[1] & 0xFF}')
+
+        elif kind == 'var':
+            name = expr[1]
+            if name in self.locals:
+                loc = self.locals[name]
+                if loc[0] == 'reg':
+                    self.emit(f'\tmov ${loc[1]},$a')
+                elif loc[0] == 'regparam':
+                    if loc[1] != 'a':
+                        self.emit(f'\tmov ${loc[1]},$a')
+                    # If param is in A, no instruction needed
+                elif loc[0] == 'dead':
+                    self.emit('\tclr $a')
+                else:
+                    self.emit(f'\tldsp {self._sp_offset(name)}')
+            elif name in self.globals:
+                self.emit(f'\tld $a,_{name}')
+            elif name in self.page3_globals:
+                self.emit(f'\tldp3 _{name}')
+            elif name in self.locals and self.locals[name][0] == 'local16':
+                # 16-bit local: load low byte into A, high byte into B
+                idx = self.locals[name][1]
+                off_lo = self.local_count - idx
+                off_hi = self.local_count - idx - 1
+                self.emit(f'\tldsp {off_lo}')    # A = low byte
+                self.emit(f'\tldsp_b {off_hi}')  # B = high byte (clobbers A!)
+                # Reload A after ldsp_b clobber
+                self.emit(f'\tldsp {off_lo}')    # A = low byte again
+            else:
+                raise SyntaxError(f'Undefined: {name}')
+
+        elif kind == 'assign':
+            op, left, right = expr[1], expr[2], expr[3]
+            if left[0] == 'index':
+                arr_name = left[1][1] if left[1][0] == 'var' else None
+                is_page3 = arr_name and arr_name in self.page3_globals
+                self.gen_expr(right)
+                self.emit('\tpush $a')
+                self.local_count += 1
+                self.gen_expr(left[2])
+                if is_page3:
+                    base = self.page3_globals.get(arr_name, 0)
+                else:
+                    base = self.globals.get(arr_name, 0)
+                if base:
+                    self.emit(f'\taddi {base},$a')
+                self.emit('\tmov $a,$b')
+                self.emit('\tpop $a')
+                self.local_count -= 1
+                self.emit('\tiderefp3' if is_page3 else '\tideref')
+                return
+
+            if op != '=':
+                self.gen_expr(left)
+                self.emit('\tmov $a,$b')
+                self.gen_expr(right)
+                self.emit('\tswap')
+                self._emit_binop(op[0])
+            else:
+                self.gen_expr(right)
+
+            # Dead or register variable: _store handles both
+            if left[0] == 'var' and left[1] in self.locals:
+                loc = self.locals[left[1]]
+                if loc[0] == 'dead':
+                    return  # skip store entirely
+            self._store(left)
+
+        elif kind == 'binop':
+            op = expr[1]
+            left, right = expr[2], expr[3]
+
+            if op in ('==', '!=', '<', '>', '<=', '>='):
+                self._gen_compare_value(op, left, right)
+                return
+
+            # Constant right operand optimizations
+            if right[0] == 'num':
+                val = right[1] & 0xFF
+                self.gen_expr(left)
+                if op == '+':
+                    if val == 1:
+                        self.emit('\tinc')
+                    else:
+                        self.emit(f'\taddi {val},$a')
+                elif op == '-':
+                    if val == 1:
+                        self.emit('\tdec')
+                    else:
+                        self.emit(f'\tsubi {val},$a')
+                elif op == '&':
+                    self.emit(f'\tandi {val},$a')
+                elif op == '|':
+                    self.emit(f'\tori {val},$a')
+                elif op == '*':
+                    # Strength reduction: constant multiply → shifts + adds
+                    if val == 0:
+                        self.emit('\tclr $a')
+                    elif val == 1:
+                        pass  # identity
+                    elif val == 2:
+                        self.emit('\tsll')
+                    elif val == 4:
+                        self.emit('\tsll')
+                        self.emit('\tsll')
+                    elif val == 8:
+                        self.emit('\tsll')
+                        self.emit('\tsll')
+                        self.emit('\tsll')
+                    elif val == 3:
+                        self.emit('\tmov $a,$b')
+                        self.emit('\tsll')
+                        self.emit('\tadd $b,$a')
+                    elif val == 5:
+                        self.emit('\tmov $a,$b')
+                        self.emit('\tsll')
+                        self.emit('\tsll')
+                        self.emit('\tadd $b,$a')
+                    elif val == 6:
+                        self.emit('\tsll')  # *2
+                        self.emit('\tmov $a,$b')
+                        self.emit('\tsll')  # *4
+                        self.emit('\tadd $b,$a')  # *2 + *4 = *6
+                    elif val == 10:
+                        self.emit('\tsll')  # *2
+                        self.emit('\tmov $a,$b')
+                        self.emit('\tsll')  # *4
+                        self.emit('\tsll')  # *8
+                        self.emit('\tadd $b,$a')  # *2 + *8 = *10
+                    else:
+                        pass  # fall through to general multiply
+                    if val in (0, 1, 2, 3, 4, 5, 6, 8, 10):
+                        return
+                elif op == '/':
+                    if val == 1: pass  # identity
+                    elif val == 2: self.emit('\tslr')
+                    elif val == 4: self.emit('\tslr'); self.emit('\tslr')
+                    elif val == 8: self.emit('\tslr'); self.emit('\tslr'); self.emit('\tslr')
+                    else: pass  # fall through to general divide
+                    if val in (1, 2, 4, 8): return
+                elif op == '%':
+                    if val == 2: self.emit('\tandi 1,$a')
+                    elif val == 4: self.emit('\tandi 3,$a')
+                    elif val == 8: self.emit('\tandi 7,$a')
+                    elif val == 16: self.emit('\tandi 15,$a')
+                    elif val == 128: self.emit('\tandi 127,$a')
+                    elif val == 256: pass  # x % 256 = x for u8
+                    else: pass  # fall through to general modulo
+                    if val in (2, 4, 8, 16, 128, 256): return
+                elif op == '<<':
+                    for _ in range(val):
+                        self.emit('\tsll')
+                elif op == '>>':
+                    for _ in range(val):
+                        self.emit('\tslr')
+                else:
+                    pass  # fall through to general case for ^, *
+                if op not in ('^', '*'):
+                    return
+
+            # General binary: eval right, push, eval left, pop into B, op
+            self.gen_expr(right)
+            self.emit('\tpush $a')
+            self.local_count += 1
+            self.gen_expr(left)
+            self.emit('\tpop $b')
+            self.local_count -= 1
+            self._emit_binop(op)
+
+        elif kind == 'unop':
+            self.gen_expr(expr[2])
+            if expr[1] == '~':
+                self.emit('\tnot')
+            elif expr[1] == '-':
+                self.emit('\tneg')
+            elif expr[1] == '!':
+                self.emit('\tcmp 0')
+                self.emit('\tsetz')
+
+        elif kind == 'call':
+            name, args = expr[1], expr[2]
+            if name == 'out':
+                if args:
+                    arg = args[0]
+                    # out_imm N: output any compile-time constant (2 bytes vs 3)
+                    const = self._const_eval(arg)
+                    if const is not None:
+                        self.emit(f'\tout_imm {const & 0xFF}')
+                        return
+                    # out $reg: output register variable directly (1 byte vs 2)
+                    if arg[0] == 'var' and arg[1] in self.locals:
+                        loc = self.locals[arg[1]]
+                        if loc[0] == 'reg' or loc[0] == 'regparam':
+                            reg = loc[1]
+                            if reg == 'a':
+                                self.emit('\tout')
+                            else:
+                                self.emit(f'\tout ${reg}')
+                            return
+                    self.gen_expr(arg)
+                self.emit('\tout')
+                return
+            if name == 'halt':
+                self.emit('\thlt')
+                return
+            if name == 'nop':
+                n = 1
+                if args:
+                    c = self._const_eval(args[0])
+                    if c is not None:
+                        n = c
+                for _ in range(n):
+                    self.emit('\tnop')
+                return
+
+            # External bus I/O builtins
+            # exw(value) — write value to D0-D7 via E0 (default)
+            # exw(value, mode) — write with E0/E1 + U0/U1 select
+            # exr() — read external input into A
+            if name == 'exw':
+                if args:
+                    self.const_vars.pop('__a_known', None)  # force reload
+                    self.gen_expr(args[0])
+                # Determine which exw variant
+                mode = 0
+                enable = 0
+                if len(args) >= 2:
+                    c = self._const_eval(args[1])
+                    if c is not None:
+                        mode = c & 3
+                if len(args) >= 3:
+                    c = self._const_eval(args[2])
+                    if c is not None:
+                        enable = c & 1
+                self.emit(f'\texw {enable} {mode}')
+                return
+            if name == 'exr':
+                channel = 0
+                if args:
+                    c = self._const_eval(args[0])
+                    if c is not None:
+                        channel = c & 1
+                self.emit(f'\texr {channel}')
+                return
+
+            # IRQ clear — exr clears IRQ when EXT_IN is HIGH
+            # clr_irq0() / clr_irq1() reads and discards to trigger the clear
+            if name == 'clr_irq0':
+                self.emit('\texr 0')  # E0 asserted, clears IRQ0 if EXT_IN HIGH
+                return
+            if name == 'clr_irq1':
+                self.emit('\texr 1')  # E1 asserted, clears IRQ1 if EXT_IN HIGH
+                return
+
+            # IRQ polling — returns 0 or 1 based on external IRQ line state
+            if name in ('irq0', 'irq1'):
+                set_l = self.label('irq_set')
+                done_l = self.label('irq_done')
+                instr = 'je0' if name == 'irq0' else 'je1'
+                self.emit(f'\t{instr} {set_l}')
+                self.emit('\tclr $a')
+                self.emit(f'\tj {done_l}')
+                self.emit(f'{set_l}:')
+                self.emit('\tldi $a,1')
+                self.emit(f'{done_l}:')
+                return
+
+            # 82C55 PPI port reads
+            if name == 'exr_port_a':
+                self.emit('\texr 1 0')
+                return
+            if name == 'exr_port_b':
+                self.emit('\texr 1 1')
+                return
+            if name == 'exr_port_c':
+                self.emit('\texr 1 2')
+                return
+
+            # W65C22S VIA reads (E0+E1: PHI2+R/W for read cycle)
+            if name == 'exrw':
+                mode = 0
+                if args:
+                    c = self._const_eval(args[0])
+                    if c is not None:
+                        mode = c & 3
+                self.emit(f'\texrw {mode}')
+                return
+            if name == 'via_read_portb':
+                self.emit('\texrw 0')
+                return
+            if name == 'via_read_porta':
+                self.emit('\texrw 1')
+                return
+
+            # ── VIA I2C builtins (emit known-good assembly patterns) ──
+
+            if name == 'lcd_init':
+                # Complete LCD init sequence as one jal call
+                if not hasattr(self, '_lcd_helpers'):
+                    self._lcd_helpers = set()
+                self._lcd_helpers.add('__lcd_init')
+                self.emit('\tjal __lcd_init')
+                return
+
+            if name == 'i2c_start':
+                if not hasattr(self, '_lcd_helpers'):
+                    self._lcd_helpers = set()
+                self._lcd_helpers.add('__i2c_st_only')
+                self.emit('\tjal __i2c_st_only')
+                return
+
+            if name == 'i2c_stop':
+                if not hasattr(self, '_lcd_helpers'):
+                    self._lcd_helpers = set()
+                self._lcd_helpers.add('__i2c_sp')
+                self.emit('\tjal __i2c_sp')
+                return
+
+            if name == 'i2c_send_byte':
+                # Call shared __i2c_sb subroutine (byte in A)
+                if args:
+                    c = self._const_eval(args[0])
+                    if c is not None:
+                        self.emit(f'\tldi $a,{c & 0xFF}')
+                    else:
+                        self.gen_expr(args[0])
+                # Ensure __i2c_sb is emitted
+                if not hasattr(self, '_lcd_helpers'):
+                    self._lcd_helpers = set()
+                self._lcd_helpers.add('__i2c_sb')
+                self.emit('\tjal __i2c_sb')
+                return
+
+            if name == 'lcd_cmd' or name == 'lcd_char':
+                # LCD command (RS=0) or character (RS=1) via I2C to PCF8574.
+                # Emits a jal to a generated helper function.
+                # The helper is emitted ONCE at the end of compilation.
+                is_char = (name == 'lcd_char')
+                flags = 0x09 if is_char else 0x00  # RS+BL or nothing
+                flags_en = (flags | 0x04) if is_char else 0x04  # +EN
+                if args:
+                    c = self._const_eval(args[0])
+                    if c is not None:
+                        self.emit(f'\tldi $d,{c & 0xFF}')
+                    else:
+                        self.gen_expr(args[0])
+                        self.emit('\tmov $a,$d')
+                helper = f'__lcd_{"chr" if is_char else "cmd"}'
+                if not hasattr(self, '_lcd_helpers'):
+                    self._lcd_helpers = set()
+                self._lcd_helpers.add(helper)
+                self.emit(f'\tjal {helper}')
+                return
+
+            # peek/poke for page 3 (convenience wrappers)
+            if name == 'peek3':
+                if args:
+                    self.gen_expr(args[0])
+                self.emit('\tderefp3')
+                return
+            if name == 'poke3':
+                if len(args) >= 2:
+                    self.gen_expr(args[0])       # value
+                    self.emit('\tpush $a')
+                    self.local_count += 1
+                    self.gen_expr(args[1])       # address
+                    self.emit('\tmov $a,$b')      # B = address
+                    self.emit('\tpop $a')
+                    self.local_count -= 1
+                    self.emit('\tiderefp3')       # page3[B] = A
+                return
+
+            nparams = self.func_params.get(name, len(args))
+            use_regcall = self._use_regcall(nparams) and len(args) == nparams
+
+            if use_regcall:
+                # Hybrid: push stack args (index 2+) right-to-left first
+                stack_args = args[2:]
+                for arg in reversed(stack_args):
+                    if arg[0] == 'num':
+                        self.emit(f'\tpush_imm {arg[1] & 0xFF}')
+                    else:
+                        self.gen_expr(arg)
+                        self.emit('\tpush $a')
+                    self.local_count += 1
+
+                # Then load B (arg 1), then A (arg 0) — B first to preserve A
+                if len(args) >= 2:
+                    if args[1][0] == 'num':
+                        self.emit(f'\tldi $b,{args[1][1] & 0xFF}')
+                    else:
+                        self.gen_expr(args[1])
+                        self.emit('\tmov $a,$b')
+                if len(args) >= 1:
+                    if args[0][0] == 'num':
+                        self.emit(f'\tldi $a,{args[0][1] & 0xFF}')
+                    else:
+                        self.gen_expr(args[0])
+
+                self.emit(f'\tjal _{name}')
+                # Pop only stack args
+                for _ in stack_args:
+                    self.emit('\tpop $d')
+                    self.local_count -= 1
+            else:
+                # Stack calling: push all args right-to-left
+                for arg in reversed(args):
+                    if arg[0] == 'num':
+                        self.emit(f'\tpush_imm {arg[1] & 0xFF}')
+                    else:
+                        self.gen_expr(arg)
+                        self.emit('\tpush $a')
+                    self.local_count += 1
+                self.emit(f'\tjal _{name}')
+                for _ in args:
+                    self.emit('\tpop $d')
+                    self.local_count -= 1
+
+        elif kind == 'index':
+            base_expr, idx_expr = expr[1], expr[2]
+            self.gen_expr(idx_expr)
+            if base_expr[0] == 'var' and base_expr[1] in self.page3_globals:
+                base = self.page3_globals[base_expr[1]]
+                if base:
+                    self.emit(f'\taddi {base},$a')
+                self.emit('\tderefp3')  # page 3 array read
+            else:
+                if base_expr[0] == 'var' and base_expr[1] in self.globals:
+                    base = self.globals[base_expr[1]]
+                    if base:
+                        self.emit(f'\taddi {base},$a')
+                self.emit('\tderef')  # page 1 array read
+
+        elif kind == 'postinc':
+            var = expr[1]
+            self.gen_expr(var)
+            self.emit('\tpush $a')
+            self.local_count += 1
+            self.emit('\tinc')
+            self._store(var)
+            self.emit('\tpop $a')
+            self.local_count -= 1
+
+        elif kind == 'postdec':
+            var = expr[1]
+            self.gen_expr(var)
+            self.emit('\tpush $a')
+            self.local_count += 1
+            self.emit('\tdec')
+            self._store(var)
+            self.emit('\tpop $a')
+            self.local_count -= 1
+
+        elif kind == 'preinc':
+            var = expr[1]
+            self.gen_expr(var)
+            self.emit('\tinc')
+            self._store(var)
+
+        elif kind == 'predec':
+            var = expr[1]
+            self.gen_expr(var)
+            self.emit('\tdec')
+            self._store(var)
+
+        elif kind == 'log_and':
+            # Short-circuit: if left is false, skip right
+            _, left, right = expr
+            false_l = self.label('and_f')
+            end_l = self.label('and_end')
+            self.gen_expr(left)
+            self.emit('\tcmp 0')
+            self.emit(f'\tjz {false_l}')
+            self.gen_expr(right)
+            self.emit('\tcmp 0')
+            self.emit(f'\tjz {false_l}')
+            self.emit('\tldi $a,1')
+            self.emit(f'\tj {end_l}')
+            self.emit(f'{false_l}:')
+            self.emit('\tclr $a')
+            self.emit(f'{end_l}:')
+
+        elif kind == 'log_or':
+            # Short-circuit: if left is true, skip right
+            _, left, right = expr
+            true_l = self.label('or_t')
+            end_l = self.label('or_end')
+            self.gen_expr(left)
+            self.emit('\tcmp 0')
+            self.emit(f'\tjnz {true_l}')
+            self.gen_expr(right)
+            self.emit('\tcmp 0')
+            self.emit(f'\tjnz {true_l}')
+            self.emit('\tclr $a')
+            self.emit(f'\tj {end_l}')
+            self.emit(f'{true_l}:')
+            self.emit('\tldi $a,1')
+            self.emit(f'{end_l}:')
+
+        elif kind == 'ternary':
+            _, cond, then, els = expr
+            else_l = self.label('tern_e')
+            end_l = self.label('tern_end')
+            self.gen_branch_false(cond, else_l)
+            self.gen_expr(then)
+            self.emit(f'\tj {end_l}')
+            self.emit(f'{else_l}:')
+            self.gen_expr(els)
+            self.emit(f'{end_l}:')
+
+    def _emit_binop(self, op):
+        if op == '+': self.emit('\tadd $b,$a')
+        elif op == '-': self.emit('\tsub $b,$a')
+        elif op == '&': self.emit('\tand $b,$a')
+        elif op == '|': self.emit('\tor $b,$a')
+        elif op == '^': self.emit('\txor')
+        elif op == '*': self._emit_multiply()
+        elif op == '/': self._emit_divide()
+        elif op == '%': self._emit_modulo()
+
+    def _emit_multiply(self):
+        loop, done = self.label('mul'), self.label('muldone')
+        self.emit('\tmov $b,$c')
+        self.emit('\tmov $a,$b')
+        self.emit('\tldi $a,0')
+        self.emit(f'{loop}:')
+        self.emit('\tpush $a')
+        self.emit('\tmov $c,$a')
+        self.emit('\tcmp 0')
+        self.emit('\tpop $a')
+        self.emit(f'\tjz {done}')
+        self.emit('\tadd $b,$a')
+        self.emit('\tpush $a')
+        self.emit('\tmov $c,$a')
+        self.emit('\tdec')
+        self.emit('\tmov $a,$c')
+        self.emit('\tpop $a')
+        self.emit(f'\tj {loop}')
+        self.emit(f'{done}:')
+
+    def _emit_divide(self):
+        """Software divide: A = A / B."""
+        loop, done = self.label('div'), self.label('divdone')
+        self.emit('\tmov $a,$c')    # C = dividend (working copy)
+        self.emit('\tclr $a')
+        self.emit('\tmov $a,$d')    # D = 0 (quotient)
+        self.emit(f'{loop}:')
+        self.emit('\tmov $c,$a')
+        self.emit('\tcmp $b')       # C < B? done
+        self.emit(f'\tjnc {done}')  # CF=0 means C < B
+        self.emit('\tsub $b,$a')    # A = C - B
+        self.emit('\tmov $a,$c')    # C = C - B
+        self.emit('\tmov $d,$a')
+        self.emit('\tinc')
+        self.emit('\tmov $a,$d')    # D++
+        self.emit(f'\tj {loop}')
+        self.emit(f'{done}:')
+        self.emit('\tmov $d,$a')    # A = quotient
+
+    def _emit_modulo(self):
+        """Software modulo: A = A % B."""
+        loop, done = self.label('mod'), self.label('moddone')
+        self.emit(f'{loop}:')
+        self.emit('\tcmp $b')       # A < B? done (A is the remainder)
+        self.emit(f'\tjnc {done}')  # CF=0 means A < B
+        self.emit('\tsub $b,$a')    # A = A - B
+        self.emit(f'\tj {loop}')
+        self.emit(f'{done}:')
+
+    def _store(self, target):
+        """Store A to variable. Register vars use mov; stack vars use stsp.
+        After stsp, D holds the original A value (microcode saves A→D first).
+        Recovery via mov $d,$a (1 byte) instead of ldsp N (2 bytes)."""
+        if target[0] == 'var':
+            name = target[1]
+            if name in self.locals:
+                loc = self.locals[name]
+                if loc[0] == 'reg':
+                    self.emit(f'\tmov $a,${loc[1]}')
+                    return  # no clobber, A preserved
+                elif loc[0] == 'regparam':
+                    if loc[1] != 'a':
+                        self.emit(f'\tmov $a,${loc[1]}')
+                    return  # A preserved (or is the target)
+                elif loc[0] == 'dead':
+                    return  # don't store to dead vars
+                off = self._sp_offset(name)
+                self.emit(f'\tstsp {off}')
+                self.emit('\tmov $d,$a')  # D = original A after stsp
+            elif name in self.globals:
+                self.emit(f'\tst $a,_{name}')
+            elif name in self.page3_globals:
+                self.emit(f'\tstp3 _{name}')
+            elif name in self.locals and self.locals[name][0] == 'local16':
+                # 16-bit store: A = low byte, B = high byte (from _gen_expr16)
+                # If the source expression was 8-bit, B might not be set — zero it
+                off_lo = self._sp_offset_raw(name, 0)
+                off_hi = self._sp_offset_raw(name, 1)
+                self.emit(f'\tstsp {off_lo}')   # store low byte (A clobbered, D=lo)
+                self.emit('\tmov $b,$a')         # A = high byte
+                self.emit(f'\tstsp {off_hi}')   # store high byte
+                self.emit('\tmov $d,$a')         # recover
+
+    # ── Comparisons (branch and value) ───────────────────────────────
+
+    def _normalize_cmp(self, op, left, right):
+        """Normalize comparison to use single-jump forms.
+
+        MK1 has jc (CF=1 → A>=B), jnc (CF=0 → A<B), jz (ZF=1), jnz (ZF=0).
+        ==, !=, >=, < all need one jump. > and <= need two.
+
+        Fix: swap operands to convert > into < and <= into >=.
+        For immediate >: use >= (val+1) when val < 255.
+        """
+        if op == '>':
+            if right[0] == 'num' and right[1] < 255:
+                # a > N  ↔  a >= (N+1)
+                return '>=', left, ('num', right[1] + 1)
+            else:
+                # a > b  ↔  b < a  (swap operands)
+                return '<', right, left
+        elif op == '<=':
+            if right[0] == 'num' and right[1] < 255:
+                # a <= N  ↔  a < (N+1)
+                return '<', left, ('num', right[1] + 1)
+            else:
+                # a <= b  ↔  b >= a  (swap operands)
+                return '>=', right, left
+        return op, left, right
+
+    def _b_has(self, expr):
+        """Check if B currently holds the value of expr."""
+        return self.b_expr is not None and self.b_expr == expr
+
+    def _emit_cmp_operands(self, left, right):
+        """Load operands and emit cmp. Left → A, right → B or imm."""
+        if right[0] == 'num':
+            self.gen_expr(left)
+            self.emit(f'\tcmp {right[1] & 0xFF}')
+        elif (right[0] == 'var' and right[1] in self.locals
+              and self.locals[right[1]] == ('regparam', 'b')):
+            # Right is regparam in B — don't move it, just load left
+            self.gen_expr(left)
+            self.emit('\tcmp $b')
+        elif self._b_has(right):
+            self.gen_expr(left)
+            self.emit('\tcmp $b')
+        elif (right[0] == 'var' and right[1] in self.locals
+              and self.locals[right[1]][0] in ('param', 'local')):
+            off = self._sp_offset(right[1])
+            self.emit(f'\tldsp_b {off}')
+            self.b_expr = right
+            self.gen_expr(left)
+            self.emit('\tcmp $b')
+        else:
+            self.gen_expr(right)
+            self.emit('\tmov $a,$b')
+            self.b_expr = right
+            self.gen_expr(left)
+            self.emit('\tcmp $b')
+
+    def gen_branch_false(self, cond, target):
+        """Branch to target if cond is false."""
+        # Constant condition: eliminate branch entirely
+        const = self._const_eval(cond)
+        if const is not None:
+            if not const:
+                self.emit(f'\tj {target}')  # always false → always skip
+            # else: always true → no branch needed, fall through
+            return
+
+        # Short-circuit &&: branch to target if EITHER is false
+        if cond[0] == 'log_and':
+            self.gen_branch_false(cond[1], target)
+            self.gen_branch_false(cond[2], target)
+            return
+
+        # Short-circuit ||: branch to target only if BOTH are false
+        if cond[0] == 'log_or':
+            true_l = self.label('or_ok')
+            self.gen_branch_true(cond[1], true_l)
+            self.gen_branch_false(cond[2], target)
+            self.emit(f'{true_l}:')
+            return
+
+        # IRQ check: if (irq0()) / if (irq1()) → je0/je1 directly (2 bytes)
+        if (cond[0] == 'call' and cond[1] in ('irq0', 'irq1')):
+            instr = 'je0' if cond[1] == 'irq0' else 'je1'
+            skip = self.label('irq_skip')
+            self.emit(f'\t{instr} {skip}')
+            self.emit(f'\tj {target}')
+            self.emit(f'{skip}:')
+            return
+
+        # Bit test: (x & CONST) → tst CONST + jz/jnz (preserves A)
+        if (cond[0] == 'binop' and cond[1] == '&'
+                and cond[3][0] == 'num'):
+            # (expr & N) used as boolean: true if any bits set, false if zero
+            self.gen_expr(cond[2])
+            self.emit(f'\ttst {cond[3][1] & 0xFF}')
+            self.emit(f'\tjz {target}')
+            return
+        if (cond[0] == 'binop' and cond[1] == '&'
+                and cond[2][0] == 'num'):
+            self.gen_expr(cond[3])
+            self.emit(f'\ttst {cond[2][1] & 0xFF}')
+            self.emit(f'\tjz {target}')
+            return
+
+        # Negation: flip branch direction
+        if cond[0] == 'unop' and cond[1] == '!':
+            self.gen_branch_true(cond[2], target)
+            return
+
+        if cond[0] == 'binop' and cond[1] in ('==', '!=', '<', '>', '<=', '>='):
+            op, left, right = cond[1], cond[2], cond[3]
+            if not self._b_has(right):
+                op, left, right = self._normalize_cmp(op, left, right)
+            self._emit_cmp_operands(left, right)
+
+            if op == '==':   self.emit(f'\tjnz {target}')
+            elif op == '!=': self.emit(f'\tjz {target}')
+            elif op == '>=': self.emit(f'\tjnc {target}')
+            elif op == '<':  self.emit(f'\tjc {target}')
+            elif op == '>':
+                self.emit(f'\tjz {target}')
+                self.emit(f'\tjnc {target}')
+            elif op == '<=':
+                skip = self.label('skip')
+                self.emit(f'\tjz {skip}')
+                self.emit(f'\tjnc {target}')
+                self.emit(f'{skip}:')
+        # Predecrement truthiness: dec already sets ZF, no cmp needed
+        elif cond[0] == 'predec' and cond[1][0] == 'var':
+            name = cond[1][1]
+            if name in self.locals:
+                loc = self.locals[name]
+                if loc[0] == 'reg':
+                    self.emit(f'\tmov ${loc[1]},$a')
+                    self.emit('\tdec')
+                    self.emit(f'\tmov $a,${loc[1]}')
+                    self.emit(f'\tjz {target}')
+                    return
+            # Fall through to general case for stack vars
+            self.gen_expr(cond)
+            self.emit('\tcmp 0')
+            self.emit(f'\tjz {target}')
+        else:
+            self.gen_expr(cond)
+            self.emit('\tcmp 0')
+            self.emit(f'\tjz {target}')
+
+    def gen_branch_true(self, cond, target):
+        """Branch to target if cond is true (inverse of gen_branch_false)."""
+        const = self._const_eval(cond)
+        if const is not None:
+            if const:
+                self.emit(f'\tj {target}')
+            return
+
+        # IRQ check: if (irq0()) → je0 target (2 bytes, optimal)
+        if cond[0] == 'call' and cond[1] in ('irq0', 'irq1'):
+            instr = 'je0' if cond[1] == 'irq0' else 'je1'
+            self.emit(f'\t{instr} {target}')
+            return
+
+        if cond[0] == 'log_and':
+            skip = self.label('and_skip')
+            self.gen_branch_false(cond[1], skip)
+            self.gen_branch_true(cond[2], target)
+            self.emit(f'{skip}:')
+            return
+
+        if cond[0] == 'log_or':
+            self.gen_branch_true(cond[1], target)
+            self.gen_branch_true(cond[2], target)
+            return
+
+        if cond[0] == 'unop' and cond[1] == '!':
+            self.gen_branch_false(cond[2], target)
+            return
+
+        # Invert comparison for true-branch
+        if cond[0] == 'binop' and cond[1] in ('==', '!=', '<', '>', '<=', '>='):
+            inv = {'==':'!=', '!=':'==', '<':'>=', '>':'<=', '<=':'>', '>=':'<'}
+            inv_cond = ('binop', inv[cond[1]], cond[2], cond[3])
+            self.gen_branch_false(inv_cond, target)
+            return
+
+        # Predecrement truthiness: dec sets ZF, branch directly with jnz
+        if cond[0] == 'predec' and cond[1][0] == 'var':
+            name = cond[1][1]
+            if name in self.locals:
+                loc = self.locals[name]
+                if loc[0] == 'reg':
+                    self.emit(f'\tmov ${loc[1]},$a')
+                    self.emit('\tdec')
+                    self.emit(f'\tmov $a,${loc[1]}')
+                    self.emit(f'\tjnz {target}')
+                    return
+
+        self.gen_expr(cond)
+        self.emit('\tcmp 0')
+        self.emit(f'\tjnz {target}')
+
+    def _gen_compare_value(self, op, left, right):
+        """Generate comparison that produces 0/1 in A."""
+        op2, left2, right2 = self._normalize_cmp(op, left, right)
+        self._emit_cmp_operands(left2, right2)
+        if op2 == '==':   self.emit('\tsetz')
+        elif op2 == '!=': self.emit('\tsetnz')
+        elif op2 == '>=': self.emit('\tsetc')
+        elif op2 == '<':  self.emit('\tsetnc')
+
+
+# ── Peephole optimizer ───────────────────────────────────────────────
+
+def peephole(lines):
+    """Multi-pass peephole optimizer with register tracking."""
+
+    def is_label(l): return l and not l.startswith('\t') and l.endswith(':')
+    def is_instr(l): return l and l.startswith('\t')
+    def mnemonic(l): return l.strip().split()[0] if is_instr(l) else None
+
+    TERMINATORS = {'ret', 'hlt', 'j'}
+    CLOBBERS_A = {'ldi', 'ldsp', 'ldsp_b', 'pop', 'push_imm', 'ld',
+                  'add', 'sub', 'or', 'and', 'xor', 'not', 'neg',
+                  'inc', 'dec', 'sll', 'slr', 'rll', 'rlr', 'swap',
+                  'setz', 'setnz', 'setc', 'setnc', 'deref', 'derefp3',
+                  'addi', 'subi', 'andi', 'ori', 'ldp3', 'stsp', 'clr',
+                  'adc', 'sbc', 'exr', 'exrw'}
+
+    # ── Pass 1: Dead code elimination ────────────────────────────────
+    changed = True
+    while changed:
+        changed = False
+        out = []
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            if is_instr(line) and mnemonic(line) in TERMINATORS:
+                out.append(line)
+                i += 1
+                while i < len(lines) and not is_label(lines[i]):
+                    changed = True
+                    i += 1
+                continue
+            out.append(line)
+            i += 1
+        lines = out
+
+    # ── Pass 2: Register-tracking optimization ───────────────────────
+    # Track what's known to be in A, B, C, D. Eliminate redundant loads/movs.
+
+    REG_NAMES = {'$a': 'a', '$b': 'b', '$c': 'c', '$d': 'd'}
+    regs = {'a': None, 'b': None, 'c': None, 'd': None}
+    _uid = [0]
+
+    def fresh_unknown():
+        """Unique unknown value — tracks register equality without knowing content."""
+        _uid[0] += 1
+        return ('unk', _uid[0])
+
+    def shift_sp(v, delta):
+        if v and v[0] == 'sp':
+            return ('sp', v[1] + delta)
+        return v
+
+    def shift_all(delta):
+        for r in regs:
+            regs[r] = shift_sp(regs[r], delta)
+
+    def invalidate_all():
+        for r in regs:
+            regs[r] = fresh_unknown()
+
+    def find_reg_with(val):
+        """Find any register (prefer B,C,D over A) that holds val."""
+        if val is None or (isinstance(val, tuple) and val[0] == 'unk'):
+            return None  # don't substitute unknown values
+        for r in ('b', 'c', 'd', 'a'):
+            if regs[r] == val:
+                return r
+        return None
+
+    out = []
+    for line in lines:
+        if is_label(line):
+            s = line.strip()
+            if not s.startswith('.'):
+                # Global label (function boundary): all unknown but distinct
+                invalidate_all()
+            else:
+                # Local label: A unknown, keep B/C/D
+                regs['a'] = fresh_unknown()
+            out.append(line)
+            continue
+        if not is_instr(line):
+            out.append(line)
+            continue
+
+        mn = mnemonic(line)
+        parts = line.strip().split()
+
+        # ldsp_b N: loads B from stack, clobbers A
+        if mn == 'ldsp_b' and len(parts) == 2:
+            try:
+                off = int(parts[1])
+            except ValueError:
+                off = None
+            out.append(line)
+            regs['b'] = ('sp', off) if off is not None else None
+            regs['a'] = fresh_unknown()  # ldsp_b clobbers A
+            continue
+
+        # ldsp N: skip if A already has it, or use mov $R,$a if another reg has it
+        if mn == 'ldsp' and len(parts) == 2:
+            try:
+                off = int(parts[1])
+            except ValueError:
+                off = None
+            target_val = ('sp', off) if off is not None else None
+            if target_val and regs['a'] == target_val:
+                continue  # A already has it
+            if target_val:
+                src = find_reg_with(target_val)
+                if src and src != 'a':
+                    out.append(f'\tmov ${src},$a')  # 1 byte vs 2
+                    regs['a'] = target_val
+                    continue
+            out.append(line)
+            regs['a'] = target_val
+            continue
+
+        # ldi $X,N: skip if register already holds N
+        if mn == 'ldi' and ',' in line:
+            parts_ldi = line.strip().split(',')
+            if len(parts_ldi) == 2:
+                reg_name = parts_ldi[0].split()[-1]  # e.g. "$c" from "ldi $c"
+                r = REG_NAMES.get(reg_name)
+                try:
+                    val = int(parts_ldi[1])
+                except ValueError:
+                    val = None
+                target_val = ('const', val) if val is not None else None
+                if r and target_val and regs[r] == target_val:
+                    continue  # register already has this value
+                out.append(line)
+                if r:
+                    regs[r] = target_val
+                continue
+
+        # clr $a: A = 0 (only clr $a is safe — ALU always uses A)
+        # clr $b/$c/$d actually compute X = A - X, NOT X = 0!
+        if line.strip() == 'clr $a':
+            if regs['a'] == ('const', 0):
+                continue
+            out.append(line)
+            regs['a'] = ('const', 0)
+            continue
+        if mn == 'clr':
+            # clr $b/$c/$d — result depends on A, treat as unknown
+            out.append(line)
+            r = REG_NAMES.get(parts[1] if len(parts) > 1 else '', None)
+            if r:
+                regs[r] = fresh_unknown()
+            continue
+
+        # mov $X,$Y: skip if Y already has X's value
+        if mn == 'mov' and len(parts) >= 2:
+            # Parse "mov $src,$dst" or "mov $src $dst"
+            tok = line.strip()[3:].replace(',', ' ').split()
+            if len(tok) == 2 and tok[0] in REG_NAMES and tok[1] in REG_NAMES:
+                src_r = REG_NAMES[tok[0]]
+                dst_r = REG_NAMES[tok[1]]
+                if regs[dst_r] == regs[src_r]:
+                    continue  # dst already has src's value
+                out.append(line)
+                regs[dst_r] = regs[src_r]
+                continue
+            # Fall through for non-register movs
+            out.append(line)
+            regs['a'] = fresh_unknown()  # conservative
+            continue
+
+        # cmp: does NOT modify any register
+        if mn == 'cmp':
+            out.append(line)
+            continue
+
+        # Conditional jumps: don't modify registers
+        if mn in ('jc', 'jnc', 'jz', 'jnz', 'je0', 'je1'):
+            out.append(line)
+            continue
+
+        # Instructions that don't modify any register
+        # tst: doesn't physically modify A, but we invalidate A tracking
+        # to prevent the optimizer from removing subsequent loads that
+        # depend on A's value in post-branch code
+        if mn == 'tst':
+            out.append(line)
+            regs['a'] = fresh_unknown()
+            continue
+
+        if mn in ('out', 'nop', 'hlt', 'ret', 'out_imm',
+                  'istc', 'ideref', 'iderefp3', 'exw', 'stp3'):
+            out.append(line)
+            continue
+
+        # push $X: SP shifts, pushed register unchanged
+        if mn == 'push' and len(parts) == 2 and parts[1] in REG_NAMES:
+            out.append(line)
+            shift_all(1)
+            continue
+
+        # push_imm N: A = N, SP shifts
+        if mn == 'push_imm' and len(parts) == 2:
+            out.append(line)
+            shift_all(1)
+            try:
+                regs['a'] = ('const', int(parts[1]))
+            except ValueError:
+                regs['a'] = fresh_unknown()
+            continue
+
+        # pop $X: SP shifts, target register gets unknown value
+        if mn == 'pop' and len(parts) == 2 and parts[1] in REG_NAMES:
+            out.append(line)
+            r = REG_NAMES[parts[1]]
+            shift_all(-1)
+            regs[r] = None
+            continue
+
+        # stsp: clobbers A, but D = original A (microcode saves A→D first)
+        if mn == 'stsp':
+            out.append(line)
+            regs['d'] = regs['a']  # D gets the value A had before stsp
+            regs['a'] = fresh_unknown()       # A is clobbered (holds offset)
+            continue
+
+        # jal/jal_r/ocall: function call, all bets off
+        if mn in ('jal', 'jal_r', 'ocall'):
+            out.append(line)
+            invalidate_all()
+            continue
+
+        # swap: exchange A and B
+        if mn == 'swap':
+            out.append(line)
+            regs['a'], regs['b'] = regs['b'], regs['a']
+            continue
+
+        # inc/dec: A modified, value unknown
+        if mn in ('inc', 'dec'):
+            out.append(line)
+            regs['a'] = fresh_unknown()
+            continue
+
+        # j (unconditional jump): don't modify regs
+        if mn == 'j':
+            out.append(line)
+            continue
+
+        # Everything else: conservatively assume A clobbered
+        out.append(line)
+        if mn in CLOBBERS_A:
+            regs['a'] = fresh_unknown()
+
+    lines = out
+
+    # ── Pass 3: Pattern-based peephole ───────────────────────────────
+    changed = True
+    while changed:
+        changed = False
+        out = []
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+
+            # stsp N / ldsp N → stsp N (when next instr clobbers A)
+            if is_instr(line) and mnemonic(line) == 'stsp':
+                parts_st = line.strip().split()
+                if (i + 1 < len(lines) and is_instr(lines[i+1])):
+                    parts_ld = lines[i+1].strip().split()
+                    if (len(parts_st) == 2 and len(parts_ld) == 2
+                            and parts_ld[0] == 'ldsp' and parts_st[1] == parts_ld[1]
+                            and i + 2 < len(lines)):
+                        # Check what follows the ldsp
+                        nxt = lines[i+2] if i + 2 < len(lines) else None
+                        if nxt and is_instr(nxt):
+                            nmn = mnemonic(nxt)
+                            if nmn in CLOBBERS_A:
+                                out.append(line)
+                                i += 2
+                                changed = True
+                                continue
+                        # Also safe if followed by label then clobber
+                        if nxt and is_label(nxt) and i + 3 < len(lines) and is_instr(lines[i+3]):
+                            nmn = mnemonic(lines[i+3])
+                            if nmn in CLOBBERS_A:
+                                out.append(line)
+                                i += 2
+                                changed = True
+                                continue
+
+            # ldi $a,X / push $a → push_imm X
+            if (is_instr(line) and line.strip().startswith('ldi $a,')
+                    and i + 1 < len(lines) and lines[i+1].strip() == 'push $a'):
+                val = line.strip().split(',')[1]
+                out.append(f'\tpush_imm {val}')
+                i += 2
+                changed = True
+                continue
+
+            # push $a / pop $a → eliminate both (no-op)
+            if (is_instr(line) and line.strip() == 'push $a'
+                    and i + 1 < len(lines) and lines[i+1].strip() == 'pop $a'):
+                i += 2
+                changed = True
+                continue
+
+            # push $a / pop $b → mov $a,$b (1 byte instead of 2)
+            if (is_instr(line) and line.strip() == 'push $a'
+                    and i + 1 < len(lines) and is_instr(lines[i+1])):
+                pop_s = lines[i+1].strip()
+                if pop_s.startswith('pop ') and pop_s != 'pop $a':
+                    dst = pop_s.split()[1]
+                    out.append(f'\tmov $a,{dst}')
+                    i += 2
+                    changed = True
+                    continue
+
+            # Branch threading: j/jz/jnz/jc/jnc to a label that is just j elsewhere
+            if is_instr(line) and mnemonic(line) in ('j', 'jz', 'jnz', 'jc', 'jnc'):
+                parts_j = line.strip().split()
+                if len(parts_j) == 2:
+                    target = parts_j[1]
+                    # Find the target label and check if next instruction is j
+                    for k in range(len(lines)):
+                        if lines[k].strip() == f'{target}:':
+                            if (k + 1 < len(lines) and is_instr(lines[k+1])
+                                    and mnemonic(lines[k+1]) == 'j'):
+                                final = lines[k+1].strip().split()[1]
+                                out.append(f'\t{parts_j[0]} {final}')
+                                i += 1
+                                changed = True
+                                break
+                    else:
+                        out.append(line)
+                        i += 1
+                    continue
+
+            out.append(line)
+            i += 1
+        lines = out
+
+    return lines
+
+
+def main():
+    ap = argparse.ArgumentParser(description='MK1 C Compiler v2')
+    ap.add_argument('input', help='C source file')
+    ap.add_argument('-o', '--output', help='Output .asm file')
+    ap.add_argument('-O', '--optimize', action='store_true', help='Enable optimization')
+    args = ap.parse_args()
+
+    with open(args.input) as f: source = f.read()
+
+    gen = MK1CodeGen(optimize=args.optimize)
+    asm = gen.compile(source)
+
+    # Always run peephole optimizer
+    lines = asm.split('\n')
+    lines = peephole(lines)
+    asm = '\n'.join(lines)
+
+    if args.output:
+        with open(args.output, 'w') as f: f.write(asm + '\n')
+    else:
+        print(asm)
+
+if __name__ == '__main__':
+    main()

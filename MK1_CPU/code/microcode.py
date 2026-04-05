@@ -142,8 +142,8 @@ ucode_template.update({
     (0b11 << 6) + (op << 4) + (first << 2) + second : ('%s %s, %s'%(alu_op_map[op][0], register_map[first][0], register_map[second][0]), [MI|PO, RO|II|PE, register_map[first][2]|EI, register_map[second][1]|EO|FI|alu_op_map[op][1], RST, RST, RST, RST], False)
     for first in range(4) for second in range(4) for op in range(4)})
 
-ucode_template[0b01111000] = ('exr 0', [MI|PO, RO|II|PE, XI|E0|AI, RST, RST, RST, RST, RST], False)
-ucode_template[0b01111001] = ('exr 1', [MI|PO, RO|II|PE, XI|E1|AI,  RST, RST, RST, RST, RST], False)
+ucode_template[0b01111000] = ('exr 0 0', [MI|PO, RO|II|PE, XI|E0|AI, RST, RST, RST, RST, RST], False)
+ucode_template[0b01111001] = ('exr 1 0', [MI|PO, RO|II|PE, XI, XI|E1|AI, RST, RST, RST, RST], False)
 
 ucode_template[0b01111010] = ('not', [MI|PO, RO|II|PE,  AO|EI, AI, NOT|EO|AI, RST, RST, RST], False)
 ucode_template[0b01111011] = ('sll', [MI|PO, RO|II|PE,  SHF|AI, RST,     RST, RST, RST, RST], False)
@@ -255,19 +255,31 @@ ucode_template[0xF3] = ('ldsp_b', [MI|PO, RO|II|PE, SO|EI, PO|MI, PE|RO|AI, EO|M
 # IDEREFP3: page3[B] = A — indirect store to page 3
 ucode_template[0xF7] = ('iderefp3', [MI|PO, RO|II|PE, BO|MI, STK|HL|AO|RI, RST, RST, RST, RST], True)
 
-# GPIO_READ: Read B-side of 652 daughter board back into A register.
-# U1 asserted → OEAB HIGH (B outputs float), NOT(U1) → OEBA LOW (B→A transparent).
-# E1 enables U70 transceiver, XI sets direction to input.
-# Uses E1 (same as exw 1 1) so E0 remains free as a spare J4 control signal.
-# Result in A: bit 0 = SDA state. Mask other bits (latch residue).
-# Reclaims 0xC5 (was i2c_start, direct I2C abandoned in favour of daughter board)
-ucode_template[0xC5] = ('gpio_read', [MI|PO, RO|II|PE, XI|E1|AI|U1, RST, RST, RST, RST, RST], False)
+# EXR variants for 82C55 PPI: stretched reads with XI setup step before E1 assertion.
+# Step 2 settles XI and U0/U1 (A0/A1). Step 3 asserts E1 (~RD) with stable address.
+# This prevents EEPROM glitches on U75 (U0/U1) from selecting the wrong 82C55 register.
+#
+# exr 1 0 = read Port A (A0=0, A1=0) — at 0x79 above
+# exr 1 1 = read Port B (A0=1, A1=0)
+ucode_template[0xC5] = ('exr 1 1', [MI|PO, RO|II|PE, XI|U0, XI|E1|AI|U0, RST, RST, RST, RST], False)
+# exr 1 2 = read Port C (A0=0, A1=1)
+ucode_template[0xC6] = ('exr 1 2', [MI|PO, RO|II|PE, XI|U1, XI|E1|AI|U1, RST, RST, RST, RST], False)
+# exr 1 3 = read Control register (A0=1, A1=1)
+ucode_template[0xD2] = ('exr 1 3', [MI|PO, RO|II|PE, XI|U0|U1, XI|E1|AI|U0|U1, RST, RST, RST, RST], False)
 
-# 0xC6: NOP — was i2c_stop, reclaimed. Available for future use.
-ucode_template[0xC6] = ('nop_c6', [MI|PO, RO|II|PE, RST, RST, RST, RST, RST, RST], False)
-
-# 0xD2: NOP — was i2c2bit, reclaimed. Available for future use.
-ucode_template[0xD2] = ('nop_d2', [MI|PO, RO|II|PE, RST, RST, RST, RST, RST, RST], False)
+# ── exrw: read with BOTH E0+E1 asserted (for W65C22S VIA) ──
+# E0 → PHI2 (bus clock), E1 → R/W=HIGH (read).
+# Stretched: XI setup in step 2, then E0+E1+AI in step 3.
+# Same as exr 1 X but with E0 added for PHI2.
+# NOTE: clears both IRQ0 and IRQ1 (XI+E0 and XI+E1 both active).
+# exrw 0 = read VIA register 0 (ORB/IRB)
+ucode_template[0xC0] = ('exrw 0', [MI|PO, RO|II|PE, XI, XI|E0|E1|AI, RST, RST, RST, RST], False)
+# exrw 1 = read VIA register 1 (ORA/IRA)
+ucode_template[0xC9] = ('exrw 1', [MI|PO, RO|II|PE, XI|U0, XI|E0|E1|AI|U0, RST, RST, RST, RST], False)
+# exrw 2 = read VIA register 2 (DDRB)
+ucode_template[0xCD] = ('exrw 2', [MI|PO, RO|II|PE, XI|U1, XI|E0|E1|AI|U1, RST, RST, RST, RST], False)
+# exrw 3 = read VIA register 3 (DDRA)
+ucode_template[0xD6] = ('exrw 3', [MI|PO, RO|II|PE, XI|U0|U1, XI|E0|E1|AI|U0|U1, RST, RST, RST, RST], False)
 
 # DEREFP3: A = page3[A] — indirect read from page 3
 ucode_template[0xD5] = ('derefp3', [MI|PO, RO|II|PE, AO|MI, STK|HL|RO|AI, RST, RST, RST, RST], True)

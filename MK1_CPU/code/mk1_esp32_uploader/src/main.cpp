@@ -29,6 +29,7 @@ static const int PIN_CLK_SENSE = A3;  // bodge wire to TP2 — reads actual syst
 static const int PIN_STK   = A4;     // bodge wire to STK — page 2/3 select
 static const int PIN_DIR   = A5;     // bodge wire to U59 pin 1 (DIR) — bus transceiver direction
 static const int PIN_RO    = A6;     // bodge wire to TP20 (~RO) — RAM output enable (active low)
+static const int PIN_OI    = A7;     // bodge wire to OI test point — output register latch
 
 static const int BUS_PINS[8] = { D2, D3, D4, D5, D6, D7, D8, D9 };
 
@@ -52,6 +53,8 @@ static int uploadSize = 0;
 
 // Forward declarations
 static void autoSaveSource(const String& source);
+static void startOIMonitor();
+static void stopOIMonitor();
 
 // ── Clock measurement ────────────────────────────────────────────────
 
@@ -101,6 +104,9 @@ static void updateClkMeasurement() {
 enum CpuState { CPU_RUNNING, CPU_HALTED, CPU_STEPPING };
 static CpuState cpuState = CPU_RUNNING;
 static uint32_t totalCycles = 0;
+static uint8_t stepNum = 0;     // microcode step within instruction (0-7)
+static uint8_t stepPC = 0;      // PC captured at step 0
+static uint8_t stepOpcode = 0;  // opcode captured at step 1
 
 // ── Bus reading ──────────────────────────────────────────────────────
 
@@ -142,9 +148,15 @@ static const int CLK_LEDC_CHANNEL = 0;
 static void stopCustomClock();  // forward declaration
 
 static void enableClock() {
-    if (customClkHz > 0) stopCustomClock();
+    if (customClkHz > 0) {
+        ledcWrite(CLK_LEDC_CHANNEL, 0);
+        ledcDetachPin(PIN_CLK);
+        customClkHz = 0;
+    }
     stopClkMonitor();
     pinMode(PIN_CLK, OUTPUT);
+    digitalWrite(PIN_CLK, LOW);   // ensure clean state
+    delayMicroseconds(10);
     digitalWrite(PIN_CLK, HIGH);
 }
 
@@ -174,6 +186,11 @@ static bool usingLEDC = false;
 
 static void startCustomClock(int hz) {
     stopClkMonitor();
+    if (customClkHz > 0) {
+        // Stop any existing LEDC before reconfiguring
+        ledcWrite(CLK_LEDC_CHANNEL, 0);
+        ledcDetachPin(PIN_CLK);
+    }
     customClkHz = hz;
     pinMode(PIN_CLK, OUTPUT);
 
@@ -186,6 +203,7 @@ static void startCustomClock(int hz) {
     ledcSetup(CLK_LEDC_CHANNEL, hz, resolution);
     ledcAttachPin(PIN_CLK, CLK_LEDC_CHANNEL);
     ledcWrite(CLK_LEDC_CHANNEL, duty);
+    startClkMonitor();  // keep measuring while custom clock runs
 }
 
 static void stopCustomClock() {
@@ -231,6 +249,7 @@ static void writeInstruction(uint8_t instr) {
 static void uploadToMK1(const uint8_t* buf, int size) {
     int savedClkHz = customClkHz;  // save custom clock state
 
+    stopOIMonitor();
     stopClkMonitor();
     busSetOutput();
     resetPulse();
@@ -249,6 +268,11 @@ static void uploadToMK1(const uint8_t* buf, int size) {
     disableClock();
     digitalWrite(PIN_HL, LOW);
     digitalWrite(PIN_STK, LOW);
+
+    // Start OI monitor BEFORE releasing CPU — the program may execute
+    // and halt within microseconds, so the interrupt must be ready first.
+    startOIMonitor();
+
     resetPulse();
     enableCU();
     totalCycles = 0;
@@ -449,6 +473,298 @@ static void handleBusSniff() {
 
     String json = "{\"bus_no_ro\":" + String(val1) +
                   ",\"bus_with_ro\":" + String(val2) + "}";
+    server.send(200, "application/json", json);
+}
+
+// ── Output register sampling via OI pin ─────────────────────────────
+// OI is driven by the microcode EEPROMs. When the CPU executes 'out',
+// OI goes HIGH for one clock cycle while AO drives the bus with A's value.
+// We attach an interrupt on OI rising edge to snapshot the bus value.
+
+static volatile uint8_t lastOutputVal = 0;
+static volatile bool outputCaptured = false;
+static volatile uint32_t oiCount = 0;
+static volatile uint8_t oiHistory[16];
+
+static uint32_t oiGpioMask = 0;  // precomputed at startOIMonitor
+
+static inline uint8_t IRAM_ATTR readBusFast() {
+    uint32_t gpio = GPIO.in;
+    uint8_t val = 0;
+    if (gpio & (1 << 5))  val |= 0x01;
+    if (gpio & (1 << 6))  val |= 0x02;
+    if (gpio & (1 << 7))  val |= 0x04;
+    if (gpio & (1 << 8))  val |= 0x08;
+    if (gpio & (1 << 9))  val |= 0x10;
+    if (gpio & (1 << 10)) val |= 0x20;
+    if (gpio & (1 << 17)) val |= 0x40;
+    if (gpio & (1 << 18)) val |= 0x80;
+    return val;
+}
+
+static void IRAM_ATTR onOIRising() {
+    uint8_t val = readBusFast();
+    if (!outputCaptured || val != lastOutputVal) {
+        if (oiCount < 16) oiHistory[oiCount] = val;
+        oiCount++;
+        lastOutputVal = val;
+        outputCaptured = true;
+    }
+}
+
+static bool oiMonitorActive = false;
+
+static void startOIMonitor() {
+    if (oiMonitorActive) return;
+    busSetInput();
+    disableOutput();
+    digitalWrite(PIN_DIR, LOW);   // B→A read mode
+    enableOutput();
+    int gpioNum = digitalPinToGPIONumber(PIN_OI);
+    if (gpioNum < 0) gpioNum = PIN_OI;
+    oiGpioMask = 1 << gpioNum;
+    outputCaptured = false;
+    oiCount = 0;
+    attachInterrupt(digitalPinToInterrupt(PIN_OI), onOIRising, RISING);
+    oiMonitorActive = true;
+}
+
+static void stopOIMonitor() {
+    if (!oiMonitorActive) return;
+    detachInterrupt(digitalPinToInterrupt(PIN_OI));
+    disableOutput();
+    digitalWrite(PIN_DIR, HIGH);
+    busSetOutput();
+    enableOutput();
+    oiMonitorActive = false;
+}
+
+// POST /upload_and_wait?timeout=10 — upload program, then immediately spin-poll for OI.
+// Combines upload + capture in one request so we don't miss fast programs.
+static void handleUploadAndWait() {
+    if (uploadSize == 0) {
+        server.send(400, "application/json", "{\"ok\":false,\"error\":\"Nothing assembled\"}");
+        return;
+    }
+    int timeoutSec = 10;
+    if (server.hasArg("timeout")) timeoutSec = server.arg("timeout").toInt();
+    if (timeoutSec < 1) timeoutSec = 1;
+    if (timeoutSec > 60) timeoutSec = 60;
+
+    int oiGpio = digitalPinToGPIONumber(PIN_OI);
+    if (oiGpio < 0) oiGpio = PIN_OI;
+    uint32_t oiMask = 1 << oiGpio;
+
+    // Upload program (starts OI monitor with U59 in read mode).
+    uploadToMK1(uploadBuf, uploadSize);
+
+    bool found = false;
+    uint8_t val = 0;
+
+    // Don't spin-poll — it causes false ACKs on the I2C bus.
+    // Just wait for the program to complete, then read the ISR result.
+    // The ISR (from startOIMonitor) captures OI values in oiHistory.
+    delay(timeoutSec * 1000);
+
+    // Find first non-spurious ISR value (filter 63=floating, 127=HLT)
+    uint32_t n = oiCount < 16 ? oiCount : 16;
+    for (uint32_t i = 0; i < n; i++) {
+        if (oiHistory[i] != 0x3F && oiHistory[i] != 0x7F &&
+            oiHistory[i] != 0xBF && oiHistory[i] != 0xFF) {
+            val = oiHistory[i];
+            found = true;
+            break;
+        }
+    }
+    // If all spurious, report the first one anyway
+    if (!found && n > 0) {
+        val = oiHistory[0];
+        found = true;
+    }
+
+    String json = "{\"value\":" + String(val) +
+                  ",\"found\":" + (found ? "true" : "false") +
+                  ",\"oi_count\":" + String(oiCount) +
+                  ",\"history\":[";
+    for (uint32_t i = 0; i < n; i++) {
+        if (i > 0) json += ",";
+        json += String(oiHistory[i]);
+    }
+    json += "]}";
+    server.send(200, "application/json", json);
+}
+
+// POST /wait_output?timeout=10 — spin-poll GPIO.in until OI fires, return bus value.
+// GPIO.in captures OI + all 8 bus pins ATOMICALLY — no ISR latency.
+// Blocks the web server until capture or timeout.
+static void handleWaitOutput() {
+    int timeoutSec = 10;
+    if (server.hasArg("timeout")) timeoutSec = server.arg("timeout").toInt();
+    if (timeoutSec < 1) timeoutSec = 1;
+    if (timeoutSec > 60) timeoutSec = 60;
+
+    int oiGpio = digitalPinToGPIONumber(PIN_OI);
+    if (oiGpio < 0) oiGpio = PIN_OI;
+    uint32_t oiMask = 1 << oiGpio;
+
+    unsigned long deadline = millis() + (timeoutSec * 1000);
+    bool found = false;
+    uint8_t val = 0;
+
+    while (millis() < deadline) {
+        uint32_t gpio = GPIO.in;
+        if (gpio & oiMask) {
+            // OI is HIGH — extract bus value from SAME snapshot
+            val = 0;
+            if (gpio & (1 << 5))  val |= 0x01;
+            if (gpio & (1 << 6))  val |= 0x02;
+            if (gpio & (1 << 7))  val |= 0x04;
+            if (gpio & (1 << 8))  val |= 0x08;
+            if (gpio & (1 << 9))  val |= 0x10;
+            if (gpio & (1 << 10)) val |= 0x20;
+            if (gpio & (1 << 17)) val |= 0x40;
+            if (gpio & (1 << 18)) val |= 0x80;
+            found = true;
+            break;
+        }
+    }
+
+    String json = "{\"value\":" + String(val) +
+                  ",\"found\":" + (found ? "true" : "false") + "}";
+    server.send(200, "application/json", json);
+}
+
+// GET /read_output — return the last value captured from an 'out' instruction
+static void handleReadOutput() {
+    int intNum = digitalPinToInterrupt(PIN_OI);
+    int gpioNum = digitalPinToGPIONumber(PIN_OI);
+    int pinState = digitalRead(PIN_OI);
+    // Find first value that isn't a known spurious bus state:
+    // 0x3F (63) = floating bus after halt
+    // 0x7F (127) = HLT opcode during fetch
+    uint8_t reportVal = 0;
+    bool found = false;
+    uint32_t n = oiCount < 16 ? oiCount : 16;
+    for (uint32_t i = 0; i < n; i++) {
+        if (oiHistory[i] != 0x3F && oiHistory[i] != 0x7F) {
+            reportVal = oiHistory[i];
+            found = true;
+            break;
+        }
+    }
+    if (!found && n > 0) reportVal = oiHistory[0];  // fallback to first
+    String json = "{\"value\":" + String(reportVal) +
+                  ",\"captured\":" + (outputCaptured ? "true" : "false") +
+                  ",\"oi_count\":" + String(oiCount) +
+                  ",\"oi_pin\":" + String(PIN_OI) +
+                  ",\"oi_gpio\":" + String(gpioNum) +
+                  ",\"oi_int\":" + String(intNum) +
+                  ",\"oi_state\":" + String(pinState) +
+                  ",\"oi_active\":" + (oiMonitorActive ? "true" : "false") +
+                  ",\"history\":[";
+    for (uint32_t i = 0; i < n; i++) {
+        if (i > 0) json += ",";
+        json += String(oiHistory[i]);
+    }
+    json += "]}";
+    server.send(200, "application/json", json);
+}
+
+// POST /run_cycles?n=500000 — pulse clock N times (default 500000).
+// Unlike LEDC clock, this respects program flow — stops after N pulses.
+// Use with OI monitor to capture output values reliably.
+static void handleRunCycles() {
+    int n = 500000;
+    if (server.hasArg("n")) n = server.arg("n").toInt();
+    if (n > 5000000) n = 5000000;
+    int halfPeriodUs = 1;  // microseconds per half-cycle (default ~500kHz — optimal for this board)
+    if (server.hasArg("us")) halfPeriodUs = server.arg("us").toInt();
+    if (halfPeriodUs < 0) halfPeriodUs = 0;
+    if (halfPeriodUs > 1000) halfPeriodUs = 1000;
+
+    stopCustomClock();
+    // Detach OI interrupt — we'll poll OI directly in the clock loop
+    if (oiMonitorActive) {
+        detachInterrupt(digitalPinToInterrupt(PIN_OI));
+    }
+    // Reset OI capture state
+    outputCaptured = false;
+    oiCount = 0;
+
+    // Poll OI at each clock edge instead of relying on interrupts.
+    // Check OI during both HIGH and LOW phases to catch the pulse.
+    int oiGpio = digitalPinToGPIONumber(PIN_OI);
+    if (oiGpio < 0) oiGpio = PIN_OI;
+    uint32_t oiMask = 1 << oiGpio;
+
+    // U59 in read mode so we can see the bus via GPIO.in
+    busSetInput();
+    disableOutput();
+    digitalWrite(PIN_DIR, LOW);       // B→A read mode
+    enableOutput();
+
+    // Pre-compute GPIO masks for fast register writes
+    // PIN_CLK = A0 = GPIO1 (in GPIO.out, bit 1)
+    int clkGpio = digitalPinToGPIONumber(PIN_CLK);
+    uint32_t clkMask = 1 << clkGpio;
+
+    pinMode(PIN_CLK, OUTPUT);
+    digitalWrite(PIN_CLK, LOW);
+
+    int actualCycles = 0;
+    for (int i = 0; i < n; i++) {
+        actualCycles++;
+
+        // CLK HIGH
+        GPIO.out_w1ts = clkMask;
+        if (halfPeriodUs > 0) delayMicroseconds(halfPeriodUs);
+
+        // Check OI during HIGH phase
+        uint32_t gpio1 = GPIO.in;
+        if (gpio1 & oiMask) {
+            uint8_t val = readBusFast();
+            if (oiCount < 16) oiHistory[oiCount] = val;
+            oiCount++;
+            lastOutputVal = val;
+            outputCaptured = true;
+            GPIO.out_w1tc = clkMask;
+            break;
+        }
+
+        // CLK LOW
+        GPIO.out_w1tc = clkMask;
+        if (halfPeriodUs > 0) delayMicroseconds(halfPeriodUs);
+
+        // Check OI during LOW phase
+        uint32_t gpio2 = GPIO.in;
+        if (gpio2 & oiMask) {
+            uint8_t val = readBusFast();
+            if (oiCount < 16) oiHistory[oiCount] = val;
+            oiCount++;
+            lastOutputVal = val;
+            outputCaptured = true;
+            break;
+        }
+    }
+    pinMode(PIN_CLK, INPUT);
+
+    // Restore bus to write mode
+    disableOutput();
+    digitalWrite(PIN_DIR, HIGH);
+    busSetOutput();
+    enableOutput();
+
+    // Sample OI pin state and raw GPIO register for debug
+    uint32_t rawGpio = GPIO.in;
+    int oiDirect = digitalRead(PIN_OI);
+    int oiFromReg = (rawGpio & oiMask) ? 1 : 0;
+    String json = "{\"ok\":true,\"cycles\":" + String(actualCycles) +
+                  ",\"max\":" + String(n) +
+                  ",\"oi_gpio\":" + String(oiGpio) +
+                  ",\"oi_mask\":\"0x" + String(oiMask, HEX) +
+                  "\",\"oi_direct\":" + String(oiDirect) +
+                  ",\"oi_from_reg\":" + String(oiFromReg) +
+                  ",\"gpio_raw\":\"0x" + String(rawGpio, HEX) + "\"}";
     server.send(200, "application/json", json);
 }
 
@@ -723,14 +1039,24 @@ static void handleStep() {
     // If running, halt first
     if (cpuState == CPU_RUNNING) {
         enableClock();
+        stepNum = 0;
     }
     cpuState = CPU_STEPPING;
 
     // Execute one clock cycle, read bus
     uint8_t busVal = singleStep();
 
+    // Track PC (step 0 = MI|PO, bus has PC) and opcode (step 1 = RO|II|PE, bus has opcode)
+    if (stepNum == 0) stepPC = busVal;
+    else if (stepNum == 1) stepOpcode = busVal;
+
     String json = "{\"ok\":true,\"bus\":" + String(busVal) +
-                  ",\"cycles\":" + String(totalCycles) + "}";
+                  ",\"cycles\":" + String(totalCycles) +
+                  ",\"step\":" + String(stepNum) +
+                  ",\"pc\":" + String(stepPC) +
+                  ",\"opcode\":" + String(stepOpcode) + "}";
+
+    stepNum = (stepNum + 1) & 7;  // wrap 0-7
     server.send(200, "application/json", json);
 }
 
@@ -780,9 +1106,13 @@ static void handleStatus() {
     updateClkMeasurement();
 
     // Sample bus (only meaningful at low speeds or when halted)
-    busSetInput();
-    disableOutput();
-    uint8_t busVal = busRead();
+    // Skip if OI monitor is active — it needs the bus in read mode undisturbed
+    uint8_t busVal = 0;
+    if (!oiMonitorActive) {
+        busSetInput();
+        disableOutput();
+        busVal = busRead();
+    }
 
     const char* stateStr = "running";
     if (cpuState == CPU_HALTED) stateStr = "halted";
@@ -1046,9 +1376,9 @@ static bool connectToWifi() {
     WiFi.mode(WIFI_STA);
     WiFi.begin(staSSID, staPSK);
 
-    // Wait up to 10 seconds
+    // Wait up to 30 seconds
     int tries = 0;
-    while (WiFi.status() != WL_CONNECTED && tries < 20) {
+    while (WiFi.status() != WL_CONNECTED && tries < 60) {
         delay(500);
         tries++;
     }
@@ -1101,6 +1431,7 @@ void setup() {
     pinMode(PIN_DIR, OUTPUT);
     digitalWrite(PIN_DIR, HIGH);  // U59 DIR: HIGH = A→B = ESP32→bus (write mode)
     pinMode(PIN_RO, INPUT);       // ~RO: high-Z by default (EEPROM drives this line during normal operation)
+    pinMode(PIN_OI, INPUT);       // OI: read to detect when CPU executes 'out'
     pinMode(PIN_RST, OUTPUT);
     digitalWrite(PIN_RST, HIGH);  // hold MK1 in reset immediately — prevents garbage execution during boot
     pinMode(PIN_CLK, INPUT);
@@ -1168,6 +1499,10 @@ void setup() {
     server.on("/programs/delete", HTTP_POST, handleProgramDelete);
     server.on("/read", HTTP_GET, handleRead);
     server.on("/bussniff", HTTP_GET, handleBusSniff);
+    server.on("/read_output", HTTP_GET, handleReadOutput);
+    server.on("/wait_output", HTTP_POST, handleWaitOutput);
+    server.on("/upload_and_wait", HTTP_POST, handleUploadAndWait);
+    server.on("/run_cycles", HTTP_POST, handleRunCycles);
     server.on("/i2cscan", HTTP_GET, handleI2CScan);
     server.on("/readtest", HTTP_GET, handleReadTest);
     server.on("/stepn", HTTP_GET, handleStepN);

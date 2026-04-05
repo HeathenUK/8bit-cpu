@@ -135,7 +135,12 @@ static const FixedInstr FIXED_INSTRUCTIONS[] = {
 
     // ── External interface ──
     { "exr 0",   0x78,  ARGS_NONE },
+    { "exr 0 0", 0x78,  ARGS_NONE },
     { "exr 1",   0x79,  ARGS_NONE },
+    { "exr 1 0", 0x79,  ARGS_NONE },
+    { "exr 1 1", 0xC5,  ARGS_NONE },
+    { "exr 1 2", 0xC6,  ARGS_NONE },
+    { "exr 1 3", 0xD2,  ARGS_NONE },
     { "exw 0 0", 0x07,  ARGS_NONE },
     { "exw 0 1", 0x0F,  ARGS_NONE },
     { "exw 0 2", 0x8E,  ARGS_NONE },
@@ -144,6 +149,12 @@ static const FixedInstr FIXED_INSTRUCTIONS[] = {
     { "exw 1 1", 0x1F,  ARGS_NONE },
     { "exw 1 2", 0x9E,  ARGS_NONE },
     { "exw 1 3", 0xA6,  ARGS_NONE },
+
+    // ── VIA read (E0+E1 for W65C22S: E0=PHI2, E1=R/W=HIGH) ──
+    { "exrw 0",  0xC0,  ARGS_NONE },  // read VIA register 0 (ORB/IRB)
+    { "exrw 1",  0xC9,  ARGS_NONE },  // read VIA register 1 (ORA/IRA)
+    { "exrw 2",  0xCD,  ARGS_NONE },  // read VIA register 2 (DDRB)
+    { "exrw 3",  0xD6,  ARGS_NONE },  // read VIA register 3 (DDRA)
 
     // ── Sentinel ──
     { nullptr, 0, ARGS_NONE }
@@ -163,5 +174,5 @@ static const CmpDef CMP_VARIANTS[] = {
     { "$b",    0xAE, false },
     { "$c",    0x46, false },
     { "$d",    0x4E, false },
-    { nullptr, 0x86, true  },  // cmp <imm>
+    { nullptr, 0x00, true  },  // cmp <imm> (expanded by assembler to ldi $b + cmp $b)
 };

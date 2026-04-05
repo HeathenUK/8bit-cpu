@@ -601,11 +601,14 @@ private:
                     return;
                 }
             }
-            // Immediate form
-            emitCode(0x86, pass1);
-            int v = resolveValue(tok, lineNum, pass1);
-            emitCode(v & 0xFF, pass1);
-            return;
+            // Immediate form: expand to ldi $b, N + cmp $b
+            {
+                int v = resolveValue(tok, lineNum, pass1);
+                emitCode(0x39, pass1);         // ldi $b
+                emitCode(v & 0xFF, pass1);
+                emitCode(0xAE, pass1);         // cmp $b
+                return;
+            }
         }
 
         // ── "push" / "pop" ──
@@ -720,7 +723,7 @@ private:
         // ── ALU immediate: "addi", "subi", "ori", "andi" ──
         {
             int alen = strlen(mnemonic);
-            if (alen >= 4 && mnemonic[alen - 1] == 'i') {
+            if (alen >= 3 && mnemonic[alen - 1] == 'i') {
                 char base[16];
                 strncpy(base, mnemonic, alen - 1);
                 base[alen - 1] = 0;

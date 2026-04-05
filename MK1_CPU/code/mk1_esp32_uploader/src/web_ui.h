@@ -32,9 +32,11 @@ header select { background: #0f3460; color: #e0e0e0; border: 1px solid #e94560; 
 #cpubar .val { color: #4ecca3; }
 #cpubar .val.off { color: #e94560; }
 main { flex: 1; display: flex; flex-direction: column; overflow: hidden; min-height: 0; }
-.editor-wrap { flex: 1; display: flex; overflow: hidden; min-height: 0; }
+.editor-wrap { flex: 1; display: flex; overflow: hidden; min-height: 0; position: relative; }
 #lines { width: 38px; background: #0d0d1a; color: #555; border: none; padding: 12px 4px 12px 0; font-family: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace; font-size: 14px; line-height: 1.6; text-align: right; overflow: hidden; user-select: none; -webkit-user-select: none; }
-#editor { flex: 1; background: #0a0a1a; color: #a8d8a8; border: none; outline: none; padding: 12px 12px 12px 8px; font-family: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace; font-size: 14px; line-height: 1.6; resize: none; tab-size: 2; white-space: pre; overflow-wrap: normal; overflow: auto; }
+#editor { flex: 1; background: transparent; color: transparent; caret-color: #a8d8a8; border: none; outline: none; padding: 12px 12px 12px 8px; font-family: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace; font-size: 14px; line-height: 1.6; resize: none; tab-size: 2; white-space: pre; overflow-wrap: normal; overflow: auto; position: relative; z-index: 2; }
+#highlight { position: absolute; top: 0; left: 38px; right: 0; bottom: 0; background: #0a0a1a; color: #a8d8a8; padding: 12px 12px 12px 8px; font-family: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace; font-size: 14px; line-height: 1.6; white-space: pre; overflow: hidden; pointer-events: none; z-index: 1; margin: 0; }
+.hl-cmt { color: #555; } .hl-lbl { color: #e94560; } .hl-dir { color: #f0c040; } .hl-reg { color: #4ecca3; } .hl-num { color: #f0a060; } .hl-mn { color: #7ab8f0; }
 #output { background: #0d0d1a; border-top: 1px solid #0f3460; padding: 6px 12px; font-family: monospace; font-size: 11px; min-height: 24px; max-height: 120px; overflow-y: auto; white-space: pre-wrap; flex-shrink: 0; }
 .err { color: #e94560; }
 .ok { color: #4ecca3; }
@@ -98,10 +100,12 @@ main { flex: 1; display: flex; flex-direction: column; overflow: hidden; min-hei
   <span><span class="lbl">CLK </span><span class="val" id="cpu-clk">---</span></span>
   <span><span class="lbl">BUS </span><span class="val" id="cpu-bus">---</span></span>
   <span><span class="lbl">CYCLES </span><span class="val" id="cpu-cycles">---</span></span>
+  <span id="step-info" style="display:none"><span class="lbl">PC </span><span class="val" id="step-pc">--</span> <span class="lbl">OP </span><span class="val" id="step-op">--</span> <span class="lbl">STEP </span><span class="val" id="step-num">-</span></span>
 </div>
 <main>
   <div class="editor-wrap">
     <pre id="lines">1</pre>
+    <pre id="highlight"></pre>
     <textarea id="editor" spellcheck="false" placeholder="; Enter MK1 assembly here..."></textarea>
   </div>
   <div id="output"><span class="info">Ready. Connect to MK1 and press Assemble &amp; Run.</span></div>
@@ -133,15 +137,43 @@ const examples = {
 
 const ed = document.getElementById('editor');
 const ln = document.getElementById('lines');
+const hl = document.getElementById('highlight');
+
+const MN = new Set(['nop','hlt','mov','ldi','ld','st','ldp3','stp3','push','pop','add','sub','or','and','xor','not','neg','inc','dec','sll','slr','rll','rlr','cmp','addi','subi','andi','ori','out','j','jz','jnz','jc','jnc','jal','ret','swap','exw','exr','stsp','ldsp','deref','ideref','derefp3','iderefp3','adc','sbc','tst','out_imm','jal_r','ocall','push_imm','ldsp_b','gpio_read','clr','setz','setnz','setc','setnc']);
+
+function highlightSource(src) {
+  return src.split('\n').map(line => {
+    let h = '', i = 0;
+    while (i < line.length) {
+      if (line[i] === ';') { h += '<span class="hl-cmt">' + esc(line.substring(i)) + '</span>'; break; }
+      if (line[i] === '#') { let e=i+1; while(e<line.length&&/\w/.test(line[e]))e++; h+='<span class="hl-dir">'+esc(line.substring(i,e))+'</span>'; i=e; continue; }
+      if (line[i] === '$') { let e=i+1; while(e<line.length&&/[a-z]/i.test(line[e]))e++; h+='<span class="hl-reg">'+esc(line.substring(i,e))+'</span>'; i=e; continue; }
+      if (line[i]==='0'&&i+1<line.length&&(line[i+1]==='x'||line[i+1]==='b')) { let e=i+2; while(e<line.length&&/[0-9a-fA-F]/.test(line[e]))e++; h+='<span class="hl-num">'+esc(line.substring(i,e))+'</span>'; i=e; continue; }
+      if (/\d/.test(line[i])&&(i===0||!/\w/.test(line[i-1]))) { let e=i; while(e<line.length&&/\d/.test(line[e]))e++; h+='<span class="hl-num">'+esc(line.substring(i,e))+'</span>'; i=e; continue; }
+      if (/[a-z_.]/i.test(line[i])) {
+        let e=i; while(e<line.length&&/[\w.]/.test(line[e]))e++;
+        let w=line.substring(i,e);
+        if (e<line.length&&line[e]===':') { h+='<span class="hl-lbl">'+esc(w+':')+'</span>'; i=e+1; continue; }
+        if (MN.has(w.toLowerCase())) { h+='<span class="hl-mn">'+esc(w)+'</span>'; i=e; continue; }
+        h+=esc(w); i=e; continue;
+      }
+      h+=esc(line[i]); i++;
+    }
+    return h;
+  }).join('\n') + '\n';
+}
+
+function updateHighlight() { hl.innerHTML = highlightSource(ed.value); }
 
 function updateLines() {
   const count = ed.value.split('\n').length;
   let s = '';
   for (let i = 1; i <= count; i++) s += i + '\n';
   ln.textContent = s;
+  updateHighlight();
 }
 
-function syncScroll() { ln.scrollTop = ed.scrollTop; }
+function syncScroll() { ln.scrollTop = ed.scrollTop; hl.scrollTop = ed.scrollTop; hl.scrollLeft = ed.scrollLeft; }
 
 ed.addEventListener('input', updateLines);
 ed.addEventListener('scroll', syncScroll);
@@ -234,6 +266,11 @@ async function mk1step() {
     if (j.ok) {
       document.getElementById('cpu-bus').textContent = j.bus + ' (0x' + j.bus.toString(16).toUpperCase().padStart(2,'0') + ')';
       document.getElementById('cpu-cycles').textContent = j.cycles;
+      const si = document.getElementById('step-info');
+      si.style.display = '';
+      document.getElementById('step-pc').textContent = '0x' + j.pc.toString(16).toUpperCase().padStart(2,'0');
+      document.getElementById('step-op').textContent = '0x' + j.opcode.toString(16).toUpperCase().padStart(2,'0');
+      document.getElementById('step-num').textContent = j.step;
     }
   } catch(e) {}
 }
@@ -241,6 +278,7 @@ async function mk1step() {
 async function mk1resume() {
   await fetch('/resume', { method: 'POST' });
   document.getElementById('status').textContent = 'Running';
+  document.getElementById('step-info').style.display = 'none';
 }
 
 async function setClk() {
@@ -406,6 +444,7 @@ ed.addEventListener('keydown', function(e) {
 // Load saved program on startup
 loadSaved();
 updateLines();
+setTimeout(updateHighlight, 500); // re-highlight after loadSaved completes
 </script>
 </body>
 </html>
