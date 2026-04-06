@@ -7,6 +7,7 @@
 	clr $a
 	exw 0 0
 	exw 0 2
+	exw 0 3			; DDRA = 0
 
 	; Write 42 to 0x0350
 	exrw 2

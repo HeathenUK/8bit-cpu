@@ -4,8 +4,9 @@
 	dec
 	jnz .via_dly
 	clr $a
-	exw 0 0
-	exw 0 2
+	exw 0 0			; ORB = 0
+	exw 0 2			; DDRB = 0
+	exw 0 3			; DDRA = 0 (ensure PA0 is input for SQW)
 	exrw 2
 	ldi $a, 0x01
 	exw 0 2
@@ -133,4 +134,23 @@ __i2c_sp:
 	exw 0 2
 	ret
 	section data
+	byte 0			; [0] D/4
+	byte 0			; [1] pass count
+	byte 0			; [2] addr_lo (param)
+	byte 0			; [3] value (param)
+	byte 0			; [4-9] reserved
 	byte 0
+	byte 0
+	byte 0
+	byte 0
+	byte 0
+	byte 42			; [10] test pattern 1
+	byte 0x20
+	byte 255		; [12] test pattern 2
+	byte 0x21
+	byte 170		; [14] test pattern 3
+	byte 0x22
+	byte 85			; [16] test pattern 4
+	byte 0x23
+	byte 99			; [18] test pattern 5
+	byte 0x24

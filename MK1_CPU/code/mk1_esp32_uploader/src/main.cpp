@@ -272,6 +272,9 @@ static void uploadToMK1(const uint8_t* buf, int size) {
     stopOIMonitor();
     stopClkMonitor();
     busSetOutput();
+    // Ensure page-select pins are OUTPUT for upload (may be INPUT from previous run)
+    pinMode(PIN_HL, OUTPUT);
+    pinMode(PIN_STK, OUTPUT);
     resetPulse();
     disableCU();
     delayMicroseconds(2);
@@ -286,8 +289,10 @@ static void uploadToMK1(const uint8_t* buf, int size) {
     }
 
     disableClock();
-    digitalWrite(PIN_HL, LOW);
-    digitalWrite(PIN_STK, LOW);
+    // Release page-select pins — let microcode control HL/STK during execution.
+    // If ESP32 holds these as OUTPUT LOW, stack push/pop corrupts code page.
+    pinMode(PIN_HL, INPUT);
+    pinMode(PIN_STK, INPUT);
 
     // Release bus — ESP32 must not drive data pins during program execution,
     // otherwise VIA reads (exrw) can't put data on the bus.
@@ -845,8 +850,8 @@ static void handleProbe() {
     digitalWrite(PIN_DIR, HIGH);
     busSetOutput();
     disableClock();
-    digitalWrite(PIN_HL, LOW);
-    digitalWrite(PIN_STK, LOW);
+    pinMode(PIN_HL, INPUT);
+    pinMode(PIN_STK, INPUT);
     enableCU();
 }
 

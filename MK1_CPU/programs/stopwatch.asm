@@ -9,6 +9,7 @@
 	clr $a
 	exw 0 0
 	exw 0 2
+	exw 0 3			; DDRA = 0 (PA0 input for SQW)
 
 	; Configure SQW
 	exrw 2
@@ -93,7 +94,8 @@
 	mov $b, $a
 	slr
 	slr
-	push $a			; stack: D/4
+	ldi $b, 0
+	ideref			; data[0] = D/4
 
 	; Stopwatch
 	ldi $d, 0
@@ -109,9 +111,10 @@
 	mov $a, $d
 	j .tick
 
-; delay_250ms: stack[2] overflows of 256 × 13-cycle loop
+; delay_250ms: data[0] overflows of 256-iteration inner loop
 delay_250ms:
-	ldsp 2
+	clr $a
+	deref			; A = data[0] = D/4
 	mov $a, $b
 .d_outer:
 	clr $a
@@ -192,3 +195,6 @@ __i2c_sp:
 	clr $a
 	exw 0 2
 	ret
+
+	section data
+	byte 0			; [0] D/4 (written by calibration, read by delay_250ms)

@@ -7,6 +7,7 @@
 	clr $a
 	exw 0 0		; ORB = 0
 	exw 0 2		; DDRB = 0
+	exw 0 3		; DDRA = 0 (PA0 input for SQW)
 
 	; Configure DS3231 SQW = 1Hz
 	ldi $a, 0x03
