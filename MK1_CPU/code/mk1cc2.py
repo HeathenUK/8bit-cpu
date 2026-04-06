@@ -928,6 +928,100 @@ class MK1CodeGen:
             self.emit('\tpop $a')            # balance stack
             self.emit('\tret')
 
+        # __delay_cal: calibrate delay against SQW, store D/4 in data[0]
+        if '__delay_cal' in helpers:
+            lbl_s1 = self.label('ds1')
+            lbl_s2 = self.label('ds2')
+            lbl_cal = self.label('dcal')
+            lbl_chi = self.label('dchi')
+            lbl_clo = self.label('dclo')
+            lbl_cli = self.label('dcli')
+            lbl_done = self.label('dcdn')
+            self.emit('__delay_cal:')
+            # Configure DS3231 SQW = 1Hz (0x68: write=0xD0)
+            self.emit('\texrw 2')
+            self.emit('\tldi $a,0x01')
+            self.emit('\texw 0 2')
+            self.emit('\tldi $a,0x03')
+            self.emit('\texw 0 2')
+            self.emit('\tldi $a,0xD0')
+            self.emit('\tjal __i2c_sb')
+            self.emit('\tldi $a,0x0E')
+            self.emit('\tjal __i2c_sb')
+            self.emit('\tclr $a')
+            self.emit('\tjal __i2c_sb')
+            self.emit('\tjal __i2c_sp')
+            # Sync: wait LOW then rising edge
+            self.emit(f'{lbl_s1}:')
+            self.emit('\texrw 1')
+            self.emit('\ttst 0x01')
+            self.emit(f'\tjz {lbl_s2}')
+            self.emit(f'\tj {lbl_s1}')
+            self.emit(f'{lbl_s2}:')
+            self.emit('\texrw 1')
+            self.emit('\ttst 0x01')
+            self.emit(f'\tjnz {lbl_cal}')
+            self.emit(f'\tj {lbl_s2}')
+            # Count: same 13-cycle inner loop as delay, check SQW between overflows
+            self.emit(f'{lbl_cal}:')
+            self.emit('\tldi $b,0')        # B = overflow count
+            self.emit(f'{lbl_chi}:')
+            self.emit('\tclr $a')
+            self.emit(f'.dci_hi{self.label_id}:')
+            for _ in range(10):
+                self.emit('\tnop')
+            self.emit('\tdec')
+            self.emit(f'\tjnz .dci_hi{self.label_id}')
+            self.emit('\tmov $b,$a')
+            self.emit('\tinc')
+            self.emit('\tmov $a,$b')
+            self.emit('\texrw 1')
+            self.emit('\ttst 0x01')
+            self.emit(f'\tjz {lbl_clo}')
+            self.emit(f'\tj {lbl_chi}')
+            # LOW phase
+            self.emit(f'{lbl_clo}:')
+            self.emit('\tclr $a')
+            self.emit(f'{lbl_cli}:')
+            for _ in range(10):
+                self.emit('\tnop')
+            self.emit('\tdec')
+            self.emit(f'\tjnz {lbl_cli}')
+            self.emit('\tmov $b,$a')
+            self.emit('\tinc')
+            self.emit('\tmov $a,$b')
+            self.emit('\texrw 1')
+            self.emit('\ttst 0x01')
+            self.emit(f'\tjnz {lbl_done}')
+            self.emit(f'\tj {lbl_clo}')
+            # Done: B = D. Store D/4 in data[0].
+            self.emit(f'{lbl_done}:')
+            self.emit('\tmov $b,$a')
+            self.emit('\tslr')
+            self.emit('\tslr')
+            self.emit('\tldi $b,0')
+            self.emit('\tideref')          # data[0] = D/4
+            self.emit('\tret')
+
+        # __delay_Nms: B = ms count. Reads D/4 from data[0].
+        if '__delay_Nms' in helpers:
+            lbl_outer = self.label('dno')
+            lbl_inner = self.label('dni')
+            self.emit('__delay_Nms:')
+            self.emit(f'{lbl_outer}:')
+            self.emit('\tclr $a')
+            self.emit('\tderef')           # A = data[0] = D/4
+            self.emit(f'{lbl_inner}:')
+            for _ in range(10):
+                self.emit('\tnop')
+            self.emit('\tdec')
+            self.emit(f'\tjnz {lbl_inner}')  # 13 cycles — same as calibration
+            self.emit('\tmov $b,$a')
+            self.emit('\tdec')
+            self.emit('\tmov $a,$b')
+            self.emit(f'\tjnz {lbl_outer}')
+            self.emit('\tret')
+
     def _overlay_partition(self):
         """If code exceeds page 0 capacity, move cold functions to page 3.
         Generates overlay loader at the start and rewrite calls to use ocall."""
@@ -961,7 +1055,8 @@ class MK1CodeGen:
             s = line.strip()
             # Don't overlay: _main, critical I2C helpers that are called from overlayed code
             _NO_OVERLAY = {'_main:', '__i2c_sb:', '__i2c_st:', '__i2c_st_only:', '__i2c_sp:',
-                           '__lcd_chr:', '__lcd_cmd:', '__lcd_send:'}
+                           '__lcd_chr:', '__lcd_cmd:', '__lcd_send:',
+                           '__delay_cal:', '__delay_Nms:', '__i2c_rb:'}
             if s.endswith(':') and not s.startswith('.') and s.startswith('_') and s not in _NO_OVERLAY:
                 name = s[:-1]
                 start = i
@@ -2466,6 +2561,31 @@ class MK1CodeGen:
                 self.emit('\tnop')
                 self.emit('\tldi $a,0x02')    # SDA released, SCL LOW
                 self.emit('\texw 0 2')
+                return
+
+            if name == 'delay_calibrate':
+                # Run SQW-based calibration, store D/4 in data page addr 0.
+                # Emits jal to __delay_cal helper (emitted once with other helpers).
+                if not hasattr(self, '_lcd_helpers'):
+                    self._lcd_helpers = set()
+                self._lcd_helpers.add('__delay_cal')
+                self.emit('\tjal __delay_cal')
+                return
+
+            if name == 'delay_ms':
+                # delay N ms using calibrated value from data[0].
+                # A = ms count. Calls __delay_Nms.
+                if args:
+                    c = self._const_eval(args[0])
+                    if c is not None:
+                        self.emit(f'\tldi $a,{c & 0xFF}')
+                    else:
+                        self.gen_expr(args[0])
+                if not hasattr(self, '_lcd_helpers'):
+                    self._lcd_helpers = set()
+                self._lcd_helpers.add('__delay_Nms')
+                self.emit('\tmov $a,$b')    # B = ms count
+                self.emit('\tjal __delay_Nms')
                 return
 
             if name == 'lcd_cmd' or name == 'lcd_char':

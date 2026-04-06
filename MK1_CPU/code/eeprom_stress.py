@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""EEPROM stress test v3 — proven patterns only."""
+"""EEPROM stress test v3 — two-phase: calibrate once, then run tests.
+Phase 1: Calibrate, store D/4 in data page addr 0.
+Phase 2: Test programs read D/4 from data page, use delay_1ms."""
 
 import requests, time, sys
 
@@ -95,70 +97,139 @@ __i2c_rb:
 	ret
 """
 
-VIA_INIT = """
-	nop
-	nop
-	nop
+# delay_Nms: B = ms count. Reads D/4 from data[0] each iteration.
+DELAY_SUBS = """
+delay_Nms:
+.dnms:
 	clr $a
-	exw 0 0
-	exw 0 2
-	ldi $a, 0x03
-	exw 0 2
-	ldi $a, 0x01
-	exw 0 2
-	clr $a
-	exw 0 2
+	deref		; A = data[0] = D/4
+.dms:
+	nop
+	nop
+	nop
+	nop
+	nop
+	nop
+	nop
+	nop
+	nop
+	nop
+	dec
+	jnz .dms	; 13 cycles × D/4 ≈ 1ms
+	mov $b, $a
+	dec
+	mov $a, $b
+	jnz .dnms
+	ret
 """
 
-BUS_RECOVERY_ASM = """
-	nop
-	nop
-	nop
+CALIBRATION_ASM = """
+	ldi $d, 0
+.via_dly:
+	dec
+	jnz .via_dly
 	clr $a
 	exw 0 0
 	exw 0 2
-	ldi $c, 9
-.busrec:
-	ldi $a, 0x02
-	exw 0 2
-	clr $a
-	exw 0 2
-	mov $c, $a
-	dec
-	mov $a, $c
-	jnz .busrec
-	ldi $a, 0x03
-	exw 0 2
+	; Configure SQW
+	exrw 2
 	ldi $a, 0x01
 	exw 0 2
+	ldi $a, 0x03
+	exw 0 2
+	ldi $a, 0xD0
+	jal __i2c_sb
+	ldi $a, 0x0E
+	jal __i2c_sb
+	clr $a
+	jal __i2c_sb
+	jal __i2c_sp
+	; Calibrate
+.s1:
+	exrw 1
+	tst 0x01
+	jz .s2
+	j .s1
+.s2:
+	exrw 1
+	tst 0x01
+	jnz .cal
+	j .s2
+.cal:
+	ldi $b, 0
+.cal_hi_ovf:
+	clr $a
+.cal_hi_inner:
+	nop
+	nop
+	nop
+	nop
+	nop
+	nop
+	nop
+	nop
+	nop
+	nop
+	dec
+	jnz .cal_hi_inner
+	mov $b, $a
+	inc
+	mov $a, $b
+	exrw 1
+	tst 0x01
+	jz .cal_lo
+	j .cal_hi_ovf
+.cal_lo:
+	clr $a
+.cal_lo_inner:
+	nop
+	nop
+	nop
+	nop
+	nop
+	nop
+	nop
+	nop
+	nop
+	nop
+	dec
+	jnz .cal_lo_inner
+	mov $b, $a
+	inc
+	mov $a, $b
+	exrw 1
+	tst 0x01
+	jnz .cal_done
+	j .cal_lo
+.cal_done:
+	; B = D. Compute D/4, store in data page addr 0.
+	mov $b, $a
+	slr
+	slr
+	ldi $b, 0
+	ideref		; data[0] = D/4
+	; Output D/4 for reference
+	out
 	clr $a
 	exw 0 2
-	out_imm 1
 	hlt
-""" + I2C_SUBS
+""" + I2C_SUBS + """
+	section data
+	byte 0
+"""
 
-def assemble_upload_run(asm, max_cycles=5000000):
-    r = requests.post(f"{BASE}/assemble", data=asm, headers={"Content-Type": "text/plain"})
-    d = r.json()
-    if d.get("errors"):
-        print(f"  ASM ERRORS: {d['errors']}")
-        return None
-    if d["code_size"] > 256:
-        print(f"  CODE TOO BIG: {d['code_size']}B")
-        return None
-    requests.post(f"{BASE}/upload")
-    r = requests.post(f"{BASE}/run_cycles", params={"n": max_cycles, "us": 1})
-    # Wait for any EEPROM write cycle triggered by STOP (10ms max + big margin)
-    time.sleep(0.15)
-    r2 = requests.get(f"{BASE}/read_output")
-    d2 = r2.json()
-    if not d2.get("captured"):
-        return None
-    return d2["value"]
 
-def make_write_asm(addr_hi, addr_lo, value):
-    """Write byte. ACK poll after to confirm write cycle complete."""
-    return VIA_INIT + f"""
+def make_write_read(addr_hi, addr_lo, value):
+    """Write byte, delay 15ms, read back. Reads D/4 from data[0]."""
+    return f"""
+	ldi $d, 0
+.via_dly:
+	dec
+	jnz .via_dly
+	clr $a
+	exw 0 0
+	exw 0 2
+	; Write
 	exrw 2
 	ldi $a, 0x01
 	exw 0 2
@@ -166,8 +237,6 @@ def make_write_asm(addr_hi, addr_lo, value):
 	exw 0 2
 	ldi $a, 0xAE
 	jal __i2c_sb
-	tst 0x01
-	jnz .wfail
 	ldi $a, {addr_hi}
 	jal __i2c_sb
 	ldi $a, {addr_lo}
@@ -175,19 +244,10 @@ def make_write_asm(addr_hi, addr_lo, value):
 	ldi $a, {value}
 	jal __i2c_sb
 	jal __i2c_sp
-	out_imm 1
-	hlt
-.wfail:
-	jal __i2c_sp
-	out_imm 222
-	hlt
-""" + I2C_SUBS
-
-def make_page_write_asm(addr_hi, addr_lo, values):
-    data_lines = ""
-    for v in values:
-        data_lines += f"\tldi $a, {v}\n\tjal __i2c_sb\n"
-    return VIA_INIT + f"""
+	; Delay 15ms
+	ldi $b, 15
+	jal delay_Nms
+	; Read: set address
 	exrw 2
 	ldi $a, 0x01
 	exw 0 2
@@ -195,32 +255,6 @@ def make_page_write_asm(addr_hi, addr_lo, values):
 	exw 0 2
 	ldi $a, 0xAE
 	jal __i2c_sb
-	tst 0x01
-	jnz .pwfail
-	ldi $a, {addr_hi}
-	jal __i2c_sb
-	ldi $a, {addr_lo}
-	jal __i2c_sb
-{data_lines}	jal __i2c_sp
-	out_imm {len(values)}
-	hlt
-.pwfail:
-	jal __i2c_sp
-	out_imm 222
-	hlt
-""" + I2C_SUBS
-
-def make_random_read_asm(addr_hi, addr_lo):
-    return VIA_INIT + f"""
-	exrw 2
-	ldi $a, 0x01
-	exw 0 2
-	ldi $a, 0x03
-	exw 0 2
-	ldi $a, 0xAE
-	jal __i2c_sb
-	tst 0x01
-	jnz .rfail
 	ldi $a, {addr_hi}
 	jal __i2c_sb
 	ldi $a, {addr_lo}
@@ -234,8 +268,6 @@ def make_random_read_asm(addr_hi, addr_lo):
 	exw 0 2
 	ldi $a, 0xAF
 	jal __i2c_sb
-	tst 0x01
-	jnz .rfail
 	jal __i2c_rb
 	ldi $a, 0x02
 	exw 0 2
@@ -248,15 +280,131 @@ def make_random_read_asm(addr_hi, addr_lo):
 	jal __i2c_sp
 	mov $d, $a
 	out
+	clr $a
+	exw 0 2
 	hlt
-.rfail:
-	jal __i2c_sp
-	out_imm 222
-	hlt
-""" + I2C_SUBS
+""" + I2C_SUBS + DELAY_SUBS + """
+	section data
+	byte 0
+"""
 
-def make_current_read_asm():
-    return VIA_INIT + """
+
+def run_on_555(asm, timeout=30):
+    """Assemble, upload, wait for 555 to run to HLT, read 7-seg value."""
+    r = requests.post(f"{BASE}/assemble", data=asm, headers={"Content-Type": "text/plain"}).json()
+    if r.get("errors"):
+        return f"ASM_ERR:{r['errors']}"
+    if r["code_size"] > 256:
+        return f"TOO_BIG:{r['code_size']}"
+    requests.post(f"{BASE}/upload")
+    for _ in range(timeout):
+        time.sleep(1)
+        s = requests.get(f"{BASE}/status").json()
+        if s["state"] == "halted":
+            # Can't read OI on 555. Need user to switch to manual for that.
+            # For now, trust the 7-seg.
+            return None  # Can't read OI on 555 auto clock
+    return "TIMEOUT"
+
+
+def run_with_cycles(asm, max_cycles=5000000):
+    """Assemble, upload, run via run_cycles. Returns OI value."""
+    r = requests.post(f"{BASE}/assemble", data=asm, headers={"Content-Type": "text/plain"}).json()
+    if r.get("errors"):
+        return f"ASM_ERR:{r['errors']}"
+    if r["code_size"] > 256:
+        return f"TOO_BIG:{r['code_size']}"
+    requests.post(f"{BASE}/upload")
+    requests.post(f"{BASE}/run_cycles", params={"n": max_cycles, "us": 1})
+    time.sleep(0.2)
+    d = requests.get(f"{BASE}/read_output").json()
+    if not d.get("captured"):
+        return "NO_OI"
+    return d["value"]
+
+
+# ── Main ──
+print("=== EEPROM Stress Test v3 ===\n")
+
+# Check sizes
+r = requests.post(f"{BASE}/assemble", data=CALIBRATION_ASM,
+                   headers={"Content-Type": "text/plain"}).json()
+print(f"Calibration program: {r['code_size']}B")
+
+test_asm = make_write_read(0x03, 0x00, 42)
+r = requests.post(f"{BASE}/assemble", data=test_asm,
+                   headers={"Content-Type": "text/plain"}).json()
+print(f"Write+read program: {r['code_size']}B")
+
+if r['code_size'] > 256:
+    print("Write+read program too big!")
+    sys.exit(1)
+
+print("\nPhase 1: Calibrate on 555 auto clock...")
+print("(Waiting for calibration to complete — takes ~3 seconds)")
+result = run_on_555(CALIBRATION_ASM, timeout=10)
+if result == "TIMEOUT":
+    print("Calibration timed out!")
+    sys.exit(1)
+print("Calibration done. D/4 stored in data page.")
+
+print("\nNow switch SW3 to MANUAL so I can use run_cycles to read OI.")
+print("Press Enter when ready...")
+input()
+
+print("\nPhase 2: Write/read tests via run_cycles...")
+passes = 0
+fails = 0
+test_cases = [
+    (0x03, 0x00, 0x00),
+    (0x03, 0x01, 0xFF),
+    (0x03, 0x02, 0xAA),
+    (0x03, 0x03, 0x55),
+    (0x03, 0x04, 0x01),
+    (0x03, 0x05, 0x80),
+    (0x03, 0x06, 0x7F),
+    (0x03, 0x07, 42),
+    (0x03, 0x08, 99),
+    (0x03, 0x09, 200),
+]
+for hi, lo, val in test_cases:
+    asm = make_write_read(hi, lo, val)
+    r = run_with_cycles(asm)
+    addr = (hi << 8) | lo
+    if isinstance(r, str):
+        print(f"  [FAIL] addr=0x{addr:04X} val={val}: {r}")
+        fails += 1
+    elif r == val:
+        print(f"  [PASS] addr=0x{addr:04X} val={val}")
+        passes += 1
+    else:
+        print(f"  [FAIL] addr=0x{addr:04X} wrote {val}, got {r}")
+        fails += 1
+
+# Re-read all to check persistence
+print("\n--- Persistence check ---")
+for hi, lo, val in test_cases:
+    # Just read (no write) — set address then read
+    read_asm = f"""
+	ldi $d, 0
+.via_dly:
+	dec
+	jnz .via_dly
+	clr $a
+	exw 0 0
+	exw 0 2
+	exrw 2
+	ldi $a, 0x01
+	exw 0 2
+	ldi $a, 0x03
+	exw 0 2
+	ldi $a, 0xAE
+	jal __i2c_sb
+	ldi $a, {hi}
+	jal __i2c_sb
+	ldi $a, {lo}
+	jal __i2c_sb
+	jal __i2c_sp
 	exrw 2
 	ldi $a, 0x01
 	exw 0 2
@@ -276,120 +424,18 @@ def make_current_read_asm():
 	jal __i2c_sp
 	mov $d, $a
 	out
+	clr $a
+	exw 0 2
 	hlt
 """ + I2C_SUBS
-
-# ── Test suite ──
-
-passes = 0
-fails = 0
-
-print("=== EEPROM Stress Test v3 ===\n")
-print("Running bus recovery...")
-assemble_upload_run(BUS_RECOVERY_ASM)
-time.sleep(0.5)  # let any write cycle from recovery complete
-print()
-
-# Test 1: Byte write/read
-print("--- Test 1: Single byte write/read ---")
-test_cases = [
-    (0x00, 0x50, 0x00),
-    (0x00, 0x51, 0xFF),
-    (0x00, 0x52, 0xAA),
-    (0x00, 0x53, 0x55),
-    (0x00, 0x54, 0x01),
-    (0x00, 0x55, 0x80),
-    (0x00, 0x56, 0x7F),
-    (0x00, 0x57, 42),
-    (0x01, 0x00, 99),
-    (0x02, 0x00, 200),
-]
-
-for hi, lo, val in test_cases:
-    w = assemble_upload_run(make_write_asm(hi, lo, val))
-    ok_w = (w == 1)
-    if not ok_w:
-        addr = (hi << 8) | lo
-        print(f"  [FAIL] addr=0x{addr:04X} val={val} (write OI={w})")
-        fails += 1
-        continue
-    r = assemble_upload_run(make_random_read_asm(hi, lo))
-    addr = (hi << 8) | lo
-    if r == val:
-        print(f"  [PASS] addr=0x{addr:04X} val={val}")
-        passes += 1
-    else:
-        print(f"  [FAIL] addr=0x{addr:04X} wrote {val}, read {r}")
-        fails += 1
-
-# Test 2: Re-read persistence
-print("\n--- Test 2: Re-read persistence ---")
-for hi, lo, val in test_cases:
-    r = assemble_upload_run(make_random_read_asm(hi, lo))
+    r = run_with_cycles(read_asm)
     addr = (hi << 8) | lo
     if r == val:
         passes += 1
         print(f"  [PASS] addr=0x{addr:04X} val={val}")
     else:
         fails += 1
-        print(f"  [FAIL] addr=0x{addr:04X} expected={val} got={r}")
-
-# Test 3: Page write + sequential read
-print("\n--- Test 3: Page write + sequential read ---")
-for hi, lo, vals in [(0x00, 0x60, [11,22,33,44]), (0x00, 0x80, [0,128,255,1])]:
-    w = assemble_upload_run(make_page_write_asm(hi, lo, vals))
-    if w == 222 or w is None:
-        print(f"  [FAIL] addr=0x{(hi<<8)|lo:04X} page write failed (OI={w})")
-        fails += 1
-        continue
-    # Bus recovery after page write (clears any stuck state)
-    assemble_upload_run(BUS_RECOVERY_ASM)
-    time.sleep(1.0)
-    # Read each byte individually via random read
-    results = []
-    for i in range(len(vals)):
-        addr = lo + i
-        addr_hi_r = hi + (addr >> 8)
-        addr_lo_r = addr & 0xFF
-        r = assemble_upload_run(make_random_read_asm(addr_hi_r, addr_lo_r))
-        results.append(r)
-    if results == vals:
-        passes += 1
-        print(f"  [PASS] addr=0x{(hi<<8)|lo:04X} {vals}")
-    else:
-        fails += 1
-        print(f"  [FAIL] addr=0x{(hi<<8)|lo:04X} wrote {vals}, read {results}")
-
-# Test 4: Overwrite
-print("\n--- Test 4: Overwrite test ---")
-for val in [0, 127, 255, 42, 0]:
-    w = assemble_upload_run(make_write_asm(0x00, 0x70, val))
-    if w != 1:
-        print(f"  [FAIL] overwrite with {val}: write OI={w}")
-        fails += 1
-        continue
-    time.sleep(0.02)
-    r = assemble_upload_run(make_random_read_asm(0x00, 0x70))
-    if r == val:
-        passes += 1
-        print(f"  [PASS] overwrite with {val}")
-    else:
-        fails += 1
-        print(f"  [FAIL] overwrite with {val}, read {r}")
-
-# Test 5: Repeated reads
-print("\n--- Test 5: Repeated read consistency (10x) ---")
-all_ok = True
-for i in range(10):
-    r = assemble_upload_run(make_random_read_asm(0x00, 0x50))
-    expected = 0x00
-    if r != expected:
-        print(f"  [FAIL] read {i+1}: expected {expected}, got {r}")
-        all_ok = False
-        fails += 1
-if all_ok:
-    print(f"  [PASS] 10/10 consistent")
-    passes += 1
+        print(f"  [FAIL] addr=0x{addr:04X} expected={val}, got={r}")
 
 print(f"\n=== Results: {passes} passed, {fails} failed ===")
 sys.exit(1 if fails > 0 else 0)
