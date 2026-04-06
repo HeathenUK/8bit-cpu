@@ -190,9 +190,11 @@ static volatile bool hltFired = false;
 static bool hltIrqAttached = false;
 
 static void IRAM_ATTR onHltRising() {
-    // Immediately kill LEDC output — must be fast to prevent re-execution
-    ledcWrite(CLK_LEDC_CHANNEL, 0);
-    hltFired = true;
+    // Verify HLT is actually HIGH (debounce — filter out brief glitches)
+    if (digitalRead(PIN_HLT) == HIGH) {
+        ledcWrite(CLK_LEDC_CHANNEL, 0);
+        hltFired = true;
+    }
 }
 
 static void startCustomClock(int hz) {
@@ -207,9 +209,10 @@ static void startCustomClock(int hz) {
 
     if (hz < 150) hz = 150;  // LEDC prescaler can't go lower than ~150Hz
 
-    uint8_t resolution = 8;  // 8-bit: good up to 312kHz
-    if ((long long)hz * 256 > 80000000LL) resolution = 1;
-    uint32_t duty = (1 << resolution) / 2;  // 50% duty
+    // Use 1-bit resolution for all frequencies — gives exact 50% duty
+    // and accurate frequency via integer prescaler (80MHz / (prescaler * 2))
+    uint8_t resolution = 1;
+    uint32_t duty = 1;  // 50% at 1-bit resolution
 
     ledcSetup(CLK_LEDC_CHANNEL, hz, resolution);
     ledcAttachPin(PIN_CLK, CLK_LEDC_CHANNEL);
@@ -285,6 +288,11 @@ static void uploadToMK1(const uint8_t* buf, int size) {
     disableClock();
     digitalWrite(PIN_HL, LOW);
     digitalWrite(PIN_STK, LOW);
+
+    // Release bus — ESP32 must not drive data pins during program execution,
+    // otherwise VIA reads (exrw) can't put data on the bus.
+    busSetInput();
+    disableOutput();
 
     // Start OI monitor BEFORE releasing CPU — the program may execute
     // and halt within microseconds, so the interrupt must be ready first.
