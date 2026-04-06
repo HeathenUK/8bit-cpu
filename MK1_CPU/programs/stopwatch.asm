@@ -1,5 +1,4 @@
-; Stopwatch with DDRA init, optimized to 204B
-; Removed redundant ldi $d,0 at start (D=0 from reset, re-inited at .tick)
+; Stopwatch with PA1 buzzer — DDRA=0 normally, DDRA=0x02 only during beep
 
 .via_dly:
 	dec
@@ -7,8 +6,6 @@
 	clr $a
 	exw 0 0
 	exw 0 2
-	exw 0 3			; DDRA = 0 (PA0 input for SQW)
-	nop				; align delay to working address
 
 	; Configure SQW
 	exrw 2
@@ -24,7 +21,6 @@
 	jal __i2c_sb
 	jal __i2c_sp
 
-	; Sync to rising edge
 .s1:
 	exrw 1
 	tst 0x01
@@ -36,7 +32,6 @@
 	jnz .cal
 	j .s2
 
-	; Calibrate
 .cal:
 	ldi $b, 0
 .cal_hi_ovf:
@@ -99,6 +94,7 @@
 	jal delay_250ms
 	jal delay_250ms
 	jal delay_250ms
+	jal beep_check
 	mov $d, $a
 	inc
 	mov $a, $d
@@ -127,6 +123,39 @@ delay_250ms:
 	dec
 	mov $a, $b
 	jnz .d_outer
+	ret
+
+beep_check:
+	clr $a
+	exw 0 3			; DDRA = 0 (PA0 input, PA1 input — safe)
+	ldi $a, 1
+	deref
+	dec
+	ldi $b, 1
+	ideref
+	jnz .no_beep
+	jal beep
+	ldi $a, 10
+	ldi $b, 1
+	ideref
+.no_beep:
+	ret
+
+beep:
+	ldi $a, 0x02
+	exw 0 3			; DDRA = 0x02 (PA1 output for beep)
+	ldi $c, 0
+.beep_loop:
+	ldi $a, 0x02
+	exw 0 1			; PA1 HIGH
+	clr $a
+	exw 0 1			; PA1 LOW
+	mov $c, $a
+	dec
+	mov $a, $c
+	jnz .beep_loop
+	clr $a
+	exw 0 3			; DDRA = 0 (restore all input)
 	ret
 
 __i2c_sb:
@@ -190,3 +219,4 @@ __i2c_sp:
 
 	section data
 	byte 0
+	byte 10
