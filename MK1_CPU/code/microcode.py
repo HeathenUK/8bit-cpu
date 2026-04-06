@@ -190,7 +190,7 @@ ucode_template[0xEF] = ('stp3', [MI|PO, RO|II|PE, PO|MI, PE|RO|MI, STK|HL|AO|RI,
 
 # LDSP: A = stack[SP + imm] (stack-relative load)
 # Step 2: E=SP, Step 3: MAR=PC, Step 4: A=offset+PC++, Step 5: MAR=A+E=SP+offset, Step 6: A=stack[addr]
-ucode_template[0xEB] = ('ldsp', [MI|PO, RO|II|PE, SO|EI, PO|MI, PE|RO|AI, EO|MI, STK|RO|AI, RST], True)
+ucode_template[0xEB] = ('ldsp', [MI|PO, RO|II|PE, SO|EI, PO|MI, PE|RO|AI, EO, EO|MI, STK|RO|AI], True)
 
 # INC: A = A + 1 (single byte, sets flags)
 # CINV=1, SUB=0: carry-in XOR'd to 1, B not inverted. A + 0 + 1 = A + 1.
@@ -250,7 +250,7 @@ ucode_template[0xE3] = ('setnc', [MI|PO, RO|II|PE, AO|EI, SUB|EO|AI, AO|EI, CINV
 ucode_template[0xE7] = ('push_imm', [MI|PO, RO|II|PE, PO|MI, PE|RO|AI, SO|MI, STK|SD|AO|RI, RST, RST], True)
 
 # LDSP_B N: B = stack[SP+N] (clobbers A with offset temporarily)
-ucode_template[0xF3] = ('ldsp_b', [MI|PO, RO|II|PE, SO|EI, PO|MI, PE|RO|AI, EO|MI, STK|RO|BI, RST], True)
+ucode_template[0xF3] = ('ldsp_b', [MI|PO, RO|II|PE, SO|EI, PO|MI, PE|RO|AI, EO, EO|MI, STK|RO|BI], True)
 
 # IDEREFP3: page3[B] = A — indirect store to page 3
 ucode_template[0xF7] = ('iderefp3', [MI|PO, RO|II|PE, BO|MI, STK|HL|AO|RI, RST, RST, RST, RST], True)
