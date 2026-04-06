@@ -1,8 +1,6 @@
-; Stopwatch: same-loop calibration (zero systematic error)
-; The calibration runs the EXACT same inner loop as the delay.
-; D overflows in 1 SQW cycle = 1 second. D/4 overflows = 250ms.
+; Stopwatch with DDRA init, optimized to 204B
+; Removed redundant ldi $d,0 at start (D=0 from reset, re-inited at .tick)
 
-	ldi $d, 0
 .via_dly:
 	dec
 	jnz .via_dly
@@ -10,6 +8,7 @@
 	exw 0 0
 	exw 0 2
 	exw 0 3			; DDRA = 0 (PA0 input for SQW)
+	nop				; align delay to working address
 
 	; Configure SQW
 	exrw 2
@@ -37,10 +36,9 @@
 	jnz .cal
 	j .s2
 
-	; Calibrate: run delay inner loop, check SQW between overflows
+	; Calibrate
 .cal:
-	ldi $b, 0		; B = overflow count
-	; HIGH phase
+	ldi $b, 0
 .cal_hi_ovf:
 	clr $a
 .cal_hi_inner:
@@ -56,15 +54,13 @@
 	nop
 	dec
 	jnz .cal_hi_inner
-	; overflow — check SQW
 	mov $b, $a
 	inc
 	mov $a, $b
 	exrw 1
 	tst 0x01
-	jz .cal_lo		; SQW fell — switch to LOW phase
+	jz .cal_lo
 	j .cal_hi_ovf
-	; LOW phase
 .cal_lo:
 	clr $a
 .cal_lo_inner:
@@ -85,19 +81,16 @@
 	mov $a, $b
 	exrw 1
 	tst 0x01
-	jnz .cal_done		; SQW rose — full cycle done
+	jnz .cal_done
 	j .cal_lo
 
 .cal_done:
-	; B = D = overflows per second using the EXACT delay loop
-	; D/4 = overflows per 250ms
 	mov $b, $a
 	slr
 	slr
 	ldi $b, 0
-	ideref			; data[0] = D/4
+	ideref
 
-	; Stopwatch
 	ldi $d, 0
 .tick:
 	mov $d, $a
@@ -111,10 +104,9 @@
 	mov $a, $d
 	j .tick
 
-; delay_250ms: data[0] overflows of 256-iteration inner loop
 delay_250ms:
 	clr $a
-	deref			; A = data[0] = D/4
+	deref
 	mov $a, $b
 .d_outer:
 	clr $a
@@ -197,4 +189,4 @@ __i2c_sp:
 	ret
 
 	section data
-	byte 0			; [0] D/4 (written by calibration, read by delay_250ms)
+	byte 0
