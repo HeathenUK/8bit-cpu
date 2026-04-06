@@ -301,6 +301,13 @@ class Parser:
     def parse_primary(self):
         t = self.peek()
         if t.type == 'NUMBER': self.advance(); return ('num', t.value)
+        if t.type == 'STRING':
+            self.advance()
+            # Strip quotes and decode escapes
+            s = t.value[1:-1]
+            s = s.replace('\\n', '\n').replace('\\r', '\r').replace('\\t', '\t')
+            s = s.replace('\\0', '\0').replace('\\\\', '\\')
+            return ('string', s)
         if t.type == 'IDENT':
             name = self.advance().value
             if self.match('('):
@@ -390,7 +397,8 @@ class MK1CodeGen:
     BUILTINS = {'out', 'halt', 'nop', 'exw', 'exr', 'exrw', 'clr_irq0', 'clr_irq1',
                 'irq0', 'irq1', 'exr_port_a', 'exr_port_b', 'exr_port_c',
                 'via_read_porta', 'via_read_portb',
-                'i2c_start', 'i2c_stop',
+                'i2c_init', 'i2c_bus_reset', 'i2c_start', 'i2c_stop',
+                'i2c_ack', 'i2c_nack',
                 'peek3', 'poke3'}
     # NOTE: i2c_send_byte, lcd_cmd, lcd_char, lcd_init are NOT builtins —
     # they use jal to subroutines that clobber B, C, D. The register
@@ -541,10 +549,12 @@ class MK1CodeGen:
 
         if main_fn:
             self.compile_function(*main_fn)
+
         for fn in other_fns:
             self.compile_function(*fn)
 
-        # Emit I2C/LCD helper functions if used
+        # Emit I2C/LCD helpers AFTER all functions — so all helpers needed
+        # by any function are registered. Protected from overlay by _NO_OVERLAY set.
         self._emit_i2c_helpers()
 
         # Dead function elimination: remove functions that are never called
@@ -577,6 +587,25 @@ class MK1CodeGen:
                         self.emit(f'\tbyte {v}')
                 else:
                     self.emit(f'\tbyte {init}')
+            self.emit('\tsection code')
+
+        # Emit LCD init data table in page 3 (if lcd_init was used)
+        if hasattr(self, '_lcd_init_p3_data'):
+            p3_base, data = self._lcd_init_p3_data
+            self.emit('\tsection page3')
+            self.emit(f'; LCD init I2C sequence at page3 offset {p3_base}')
+            for b in data:
+                self.emit(f'\tbyte {b}')
+            self.emit('\tsection code')
+
+        # Emit lcd_print string data in page 3
+        if hasattr(self, '_lcd_print_strings'):
+            self.emit('\tsection page3')
+            for p3_off, s in self._lcd_print_strings:
+                self.emit(f'; string at page3 offset {p3_off}')
+                for ch in s:
+                    self.emit(f'\tbyte {ord(ch)}')
+                self.emit('\tbyte 0')  # null terminator
             self.emit('\tsection code')
 
         return '\n'.join(self.code)
@@ -731,40 +760,94 @@ class MK1CodeGen:
         self.emit('\texw 0 2')
         self.emit('\tret')
 
-        if '__lcd_init' in helpers:
-            self.emit('__lcd_init:')
-            # Reset PCF8574
-            self.emit('\tjal __i2c_st')
-            self.emit('\tldi $a,0x00')
-            self.emit('\tjal __i2c_sb')
-            self.emit('\tjal __i2c_sp')
-            # Nibble 0x03 x3 (no BL during init)
-            for _ in range(3):
-                self.emit('\tjal __i2c_st')
-                self.emit('\tldi $a,0x34')
-                self.emit('\tjal __i2c_sb')
-                self.emit('\tldi $a,0x30')
-                self.emit('\tjal __i2c_sb')
-                self.emit('\tjal __i2c_sp')
-            # Nibble 0x02 (4-bit mode)
-            self.emit('\tjal __i2c_st')
-            self.emit('\tldi $a,0x24')
-            self.emit('\tjal __i2c_sb')
-            self.emit('\tldi $a,0x20')
-            self.emit('\tjal __i2c_sb')
-            self.emit('\tjal __i2c_sp')
-            # Commands: 0x28, 0x0C, 0x01, 0x06
-            for cmd in [0x28, 0x0C, 0x01, 0x06]:
-                self.emit(f'\tldi $d,{cmd}')
-                self.emit('\tjal __lcd_cmd')
-            # Backlight on
-            self.emit('\tjal __i2c_st')
-            self.emit('\tldi $a,0x08')
-            self.emit('\tjal __i2c_sb')
-            self.emit('\tjal __i2c_sp')
+        # __i2c_rb: read one I2C byte into D (8 bits MSB first)
+        if '__i2c_rb' in helpers:
+            lbl_rb = self.label('rb')
+            self.emit('__i2c_rb:')
+            self.emit('\tldi $d,0')
+            self.emit('\tldi $c,8')
+            self.emit(f'{lbl_rb}:')
+            self.emit('\tldi $a,0x02')    # SCL LOW, SDA released
+            self.emit('\texw 0 2')
+            self.emit('\tnop')
+            self.emit('\tnop')
+            self.emit('\tclr $a')         # SCL HIGH, SDA released
+            self.emit('\texw 0 2')
+            self.emit('\tnop')
+            self.emit('\tnop')
+            self.emit('\tnop')
+            self.emit('\texrw 0')         # A = port B (bit 0 = SDA)
+            self.emit('\tpush $a')
+            self.emit('\tmov $d,$a')
+            self.emit('\tsll')
+            self.emit('\tmov $a,$d')      # D <<= 1
+            self.emit('\tpop $a')
+            self.emit('\tandi 0x01,$a')   # isolate SDA
+            self.emit('\tor $d,$a')       # A = (D<<1) | bit
+            self.emit('\tmov $a,$d')      # D = result
+            self.emit('\tldi $a,0x02')    # SCL LOW
+            self.emit('\texw 0 2')
+            self.emit('\tmov $c,$a')
+            self.emit('\tdec')
+            self.emit('\tmov $a,$c')
+            self.emit(f'\tjnz {lbl_rb}')
             self.emit('\tret')
-            # Force __lcd_cmd to be emitted
-            helpers.add('__lcd_cmd')
+
+        if '__lcd_init' in helpers:
+            # Data-driven LCD init: store I2C byte sequence in page 3,
+            # use compact loop to send. Keeps overlay small (~35B vs ~85B).
+            # Sentinels: 0xFE=START, 0xFD=STOP, 0xFF=END, else=send byte
+            START, STOP, END = 0xFE, 0xFD, 0xFF
+            lcd_init_data = []
+            # No PCF reset (0x00) — backlight defaults to on, reset turns it off
+            BL = 0x08  # backlight bit — keep on throughout init
+            for _ in range(3):
+                lcd_init_data += [START, 0x34|BL, 0x30|BL, STOP]   # nibble 0x03 x3
+            lcd_init_data += [START, 0x24|BL, 0x20|BL, STOP]       # nibble 0x02
+            for cmd in [0x28, 0x0C, 0x01, 0x06]:             # HD44780 commands
+                hi = cmd & 0xF0
+                lo = (cmd & 0x0F) << 4
+                lcd_init_data += [START, hi|0x04|BL, hi|BL, lo|0x04|BL, lo|BL, STOP]
+            lcd_init_data.append(END)
+
+            p3_base = self.page3_alloc
+            self.page3_alloc += len(lcd_init_data)
+            self._lcd_init_p3_data = (p3_base, lcd_init_data)
+
+            lbl_loop = self.label('li_lp')
+            lbl_ns = self.label('li_ns')
+            lbl_send = self.label('li_sd')
+            lbl_adv = self.label('li_av')
+            lbl_done = self.label('li_dn')
+
+            self.emit('__lcd_init:')
+            self.emit(f'\tldi $d,{p3_base}')
+            self.emit(f'{lbl_loop}:')
+            self.emit('\tmov $d,$a')
+            self.emit('\tderefp3')
+            self.emit(f'\tldi $b,{END}')
+            self.emit('\tcmp $b')
+            self.emit(f'\tjz {lbl_done}')
+            self.emit(f'\tldi $b,{START}')
+            self.emit('\tcmp $b')
+            self.emit(f'\tjnz {lbl_ns}')
+            self.emit('\tjal __i2c_st')
+            self.emit(f'\tj {lbl_adv}')
+            self.emit(f'{lbl_ns}:')
+            self.emit(f'\tldi $b,{STOP}')
+            self.emit('\tcmp $b')
+            self.emit(f'\tjnz {lbl_send}')
+            self.emit('\tjal __i2c_sp')
+            self.emit(f'\tj {lbl_adv}')
+            self.emit(f'{lbl_send}:')
+            self.emit('\tjal __i2c_sb')
+            self.emit(f'{lbl_adv}:')
+            self.emit('\tmov $d,$a')
+            self.emit('\tinc')
+            self.emit('\tmov $a,$d')
+            self.emit(f'\tj {lbl_loop}')
+            self.emit(f'{lbl_done}:')
+            self.emit('\tret')
 
         # Merged __lcd_cmd / __lcd_chr — differ only in flags (EN vs EN+RS+BL)
         if '__lcd_chr' in helpers:
@@ -823,6 +906,28 @@ class MK1CodeGen:
             self.emit('\tpop $a')         # balance the push at entry
             self.emit('\tret')
 
+        if '__lcd_print' in helpers:
+            # Print null-terminated string from page 3. A = page3 offset.
+            lbl_lp = self.label('lp_lp')
+            lbl_dn = self.label('lp_dn')
+            self.emit('__lcd_print:')
+            self.emit('\tmov $a,$d')         # D = pointer
+            self.emit(f'{lbl_lp}:')
+            self.emit('\tmov $d,$a')         # A = pointer
+            self.emit('\tpush $a')           # save pointer
+            self.emit('\tderefp3')           # A = page3[pointer]
+            self.emit('\tcmp 0')             # null terminator?
+            self.emit(f'\tjz {lbl_dn}')
+            self.emit('\tmov $a,$d')         # D = char (for __lcd_chr)
+            self.emit('\tjal __lcd_chr')     # print char (clobbers all)
+            self.emit('\tpop $a')            # A = pointer
+            self.emit('\taddi 1,$a')         # pointer++
+            self.emit('\tmov $a,$d')         # D = pointer
+            self.emit(f'\tj {lbl_lp}')
+            self.emit(f'{lbl_dn}:')
+            self.emit('\tpop $a')            # balance stack
+            self.emit('\tret')
+
     def _overlay_partition(self):
         """If code exceeds page 0 capacity, move cold functions to page 3.
         Generates overlay loader at the start and rewrite calls to use ocall."""
@@ -854,7 +959,10 @@ class MK1CodeGen:
         while i < len(self.code):
             line = self.code[i]
             s = line.strip()
-            if s.endswith(':') and not s.startswith('.') and s.startswith('_') and s != '_main:':
+            # Don't overlay: _main, critical I2C helpers that are called from overlayed code
+            _NO_OVERLAY = {'_main:', '__i2c_sb:', '__i2c_st:', '__i2c_st_only:', '__i2c_sp:',
+                           '__lcd_chr:', '__lcd_cmd:', '__lcd_send:'}
+            if s.endswith(':') and not s.startswith('.') and s.startswith('_') and s not in _NO_OVERLAY:
                 name = s[:-1]
                 start = i
                 func_size = 0
@@ -906,7 +1014,19 @@ class MK1CodeGen:
         #
         # Page 3 layout: [metadata: 3 bytes/overlay] [code bytes]
 
-        OVERLAY_REGION = 200
+        # OVERLAY_REGION must satisfy two constraints:
+        # 1. OVERLAY_REGION >= resident_code_size (don't overlap resident code)
+        # 2. OVERLAY_REGION + max_overlay_size <= 256 (overlay must fit)
+        overlay_loader_size_actual = 27
+        max_overlay_size = max(fsize for _, _, _, fsize in overlay_funcs)
+        non_overlay_size = remaining_size + overlay_loader_size_actual
+        OVERLAY_REGION = 256 - max_overlay_size
+        if OVERLAY_REGION < non_overlay_size + 2:
+            # Can't fit — resident code + largest overlay > 256
+            import sys
+            print(f"WARNING: overlay won't fit. Resident={non_overlay_size}B, "
+                  f"largest overlay={max_overlay_size}B, total={non_overlay_size+max_overlay_size}B > 256",
+                  file=sys.stderr)
         META_SIZE = 3
 
         overlay_meta = []
@@ -933,12 +1053,81 @@ class MK1CodeGen:
                 rewritten = False
                 for idx, name, _ in overlay_meta:
                     if s == f'jal {name}':
-                        new_code.append(f'	ocall {idx}')
+                        new_code.append(f'	ldi $a,{idx}')
+                        new_code.append(f'	jal _overlay_load')
                         rewritten = True
                         break
                 if not rewritten:
                     new_code.append(line)
                 i += 1
+
+        # ── Inline helpers only used by overlay code ──
+        # If a _NO_OVERLAY helper is never called from resident code,
+        # inline its body into each overlay that calls it and remove from resident.
+        overlay_names = {name for name, _, _, _ in overlay_funcs}
+        # Find helper bodies in new_code (resident)
+        helper_bodies = {}
+        hi = 0
+        while hi < len(new_code):
+            hs = new_code[hi].strip()
+            if hs.endswith(':') and hs.startswith('__') and not hs.startswith('.'):
+                hname = hs[:-1]
+                hstart = hi
+                hi += 1
+                hlines = []
+                while hi < len(new_code):
+                    ns = new_code[hi].strip()
+                    if ns.endswith(':') and not ns.startswith('.') and ns.startswith('_'):
+                        break
+                    hlines.append(new_code[hi])
+                    hi += 1
+                helper_bodies[hname] = (hstart, hi, hlines)
+            else:
+                hi += 1
+
+        for hname, (hstart, hend, hlines) in list(helper_bodies.items()):
+            # Check if any resident code (non-label, non-helper-body) calls this helper
+            called_from_resident = False
+            for ci, cline in enumerate(new_code):
+                if ci >= hstart and ci < hend:
+                    continue  # skip the helper's own body
+                cs = cline.strip()
+                # Check for any reference: jal, j, or other use of the helper name
+                if hname in cs and cs != f'{hname}:':
+                    called_from_resident = True
+                    break
+            if not called_from_resident:
+                # Inline into each overlay block and remove from resident
+                # Replace 'jal hname' + 'ret' pattern: expand body minus final ret
+                inline_body = [l for l in hlines if l.strip() != 'ret']
+                for oi, (oname, olines, ofsize) in enumerate(overlay_asm_blocks):
+                    new_olines = []
+                    for oline in olines:
+                        if oline.strip() == f'jal {hname}':
+                            new_olines.extend(inline_body)
+                        else:
+                            new_olines.append(oline)
+                    # Recompute size
+                    new_fsize = 0
+                    for nl in new_olines:
+                        ns = nl.strip()
+                        if not ns or ns.endswith(':'): continue
+                        mn = ns.split()[0]
+                        if mn in two_byte: new_fsize += 2
+                        elif mn == 'cmp':
+                            parts = ns.split()
+                            new_fsize += 1 if (len(parts)>1 and parts[1].startswith('$')) else 2
+                        else: new_fsize += 1
+                    overlay_asm_blocks[oi] = (oname, new_olines, new_fsize)
+                # Remove from resident
+                for ri in range(hstart, hend):
+                    new_code[ri] = ''  # blank out
+
+        # Clean blanked lines
+        new_code = [l for l in new_code if l != '']
+
+        # Rebuild overlay_meta with updated sizes
+        overlay_meta = [(idx, name, fsize) for idx, (name, _, fsize) in enumerate(overlay_asm_blocks)]
 
         # ── Optimized overlay loader ──
         # Metadata: 2 bytes per overlay (src_offset, length). Entry is always
@@ -946,11 +1135,16 @@ class MK1CodeGen:
         # Loop uses cmp $c to check dst against precomputed end address,
         # eliminating the separate counter register.
         META_SIZE = 2
+        p3_used = self.page3_alloc  # page 3 bytes already used by globals + LCD init
 
         loader = [
             '; ── Overlay loader ──',
             '_overlay_load:',
             '\tsll',                        # A = index * 2 = metadata offset
+        ]
+        if p3_used > 0:
+            loader.append(f'\taddi {p3_used},$a')  # skip past pre-existing page 3 data
+        loader += [
             '\tpush $a',                    # save meta_offset
             '\tderefp3',                    # A = page3[offset] = src_offset
             '\tmov $a,$d',                  # D = src (read pointer)
@@ -972,20 +1166,22 @@ class MK1CodeGen:
             '\tmov $a,$b',                  # B++ (dst)
             '\tcmp $c',                     # dst == end?
             '\tjnz .copy',                  # no: keep copying
-            f'\tldi $a,{OVERLAY_REGION}',
-            '\tjal_r',                      # call overlay function
-            '\tret',                        # return to original caller
+            f'\tj {OVERLAY_REGION}',           # jump to overlay; caller's jal return addr is on stack
         ]
 
-        self.code = loader + new_code
+        # Main must be at address 0 (CPU starts there).
+        # Loader goes after main; ocall replaced with ldi+jal.
+        self.code = new_code + loader
 
         # ── Page 3: metadata (2 bytes/overlay) + overlay code ──
+        # Account for page 3 space already used by globals + LCD init data
+        p3_used = self.page3_alloc
         meta_table_size = len(overlay_meta) * META_SIZE
-        p3_offset = meta_table_size
+        p3_offset = p3_used + meta_table_size
 
         self.code.append('\tsection page3')
         for idx, name, fsize in overlay_meta:
-            self.code.append(f'\tbyte {p3_offset}')   # src offset in page 3
+            self.code.append(f'\tbyte {p3_offset}')   # absolute offset in page 3
             self.code.append(f'\tbyte {fsize}')        # length
             p3_offset += fsize
 
@@ -2055,12 +2251,17 @@ class MK1CodeGen:
                             if reg == 'a':
                                 self.emit('\tout')
                             else:
-                                self.emit(f'\tout ${reg}')
+                                self.emit(f'\tmov ${reg},$a')
+                                self.emit('\tout')
                             return
                     self.gen_expr(arg)
                 self.emit('\tout')
                 return
             if name == 'halt':
+                # Release I2C bus before halting — prevents ESP32 upload from
+                # creating spurious I2C activity via VIA's retained DDRB state
+                self.emit('\tclr $a')
+                self.emit('\texw 0 2')       # DDRB = 0 (SDA/SCL idle)
                 self.emit('\thlt')
                 return
             if name == 'nop':
@@ -2154,6 +2355,41 @@ class MK1CodeGen:
 
             # ── VIA I2C builtins (emit known-good assembly patterns) ──
 
+            if name == 'i2c_init':
+                # VIA init for I2C: delay for VIA ~RES settle (RC = 1ms),
+                # then set ORB=0, DDRB=0.
+                # Uses a delay loop instead of many NOPs to save code space.
+                # ~500 iterations × ~5 cycles × 2µs = ~5ms >> 1ms RC constant.
+                self.emit('\tldi $d,0')       # D = 0 (will count 256 iterations)
+                lbl = self.label('via_dly')
+                self.emit(f'{lbl}:')
+                self.emit('\tdec')
+                self.emit(f'\tjnz {lbl}')
+                self.emit('\tclr $a')
+                self.emit('\texw 0 0')       # ORB = 0
+                self.emit('\texw 0 2')       # DDRB = 0 (both lines idle/HIGH)
+                return
+
+            if name == 'i2c_bus_reset':
+                # Full bus reset: VIA delay + init + STOP to clear stuck I2C state.
+                # ONLY use at the start of the FIRST program in a session.
+                # The STOP resets the EEPROM's address pointer.
+                self.emit('\tldi $d,0')       # delay for VIA ~RES settle (~1.5ms)
+                lbl = self.label('br_dly')
+                self.emit(f'{lbl}:')
+                self.emit('\tdec')
+                self.emit(f'\tjnz {lbl}')
+                self.emit('\tclr $a')
+                self.emit('\texw 0 0')       # ORB = 0
+                self.emit('\texw 0 2')       # DDRB = 0 (idle)
+                self.emit('\tldi $a,0x03')   # STOP: both LOW
+                self.emit('\texw 0 2')
+                self.emit('\tldi $a,0x01')   # STOP: SDA LOW, SCL HIGH
+                self.emit('\texw 0 2')
+                self.emit('\tclr $a')        # STOP: both HIGH (idle)
+                self.emit('\texw 0 2')
+                return
+
             if name == 'lcd_init':
                 # Complete LCD init sequence as one jal call
                 if not hasattr(self, '_lcd_helpers'):
@@ -2163,17 +2399,22 @@ class MK1CodeGen:
                 return
 
             if name == 'i2c_start':
-                if not hasattr(self, '_lcd_helpers'):
-                    self._lcd_helpers = set()
-                self._lcd_helpers.add('__i2c_st_only')
-                self.emit('\tjal __i2c_st_only')
+                # Inline START — avoids jal overhead that causes EEPROM NACK
+                self.emit('\texrw 2')
+                self.emit('\tldi $a,0x01')    # SDA LOW, SCL HIGH
+                self.emit('\texw 0 2')
+                self.emit('\tldi $a,0x03')    # both LOW
+                self.emit('\texw 0 2')
                 return
 
             if name == 'i2c_stop':
-                if not hasattr(self, '_lcd_helpers'):
-                    self._lcd_helpers = set()
-                self._lcd_helpers.add('__i2c_sp')
-                self.emit('\tjal __i2c_sp')
+                # Inline STOP — avoids jal overhead
+                self.emit('\tldi $a,0x03')    # both LOW
+                self.emit('\texw 0 2')
+                self.emit('\tldi $a,0x01')    # SDA LOW, SCL HIGH
+                self.emit('\texw 0 2')
+                self.emit('\tclr $a')         # both HIGH (idle)
+                self.emit('\texw 0 2')
                 return
 
             if name == 'i2c_send_byte':
@@ -2189,6 +2430,42 @@ class MK1CodeGen:
                     self._lcd_helpers = set()
                 self._lcd_helpers.add('__i2c_sb')
                 self.emit('\tjal __i2c_sb')
+                return
+
+            if name == 'i2c_read_byte':
+                # Read one I2C byte into A (8 bits MSB first, SDA released)
+                # Caller must send ACK or NACK after this
+                if not hasattr(self, '_lcd_helpers'):
+                    self._lcd_helpers = set()
+                self._lcd_helpers.add('__i2c_rb')
+                self.emit('\tjal __i2c_rb')
+                self.emit('\tmov $d,$a')  # A = byte read (from D)
+                return
+
+            if name == 'i2c_ack':
+                # Send ACK (pull SDA LOW, clock SCL once) — tells slave to send more
+                self.emit('\tldi $a,0x03')    # SDA LOW, SCL LOW
+                self.emit('\texw 0 2')
+                self.emit('\tldi $a,0x01')    # SDA LOW, SCL HIGH
+                self.emit('\texw 0 2')
+                self.emit('\tnop')
+                self.emit('\tnop')
+                self.emit('\tldi $a,0x03')    # SDA LOW, SCL LOW
+                self.emit('\texw 0 2')
+                self.emit('\tldi $a,0x02')    # SDA released, SCL LOW
+                self.emit('\texw 0 2')
+                return
+
+            if name == 'i2c_nack':
+                # Send NACK (SDA released/HIGH, clock SCL once) — tells slave to stop
+                self.emit('\tldi $a,0x02')    # SDA released, SCL LOW
+                self.emit('\texw 0 2')
+                self.emit('\tclr $a')         # SDA released, SCL HIGH
+                self.emit('\texw 0 2')
+                self.emit('\tnop')
+                self.emit('\tnop')
+                self.emit('\tldi $a,0x02')    # SDA released, SCL LOW
+                self.emit('\texw 0 2')
                 return
 
             if name == 'lcd_cmd' or name == 'lcd_char':
@@ -2210,6 +2487,25 @@ class MK1CodeGen:
                     self._lcd_helpers = set()
                 self._lcd_helpers.add(helper)
                 self.emit(f'\tjal {helper}')
+                return
+
+            if name == 'lcd_print':
+                # lcd_print("string") — store string in page 3, emit loop to print
+                if args and args[0][0] == 'string':
+                    s = args[0][1]
+                    # Allocate string bytes in page 3 (null-terminated)
+                    p3_off = self.page3_alloc
+                    if not hasattr(self, '_lcd_print_strings'):
+                        self._lcd_print_strings = []
+                    self._lcd_print_strings.append((p3_off, s))
+                    self.page3_alloc += len(s) + 1  # +1 for null terminator
+                    # Emit call to shared __lcd_print helper
+                    self.emit(f'\tldi $a,{p3_off}')
+                    if not hasattr(self, '_lcd_helpers'):
+                        self._lcd_helpers = set()
+                    self._lcd_helpers.add('__lcd_print')
+                    self._lcd_helpers.add('__lcd_chr')  # __lcd_print calls __lcd_chr
+                    self.emit('\tjal __lcd_print')
                 return
 
             # peek/poke for page 3 (convenience wrappers)
@@ -2679,7 +2975,8 @@ def peephole(lines):
     """Multi-pass peephole optimizer with register tracking."""
 
     def is_label(l): return l and not l.startswith('\t') and l.endswith(':')
-    def is_instr(l): return l and l.startswith('\t')
+    def is_section(l): return l and 'section ' in l
+    def is_instr(l): return l and l.startswith('\t') and not is_section(l)
     def mnemonic(l): return l.strip().split()[0] if is_instr(l) else None
 
     TERMINATORS = {'ret', 'hlt', 'j'}
@@ -2701,7 +2998,7 @@ def peephole(lines):
             if is_instr(line) and mnemonic(line) in TERMINATORS:
                 out.append(line)
                 i += 1
-                while i < len(lines) and not is_label(lines[i]):
+                while i < len(lines) and not is_label(lines[i]) and not is_section(lines[i]):
                     changed = True
                     i += 1
                 continue

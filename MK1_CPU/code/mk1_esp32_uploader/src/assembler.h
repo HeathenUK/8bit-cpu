@@ -317,6 +317,9 @@ private:
 
     void pass(const char* source, bool pass1, bool isInclude = false) {
         if (!pass1 && !isInclude) {
+            // Fill code page with HLT (0x7F) so unused bytes halt the CPU
+            // instead of executing as NOPs and wrapping PC back to 0
+            memset(result.code, 0x7F, CODE_SIZE);
             result.code_size = 0;
             result.data_size = 0;
             result.page3_size = 0;

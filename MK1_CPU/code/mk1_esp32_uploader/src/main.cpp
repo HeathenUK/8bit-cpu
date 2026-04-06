@@ -30,6 +30,7 @@ static const int PIN_STK   = A4;     // bodge wire to STK — page 2/3 select
 static const int PIN_DIR   = A5;     // bodge wire to U59 pin 1 (DIR) — bus transceiver direction
 static const int PIN_RO    = A6;     // bodge wire to TP20 (~RO) — RAM output enable (active low)
 static const int PIN_OI    = A7;     // bodge wire to OI test point — output register latch
+static const int PIN_HLT   = D1;     // bodge wire to HLT LED — detect program halt
 
 static const int BUS_PINS[8] = { D2, D3, D4, D5, D6, D7, D8, D9 };
 
@@ -96,6 +97,7 @@ static void updateClkMeasurement() {
         measuredClkHz = (float)edges * 1000.0f / (float)dt;
         lastClkCount = count;
         lastClkTime = now;
+
     }
 }
 
@@ -183,6 +185,15 @@ static void IRAM_ATTR onClkTimer() {
 }
 
 static bool usingLEDC = false;
+static unsigned long ledcStartTime = 0;
+static volatile bool hltFired = false;
+static bool hltIrqAttached = false;
+
+static void IRAM_ATTR onHltRising() {
+    // Immediately kill LEDC output — must be fast to prevent re-execution
+    ledcWrite(CLK_LEDC_CHANNEL, 0);
+    hltFired = true;
+}
 
 static void startCustomClock(int hz) {
     stopClkMonitor();
@@ -203,6 +214,11 @@ static void startCustomClock(int hz) {
     ledcSetup(CLK_LEDC_CHANNEL, hz, resolution);
     ledcAttachPin(PIN_CLK, CLK_LEDC_CHANNEL);
     ledcWrite(CLK_LEDC_CHANNEL, duty);
+    usingLEDC = true;
+    ledcStartTime = millis();
+    hltFired = false;
+    // Don't attach HLT interrupt yet — HLT may be high during reset.
+    // loop() will attach it after a grace period.
     startClkMonitor();  // keep measuring while custom clock runs
 }
 
@@ -210,6 +226,7 @@ static void stopCustomClock() {
     ledcWrite(CLK_LEDC_CHANNEL, 0);
     ledcDetachPin(PIN_CLK);
     customClkHz = 0;
+    usingLEDC = false;
     pinMode(PIN_CLK, INPUT);
     startClkMonitor();
 }
@@ -1432,6 +1449,7 @@ void setup() {
     digitalWrite(PIN_DIR, HIGH);  // U59 DIR: HIGH = A→B = ESP32→bus (write mode)
     pinMode(PIN_RO, INPUT);       // ~RO: high-Z by default (EEPROM drives this line during normal operation)
     pinMode(PIN_OI, INPUT);       // OI: read to detect when CPU executes 'out'
+    pinMode(PIN_HLT, INPUT);      // HLT: read to detect when CPU halts
     pinMode(PIN_RST, OUTPUT);
     digitalWrite(PIN_RST, HIGH);  // hold MK1 in reset immediately — prevents garbage execution during boot
     pinMode(PIN_CLK, INPUT);
@@ -1521,4 +1539,22 @@ void loop() {
     handleSerialUpload();
     disableOutput();
     updateClkMeasurement();
+
+    // Attach HLT interrupt: wait until HLT is LOW (CPU running), then arm.
+    // This avoids false triggers from HLT being high during reset.
+    if (usingLEDC && !hltIrqAttached && !hltFired) {
+        if (digitalRead(PIN_HLT) == LOW) {
+            attachInterrupt(digitalPinToInterrupt(PIN_HLT), onHltRising, RISING);
+            hltIrqAttached = true;
+        }
+    }
+
+    // HLT detection: ISR already killed LEDC, just update state
+    if (hltFired) {
+        hltFired = false;
+        hltIrqAttached = false;
+        detachInterrupt(digitalPinToInterrupt(PIN_HLT));
+        usingLEDC = false;
+        cpuState = CPU_HALTED;
+    }
 }
