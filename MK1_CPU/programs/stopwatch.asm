@@ -1,4 +1,4 @@
-; Stopwatch with PA1 buzzer — DDRA=0 normally, DDRA=0x02 only during beep
+; Stopwatch: 64-iteration inner loop (clock-agnostic), PA1 buzzer synced to display
 
 .via_dly:
 	dec
@@ -6,6 +6,7 @@
 	clr $a
 	exw 0 0
 	exw 0 2
+	exw 0 3			; DDRA = 0 (essential for SQW + prevents stale state)
 
 	; Configure SQW
 	exrw 2
@@ -32,10 +33,11 @@
 	jnz .cal
 	j .s2
 
+	; Calibrate: 64-iteration inner loop (not 256)
 .cal:
 	ldi $b, 0
 .cal_hi_ovf:
-	clr $a
+	ldi $a, 64
 .cal_hi_inner:
 	nop
 	nop
@@ -57,7 +59,7 @@
 	jz .cal_lo
 	j .cal_hi_ovf
 .cal_lo:
-	clr $a
+	ldi $a, 64
 .cal_lo_inner:
 	nop
 	nop
@@ -84,28 +86,34 @@
 	slr
 	slr
 	ldi $b, 0
-	ideref
+	ideref			; data[0] = D/4
+
+	; Init beep target
+	ldi $a, 10
+	ldi $b, 1
+	ideref			; data[1] = 10 (first beep at tick 10)
 
 	ldi $d, 0
 .tick:
 	mov $d, $a
 	out
-	jal delay_250ms
-	jal delay_250ms
-	jal delay_250ms
-	jal delay_250ms
 	jal beep_check
+	jal delay_250ms
+	jal delay_250ms
+	jal delay_250ms
+	jal delay_250ms
 	mov $d, $a
 	inc
 	mov $a, $d
 	j .tick
 
+; delay_250ms: D/4 overflows of 64-iteration inner loop (matches calibration)
 delay_250ms:
 	clr $a
-	deref
+	deref			; A = data[0] = D/4
 	mov $a, $b
 .d_outer:
-	clr $a
+	ldi $a, 64
 .d_inner:
 	nop
 	nop
@@ -125,25 +133,28 @@ delay_250ms:
 	jnz .d_outer
 	ret
 
+; beep_check: beep when D matches data[1], then advance target by 10
 beep_check:
 	clr $a
-	exw 0 3			; DDRA = 0 (PA0 input, PA1 input — safe)
+	exw 0 3			; DDRA = 0
 	ldi $a, 1
-	deref
-	dec
-	ldi $b, 1
-	ideref
+	deref			; A = data[1] = next beep target
+	cmp $d			; target == D?
 	jnz .no_beep
+	; Beep!
 	jal beep
-	ldi $a, 10
+	; Advance target by 10
+	ldi $a, 1
+	deref			; A = data[1]
+	addi 10, $a		; A += 10 (wraps at 256)
 	ldi $b, 1
-	ideref
+	ideref			; data[1] = new target
 .no_beep:
 	ret
 
 beep:
 	ldi $a, 0x02
-	exw 0 3			; DDRA = 0x02 (PA1 output for beep)
+	exw 0 3			; DDRA = 0x02 (PA1 output)
 	ldi $c, 0
 .beep_loop:
 	ldi $a, 0x02
@@ -155,7 +166,7 @@ beep:
 	mov $a, $c
 	jnz .beep_loop
 	clr $a
-	exw 0 3			; DDRA = 0 (restore all input)
+	exw 0 3			; DDRA = 0
 	ret
 
 __i2c_sb:
@@ -218,5 +229,5 @@ __i2c_sp:
 	ret
 
 	section data
-	byte 0
-	byte 10
+	byte 0			; [0] D/4
+	byte 10			; [1] next beep target
