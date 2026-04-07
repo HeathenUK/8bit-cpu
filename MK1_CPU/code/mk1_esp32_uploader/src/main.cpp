@@ -924,6 +924,7 @@ static void handleAssemble() {
         int p3Bytes = r.page3_size < DATA_SIZE ? r.page3_size : DATA_SIZE;
 
         memcpy(uploadBuf, r.code, CODE_SIZE);  // copy full page (includes HLT fill)
+
         uploadSize = CODE_SIZE;
 
         if (dataBytes > 0 || p3Bytes > 0) {
@@ -956,7 +957,12 @@ static void handleAssemble() {
             json += hex;
             if (i < dataBytes - 1) json += " ";
         }
-        json += "\"}";
+        json += "\",\"src_len\":" + String(source.length());
+        // Checksum of upload buffer for WiFi corruption detection
+        uint32_t cksum = 0;
+        for (int i = 0; i < uploadSize; i++) cksum += uploadBuf[i];
+        json += ",\"cksum\":" + String(cksum);
+        json += "}";
     }
 
     server.send(200, "application/json", json);
@@ -1430,17 +1436,149 @@ static void startAP() {
 
 static const uint8_t SERIAL_MAGIC[] = { 0x4D, 0x4B };
 
+static String serialLineBuf;
+
+static void handleSerialCommand(const String& line) {
+    // Serial command protocol: "CMD:<command> [args]"
+    // Responses are JSON, same as HTTP endpoints.
+    if (line.startsWith("ASM:")) {
+        // ASM:<assembly source> — assemble and prepare upload buffer
+        String source = line.substring(4);
+        source.replace("\\n", "\n");  // unescape newlines
+        assembler.assemble(source.c_str());
+        const AsmResult& r = assembler.result;
+        if (r.error_count > 0) {
+            Serial.printf("{\"ok\":false,\"errors\":%d}\n", r.error_count);
+            return;
+        }
+        int codeBytes = r.code_size < CODE_SIZE ? r.code_size : CODE_SIZE;
+        memcpy(uploadBuf, r.code, CODE_SIZE);
+        uploadSize = CODE_SIZE;
+        int dataBytes = r.data_size < DATA_SIZE ? r.data_size : DATA_SIZE;
+        if (dataBytes > 0) {
+            memcpy(uploadBuf + CODE_SIZE, r.data, dataBytes);
+            memset(uploadBuf + CODE_SIZE + dataBytes, 0, DATA_SIZE - dataBytes);
+            uploadSize = CODE_SIZE + DATA_SIZE;
+        }
+        uint32_t cksum = 0;
+        for (int i = 0; i < uploadSize; i++) cksum += uploadBuf[i];
+        Serial.printf("{\"ok\":true,\"code\":%d,\"data\":%d,\"cksum\":%u,\"hex\":\"", codeBytes, dataBytes, cksum);
+        for (int i = 0; i < codeBytes && i < 16; i++) {
+            if (i) Serial.print(' ');
+            Serial.printf("%02X", r.code[i]);
+        }
+        Serial.println("\"}");
+    }
+    else if (line == "UPLOAD") {
+        if (uploadSize == 0) { Serial.println("{\"ok\":false}"); return; }
+        uploadToMK1(uploadBuf, uploadSize);
+        Serial.println("{\"ok\":true}");
+    }
+    else if (line.startsWith("RUN:")) {
+        // RUN:cycles,us — run N cycles at us half-period
+        int comma = line.indexOf(',', 4);
+        int n = line.substring(4, comma > 0 ? comma : line.length()).toInt();
+        int us = comma > 0 ? line.substring(comma + 1).toInt() : 1;
+        if (n < 1) n = 1;
+        if (n > 5000000) n = 5000000;
+        if (us < 0) us = 0;
+
+        stopCustomClock();
+        if (oiMonitorActive) detachInterrupt(digitalPinToInterrupt(PIN_OI));
+        outputCaptured = false;
+        oiCount = 0;
+
+        int oiGpio = digitalPinToGPIONumber(PIN_OI);
+        if (oiGpio < 0) oiGpio = PIN_OI;
+        uint32_t oiMask = 1 << oiGpio;
+
+        busSetInput();
+        disableOutput();
+        digitalWrite(PIN_DIR, LOW);
+        enableOutput();
+
+        int clkGpio = digitalPinToGPIONumber(PIN_CLK);
+        uint32_t clkMask = 1 << clkGpio;
+        pinMode(PIN_CLK, OUTPUT);
+        digitalWrite(PIN_CLK, LOW);
+
+        int actualCycles = 0;
+        for (int i = 0; i < n; i++) {
+            actualCycles++;
+            GPIO.out_w1ts = clkMask;
+            if (us > 0) delayMicroseconds(us);
+            uint32_t gpio1 = GPIO.in;
+            if (gpio1 & oiMask) {
+                uint8_t val = readBusFast();
+                if (oiCount < 16) oiHistory[oiCount] = val;
+                oiCount++;
+                lastOutputVal = val;
+                outputCaptured = true;
+                GPIO.out_w1tc = clkMask;
+                break;
+            }
+            GPIO.out_w1tc = clkMask;
+            if (us > 0) delayMicroseconds(us);
+            uint32_t gpio2 = GPIO.in;
+            if (gpio2 & oiMask) {
+                uint8_t val = readBusFast();
+                if (oiCount < 16) oiHistory[oiCount] = val;
+                oiCount++;
+                lastOutputVal = val;
+                outputCaptured = true;
+                break;
+            }
+        }
+        pinMode(PIN_CLK, INPUT);
+        disableOutput();
+        digitalWrite(PIN_DIR, HIGH);
+        busSetOutput();
+        enableOutput();
+
+        Serial.printf("{\"cyc\":%d,\"val\":%d,\"cap\":%s}\n",
+            actualCycles,
+            oiCount > 0 ? oiHistory[0] : 0,
+            outputCaptured ? "true" : "false");
+    }
+    else if (line == "OI") {
+        uint8_t val = 0;
+        bool found = false;
+        uint32_t n = oiCount < 16 ? oiCount : 16;
+        for (uint32_t i = 0; i < n; i++) {
+            if (oiHistory[i] != 0x3F && oiHistory[i] != 0x7F) {
+                val = oiHistory[i]; found = true; break;
+            }
+        }
+        if (!found && n > 0) val = oiHistory[0];
+        Serial.printf("{\"val\":%d,\"cap\":%s,\"cnt\":%d}\n",
+            val, outputCaptured ? "true" : "false", oiCount);
+    }
+    else if (line == "STATUS") {
+        Serial.printf("{\"state\":\"%s\"}\n",
+            cpuState == CPU_HALTED ? "halted" : "running");
+    }
+    else if (line == "RESET") {
+        disableClock();
+        resetPulse();
+        enableCU();
+        Serial.println("{\"ok\":true}");
+    }
+    else {
+        Serial.println("{\"err\":\"unknown\"}");
+    }
+}
+
 static void handleSerialUpload() {
-    if (Serial.available() >= 2) {
-        uint8_t header[2];
-        Serial.readBytes(header, 2);
-        if (header[0] == SERIAL_MAGIC[0] && header[1] == SERIAL_MAGIC[1]) {
-            uint8_t buf[512];
-            int n = Serial.readBytes(buf, sizeof(buf));
-            Serial.write(0x00);
-            uploadToMK1(buf, n);
-        } else {
-            while (Serial.available()) Serial.read();
+    // Check for text commands (lines ending with \n)
+    while (Serial.available()) {
+        char c = Serial.read();
+        if (c == '\n' || c == '\r') {
+            if (serialLineBuf.length() > 0) {
+                handleSerialCommand(serialLineBuf);
+                serialLineBuf = "";
+            }
+        } else if (serialLineBuf.length() < 4096) {
+            serialLineBuf += c;
         }
     }
 }
