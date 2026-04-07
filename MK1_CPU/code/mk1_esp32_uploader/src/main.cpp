@@ -534,12 +534,10 @@ static inline uint8_t IRAM_ATTR readBusFast() {
 
 static void IRAM_ATTR onOIRising() {
     uint8_t val = readBusFast();
-    if (!outputCaptured || val != lastOutputVal) {
-        if (oiCount < 16) oiHistory[oiCount] = val;
-        oiCount++;
-        lastOutputVal = val;
-        outputCaptured = true;
-    }
+    if (oiCount < 16) oiHistory[oiCount] = val;
+    oiCount++;  // always count, even if value is same (for rate measurement)
+    lastOutputVal = val;
+    outputCaptured = true;
 }
 
 static bool oiMonitorActive = false;
@@ -1561,6 +1559,21 @@ static void handleSerialCommand(const String& line) {
         disableClock();
         resetPulse();
         enableCU();
+        Serial.println("{\"ok\":true}");
+    }
+    else if (line.startsWith("CLOCK:")) {
+        int hz = line.substring(6).toInt();
+        if (hz > 0) {
+            startCustomClock(hz);
+            Serial.printf("{\"ok\":true,\"hz\":%d}\n", hz);
+        } else {
+            stopCustomClock();
+            Serial.println("{\"ok\":true,\"hz\":0}");
+        }
+    }
+    else if (line == "HALT") {
+        enableClock();  // hold CLK high = freeze
+        cpuState = CPU_HALTED;
         Serial.println("{\"ok\":true}");
     }
     else {
