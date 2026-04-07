@@ -514,7 +514,7 @@ static void handleBusSniff() {
 static volatile uint8_t lastOutputVal = 0;
 static volatile bool outputCaptured = false;
 static volatile uint32_t oiCount = 0;
-static volatile uint8_t oiHistory[16];
+static volatile uint8_t oiHistory[256];
 
 static uint32_t oiGpioMask = 0;  // precomputed at startOIMonitor
 
@@ -534,7 +534,7 @@ static inline uint8_t IRAM_ATTR readBusFast() {
 
 static void IRAM_ATTR onOIRising() {
     uint8_t val = readBusFast();
-    if (oiCount < 16) oiHistory[oiCount] = val;
+    if (oiCount < 256) oiHistory[oiCount] = val;
     oiCount++;  // always count, even if value is same (for rate measurement)
     lastOutputVal = val;
     outputCaptured = true;
@@ -595,7 +595,7 @@ static void handleUploadAndWait() {
     delay(timeoutSec * 1000);
 
     // Find first non-spurious ISR value (filter 63=floating, 127=HLT)
-    uint32_t n = oiCount < 16 ? oiCount : 16;
+    uint32_t n = oiCount < 256 ? oiCount : 16;
     for (uint32_t i = 0; i < n; i++) {
         if (oiHistory[i] != 0x3F && oiHistory[i] != 0x7F &&
             oiHistory[i] != 0xBF && oiHistory[i] != 0xFF) {
@@ -672,7 +672,7 @@ static void handleReadOutput() {
     // 0x7F (127) = HLT opcode during fetch
     uint8_t reportVal = 0;
     bool found = false;
-    uint32_t n = oiCount < 16 ? oiCount : 16;
+    uint32_t n = oiCount < 256 ? oiCount : 16;
     for (uint32_t i = 0; i < n; i++) {
         if (oiHistory[i] != 0x3F && oiHistory[i] != 0x7F) {
             reportVal = oiHistory[i];
@@ -751,7 +751,7 @@ static void handleRunCycles() {
         uint32_t gpio1 = GPIO.in;
         if (gpio1 & oiMask) {
             uint8_t val = readBusFast();
-            if (oiCount < 16) oiHistory[oiCount] = val;
+            if (oiCount < 256) oiHistory[oiCount] = val;
             oiCount++;
             lastOutputVal = val;
             outputCaptured = true;
@@ -767,7 +767,7 @@ static void handleRunCycles() {
         uint32_t gpio2 = GPIO.in;
         if (gpio2 & oiMask) {
             uint8_t val = readBusFast();
-            if (oiCount < 16) oiHistory[oiCount] = val;
+            if (oiCount < 256) oiHistory[oiCount] = val;
             oiCount++;
             lastOutputVal = val;
             outputCaptured = true;
@@ -1508,7 +1508,7 @@ static void handleSerialCommand(const String& line) {
             uint32_t gpio1 = GPIO.in;
             if (gpio1 & oiMask) {
                 uint8_t val = readBusFast();
-                if (oiCount < 16) oiHistory[oiCount] = val;
+                if (oiCount < 256) oiHistory[oiCount] = val;
                 oiCount++;
                 lastOutputVal = val;
                 outputCaptured = true;
@@ -1520,7 +1520,7 @@ static void handleSerialCommand(const String& line) {
             uint32_t gpio2 = GPIO.in;
             if (gpio2 & oiMask) {
                 uint8_t val = readBusFast();
-                if (oiCount < 16) oiHistory[oiCount] = val;
+                if (oiCount < 256) oiHistory[oiCount] = val;
                 oiCount++;
                 lastOutputVal = val;
                 outputCaptured = true;
@@ -1541,7 +1541,7 @@ static void handleSerialCommand(const String& line) {
     else if (line == "OI") {
         uint8_t val = 0;
         bool found = false;
-        uint32_t n = oiCount < 16 ? oiCount : 16;
+        uint32_t n = oiCount < 256 ? oiCount : 16;
         for (uint32_t i = 0; i < n; i++) {
             if (oiHistory[i] != 0x3F && oiHistory[i] != 0x7F) {
                 val = oiHistory[i]; found = true; break;
@@ -1571,6 +1571,77 @@ static void handleSerialCommand(const String& line) {
             Serial.println("{\"ok\":true,\"hz\":0}");
         }
     }
+    else if (line == "OICNT") {
+        Serial.println(oiCount);
+    }
+    else if (line.startsWith("RUNLOG:")) {
+        // RUNLOG:cycles,us — run without stopping on OI, log all OI values
+        int comma = line.indexOf(',', 7);
+        int n = line.substring(7, comma > 0 ? comma : line.length()).toInt();
+        int us = comma > 0 ? line.substring(comma + 1).toInt() : 1;
+        if (n < 1) n = 1;
+        if (n > 5000000) n = 5000000;
+        if (us < 0) us = 0;
+
+        stopCustomClock();
+        if (oiMonitorActive) detachInterrupt(digitalPinToInterrupt(PIN_OI));
+        outputCaptured = false;
+        oiCount = 0;
+
+        int oiGpio = digitalPinToGPIONumber(PIN_OI);
+        if (oiGpio < 0) oiGpio = PIN_OI;
+        uint32_t oiMask = 1 << oiGpio;
+
+        busSetInput();
+        disableOutput();
+        digitalWrite(PIN_DIR, LOW);
+        enableOutput();
+
+        int clkGpio = digitalPinToGPIONumber(PIN_CLK);
+        uint32_t clkMask = 1 << clkGpio;
+        pinMode(PIN_CLK, OUTPUT);
+        digitalWrite(PIN_CLK, LOW);
+
+        int actualCycles = 0;
+        for (int i = 0; i < n; i++) {
+            actualCycles++;
+            GPIO.out_w1ts = clkMask;
+            if (us > 0) delayMicroseconds(us);
+            uint32_t gpio1 = GPIO.in;
+            if (gpio1 & oiMask) {
+                uint8_t val = readBusFast();
+                if (oiCount < 256) oiHistory[oiCount] = val;
+                oiCount++;
+                lastOutputVal = val;
+                outputCaptured = true;
+                // DON'T break — keep running
+            }
+            GPIO.out_w1tc = clkMask;
+            if (us > 0) delayMicroseconds(us);
+            uint32_t gpio2 = GPIO.in;
+            if (gpio2 & oiMask) {
+                uint8_t val = readBusFast();
+                if (oiCount < 256) oiHistory[oiCount] = val;
+                oiCount++;
+                lastOutputVal = val;
+                outputCaptured = true;
+            }
+        }
+        pinMode(PIN_CLK, INPUT);
+        disableOutput();
+        digitalWrite(PIN_DIR, HIGH);
+        busSetOutput();
+        enableOutput();
+
+        // Output all captured values
+        Serial.printf("{\"cyc\":%d,\"cnt\":%d,\"vals\":[", actualCycles, oiCount);
+        int show = oiCount < 256 ? oiCount : 16;
+        for (int i = 0; i < show; i++) {
+            if (i) Serial.print(',');
+            Serial.print(oiHistory[i]);
+        }
+        Serial.println("]}");
+    }
     else if (line == "HALT") {
         enableClock();  // hold CLK high = freeze
         cpuState = CPU_HALTED;
@@ -1590,7 +1661,7 @@ static void handleSerialUpload() {
                 handleSerialCommand(serialLineBuf);
                 serialLineBuf = "";
             }
-        } else if (serialLineBuf.length() < 4096) {
+        } else if (serialLineBuf.length() < 16384) {
             serialLineBuf += c;
         }
     }
