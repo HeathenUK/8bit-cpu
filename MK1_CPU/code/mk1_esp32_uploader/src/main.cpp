@@ -923,8 +923,7 @@ static void handleAssemble() {
 
         int p3Bytes = r.page3_size < DATA_SIZE ? r.page3_size : DATA_SIZE;
 
-        memcpy(uploadBuf, r.code, codeBytes);
-        memset(uploadBuf + codeBytes, 0, CODE_SIZE - codeBytes);
+        memcpy(uploadBuf, r.code, CODE_SIZE);  // copy full page (includes HLT fill)
         uploadSize = CODE_SIZE;
 
         if (dataBytes > 0 || p3Bytes > 0) {
@@ -1020,8 +1019,7 @@ static void handleRun() {
     int dataBytes = r.data_size < DATA_SIZE ? r.data_size : DATA_SIZE;
     int p3Bytes = r.page3_size < DATA_SIZE ? r.page3_size : DATA_SIZE;
 
-    memcpy(uploadBuf, r.code, codeBytes);
-    memset(uploadBuf + codeBytes, 0, CODE_SIZE - codeBytes);
+    memcpy(uploadBuf, r.code, CODE_SIZE);  // copy full page (includes HLT fill)
     uploadSize = CODE_SIZE;
 
     if (dataBytes > 0 || p3Bytes > 0) {

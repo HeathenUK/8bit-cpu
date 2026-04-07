@@ -317,8 +317,8 @@ private:
 
     void pass(const char* source, bool pass1, bool isInclude = false) {
         if (!pass1 && !isInclude) {
-            // Fill code page with NOP (0x00) — use HLT fill only for halting programs
-            memset(result.code, 0x00, CODE_SIZE);
+            // Fill code page with HLT (0x7F) — prevents runaway execution past program end
+            memset(result.code, 0x7F, CODE_SIZE);
             result.code_size = 0;
             result.data_size = 0;
             result.page3_size = 0;
