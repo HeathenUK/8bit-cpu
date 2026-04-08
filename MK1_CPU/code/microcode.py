@@ -312,6 +312,13 @@ ucode_template[0xC2] = ('sbc', [MI|PO, RO|II|PE, BO|EI, SUB|CINV|EO|AI|FI, RST, 
 # Loads immediate into E, computes AND for flags only (no AI)
 ucode_template[0xFF] = ('tst', [MI|PO, RO|II|PE, PO|MI, PE|RO|EI, AND|FI, RST, RST, RST], True)
 
+# DDRB_IMM N: write immediate to DDRB (VIA register 2), preserves all registers
+# Same pattern as OUT_IMM but targets VIA DDRB via E0|U1 instead of OI.
+# Immediate goes RAM→bus→VIA in one step. 4 non-VIA steps between consecutive
+# writes provide settling time that prevents the DDRA corruption bug
+# (caused by data bus transition bleeding into RS0 during rapid exw 0 2 sequences).
+ucode_template[0xE2] = ('ddrb_imm', [MI|PO, RO|II|PE, PO|MI, PE|RO|E0|U1, RST, RST, RST, RST], True)
+
 # SWAP: swap A and B (using stack as scratch)
 # Step 2: MAR=SP, Step 3: push A (SP--), Step 4: A=B, Step 5: SP++, Step 6: MAR=SP, Step 7: B=pop
 # Uses all 8 steps (no RST needed — counter wraps naturally)

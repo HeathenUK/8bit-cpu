@@ -1635,7 +1635,7 @@ static void handleSerialCommand(const String& line) {
 
         // Output all captured values
         Serial.printf("{\"cyc\":%d,\"cnt\":%d,\"vals\":[", actualCycles, oiCount);
-        int show = oiCount < 256 ? oiCount : 16;
+        int show = oiCount < 256 ? oiCount : 256;
         for (int i = 0; i < show; i++) {
             if (i) Serial.print(',');
             Serial.print(oiHistory[i]);
