@@ -965,6 +965,19 @@ class MK1CodeGen:
             self.emit('\tslr')
             self.emit('\tldi $b,0')
             self.emit('\tideref')          # data[0] = D/4
+            # Disable SQW to prevent coupling into SDA during I2C
+            self.emit('\texrw 2')
+            self.emit('\tddrb_imm 0x01')
+            self.emit('\tddrb_imm 0x03')
+            self.emit('\tldi $a,0xD0')
+            self.emit('\tjal __i2c_sb')
+            self.emit('\tldi $a,0x0E')
+            self.emit('\tjal __i2c_sb')
+            self.emit('\tldi $a,0x1C')     # INTCN=1, SQW disabled
+            self.emit('\tjal __i2c_sb')
+            self.emit('\tjal __i2c_sp')
+            self.emit('\tclr $a')
+            self.emit('\texw 0 3')         # clear DDRA
             self.emit('\tret')
 
         # __delay_Nms: B = ms count. Reads D/4 from data[0].
@@ -2497,14 +2510,30 @@ class MK1CodeGen:
                 return
 
             if name == 'eeprom_write_byte':
-                # eeprom_write_byte(addr_hi, addr_lo, data)
-                # Writes one byte, waits for write cycle via ACK polling
-                if not args or len(args) < 3:
-                    self.gen_error("eeprom_write_byte needs 3 args: addr_hi, addr_lo, data")
+                # eeprom_write_byte(addr, data) — addr is 16-bit, split at compile time
+                # Also accepts eeprom_write_byte(addr_hi, addr_lo, data) for backwards compat
+                if not args or len(args) < 2:
+                    self.gen_error("eeprom_write_byte(addr, data) or eeprom_write_byte(hi, lo, data)")
                     return
                 if not hasattr(self, '_lcd_helpers'):
                     self._lcd_helpers = set()
                 self._lcd_helpers.add('__i2c_sb')
+                if len(args) == 2:
+                    # 2-arg form: eeprom_write_byte(addr16, data)
+                    addr_c = self._const_eval(args[0])
+                    if addr_c is None:
+                        self.gen_error("eeprom_write_byte: address must be a constant")
+                        return
+                    addr_hi = (addr_c >> 8) & 0xFF
+                    addr_lo = addr_c & 0xFF
+                    data_arg = args[1]
+                else:
+                    # 3-arg form: eeprom_write_byte(hi, lo, data)
+                    addr_hi_c = self._const_eval(args[0])
+                    addr_lo_c = self._const_eval(args[1])
+                    addr_hi = addr_hi_c & 0xFF if addr_hi_c is not None else None
+                    addr_lo = addr_lo_c & 0xFF if addr_lo_c is not None else None
+                    data_arg = args[2]
                 # START
                 self.emit('\texrw 2')
                 self.emit('\tddrb_imm 0x01')
@@ -2513,25 +2542,23 @@ class MK1CodeGen:
                 self.emit('\tldi $a,0xAE')
                 self.emit('\tjal __i2c_sb')
                 # Address high byte
-                c = self._const_eval(args[0])
-                if c is not None:
-                    self.emit(f'\tldi $a,{c & 0xFF}')
+                if addr_hi is not None:
+                    self.emit(f'\tldi $a,{addr_hi}')
                 else:
                     self.gen_expr(args[0])
                 self.emit('\tjal __i2c_sb')
                 # Address low byte
-                c = self._const_eval(args[1])
-                if c is not None:
-                    self.emit(f'\tldi $a,{c & 0xFF}')
+                if addr_lo is not None:
+                    self.emit(f'\tldi $a,{addr_lo}')
                 else:
                     self.gen_expr(args[1])
                 self.emit('\tjal __i2c_sb')
                 # Data byte
-                c = self._const_eval(args[2])
+                c = self._const_eval(data_arg)
                 if c is not None:
                     self.emit(f'\tldi $a,{c & 0xFF}')
                 else:
-                    self.gen_expr(args[2])
+                    self.gen_expr(data_arg)
                 self.emit('\tjal __i2c_sb')
                 # STOP
                 self.emit('\tddrb_imm 0x03')
@@ -2555,30 +2582,40 @@ class MK1CodeGen:
                 return
 
             if name == 'eeprom_read_byte':
-                # eeprom_read_byte(addr_hi, addr_lo) — returns byte in A
-                # Sets address, does current-address read
-                if not args or len(args) < 2:
-                    self.gen_error("eeprom_read_byte needs 2 args: addr_hi, addr_lo")
+                # eeprom_read_byte(addr) — addr is 16-bit constant, returns byte in A
+                # Also accepts eeprom_read_byte(addr_hi, addr_lo)
+                if not args:
+                    self.gen_error("eeprom_read_byte(addr) or eeprom_read_byte(hi, lo)")
                     return
                 if not hasattr(self, '_lcd_helpers'):
                     self._lcd_helpers = set()
                 self._lcd_helpers.add('__i2c_sb')
                 self._lcd_helpers.add('__i2c_rb')
+                if len(args) == 1:
+                    addr_c = self._const_eval(args[0])
+                    if addr_c is None:
+                        self.gen_error("eeprom_read_byte: address must be a constant")
+                        return
+                    addr_hi = (addr_c >> 8) & 0xFF
+                    addr_lo = addr_c & 0xFF
+                else:
+                    addr_hi_c = self._const_eval(args[0])
+                    addr_lo_c = self._const_eval(args[1])
+                    addr_hi = addr_hi_c & 0xFF if addr_hi_c is not None else None
+                    addr_lo = addr_lo_c & 0xFF if addr_lo_c is not None else None
                 # Set address: START + 0xAE + addr_hi + addr_lo + STOP
                 self.emit('\texrw 2')
                 self.emit('\tddrb_imm 0x01')
                 self.emit('\tddrb_imm 0x03')
                 self.emit('\tldi $a,0xAE')
                 self.emit('\tjal __i2c_sb')
-                c = self._const_eval(args[0])
-                if c is not None:
-                    self.emit(f'\tldi $a,{c & 0xFF}')
+                if addr_hi is not None:
+                    self.emit(f'\tldi $a,{addr_hi}')
                 else:
                     self.gen_expr(args[0])
                 self.emit('\tjal __i2c_sb')
-                c = self._const_eval(args[1])
-                if c is not None:
-                    self.emit(f'\tldi $a,{c & 0xFF}')
+                if addr_lo is not None:
+                    self.emit(f'\tldi $a,{addr_lo}')
                 else:
                     self.gen_expr(args[1])
                 self.emit('\tjal __i2c_sb')
