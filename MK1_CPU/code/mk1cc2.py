@@ -398,9 +398,10 @@ class MK1CodeGen:
                 'irq0', 'irq1', 'exr_port_a', 'exr_port_b', 'exr_port_c',
                 'via_read_porta', 'via_read_portb',
                 'i2c_init', 'i2c_bus_reset', 'i2c_start', 'i2c_stop',
-                'i2c_ack', 'i2c_nack',
+                'i2c_ack', 'i2c_nack', 'i2c_wait_ack',
                 'peek3', 'poke3'}
-    # NOTE: i2c_send_byte, lcd_cmd, lcd_char, lcd_init are NOT builtins —
+    # NOTE: i2c_send_byte, i2c_read_byte, eeprom_write_byte, eeprom_read_byte,
+    # rtc_read_seconds, rtc_read_temp, lcd_cmd, lcd_char, lcd_init are NOT builtins —
     # they use jal to subroutines that clobber B, C, D. The register
     # allocator must treat them as user function calls.
 
@@ -2495,6 +2496,175 @@ class MK1CodeGen:
                 self.emit('\tmov $d,$a')  # A = byte read (from D)
                 return
 
+            if name == 'eeprom_write_byte':
+                # eeprom_write_byte(addr_hi, addr_lo, data)
+                # Writes one byte, waits for write cycle via ACK polling
+                if not args or len(args) < 3:
+                    self.gen_error("eeprom_write_byte needs 3 args: addr_hi, addr_lo, data")
+                    return
+                if not hasattr(self, '_lcd_helpers'):
+                    self._lcd_helpers = set()
+                self._lcd_helpers.add('__i2c_sb')
+                # START
+                self.emit('\texrw 2')
+                self.emit('\tddrb_imm 0x01')
+                self.emit('\tddrb_imm 0x03')
+                # Device address (write)
+                self.emit('\tldi $a,0xAE')
+                self.emit('\tjal __i2c_sb')
+                # Address high byte
+                c = self._const_eval(args[0])
+                if c is not None:
+                    self.emit(f'\tldi $a,{c & 0xFF}')
+                else:
+                    self.gen_expr(args[0])
+                self.emit('\tjal __i2c_sb')
+                # Address low byte
+                c = self._const_eval(args[1])
+                if c is not None:
+                    self.emit(f'\tldi $a,{c & 0xFF}')
+                else:
+                    self.gen_expr(args[1])
+                self.emit('\tjal __i2c_sb')
+                # Data byte
+                c = self._const_eval(args[2])
+                if c is not None:
+                    self.emit(f'\tldi $a,{c & 0xFF}')
+                else:
+                    self.gen_expr(args[2])
+                self.emit('\tjal __i2c_sb')
+                # STOP
+                self.emit('\tddrb_imm 0x03')
+                self.emit('\tddrb_imm 0x01')
+                self.emit('\tddrb_imm 0x00')
+                # ACK poll (wait for write cycle)
+                lbl = self.label('ewp')
+                self.emit(f'{lbl}:')
+                self.emit('\texrw 2')
+                self.emit('\tddrb_imm 0x01')
+                self.emit('\tddrb_imm 0x03')
+                self.emit('\tldi $a,0xAE')
+                self.emit('\tjal __i2c_sb')
+                self.emit('\tpush $a')
+                self.emit('\tddrb_imm 0x03')
+                self.emit('\tddrb_imm 0x01')
+                self.emit('\tddrb_imm 0x00')
+                self.emit('\tpop $a')
+                self.emit('\ttst 0x01')
+                self.emit(f'\tjnz {lbl}')
+                return
+
+            if name == 'eeprom_read_byte':
+                # eeprom_read_byte(addr_hi, addr_lo) — returns byte in A
+                # Sets address, does current-address read
+                if not args or len(args) < 2:
+                    self.gen_error("eeprom_read_byte needs 2 args: addr_hi, addr_lo")
+                    return
+                if not hasattr(self, '_lcd_helpers'):
+                    self._lcd_helpers = set()
+                self._lcd_helpers.add('__i2c_sb')
+                self._lcd_helpers.add('__i2c_rb')
+                # Set address: START + 0xAE + addr_hi + addr_lo + STOP
+                self.emit('\texrw 2')
+                self.emit('\tddrb_imm 0x01')
+                self.emit('\tddrb_imm 0x03')
+                self.emit('\tldi $a,0xAE')
+                self.emit('\tjal __i2c_sb')
+                c = self._const_eval(args[0])
+                if c is not None:
+                    self.emit(f'\tldi $a,{c & 0xFF}')
+                else:
+                    self.gen_expr(args[0])
+                self.emit('\tjal __i2c_sb')
+                c = self._const_eval(args[1])
+                if c is not None:
+                    self.emit(f'\tldi $a,{c & 0xFF}')
+                else:
+                    self.gen_expr(args[1])
+                self.emit('\tjal __i2c_sb')
+                self.emit('\tddrb_imm 0x03')
+                self.emit('\tddrb_imm 0x01')
+                self.emit('\tddrb_imm 0x00')
+                # Read: START + 0xAF + read byte + NACK + STOP
+                self.emit('\texrw 2')
+                self.emit('\tddrb_imm 0x01')
+                self.emit('\tddrb_imm 0x03')
+                self.emit('\tldi $a,0xAF')
+                self.emit('\tjal __i2c_sb')
+                self.emit('\tjal __i2c_rb')
+                self.emit('\tmov $d,$a')       # A = read byte
+                # NACK + STOP (merged)
+                self.emit('\tddrb_imm 0x02')
+                self.emit('\tddrb_imm 0x00')
+                self.emit('\tddrb_imm 0x03')
+                self.emit('\tddrb_imm 0x01')
+                self.emit('\tddrb_imm 0x00')
+                return
+
+            if name == 'rtc_read_seconds':
+                # Read DS3231 seconds register (0x00), returns BCD in A
+                if not hasattr(self, '_lcd_helpers'):
+                    self._lcd_helpers = set()
+                self._lcd_helpers.add('__i2c_sb')
+                self._lcd_helpers.add('__i2c_rb')
+                # Set register pointer: START + 0xD0 + 0x00 + STOP
+                self.emit('\texrw 2')
+                self.emit('\tddrb_imm 0x01')
+                self.emit('\tddrb_imm 0x03')
+                self.emit('\tldi $a,0xD0')
+                self.emit('\tjal __i2c_sb')
+                self.emit('\tclr $a')
+                self.emit('\tjal __i2c_sb')
+                self.emit('\tddrb_imm 0x03')
+                self.emit('\tddrb_imm 0x01')
+                self.emit('\tddrb_imm 0x00')
+                # Read: START + 0xD1 + read byte + NACK + STOP
+                self.emit('\texrw 2')
+                self.emit('\tddrb_imm 0x01')
+                self.emit('\tddrb_imm 0x03')
+                self.emit('\tldi $a,0xD1')
+                self.emit('\tjal __i2c_sb')
+                self.emit('\tjal __i2c_rb')
+                self.emit('\tmov $d,$a')
+                self.emit('\tddrb_imm 0x02')
+                self.emit('\tddrb_imm 0x00')
+                self.emit('\tddrb_imm 0x03')
+                self.emit('\tddrb_imm 0x01')
+                self.emit('\tddrb_imm 0x00')
+                return
+
+            if name == 'rtc_read_temp':
+                # Read DS3231 temperature MSB (register 0x11), returns signed °C in A
+                if not hasattr(self, '_lcd_helpers'):
+                    self._lcd_helpers = set()
+                self._lcd_helpers.add('__i2c_sb')
+                self._lcd_helpers.add('__i2c_rb')
+                # Set register pointer to 0x11
+                self.emit('\texrw 2')
+                self.emit('\tddrb_imm 0x01')
+                self.emit('\tddrb_imm 0x03')
+                self.emit('\tldi $a,0xD0')
+                self.emit('\tjal __i2c_sb')
+                self.emit('\tldi $a,0x11')
+                self.emit('\tjal __i2c_sb')
+                self.emit('\tddrb_imm 0x03')
+                self.emit('\tddrb_imm 0x01')
+                self.emit('\tddrb_imm 0x00')
+                # Read MSB
+                self.emit('\texrw 2')
+                self.emit('\tddrb_imm 0x01')
+                self.emit('\tddrb_imm 0x03')
+                self.emit('\tldi $a,0xD1')
+                self.emit('\tjal __i2c_sb')
+                self.emit('\tjal __i2c_rb')
+                self.emit('\tmov $d,$a')
+                self.emit('\tddrb_imm 0x02')
+                self.emit('\tddrb_imm 0x00')
+                self.emit('\tddrb_imm 0x03')
+                self.emit('\tddrb_imm 0x01')
+                self.emit('\tddrb_imm 0x00')
+                return
+
             if name == 'i2c_ack':
                 # Send ACK (pull SDA LOW, clock SCL once)
                 self.emit('\tddrb_imm 0x03')   # SDA LOW, SCL LOW
@@ -2507,6 +2677,33 @@ class MK1CodeGen:
                 self.emit('\tddrb_imm 0x02')   # SDA released, SCL LOW
                 self.emit('\tddrb_imm 0x00')   # SDA released, SCL HIGH
                 self.emit('\tddrb_imm 0x02')   # SDA released, SCL LOW
+                return
+
+            if name == 'i2c_wait_ack':
+                # Poll until device ACKs (for EEPROM write cycle completion)
+                # Arg: device address byte (e.g. 0xAE for EEPROM write)
+                lbl = self.label('wpoll')
+                if args:
+                    c = self._const_eval(args[0])
+                self.emit(f'{lbl}:')
+                self.emit('\texrw 2')           # START
+                self.emit('\tddrb_imm 0x01')
+                self.emit('\tddrb_imm 0x03')
+                if c is not None:
+                    self.emit(f'\tldi $a,{c & 0xFF}')
+                else:
+                    self.gen_expr(args[0])
+                if not hasattr(self, '_lcd_helpers'):
+                    self._lcd_helpers = set()
+                self._lcd_helpers.add('__i2c_sb')
+                self.emit('\tjal __i2c_sb')      # send addr, A = ACK bit
+                self.emit('\tpush $a')
+                self.emit('\tddrb_imm 0x03')     # STOP
+                self.emit('\tddrb_imm 0x01')
+                self.emit('\tddrb_imm 0x00')
+                self.emit('\tpop $a')
+                self.emit('\ttst 0x01')          # check ACK (bit 0: 0=ACK, 1=NACK)
+                self.emit(f'\tjnz {lbl}')        # retry if NACK
                 return
 
             if name == 'delay_calibrate':
