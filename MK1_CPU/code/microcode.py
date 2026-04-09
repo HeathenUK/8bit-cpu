@@ -151,14 +151,18 @@ ucode_template[0b01111100] = ('slr', [MI|PO, RO|II|PE,  SHF|RGT|AI|FI, RST, RST,
 ucode_template[0b01111101] = ('rll', [MI|PO, RO|II|PE,  ROT|AI|FI, RST,     RST, RST, RST, RST], False)
 ucode_template[0b01111110] = ('rlr', [MI|PO, RO|II|PE,  ROT|RGT|AI|FI, RST, RST, RST, RST, RST], False)
 
-ucode_template[0b00000111] = ('exw 0 0', [MI|PO, RO|II|PE, AO|E0, RST, RST, RST, RST, RST], False)
-ucode_template[0b00001111] = ('exw 0 1', [MI|PO, RO|II|PE, AO|E0|U0, RST, RST, RST, RST, RST], False)
-ucode_template[0b10001110] = ('exw 0 2', [MI|PO, RO|II|PE, AO|E0|U1, RST, RST, RST, RST, RST], False)
-ucode_template[0b10010110] = ('exw 0 3', [MI|PO, RO|II|PE, AO|E0|U1|U0, RST, RST, RST, RST, RST], False)
-ucode_template[0b00010111] = ('exw 1 0', [MI|PO, RO|II|PE, AO|E1, RST, RST, RST, RST, RST], False)
+# exw: external write with pre-settle step
+# Step 2: AO + register select (data on bus, register selected, NO enable yet)
+# Step 3: AO + enable + register select (VIA latches with stable signals)
+# This prevents data bus glitches from coupling into register select lines.
+ucode_template[0b00000111] = ('exw 0 0', [MI|PO, RO|II|PE, AO, AO|E0, RST, RST, RST, RST], False)
+ucode_template[0b00001111] = ('exw 0 1', [MI|PO, RO|II|PE, AO|U0, AO|E0|U0, RST, RST, RST, RST], False)
+ucode_template[0b10001110] = ('exw 0 2', [MI|PO, RO|II|PE, AO|U1, AO|E0|U1, RST, RST, RST, RST], False)
+ucode_template[0b10010110] = ('exw 0 3', [MI|PO, RO|II|PE, AO|U1|U0, AO|E0|U1|U0, RST, RST, RST, RST], False)
+ucode_template[0b00010111] = ('exw 1 0', [MI|PO, RO|II|PE, AO, AO|E1, RST, RST, RST, RST], False)
 ucode_template[0b00011111] = ('exw 1 1', [MI|PO, RO|II|PE, AO|E1, AO|E1|E0, RST, RST, RST, RST], False)
-ucode_template[0b10011110] = ('exw 1 2', [MI|PO, RO|II|PE, AO|E1|U1, RST, RST, RST, RST, RST], False)
-ucode_template[0b10100110] = ('exw 1 3', [MI|PO, RO|II|PE, AO|E1|U1|U0, RST, RST, RST, RST, RST], False)
+ucode_template[0b10011110] = ('exw 1 2', [MI|PO, RO|II|PE, AO|U1, AO|E1|U1, RST, RST, RST, RST], False)
+ucode_template[0b10100110] = ('exw 1 3', [MI|PO, RO|II|PE, AO|U1|U0, AO|E1|U1|U0, RST, RST, RST, RST], False)
 
 ucode_template[0b10101110] = ('cmp $b', [MI|PO, RO|II|PE, BO|EI, SUB|FI, RST, RST, RST, RST], False)
 ucode_template[0b01000110] = ('cmp $c', [MI|PO, RO|II|PE, CO|EI, SUB|FI, RST, RST, RST, RST], False)
