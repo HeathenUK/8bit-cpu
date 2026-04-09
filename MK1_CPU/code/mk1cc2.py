@@ -674,6 +674,8 @@ class MK1CodeGen:
             return
 
         # Always emit __i2c_sb (send byte, B=byte, C=counter) — shared by all helpers
+        # Optimized: uses ddrb_imm (bus-safe, preserves A), merged tst+shift,
+        # zero NOPs, no push/pop in ACK clock.
         self.emit('__i2c_sb:')
         self.emit('\tmov $a,$b')
         self.emit('\tldi $a,8')
@@ -684,109 +686,72 @@ class MK1CodeGen:
         self.emit(f'{lbl_s}:')
         self.emit('\tmov $b,$a')
         self.emit('\ttst 0x80')
-        self.emit(f'\tjnz {lbl_h}')
-        self.emit('\tldi $a,0x03')
-        self.emit('\texw 0 2')
-        self.emit('\tldi $a,0x01')
-        self.emit('\texw 0 2')
-        self.emit('\tldi $a,0x03')
-        self.emit('\texw 0 2')
-        self.emit(f'\tj {lbl_n}')
-        self.emit(f'{lbl_h}:')
-        self.emit('\tldi $a,0x02')
-        self.emit('\texw 0 2')
-        self.emit('\tldi $a,0x00')
-        self.emit('\texw 0 2')
-        self.emit('\tldi $a,0x02')
-        self.emit('\texw 0 2')
-        self.emit(f'{lbl_n}:')
-        self.emit('\tmov $b,$a')
         self.emit('\tsll')
         self.emit('\tmov $a,$b')
+        self.emit(f'\tjnz {lbl_h}')
+        self.emit('\tddrb_imm 0x03')
+        self.emit('\tddrb_imm 0x01')
+        self.emit('\tddrb_imm 0x03')
+        self.emit(f'\tj {lbl_n}')
+        self.emit(f'{lbl_h}:')
+        self.emit('\tddrb_imm 0x02')
+        self.emit('\tddrb_imm 0x00')
+        self.emit('\tddrb_imm 0x02')
+        self.emit(f'{lbl_n}:')
         self.emit('\tmov $c,$a')
         self.emit('\tdec')
         self.emit('\tmov $a,$c')
         self.emit(f'\tjnz {lbl_s}')
-        # ACK clock with settling NOPs (required for reliable scan)
-        self.emit('\tldi $a,0x02')   # SDA released, SCL LOW
-        self.emit('\texw 0 2')
-        self.emit('\tnop')           # wait for SDA pull-up
-        self.emit('\tnop')
-        self.emit('\tnop')
-        self.emit('\tnop')
-        self.emit('\tnop')
-        self.emit('\tldi $a,0x00')   # SDA released, SCL HIGH (ACK clock)
-        self.emit('\texw 0 2')
-        self.emit('\tnop')           # wait for slave ACK
-        self.emit('\tnop')
-        self.emit('\tnop')
-        self.emit('\tnop')
-        self.emit('\tnop')
-        self.emit('\texrw 0')        # A = port B (bit 0 = SDA = ACK)
-        self.emit('\tpush $a')       # save ACK value
-        self.emit('\tldi $a,0x02')   # SCL LOW
-        self.emit('\texw 0 2')
-        self.emit('\tpop $a')        # A = ACK value (returned to caller)
+        # ACK clock: no NOPs needed (ddrb_imm has built-in settling),
+        # no push/pop needed (ddrb_imm preserves A)
+        self.emit('\tddrb_imm 0x02')   # SCL LOW, SDA released
+        self.emit('\tddrb_imm 0x00')   # SCL HIGH (read ACK)
+        self.emit('\texrw 0')          # A = port B (bit 0 = ACK)
+        self.emit('\tddrb_imm 0x02')   # SCL LOW
         self.emit('\tret')
 
         # __i2c_st_only: just START (no address)
         if '__i2c_st_only' in helpers:
             self.emit('__i2c_st_only:')
             self.emit('\texrw 2')
-            self.emit('\tldi $a,0x01')
-            self.emit('\texw 0 2')
-            self.emit('\tldi $a,0x03')
-            self.emit('\texw 0 2')
+            self.emit('\tddrb_imm 0x01')
+            self.emit('\tddrb_imm 0x03')
             self.emit('\tret')
 
         # __i2c_st: START + send address 0x4E
         self.emit('__i2c_st:')
         self.emit('\texrw 2')
-        self.emit('\tldi $a,0x01')
-        self.emit('\texw 0 2')
-        self.emit('\tldi $a,0x03')
-        self.emit('\texw 0 2')
+        self.emit('\tddrb_imm 0x01')
+        self.emit('\tddrb_imm 0x03')
         self.emit('\tldi $a,0x4E')
         self.emit('\tjal __i2c_sb')
         self.emit('\tret')
 
         # __i2c_sp: STOP
         self.emit('__i2c_sp:')
-        self.emit('\tldi $a,0x03')
-        self.emit('\texw 0 2')
-        self.emit('\tldi $a,0x01')
-        self.emit('\texw 0 2')
-        self.emit('\tldi $a,0x00')
-        self.emit('\texw 0 2')
+        self.emit('\tddrb_imm 0x03')
+        self.emit('\tddrb_imm 0x01')
+        self.emit('\tddrb_imm 0x00')
         self.emit('\tret')
 
         # __i2c_rb: read one I2C byte into D (8 bits MSB first)
+        # Optimized: zero NOPs, no push/pop (uses B for SDA bit),
+        # SCL dedup (2 ddrb_imm per bit instead of 3)
         if '__i2c_rb' in helpers:
             lbl_rb = self.label('rb')
             self.emit('__i2c_rb:')
             self.emit('\tldi $d,0')
             self.emit('\tldi $c,8')
             self.emit(f'{lbl_rb}:')
-            self.emit('\tldi $a,0x02')    # SCL LOW, SDA released
-            self.emit('\texw 0 2')
-            self.emit('\tnop')
-            self.emit('\tnop')
-            self.emit('\tclr $a')         # SCL HIGH, SDA released
-            self.emit('\texw 0 2')
-            self.emit('\tnop')
-            self.emit('\tnop')
-            self.emit('\tnop')
-            self.emit('\texrw 0')         # A = port B (bit 0 = SDA)
-            self.emit('\tpush $a')
-            self.emit('\tmov $d,$a')
-            self.emit('\tsll')
-            self.emit('\tmov $a,$d')      # D <<= 1
-            self.emit('\tpop $a')
-            self.emit('\tandi 0x01,$a')   # isolate SDA
-            self.emit('\tor $d,$a')       # A = (D<<1) | bit
-            self.emit('\tmov $a,$d')      # D = result
-            self.emit('\tldi $a,0x02')    # SCL LOW
-            self.emit('\texw 0 2')
+            self.emit('\tddrb_imm 0x00')   # SCL HIGH
+            self.emit('\texrw 0')          # A = port B
+            self.emit('\tandi 0x01,$a')    # isolate SDA
+            self.emit('\tmov $a,$b')       # B = SDA bit
+            self.emit('\tmov $d,$a')       # A = accumulated byte
+            self.emit('\tsll')             # shift left
+            self.emit('\tor $b,$a')        # OR in SDA bit
+            self.emit('\tmov $a,$d')       # D = result
+            self.emit('\tddrb_imm 0x02')   # SCL LOW
             self.emit('\tmov $c,$a')
             self.emit('\tdec')
             self.emit('\tmov $a,$c')
@@ -940,10 +905,8 @@ class MK1CodeGen:
             self.emit('__delay_cal:')
             # Configure DS3231 SQW = 1Hz (0x68: write=0xD0)
             self.emit('\texrw 2')
-            self.emit('\tldi $a,0x01')
-            self.emit('\texw 0 2')
-            self.emit('\tldi $a,0x03')
-            self.emit('\texw 0 2')
+            self.emit('\tddrb_imm 0x01')
+            self.emit('\tddrb_imm 0x03')
             self.emit('\tldi $a,0xD0')
             self.emit('\tjal __i2c_sb')
             self.emit('\tldi $a,0x0E')
@@ -2355,8 +2318,7 @@ class MK1CodeGen:
             if name == 'halt':
                 # Release I2C bus before halting — prevents ESP32 upload from
                 # creating spurious I2C activity via VIA's retained DDRB state
-                self.emit('\tclr $a')
-                self.emit('\texw 0 2')       # DDRB = 0 (SDA/SCL idle)
+                self.emit('\tddrb_imm 0x00')   # DDRB = 0 (SDA/SCL idle)
                 self.emit('\thlt')
                 return
             if name == 'nop':
@@ -2452,37 +2414,38 @@ class MK1CodeGen:
 
             if name == 'i2c_init':
                 # VIA init for I2C: delay for VIA ~RES settle (RC = 1ms),
-                # then set ORB=0, DDRB=0.
-                # Uses a delay loop instead of many NOPs to save code space.
-                # ~500 iterations × ~5 cycles × 2µs = ~5ms >> 1ms RC constant.
-                self.emit('\tldi $d,0')       # D = 0 (will count 256 iterations)
+                # then set ORB=0, DDRB=0, DDRA=0.
+                self.emit('\tldi $d,0')
                 lbl = self.label('via_dly')
                 self.emit(f'{lbl}:')
                 self.emit('\tdec')
                 self.emit(f'\tjnz {lbl}')
                 self.emit('\tclr $a')
-                self.emit('\texw 0 0')       # ORB = 0
-                self.emit('\texw 0 2')       # DDRB = 0 (both lines idle/HIGH)
+                self.emit('\texw 0 0')         # ORB = 0
+                self.emit('\tddrb_imm 0x00')   # DDRB = 0 (both lines idle/HIGH)
+                self.emit('\tclr $a')
+                self.emit('\texw 0 3')         # DDRA = 0
+                self.emit('\tpush $a')         # stack warmup
+                self.emit('\tpop $a')
                 return
 
             if name == 'i2c_bus_reset':
                 # Full bus reset: VIA delay + init + STOP to clear stuck I2C state.
-                # ONLY use at the start of the FIRST program in a session.
-                # The STOP resets the EEPROM's address pointer.
-                self.emit('\tldi $d,0')       # delay for VIA ~RES settle (~1.5ms)
+                self.emit('\tldi $d,0')
                 lbl = self.label('br_dly')
                 self.emit(f'{lbl}:')
                 self.emit('\tdec')
                 self.emit(f'\tjnz {lbl}')
                 self.emit('\tclr $a')
-                self.emit('\texw 0 0')       # ORB = 0
-                self.emit('\texw 0 2')       # DDRB = 0 (idle)
-                self.emit('\tldi $a,0x03')   # STOP: both LOW
-                self.emit('\texw 0 2')
-                self.emit('\tldi $a,0x01')   # STOP: SDA LOW, SCL HIGH
-                self.emit('\texw 0 2')
-                self.emit('\tclr $a')        # STOP: both HIGH (idle)
-                self.emit('\texw 0 2')
+                self.emit('\texw 0 0')         # ORB = 0
+                self.emit('\tddrb_imm 0x00')   # DDRB = 0 (idle)
+                self.emit('\tclr $a')
+                self.emit('\texw 0 3')         # DDRA = 0
+                self.emit('\tpush $a')
+                self.emit('\tpop $a')
+                self.emit('\tddrb_imm 0x03')   # STOP: both LOW
+                self.emit('\tddrb_imm 0x01')   # STOP: SDA LOW, SCL HIGH
+                self.emit('\tddrb_imm 0x00')   # STOP: both HIGH (idle)
                 return
 
             if name == 'lcd_init':
@@ -2494,22 +2457,17 @@ class MK1CodeGen:
                 return
 
             if name == 'i2c_start':
-                # Inline START — avoids jal overhead that causes EEPROM NACK
+                # Inline START
                 self.emit('\texrw 2')
-                self.emit('\tldi $a,0x01')    # SDA LOW, SCL HIGH
-                self.emit('\texw 0 2')
-                self.emit('\tldi $a,0x03')    # both LOW
-                self.emit('\texw 0 2')
+                self.emit('\tddrb_imm 0x01')   # SDA LOW, SCL HIGH
+                self.emit('\tddrb_imm 0x03')   # both LOW
                 return
 
             if name == 'i2c_stop':
-                # Inline STOP — avoids jal overhead
-                self.emit('\tldi $a,0x03')    # both LOW
-                self.emit('\texw 0 2')
-                self.emit('\tldi $a,0x01')    # SDA LOW, SCL HIGH
-                self.emit('\texw 0 2')
-                self.emit('\tclr $a')         # both HIGH (idle)
-                self.emit('\texw 0 2')
+                # Inline STOP
+                self.emit('\tddrb_imm 0x03')   # both LOW
+                self.emit('\tddrb_imm 0x01')   # SDA LOW, SCL HIGH
+                self.emit('\tddrb_imm 0x00')   # both HIGH (idle)
                 return
 
             if name == 'i2c_send_byte':
@@ -2538,29 +2496,17 @@ class MK1CodeGen:
                 return
 
             if name == 'i2c_ack':
-                # Send ACK (pull SDA LOW, clock SCL once) — tells slave to send more
-                self.emit('\tldi $a,0x03')    # SDA LOW, SCL LOW
-                self.emit('\texw 0 2')
-                self.emit('\tldi $a,0x01')    # SDA LOW, SCL HIGH
-                self.emit('\texw 0 2')
-                self.emit('\tnop')
-                self.emit('\tnop')
-                self.emit('\tldi $a,0x03')    # SDA LOW, SCL LOW
-                self.emit('\texw 0 2')
-                self.emit('\tldi $a,0x02')    # SDA released, SCL LOW
-                self.emit('\texw 0 2')
+                # Send ACK (pull SDA LOW, clock SCL once)
+                self.emit('\tddrb_imm 0x03')   # SDA LOW, SCL LOW
+                self.emit('\tddrb_imm 0x01')   # SDA LOW, SCL HIGH
+                self.emit('\tddrb_imm 0x02')   # SDA released, SCL LOW
                 return
 
             if name == 'i2c_nack':
-                # Send NACK (SDA released/HIGH, clock SCL once) — tells slave to stop
-                self.emit('\tldi $a,0x02')    # SDA released, SCL LOW
-                self.emit('\texw 0 2')
-                self.emit('\tclr $a')         # SDA released, SCL HIGH
-                self.emit('\texw 0 2')
-                self.emit('\tnop')
-                self.emit('\tnop')
-                self.emit('\tldi $a,0x02')    # SDA released, SCL LOW
-                self.emit('\texw 0 2')
+                # Send NACK (SDA released/HIGH, clock SCL once)
+                self.emit('\tddrb_imm 0x02')   # SDA released, SCL LOW
+                self.emit('\tddrb_imm 0x00')   # SDA released, SCL HIGH
+                self.emit('\tddrb_imm 0x02')   # SDA released, SCL LOW
                 return
 
             if name == 'delay_calibrate':
