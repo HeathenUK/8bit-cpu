@@ -130,8 +130,11 @@ static const FixedInstr FIXED_INSTRUCTIONS[] = {
     { "i2c_start", 0xC5,  ARGS_NONE },  // I2C START: SDA falls while SCL HIGH (needs A=0x80)
     { "i2c_stop",  0xC6,  ARGS_NONE },  // I2C STOP: SDA rises while SCL HIGH (needs A=0x00)
 
-    // ── VIA DDRB write (with bus settling to prevent DDRA corruption) ──
-    { "ddrb_imm",0xE2,  ARGS_IMM  },  // DDRB = N, all registers preserved
+    // ── VIA register immediate writes (bus settling, preserves all registers) ──
+    { "orb_imm", 0xF0,  ARGS_IMM  },  // ORB = N (VIA register 0)
+    { "ora_imm", 0xE6,  ARGS_IMM  },  // ORA = N (VIA register 1) — tone generation
+    { "ddrb_imm",0xE2,  ARGS_IMM  },  // DDRB = N (VIA register 2) — I2C
+    { "ddra_imm",0xE9,  ARGS_IMM  },  // DDRA = N (VIA register 3) — pin direction
     { "i2c_rel", 0xE2,  ARGS_IMM  },  // alias: ddrb_imm (use with 0x00 = both released)
     { "i2c_sda", 0xE2,  ARGS_IMM  },  // alias: ddrb_imm (use with 0x01 = SDA low, SCL high)
     { "i2c_scl", 0xE2,  ARGS_IMM  },  // alias: ddrb_imm (use with 0x02 = SCL low, SDA released)

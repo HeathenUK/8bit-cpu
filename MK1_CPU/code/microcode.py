@@ -146,10 +146,10 @@ ucode_template[0b01111000] = ('exr 0 0', [MI|PO, RO|II|PE, XI|E0|AI, RST, RST, R
 ucode_template[0b01111001] = ('exr 1 0', [MI|PO, RO|II|PE, XI, XI|E1|AI, RST, RST, RST, RST], False)
 
 ucode_template[0b01111010] = ('not', [MI|PO, RO|II|PE,  AO|EI, AI, NOT|EO|AI, RST, RST, RST], False)
-ucode_template[0b01111011] = ('sll', [MI|PO, RO|II|PE,  SHF|AI, RST,     RST, RST, RST, RST], False)
-ucode_template[0b01111100] = ('slr', [MI|PO, RO|II|PE,  SHF|RGT|AI, RST, RST, RST, RST, RST], False)
-ucode_template[0b01111101] = ('rll', [MI|PO, RO|II|PE,  ROT|AI, RST,     RST, RST, RST, RST], False)
-ucode_template[0b01111110] = ('rlr', [MI|PO, RO|II|PE,  ROT|RGT|AI, RST, RST, RST, RST, RST], False)
+ucode_template[0b01111011] = ('sll', [MI|PO, RO|II|PE,  SHF|AI|FI, RST,     RST, RST, RST, RST], False)
+ucode_template[0b01111100] = ('slr', [MI|PO, RO|II|PE,  SHF|RGT|AI|FI, RST, RST, RST, RST, RST], False)
+ucode_template[0b01111101] = ('rll', [MI|PO, RO|II|PE,  ROT|AI|FI, RST,     RST, RST, RST, RST], False)
+ucode_template[0b01111110] = ('rlr', [MI|PO, RO|II|PE,  ROT|RGT|AI|FI, RST, RST, RST, RST, RST], False)
 
 ucode_template[0b00000111] = ('exw 0 0', [MI|PO, RO|II|PE, AO|E0, RST, RST, RST, RST, RST], False)
 ucode_template[0b00001111] = ('exw 0 1', [MI|PO, RO|II|PE, AO|E0|U0, RST, RST, RST, RST, RST], False)
@@ -318,6 +318,17 @@ ucode_template[0xFF] = ('tst', [MI|PO, RO|II|PE, PO|MI, PE|RO|EI, AND|FI, RST, R
 # writes provide settling time that prevents the DDRA corruption bug
 # (caused by data bus transition bleeding into RS0 during rapid exw 0 2 sequences).
 ucode_template[0xE2] = ('ddrb_imm', [MI|PO, RO|II|PE, PO|MI, PE|RO|E0|U1, RST, RST, RST, RST], True)
+
+# ORB_IMM N: write immediate to ORB (VIA register 0), preserves all registers
+ucode_template[0xF0] = ('orb_imm', [MI|PO, RO|II|PE, PO|MI, PE|RO|E0, RST, RST, RST, RST], True)
+
+# ORA_IMM N: write immediate to ORA (VIA register 1), preserves all registers
+# Key for tone generation: toggle PA1 (piezo) without clobbering A (delay counter)
+ucode_template[0xE6] = ('ora_imm', [MI|PO, RO|II|PE, PO|MI, PE|RO|E0|U0, RST, RST, RST, RST], True)
+
+# DDRA_IMM N: write immediate to DDRA (VIA register 3), preserves all registers
+# Safety: clear DDRA after I2C to prevent port A pins stuck as outputs
+ucode_template[0xE9] = ('ddra_imm', [MI|PO, RO|II|PE, PO|MI, PE|RO|E0|U0|U1, RST, RST, RST, RST], True)
 
 # SWAP: swap A and B (using stack as scratch)
 # Step 2: MAR=SP, Step 3: push A (SP--), Step 4: A=B, Step 5: SP++, Step 6: MAR=SP, Step 7: B=pop
