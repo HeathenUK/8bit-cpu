@@ -895,16 +895,16 @@ class MK1CodeGen:
             self.emit('\tret')
 
         # __delay_cal: calibrate delay against SQW, store D/4 in data[0]
+        # Single-phase: counts HIGH phase only (D_half), stores D_half/2 = D/4.
+        # Saves ~23 bytes vs dual-phase counting.
         if '__delay_cal' in helpers:
             lbl_s1 = self.label('ds1')
             lbl_s2 = self.label('ds2')
             lbl_cal = self.label('dcal')
             lbl_chi = self.label('dchi')
-            lbl_clo = self.label('dclo')
-            lbl_cli = self.label('dcli')
             lbl_done = self.label('dcdn')
             self.emit('__delay_cal:')
-            # Configure DS3231 SQW = 1Hz (0x68: write=0xD0)
+            # Configure DS3231 SQW = 1Hz
             self.emit('\texrw 2')
             self.emit('\tddrb_imm 0x01')
             self.emit('\tddrb_imm 0x03')
@@ -915,7 +915,9 @@ class MK1CodeGen:
             self.emit('\tclr $a')
             self.emit('\tjal __i2c_sb')
             self.emit('\tjal __i2c_sp')
-            # Sync: wait LOW then rising edge
+            self.emit('\tclr $a')
+            self.emit('\texw 0 3')         # clear DDRA before sync
+            # Sync: wait LOW then HIGH (rising edge)
             self.emit(f'{lbl_s1}:')
             self.emit('\texrw 1')
             self.emit('\ttst 0x01')
@@ -926,46 +928,30 @@ class MK1CodeGen:
             self.emit('\ttst 0x01')
             self.emit(f'\tjnz {lbl_cal}')
             self.emit(f'\tj {lbl_s2}')
-            # Count: same 13-cycle inner loop as delay, check SQW between overflows
+            # Count overflows during HIGH phase only
             self.emit(f'{lbl_cal}:')
             self.emit('\tldi $b,0')        # B = overflow count
             self.emit(f'{lbl_chi}:')
             self.emit('\tclr $a')
-            self.emit(f'.dci_hi{self.label_id}:')
+            self.emit(f'.dci{self.label_id}:')
             for _ in range(10):
                 self.emit('\tnop')
             self.emit('\tdec')
-            self.emit(f'\tjnz .dci_hi{self.label_id}')
+            self.emit(f'\tjnz .dci{self.label_id}')
             self.emit('\tmov $b,$a')
             self.emit('\tinc')
             self.emit('\tmov $a,$b')
             self.emit('\texrw 1')
             self.emit('\ttst 0x01')
-            self.emit(f'\tjz {lbl_clo}')
+            self.emit(f'\tjz {lbl_done}')  # SQW went LOW → done
             self.emit(f'\tj {lbl_chi}')
-            # LOW phase
-            self.emit(f'{lbl_clo}:')
-            self.emit('\tclr $a')
-            self.emit(f'{lbl_cli}:')
-            for _ in range(10):
-                self.emit('\tnop')
-            self.emit('\tdec')
-            self.emit(f'\tjnz {lbl_cli}')
-            self.emit('\tmov $b,$a')
-            self.emit('\tinc')
-            self.emit('\tmov $a,$b')
-            self.emit('\texrw 1')
-            self.emit('\ttst 0x01')
-            self.emit(f'\tjnz {lbl_done}')
-            self.emit(f'\tj {lbl_clo}')
-            # Done: B = D. Store D/4 in data[0].
+            # Done: B = D_half. D/4 = D_half/2.
             self.emit(f'{lbl_done}:')
             self.emit('\tmov $b,$a')
-            self.emit('\tslr')
-            self.emit('\tslr')
+            self.emit('\tslr')             # A = D_half / 2 = D/4
             self.emit('\tldi $b,0')
             self.emit('\tideref')          # data[0] = D/4
-            # Disable SQW to prevent coupling into SDA during I2C
+            # Disable SQW to prevent coupling into SDA
             self.emit('\texrw 2')
             self.emit('\tddrb_imm 0x01')
             self.emit('\tddrb_imm 0x03')
