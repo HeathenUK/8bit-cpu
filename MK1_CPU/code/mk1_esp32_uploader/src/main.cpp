@@ -1473,13 +1473,19 @@ static void handleSerialCommand(const String& line) {
         Serial.println("{\"ok\":true}");
     }
     else if (line.startsWith("RUN:")) {
-        // RUN:cycles,us — run N cycles at us half-period
-        int comma = line.indexOf(',', 4);
-        int n = line.substring(4, comma > 0 ? comma : line.length()).toInt();
-        int us = comma > 0 ? line.substring(comma + 1).toInt() : 1;
+        // RUN:cycles,us[,nops] — run N cycles at us half-period
+        // If us=0 and nops specified: use tight NOP loop for sub-µs delay
+        // Each NOP iteration ≈ 4ns at 240MHz. nops=200 ≈ 833ns ≈ 600kHz
+        int comma1 = line.indexOf(',', 4);
+        int comma2 = comma1 > 0 ? line.indexOf(',', comma1 + 1) : -1;
+        int n = line.substring(4, comma1 > 0 ? comma1 : line.length()).toInt();
+        int us = comma1 > 0 ? line.substring(comma1 + 1, comma2 > 0 ? comma2 : line.length()).toInt() : 1;
+        int nops = comma2 > 0 ? line.substring(comma2 + 1).toInt() : 0;
         if (n < 1) n = 1;
         if (n > 5000000) n = 5000000;
         if (us < 0) us = 0;
+        if (nops < 0) nops = 0;
+        if (nops > 10000) nops = 10000;
 
         stopCustomClock();
         if (oiMonitorActive) detachInterrupt(digitalPinToInterrupt(PIN_OI));
@@ -1505,6 +1511,7 @@ static void handleSerialCommand(const String& line) {
             actualCycles++;
             GPIO.out_w1ts = clkMask;
             if (us > 0) delayMicroseconds(us);
+            else if (nops > 0) { for (volatile int j = 0; j < nops; j++) __asm__ __volatile__("nop"); }
             uint32_t gpio1 = GPIO.in;
             if (gpio1 & oiMask) {
                 uint8_t val = readBusFast();
@@ -1517,6 +1524,7 @@ static void handleSerialCommand(const String& line) {
             }
             GPIO.out_w1tc = clkMask;
             if (us > 0) delayMicroseconds(us);
+            else if (nops > 0) { for (volatile int j = 0; j < nops; j++) __asm__ __volatile__("nop"); }
             uint32_t gpio2 = GPIO.in;
             if (gpio2 & oiMask) {
                 uint8_t val = readBusFast();
@@ -1730,6 +1738,192 @@ void setup() {
     // Try STA mode first, fall back to AP
     if (!connectToWifi()) {
         startAP();
+    }
+
+    // ── NTP → DS3231 RTC sync ──────────────────────────────────────────
+    // If connected to WiFi and time hasn't been set (cold boot), sync NTP
+    // then program the DS3231 RTC via an MK1 I2C program.
+    if (staMode && time(NULL) < 1000000000) {
+        // UK timezone: GMT0BST,M3.5.0/1,M10.5.0/2
+        configTzTime("GMT0BST,M3.5.0/1,M10.5.0/2", "pool.ntp.org", "time.google.com");
+        Serial.print("NTP sync...");
+        int ntpTries = 0;
+        while (time(NULL) < 1000000000 && ntpTries < 20) {
+            delay(500);
+            ntpTries++;
+        }
+        if (time(NULL) > 1000000000) {
+            struct tm t;
+            getLocalTime(&t);
+            Serial.printf(" OK: %04d-%02d-%02d %02d:%02d:%02d\n",
+                t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
+                t.tm_hour, t.tm_min, t.tm_sec);
+
+            // Convert to BCD for DS3231 registers 0x00-0x06
+            auto toBCD = [](int v) -> uint8_t { return ((v / 10) << 4) | (v % 10); };
+            uint8_t sec  = toBCD(t.tm_sec);
+            uint8_t min  = toBCD(t.tm_min);
+            uint8_t hour = toBCD(t.tm_hour);  // 24-hour mode (bit 6 = 0)
+            uint8_t dow  = toBCD(t.tm_wday + 1);  // DS3231: 1=Sunday
+            uint8_t date = toBCD(t.tm_mday);
+            uint8_t mon  = toBCD(t.tm_mon + 1);
+            uint8_t year = toBCD(t.tm_year % 100);
+
+            // Build MK1 assembly to write DS3231 time registers via I2C
+            // DS3231 I2C addr: 0x68 → write = 0xD0
+            // Write 7 bytes starting at register 0x00
+            char asmBuf[2048];
+            snprintf(asmBuf, sizeof(asmBuf),
+                "; NTP → DS3231 RTC sync (auto-generated)\n"
+                "    ldi $d, 0\n"
+                ".dly:\n"
+                "    dec\n"
+                "    jnz .dly\n"
+                "    clr $a\n"
+                "    exw 0 0\n"
+                "    ddrb_imm 0x00\n"
+                "    clr $a\n"
+                "    exw 0 3\n"
+                "    push $a\n"
+                "    pop $a\n"
+                "    jal __i2c_st\n"
+                "    ldi $a, 0xD0\n"  // DS3231 write address
+                "    jal __i2c_sb\n"
+                "    clr $a\n"        // register 0x00
+                "    jal __i2c_sb\n"
+                "    ldi $a, 0x%02X\n"  // seconds
+                "    jal __i2c_sb\n"
+                "    ldi $a, 0x%02X\n"  // minutes
+                "    jal __i2c_sb\n"
+                "    ldi $a, 0x%02X\n"  // hours (24h)
+                "    jal __i2c_sb\n"
+                "    ldi $a, 0x%02X\n"  // day of week
+                "    jal __i2c_sb\n"
+                "    ldi $a, 0x%02X\n"  // date
+                "    jal __i2c_sb\n"
+                "    ldi $a, 0x%02X\n"  // month
+                "    jal __i2c_sb\n"
+                "    ldi $a, 0x%02X\n"  // year
+                "    jal __i2c_sb\n"
+                "    jal __i2c_sp\n"
+                "    out_imm 0xDD\n"
+                "    hlt\n"
+                "__i2c_st:\n"
+                "    exrw 2\n"
+                "    ddrb_imm 0x01\n"
+                "    ddrb_imm 0x03\n"
+                "    ret\n"
+                "__i2c_sp:\n"
+                "    ddrb_imm 0x03\n"
+                "    ddrb_imm 0x01\n"
+                "    ddrb_imm 0x00\n"
+                "    ret\n"
+                "__i2c_sb:\n"
+                "    mov $a, $b\n"
+                "    ldi $a, 8\n"
+                "    mov $a, $c\n"
+                ".isb:\n"
+                "    mov $b, $a\n"
+                "    tst 0x80\n"
+                "    sll\n"
+                "    mov $a, $b\n"
+                "    jnz .isbh\n"
+                "    ddrb_imm 0x03\n"
+                "    ddrb_imm 0x01\n"
+                "    ddrb_imm 0x03\n"
+                "    j .isbn\n"
+                ".isbh:\n"
+                "    ddrb_imm 0x02\n"
+                "    ddrb_imm 0x00\n"
+                "    ddrb_imm 0x02\n"
+                ".isbn:\n"
+                "    mov $c, $a\n"
+                "    dec\n"
+                "    mov $a, $c\n"
+                "    jnz .isb\n"
+                "    ddrb_imm 0x02\n"
+                "    ddrb_imm 0x00\n"
+                "    exrw 0\n"
+                "    ddrb_imm 0x02\n"
+                "    ret\n",
+                sec, min, hour, dow, date, mon, year
+            );
+
+            // Assemble and run
+            assembler.assemble(asmBuf);
+            const AsmResult& r = assembler.result;
+            if (r.error_count == 0) {
+                memcpy(uploadBuf, r.code, CODE_SIZE);
+                uploadSize = CODE_SIZE;
+                uploadToMK1(uploadBuf, uploadSize);
+
+                // Run at 500kHz (us=1) — enough cycles for VIA init + I2C write
+                stopCustomClock();
+                if (oiMonitorActive) detachInterrupt(digitalPinToInterrupt(PIN_OI));
+                outputCaptured = false;
+                oiCount = 0;
+
+                int clkGpio = digitalPinToGPIONumber(PIN_CLK);
+                uint32_t clkMask = 1 << clkGpio;
+                int oiGpio = digitalPinToGPIONumber(PIN_OI);
+                if (oiGpio < 0) oiGpio = PIN_OI;
+                uint32_t oiMask = 1 << oiGpio;
+
+                busSetInput();
+                disableOutput();
+                digitalWrite(PIN_DIR, LOW);
+                enableOutput();
+                pinMode(PIN_CLK, OUTPUT);
+                digitalWrite(PIN_CLK, LOW);
+
+                bool rtcOk = false;
+                for (int i = 0; i < 50000; i++) {
+                    GPIO.out_w1ts = clkMask;
+                    delayMicroseconds(1);
+                    if (GPIO.in & oiMask) {
+                        uint8_t val = readBusFast();
+                        rtcOk = (val == 0xDD);
+                        GPIO.out_w1tc = clkMask;
+                        break;
+                    }
+                    GPIO.out_w1tc = clkMask;
+                    delayMicroseconds(1);
+                    if (GPIO.in & oiMask) {
+                        uint8_t val = readBusFast();
+                        rtcOk = (val == 0xDD);
+                        break;
+                    }
+                }
+                pinMode(PIN_CLK, INPUT);
+                disableOutput();
+                digitalWrite(PIN_DIR, HIGH);
+                busSetOutput();
+                enableOutput();
+
+                Serial.printf("DS3231 RTC set: %s\n", rtcOk ? "OK" : "FAIL");
+            } else {
+                Serial.printf("RTC program assembly failed (%d errors)\n", r.error_count);
+            }
+
+            // Restore the saved program (the RTC set program overwrote RAM)
+            File f = FFat.open(AUTOSAVE_PATH, "r");
+            if (f) {
+                String source = f.readString();
+                f.close();
+                if (source.length() > 0) {
+                    assembler.assemble(source.c_str());
+                    const AsmResult& r2 = assembler.result;
+                    if (r2.error_count == 0 && r2.code_size > 0) {
+                        memcpy(uploadBuf, r2.code, CODE_SIZE);
+                        uploadSize = CODE_SIZE;
+                        uploadToMK1(uploadBuf, uploadSize);
+                        Serial.println("Restored saved program after RTC set");
+                    }
+                }
+            }
+        } else {
+            Serial.println(" NTP timeout");
+        }
     }
 
     MDNS.begin(MDNS_HOST);  // mk1.local
