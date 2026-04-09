@@ -399,6 +399,7 @@ class MK1CodeGen:
                 'via_read_porta', 'via_read_portb',
                 'i2c_init', 'i2c_bus_reset', 'i2c_start', 'i2c_stop',
                 'i2c_ack', 'i2c_nack', 'i2c_wait_ack',
+                'ora_imm', 'orb_imm', 'ddra_imm',
                 'peek3', 'poke3'}
     # NOTE: i2c_send_byte, i2c_read_byte, eeprom_write_byte, eeprom_read_byte,
     # rtc_read_seconds, rtc_read_temp, lcd_cmd, lcd_char, lcd_init are NOT builtins —
@@ -1012,6 +1013,84 @@ class MK1CodeGen:
             self.emit('\tdec')
             self.emit('\tmov $a,$b')
             self.emit('\tclr $a')
+            self.emit(f'\tj {lbl_loop}')
+            self.emit(f'{lbl_done}:')
+            self.emit('\tret')
+
+        # __tone_setup: B = ratio → C = half_period = (ipm × ratio) >> 4.
+        # Reads ipm from data[0]. Clobbers A, B, D.
+        if '__tone_setup' in helpers:
+            lbl_mul = self.label('tsmul')
+            lbl_noc = self.label('tsnoc')
+            self.emit('__tone_setup:')
+            self.emit('\tclr $a')
+            self.emit('\tderef')           # A = ipm from data[0]
+            self.emit('\tmov $a,$c')       # C = ipm
+            self.emit('\tldi $d,0')        # D = product high
+            self.emit('\tclr $a')          # A = product low
+            # Multiply: D:A += C, B times
+            self.emit(f'{lbl_mul}:')
+            self.emit('\tadd $c,$a')       # A += C
+            self.emit(f'\tjnc {lbl_noc}')
+            self.emit('\tpush $a')
+            self.emit('\tmov $d,$a')
+            self.emit('\tinc')
+            self.emit('\tmov $a,$d')
+            self.emit('\tpop $a')
+            self.emit(f'{lbl_noc}:')
+            self.emit('\tpush $a')         # save product low
+            self.emit('\tmov $b,$a')       # A = B (counter)
+            self.emit('\tdec')
+            self.emit('\tmov $a,$b')       # B = counter-1
+            self.emit('\tpop $a')          # A = product low
+            self.emit(f'\tjnz {lbl_mul}')
+            # D:A = ipm × ratio. Shift >> 4.
+            # Result = (D << 4) | (A >> 4). Non-overlapping nibbles, so add works.
+            self.emit('\tslr')
+            self.emit('\tslr')
+            self.emit('\tslr')
+            self.emit('\tslr')             # A = A >> 4
+            self.emit('\tmov $a,$c')       # C = A >> 4 (temp)
+            self.emit('\tmov $d,$a')       # A = D
+            self.emit('\tsll')
+            self.emit('\tsll')
+            self.emit('\tsll')
+            self.emit('\tsll')             # A = D << 4
+            self.emit('\tadd $c,$a')       # A = (D<<4) + (A>>4) = half_period
+            self.emit('\tmov $a,$c')       # C = half_period
+            self.emit('\tret')
+
+        # __tone: play square wave on PA1.
+        # C = half_period (dec+jnz iterations per half-cycle).
+        # D:B = 16-bit cycle count (D=high, B=low).
+        # DDRA must already be 0x02.
+        if '__tone' in helpers:
+            lbl_loop = self.label('ttl')
+            lbl_hi = self.label('thi')
+            lbl_lo = self.label('tlo')
+            lbl_done = self.label('tdn')
+            self.emit('__tone:')
+            self.emit(f'{lbl_loop}:')
+            self.emit('\tora_imm 0x02')    # PA1 HIGH
+            self.emit('\tmov $c,$a')       # A = half_period
+            self.emit(f'{lbl_hi}:')
+            self.emit('\tdec')
+            self.emit(f'\tjnz {lbl_hi}')
+            self.emit('\tora_imm 0x00')    # PA1 LOW
+            self.emit('\tmov $c,$a')
+            self.emit(f'{lbl_lo}:')
+            self.emit('\tdec')
+            self.emit(f'\tjnz {lbl_lo}')
+            # 16-bit decrement D:B
+            self.emit('\tmov $b,$a')       # A = B (low)
+            self.emit('\tdec')
+            self.emit('\tmov $a,$b')       # B = B-1
+            self.emit(f'\tjnz {lbl_loop}') # low byte nonzero, continue
+            self.emit('\tmov $d,$a')       # A = D (high)
+            self.emit('\ttst 0xFF')
+            self.emit(f'\tjz {lbl_done}')  # D==0, all done
+            self.emit('\tdec')
+            self.emit('\tmov $a,$d')       # D = D-1
             self.emit(f'\tj {lbl_loop}')
             self.emit(f'{lbl_done}:')
             self.emit('\tret')
@@ -2733,6 +2812,16 @@ class MK1CodeGen:
                 self.emit('\tddrb_imm 0x02')   # SDA released, SCL LOW
                 return
 
+            if name in ('ora_imm', 'orb_imm', 'ddra_imm'):
+                # VIA register immediate writes — preserves all registers
+                if args:
+                    c = self._const_eval(args[0])
+                    if c is not None:
+                        self.emit(f'\t{name} {c & 0xFF}')
+                    else:
+                        self.gen_error(f"{name} requires a constant argument")
+                return
+
             if name == 'i2c_wait_ack':
                 # Poll until device ACKs (for EEPROM write cycle completion)
                 # Arg: device address byte (e.g. 0xAE for EEPROM write)
@@ -2782,6 +2871,54 @@ class MK1CodeGen:
                     self._lcd_helpers = set()
                 self._lcd_helpers.add('__delay_Nms')
                 self.emit('\tmov $a,$b')    # B = ms count
+                self.emit('\tjal __delay_Nms')
+                return
+
+            if name == 'tone':
+                # tone(freq_hz, duration_ms) — play square wave on PA1.
+                # Both args MUST be compile-time constants.
+                # Uses calibrated ipm from data[0] (call delay_calibrate() first).
+                # DDRA must already be set to 0x02.
+                # ratio = round(8000/freq). half_period = (ipm * ratio) >> 4.
+                # cycles = freq * duration / 1000 (16-bit).
+                if len(args) < 2:
+                    raise Exception("tone() requires 2 arguments: freq_hz, duration_ms")
+                freq = self._const_eval(args[0])
+                dur = self._const_eval(args[1])
+                if freq is None or dur is None:
+                    raise Exception("tone() requires constant arguments")
+                ratio = round(8000 / freq)
+                if ratio > 255 or ratio < 1:
+                    raise Exception(f"tone frequency {freq}Hz out of range (~32Hz-8kHz)")
+                total_cycles = freq * dur // 1000
+                if total_cycles < 1:
+                    return  # too short to play
+                cyc_hi = min((total_cycles >> 8) & 0xFF, 255)
+                cyc_lo = total_cycles & 0xFF
+                if not hasattr(self, '_lcd_helpers'):
+                    self._lcd_helpers = set()
+                self._lcd_helpers.add('__tone_setup')
+                self._lcd_helpers.add('__tone')
+                self.emit(f'\tldi $b,{ratio}')
+                self.emit('\tjal __tone_setup')   # C = half_period
+                self.emit(f'\tldi $d,{cyc_hi}')
+                self.emit(f'\tldi $b,{cyc_lo}')
+                self.emit('\tjal __tone')
+                return
+
+            if name == 'silence':
+                # silence(duration_ms) — pause between notes using delay().
+                # Convenience alias for delay().
+                if args:
+                    c = self._const_eval(args[0])
+                    if c is not None:
+                        self.emit(f'\tldi $a,{c & 0xFF}')
+                    else:
+                        self.gen_expr(args[0])
+                if not hasattr(self, '_lcd_helpers'):
+                    self._lcd_helpers = set()
+                self._lcd_helpers.add('__delay_Nms')
+                self.emit('\tmov $a,$b')
                 self.emit('\tjal __delay_Nms')
                 return
 
