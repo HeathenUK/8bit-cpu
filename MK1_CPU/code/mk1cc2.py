@@ -610,6 +610,16 @@ class MK1CodeGen:
                 self.emit('\tbyte 0')  # null terminator
             self.emit('\tsection code')
 
+        # Emit note table data in page 3
+        if hasattr(self, '_note_table'):
+            self.emit('\tsection page3')
+            for p3_off, ratio, cyc_lo, cyc_hi in self._note_table:
+                self.emit(f'; note at page3 offset {p3_off}: ratio={ratio} cyc={cyc_hi}:{cyc_lo}')
+                self.emit(f'\tbyte {ratio}')
+                self.emit(f'\tbyte {cyc_lo}')
+                self.emit(f'\tbyte {cyc_hi}')
+            self.emit('\tsection code')
+
         return '\n'.join(self.code)
 
     def _eliminate_dead_functions(self):
@@ -1094,6 +1104,45 @@ class MK1CodeGen:
             self.emit(f'\tj {lbl_loop}')
             self.emit(f'{lbl_done}:')
             self.emit('\tret')
+
+        # __play_note: A = page 3 offset into note table.
+        # Reads [ratio, cyc_lo, cyc_hi] from page 3.
+        # If ratio=0 and __delay_Nms available, plays silence (cyc_lo = ms).
+        # Otherwise calls __tone_setup + __tone.
+        if '__play_note' in helpers:
+            has_silence = '__delay_Nms' in helpers
+            lbl_sil = self.label('pnsil') if has_silence else None
+            self.emit('__play_note:')
+            self.emit('\tmov $a,$d')       # D = base offset (preserved)
+            self.emit('\tderefp3')         # A = page3[offset] = ratio
+            if has_silence:
+                self.emit('\ttst 0xFF')
+                self.emit(f'\tjz {lbl_sil}')   # ratio=0 → silence
+            self.emit('\tmov $a,$b')       # B = ratio
+            self.emit('\tpush $d')         # save base offset
+            self.emit('\tjal __tone_setup') # C = half_period (clobbers A,B,D)
+            self.emit('\tpop $a')          # A = base offset
+            self.emit('\tinc')
+            self.emit('\tmov $a,$d')       # D = offset+1
+            self.emit('\tderefp3')         # A = page3[offset+1] = cyc_lo
+            self.emit('\tpush $a')         # save cyc_lo
+            self.emit('\tmov $d,$a')       # A = offset+1
+            self.emit('\tinc')
+            self.emit('\tderefp3')         # A = page3[offset+2] = cyc_hi
+            self.emit('\tmov $a,$d')       # D = cyc_hi
+            self.emit('\tpop $a')          # A = cyc_lo
+            self.emit('\tmov $a,$b')       # B = cyc_lo
+            self.emit('\tjal __tone')
+            self.emit('\tret')
+            # Silence path (only if silence() is used)
+            if has_silence:
+                self.emit(f'{lbl_sil}:')
+                self.emit('\tmov $d,$a')       # A = base offset
+                self.emit('\tinc')
+                self.emit('\tderefp3')         # A = page3[offset+1] = ms
+                self.emit('\tmov $a,$b')       # B = ms
+                self.emit('\tjal __delay_Nms')
+                self.emit('\tret')
 
     def _overlay_partition(self):
         """If code exceeds page 0 capacity, move cold functions to page 3.
@@ -2877,10 +2926,8 @@ class MK1CodeGen:
             if name == 'tone':
                 # tone(freq_hz, duration_ms) — play square wave on PA1.
                 # Both args MUST be compile-time constants.
-                # Uses calibrated ipm from data[0] (call delay_calibrate() first).
-                # DDRA must already be set to 0x02.
-                # ratio = round(8000/freq). half_period = (ipm * ratio) >> 4.
-                # cycles = freq * duration / 1000 (16-bit).
+                # Stores [ratio, cyc_lo, cyc_hi] in page 3 note table.
+                # Emits: ldi $a, offset; jal __play_note (4 bytes per call).
                 if len(args) < 2:
                     raise Exception("tone() requires 2 arguments: freq_hz, duration_ms")
                 freq = self._const_eval(args[0])
@@ -2895,31 +2942,41 @@ class MK1CodeGen:
                     return  # too short to play
                 cyc_hi = min((total_cycles >> 8) & 0xFF, 255)
                 cyc_lo = total_cycles & 0xFF
+                # Allocate 3 bytes in page 3 note table
+                p3_off = self.page3_alloc
+                if not hasattr(self, '_note_table'):
+                    self._note_table = []
+                self._note_table.append((p3_off, ratio, cyc_lo, cyc_hi))
+                self.page3_alloc += 3
                 if not hasattr(self, '_lcd_helpers'):
                     self._lcd_helpers = set()
+                self._lcd_helpers.add('__play_note')
                 self._lcd_helpers.add('__tone_setup')
                 self._lcd_helpers.add('__tone')
-                self.emit(f'\tldi $b,{ratio}')
-                self.emit('\tjal __tone_setup')   # C = half_period
-                self.emit(f'\tldi $d,{cyc_hi}')
-                self.emit(f'\tldi $b,{cyc_lo}')
-                self.emit('\tjal __tone')
+                self.emit(f'\tldi $a,{p3_off}')
+                self.emit('\tjal __play_note')
                 return
 
             if name == 'silence':
-                # silence(duration_ms) — pause between notes using delay().
-                # Convenience alias for delay().
-                if args:
-                    c = self._const_eval(args[0])
-                    if c is not None:
-                        self.emit(f'\tldi $a,{c & 0xFF}')
-                    else:
-                        self.gen_expr(args[0])
+                # silence(duration_ms) — pause between notes.
+                # Stores [0, ms, 0] in page 3 (ratio=0 = silence marker).
+                # Same 4 bytes per call via __play_note.
+                if not args:
+                    return
+                dur_ms = self._const_eval(args[0])
+                if dur_ms is None:
+                    raise Exception("silence() requires a constant argument")
+                p3_off = self.page3_alloc
+                if not hasattr(self, '_note_table'):
+                    self._note_table = []
+                self._note_table.append((p3_off, 0, dur_ms & 0xFF, 0))
+                self.page3_alloc += 3
                 if not hasattr(self, '_lcd_helpers'):
                     self._lcd_helpers = set()
+                self._lcd_helpers.add('__play_note')
                 self._lcd_helpers.add('__delay_Nms')
-                self.emit('\tmov $a,$b')
-                self.emit('\tjal __delay_Nms')
+                self.emit(f'\tldi $a,{p3_off}')
+                self.emit('\tjal __play_note')
                 return
 
             if name == 'lcd_cmd' or name == 'lcd_char':

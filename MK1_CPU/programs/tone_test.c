@@ -1,4 +1,4 @@
-/* Piezo melody test - C major arpeggio */
+/* Piezo melody test - C major arpeggio, note table approach */
 void main(void) {
     i2c_init();
     delay_calibrate();

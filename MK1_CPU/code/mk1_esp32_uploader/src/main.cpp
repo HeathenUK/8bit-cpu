@@ -1450,13 +1450,20 @@ static void handleSerialCommand(const String& line) {
             return;
         }
         int codeBytes = r.code_size < CODE_SIZE ? r.code_size : CODE_SIZE;
+        int dataBytes = r.data_size < DATA_SIZE ? r.data_size : DATA_SIZE;
+        int p3Bytes = r.page3_size < DATA_SIZE ? r.page3_size : DATA_SIZE;
         memcpy(uploadBuf, r.code, CODE_SIZE);
         uploadSize = CODE_SIZE;
-        int dataBytes = r.data_size < DATA_SIZE ? r.data_size : DATA_SIZE;
-        if (dataBytes > 0) {
+        if (dataBytes > 0 || p3Bytes > 0) {
             memcpy(uploadBuf + CODE_SIZE, r.data, dataBytes);
             memset(uploadBuf + CODE_SIZE + dataBytes, 0, DATA_SIZE - dataBytes);
             uploadSize = CODE_SIZE + DATA_SIZE;
+        }
+        if (p3Bytes > 0) {
+            memset(uploadBuf + CODE_SIZE + DATA_SIZE, 0, DATA_SIZE);  // page 2 = zeros
+            memcpy(uploadBuf + CODE_SIZE + DATA_SIZE + DATA_SIZE, r.page3, p3Bytes);
+            memset(uploadBuf + CODE_SIZE + DATA_SIZE + DATA_SIZE + p3Bytes, 0, DATA_SIZE - p3Bytes);
+            uploadSize = CODE_SIZE + DATA_SIZE + DATA_SIZE + DATA_SIZE;
         }
         uint32_t cksum = 0;
         for (int i = 0; i < uploadSize; i++) cksum += uploadBuf[i];
