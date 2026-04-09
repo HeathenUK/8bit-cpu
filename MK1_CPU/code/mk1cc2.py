@@ -928,11 +928,17 @@ class MK1CodeGen:
             self.emit('\ttst 0x01')
             self.emit(f'\tjnz {lbl_cal}')
             self.emit(f'\tj {lbl_s2}')
-            # Count overflows during HIGH phase only
+            # Count overflows during HIGH phase only.
+            # Inner loop: ldi $a,64 + 10 nop + dec + jnz = 64 iters × ~41 cyc ≈ 5ms/overflow.
+            # D_half ≈ 96 overflows at 500kHz. Store D_half/2 in data[0].
+            # delay(N) runs N × data[0] overflows of the same inner loop.
+            # Each delay(1) ≈ 250ms (D_half/2 overflows × 5ms each).
+            # True ms resolution not achievable with 8-bit counters — overflow
+            # count would exceed 255 with shorter inner loops.
             self.emit(f'{lbl_cal}:')
             self.emit('\tldi $b,0')        # B = overflow count
             self.emit(f'{lbl_chi}:')
-            self.emit('\tclr $a')
+            self.emit('\tldi $a,64')       # 64 iterations (~5ms/overflow at 500kHz)
             self.emit(f'.dci{self.label_id}:')
             for _ in range(10):
                 self.emit('\tnop')
@@ -945,12 +951,12 @@ class MK1CodeGen:
             self.emit('\ttst 0x01')
             self.emit(f'\tjz {lbl_done}')  # SQW went LOW → done
             self.emit(f'\tj {lbl_chi}')
-            # Done: B = D_half. D/4 = D_half/2.
+            # Done: B = D_half. Store D_half/2 in data[0].
             self.emit(f'{lbl_done}:')
             self.emit('\tmov $b,$a')
-            self.emit('\tslr')             # A = D_half / 2 = D/4
+            self.emit('\tslr')             # A = D_half / 2
             self.emit('\tldi $b,0')
-            self.emit('\tideref')          # data[0] = D/4
+            self.emit('\tideref')          # data[0] = D_half/2
             # Disable SQW to prevent coupling into SDA
             self.emit('\texrw 2')
             self.emit('\tddrb_imm 0x01')
@@ -966,20 +972,29 @@ class MK1CodeGen:
             self.emit('\texw 0 3')         # clear DDRA
             self.emit('\tret')
 
-        # __delay_Nms: B = ms count. Reads D/4 from data[0].
+        # __delay_Nms: B = delay count. Reads D_half/2 from data[0].
+        # Each unit = D_half/2 overflows × 64-iter inner ≈ 5ms at any clock speed.
+        # MUST use identical inner loop to calibration (same ldi $a,64 + 10 nop + dec + jnz).
         if '__delay_Nms' in helpers:
             lbl_outer = self.label('dno')
             lbl_inner = self.label('dni')
             self.emit('__delay_Nms:')
             self.emit(f'{lbl_outer}:')
             self.emit('\tclr $a')
-            self.emit('\tderef')           # A = data[0] = D/4
+            self.emit('\tderef')           # A = data[0] = D_half/2
+            self.emit('\tmov $a,$c')       # C = overflow count
+            self.emit(f'.dno2{self.label_id}:')
+            self.emit('\tldi $a,64')       # same inner loop as calibration
             self.emit(f'{lbl_inner}:')
             for _ in range(10):
                 self.emit('\tnop')
             self.emit('\tdec')
-            self.emit(f'\tjnz {lbl_inner}')  # 13 cycles — same as calibration
-            self.emit('\tmov $b,$a')
+            self.emit(f'\tjnz {lbl_inner}')
+            self.emit('\tmov $c,$a')       # A = overflow counter
+            self.emit('\tdec')
+            self.emit('\tmov $a,$c')
+            self.emit(f'\tjnz .dno2{self.label_id}')
+            self.emit('\tmov $b,$a')       # A = delay counter
             self.emit('\tdec')
             self.emit('\tmov $a,$b')
             self.emit(f'\tjnz {lbl_outer}')
@@ -2425,8 +2440,8 @@ class MK1CodeGen:
                 self.emit('\tddrb_imm 0x00')   # DDRB = 0 (both lines idle/HIGH)
                 self.emit('\tclr $a')
                 self.emit('\texw 0 3')         # DDRA = 0
-                self.emit('\tpush $a')         # stack warmup
-                self.emit('\tpop $a')
+                self.emit('\tpush $a ;!keep')  # stack warmup (STK pin settling)
+                self.emit('\tpop $a ;!keep')
                 return
 
             if name == 'i2c_bus_reset':
@@ -2441,8 +2456,8 @@ class MK1CodeGen:
                 self.emit('\tddrb_imm 0x00')   # DDRB = 0 (idle)
                 self.emit('\tclr $a')
                 self.emit('\texw 0 3')         # DDRA = 0
-                self.emit('\tpush $a')
-                self.emit('\tpop $a')
+                self.emit('\tpush $a ;!keep')  # stack warmup
+                self.emit('\tpop $a ;!keep')
                 self.emit('\tddrb_imm 0x03')   # STOP: both LOW
                 self.emit('\tddrb_imm 0x01')   # STOP: SDA LOW, SCL HIGH
                 self.emit('\tddrb_imm 0x00')   # STOP: both HIGH (idle)
@@ -2738,7 +2753,7 @@ class MK1CodeGen:
                 self.emit('\tjal __delay_cal')
                 return
 
-            if name == 'delay_ms':
+            if name == 'delay':
                 # delay N ms using calibrated value from data[0].
                 # A = ms count. Calls __delay_Nms.
                 if args:
@@ -3556,8 +3571,10 @@ def peephole(lines):
                 continue
 
             # push $a / pop $a → eliminate both (no-op)
+            # Skip if either line has ;!keep annotation (hardware side-effect)
             if (is_instr(line) and line.strip() == 'push $a'
-                    and i + 1 < len(lines) and lines[i+1].strip() == 'pop $a'):
+                    and i + 1 < len(lines) and lines[i+1].strip() == 'pop $a'
+                    and ';!keep' not in line and ';!keep' not in lines[i+1]):
                 i += 2
                 changed = True
                 continue
