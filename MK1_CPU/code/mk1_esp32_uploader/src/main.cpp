@@ -1507,6 +1507,7 @@ static void handleSerialCommand(const String& line) {
         digitalWrite(PIN_CLK, LOW);
 
         int actualCycles = 0;
+        unsigned long t0_us = micros();
         for (int i = 0; i < n; i++) {
             actualCycles++;
             GPIO.out_w1ts = clkMask;
@@ -1535,16 +1536,22 @@ static void handleSerialCommand(const String& line) {
                 break;
             }
         }
+        unsigned long elapsed_us = micros() - t0_us;
         pinMode(PIN_CLK, INPUT);
         disableOutput();
         digitalWrite(PIN_DIR, HIGH);
         busSetOutput();
         enableOutput();
 
-        Serial.printf("{\"cyc\":%d,\"val\":%d,\"cap\":%s}\n",
+        // Report actual frequency: cycles / elapsed_time
+        float actual_khz = (actualCycles > 100 && elapsed_us > 100)
+            ? (float)actualCycles / elapsed_us * 1000.0f : 0;
+        Serial.printf("{\"cyc\":%d,\"val\":%d,\"cap\":%s,\"us\":%lu,\"khz\":%.1f}\n",
             actualCycles,
             oiCount > 0 ? oiHistory[0] : 0,
-            outputCaptured ? "true" : "false");
+            outputCaptured ? "true" : "false",
+            elapsed_us,
+            actual_khz);
     }
     else if (line == "OI") {
         uint8_t val = 0;
@@ -1611,6 +1618,7 @@ static void handleSerialCommand(const String& line) {
         digitalWrite(PIN_CLK, LOW);
 
         int actualCycles = 0;
+        unsigned long t0_us = micros();
         for (int i = 0; i < n; i++) {
             actualCycles++;
             GPIO.out_w1ts = clkMask;
@@ -1635,14 +1643,17 @@ static void handleSerialCommand(const String& line) {
                 outputCaptured = true;
             }
         }
+        unsigned long elapsed_us = micros() - t0_us;
         pinMode(PIN_CLK, INPUT);
         disableOutput();
         digitalWrite(PIN_DIR, HIGH);
         busSetOutput();
         enableOutput();
 
+        float actual_khz = (actualCycles > 100 && elapsed_us > 100)
+            ? (float)actualCycles / elapsed_us * 1000.0f : 0;
         // Output all captured values
-        Serial.printf("{\"cyc\":%d,\"cnt\":%d,\"vals\":[", actualCycles, oiCount);
+        Serial.printf("{\"cyc\":%d,\"cnt\":%d,\"khz\":%.1f,\"vals\":[", actualCycles, oiCount, actual_khz);
         int show = oiCount < 256 ? oiCount : 256;
         for (int i = 0; i < show; i++) {
             if (i) Serial.print(',');
