@@ -966,25 +966,53 @@ class MK1CodeGen:
             self.emit('\texw 0 3')         # clear DDRA
             self.emit('\tret')
 
-        # __delay_Nms: B = delay count. Reads D_half/2 from data[0].
-        # delay(N): B = N (ms count). Reads ipm from data[0].
-        # Runs N × ipm iterations of bare (dec+jnz) — same loop as calibration.
-        # Two-level: outer counts N ms, inner counts ipm iterations.
-        # At 500kHz: ipm≈54, delay(1)≈1ms (<2% error).
+        # __delay_Nms: B = delay count (ms). Reads ipm from data[0].
+        # Computes total = N × ipm (16-bit), runs flat dec+jnz countdown.
+        # Same inner loop as calibration. No per-ms overhead.
+        # At 500kHz: ipm≈54, <2% error for any N from 1-255.
+        # B = N on entry. Uses C for multiply accumulator.
         if '__delay_Nms' in helpers:
-            lbl_outer = self.label('dno')
-            lbl_inner = self.label('dni')
+            lbl_mul = self.label('dmul')
+            lbl_loop = self.label('dlp')
+            lbl_done = self.label('ddn')
             self.emit('__delay_Nms:')
-            self.emit(f'{lbl_outer}:')
+            # Multiply B × data[0]: result in D:C (hi:lo)
             self.emit('\tclr $a')
-            self.emit('\tderef')           # A = data[0] = ipm
-            self.emit(f'{lbl_inner}:')
-            self.emit('\tdec')
-            self.emit(f'\tjnz {lbl_inner}')  # bare dec+jnz, same as cal inner
-            self.emit('\tmov $b,$a')       # A = ms counter
+            self.emit('\tderef')           # A = ipm from data[0]
+            self.emit('\tmov $a,$c')       # C = ipm
+            self.emit('\tldi $d,0')        # D = result high byte
+            self.emit('\tclr $a')          # A = result low byte
+            # Add C to D:A, B times
+            self.emit(f'{lbl_mul}:')
+            self.emit('\tadd $c,$a')       # A += C (with carry)
+            self.emit('\tjnc .noc%d' % self.label_id)
+            self.emit('\tpush $a')
+            self.emit('\tmov $d,$a')
+            self.emit('\tinc')
+            self.emit('\tmov $a,$d')
+            self.emit('\tpop $a')
+            self.emit('.noc%d:' % self.label_id)
+            self.emit('\tmov $b,$a')       # check B
             self.emit('\tdec')
             self.emit('\tmov $a,$b')
-            self.emit(f'\tjnz {lbl_outer}')
+            self.emit(f'\tjnz {lbl_mul}')
+            # D:A = total iterations (D=high, A=low). Need B=high, A=low.
+            self.emit('\tpush $a')         # save low byte
+            self.emit('\tmov $d,$a')       # A = D = high byte
+            self.emit('\tmov $a,$b')       # B = high byte
+            self.emit('\tpop $a')          # A = low byte restored
+            # 16-bit countdown: A counts down, B decrements on A wrap
+            self.emit(f'{lbl_loop}:')
+            self.emit('\tdec')
+            self.emit(f'\tjnz {lbl_loop}')
+            self.emit('\tmov $b,$a')       # A = B (high byte)
+            self.emit('\ttst 0xFF')        # B == 0?
+            self.emit(f'\tjz {lbl_done}')
+            self.emit('\tdec')
+            self.emit('\tmov $a,$b')
+            self.emit('\tclr $a')
+            self.emit(f'\tj {lbl_loop}')
+            self.emit(f'{lbl_done}:')
             self.emit('\tret')
 
     def _overlay_partition(self):
