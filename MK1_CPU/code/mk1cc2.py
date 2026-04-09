@@ -928,35 +928,29 @@ class MK1CodeGen:
             self.emit('\ttst 0x01')
             self.emit(f'\tjnz {lbl_cal}')
             self.emit(f'\tj {lbl_s2}')
-            # Count overflows during HIGH phase only.
-            # Inner loop: ldi $a,64 + 10 nop + dec + jnz = 64 iters × ~41 cyc ≈ 5ms/overflow.
-            # D_half ≈ 96 overflows at 500kHz. Store D_half/2 in data[0].
-            # delay(N) runs N × data[0] overflows of the same inner loop.
-            # Each delay(1) ≈ 250ms (D_half/2 overflows × 5ms each).
-            # True ms resolution not achievable with 8-bit counters — overflow
-            # count would exceed 255 with shorter inner loops.
+            # Calibrate: count bare (dec+jnz) iterations during SQW HIGH.
+            # A loops 256→0 (bare dec+jnz). B counts A-wraps (overflows).
+            # Store B in data[0] = iterations per ~1ms at 500kHz.
+            # delay(N) runs flat N×B iterations of the same dec+jnz.
+            # Accuracy: <2% at 500kHz, ~30% at 250kHz (cal overhead mismatch).
             self.emit(f'{lbl_cal}:')
-            self.emit('\tldi $b,0')        # B = overflow count
+            self.emit('\tldi $b,0')
+            self.emit('\tclr $a')
             self.emit(f'{lbl_chi}:')
-            self.emit('\tldi $a,64')       # 64 iterations (~5ms/overflow at 500kHz)
-            self.emit(f'.dci{self.label_id}:')
-            for _ in range(10):
-                self.emit('\tnop')
             self.emit('\tdec')
-            self.emit(f'\tjnz .dci{self.label_id}')
+            self.emit(f'\tjnz {lbl_chi}')
             self.emit('\tmov $b,$a')
             self.emit('\tinc')
             self.emit('\tmov $a,$b')
             self.emit('\texrw 1')
             self.emit('\ttst 0x01')
-            self.emit(f'\tjz {lbl_done}')  # SQW went LOW → done
+            self.emit(f'\tjz {lbl_done}')
+            self.emit('\tclr $a')
             self.emit(f'\tj {lbl_chi}')
-            # Done: B = D_half. Store D_half/2 in data[0].
             self.emit(f'{lbl_done}:')
-            self.emit('\tmov $b,$a')
-            self.emit('\tslr')             # A = D_half / 2
+            self.emit('\tmov $b,$a')       # A = B (ipm)
             self.emit('\tldi $b,0')
-            self.emit('\tideref')          # data[0] = D_half/2
+            self.emit('\tideref')          # data[0] = ipm
             # Disable SQW to prevent coupling into SDA
             self.emit('\texrw 2')
             self.emit('\tddrb_imm 0x01')
@@ -973,28 +967,21 @@ class MK1CodeGen:
             self.emit('\tret')
 
         # __delay_Nms: B = delay count. Reads D_half/2 from data[0].
-        # Each unit = D_half/2 overflows × 64-iter inner ≈ 5ms at any clock speed.
-        # MUST use identical inner loop to calibration (same ldi $a,64 + 10 nop + dec + jnz).
+        # delay(N): B = N (ms count). Reads ipm from data[0].
+        # Runs N × ipm iterations of bare (dec+jnz) — same loop as calibration.
+        # Two-level: outer counts N ms, inner counts ipm iterations.
+        # At 500kHz: ipm≈54, delay(1)≈1ms (<2% error).
         if '__delay_Nms' in helpers:
             lbl_outer = self.label('dno')
             lbl_inner = self.label('dni')
             self.emit('__delay_Nms:')
             self.emit(f'{lbl_outer}:')
             self.emit('\tclr $a')
-            self.emit('\tderef')           # A = data[0] = D_half/2
-            self.emit('\tmov $a,$c')       # C = overflow count
-            self.emit(f'.dno2{self.label_id}:')
-            self.emit('\tldi $a,64')       # same inner loop as calibration
+            self.emit('\tderef')           # A = data[0] = ipm
             self.emit(f'{lbl_inner}:')
-            for _ in range(10):
-                self.emit('\tnop')
             self.emit('\tdec')
-            self.emit(f'\tjnz {lbl_inner}')
-            self.emit('\tmov $c,$a')       # A = overflow counter
-            self.emit('\tdec')
-            self.emit('\tmov $a,$c')
-            self.emit(f'\tjnz .dno2{self.label_id}')
-            self.emit('\tmov $b,$a')       # A = delay counter
+            self.emit(f'\tjnz {lbl_inner}')  # bare dec+jnz, same as cal inner
+            self.emit('\tmov $b,$a')       # A = ms counter
             self.emit('\tdec')
             self.emit('\tmov $a,$b')
             self.emit(f'\tjnz {lbl_outer}')
