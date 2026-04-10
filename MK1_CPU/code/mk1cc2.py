@@ -1128,40 +1128,30 @@ class MK1CodeGen:
         if '__eeprom_r2c_loop' in helpers:
             lbl_loop = self.label('r2c')
             lbl_last = self.label('r2cl')
-            # Page 3 kernel state addresses (top of page 3, away from app data)
-            P3_DEST = 241    # overlay dest address
-            P3_COUNT = 242   # overlay byte count
+            P3_COUNT = 242   # overlay byte count (page 3 kernel state)
             self.emit('__eeprom_r2c_loop:')
             # Entry: B = code dest, stack = [ret_addr, count, ...]
-            # Store dest and count in page 3 (not data page — leave that for app)
-            self.emit('\tmov $b,$a')         # A = dest
-            self.emit(f'\tldi $b,{P3_DEST}')
-            self.emit('\tiderefp3')          # page3[241] = dest
-            self.emit('\tldsp 2')            # A = count (past ret addr)
+            # Save B (dest), store count to page3, restore B.
+            self.emit('\tpush_b')            # save dest
+            self.emit('\tldsp 3')            # A = count (past: dest_pushed, ret_addr)
             self.emit(f'\tldi $b,{P3_COUNT}')
             self.emit('\tiderefp3')          # page3[242] = count
-            # Read loop
+            self.emit('\tpop_b')             # B = dest (restored)
+            # Read loop: B = dest (auto-incremented by istc_inc)
             self.emit(f'{lbl_loop}:')
+            self.emit('\tpush_b')            # save dest before i2c_rb clobbers B
             self.emit('\tjal __i2c_rb')      # D = byte, A/B/C clobbered
-            # Write byte to code page: istc needs A=byte, B=dest
+            self.emit('\tpop_b')             # B = dest
             self.emit('\tmov $d,$a')         # A = byte
-            self.emit('\tpush $a')           # save byte
-            self.emit(f'\tldi $a,{P3_DEST}')
-            self.emit('\tderefp3')           # A = page3[241] = dest
-            self.emit('\tmov $a,$b')         # B = dest
-            self.emit('\tpop $a')            # A = byte
-            self.emit('\tistc')              # code[B] = A
-            # Increment dest in page3
-            self.emit('\tmov $b,$a')         # A = dest
-            self.emit('\tinc')
-            self.emit(f'\tldi $b,{P3_DEST}')
-            self.emit('\tiderefp3')          # page3[241] = dest + 1
-            # Decrement count in page3, branch on zero
+            self.emit('\tistc_inc')          # code[B] = A; B = dest+1
+            # Decrement count: save B (dest+1), do count--, restore B
+            self.emit('\tpush_b')            # save dest+1
             self.emit(f'\tldi $a,{P3_COUNT}')
-            self.emit('\tderefp3')           # A = page3[242] = remaining
-            self.emit('\tdec')               # A = remaining - 1, ZF set
+            self.emit('\tderefp3')           # A = remaining
+            self.emit('\tdec')               # A = remaining-1, ZF set
             self.emit(f'\tldi $b,{P3_COUNT}')
-            self.emit('\tiderefp3')          # page3[242] = remaining - 1 (ZF preserved)
+            self.emit('\tiderefp3')          # page3[242] = remaining-1 (ZF preserved)
+            self.emit('\tpop_b')             # B = dest+1 (ZF preserved: pop_b has no FI)
             self.emit(f'\tjz {lbl_last}')    # ZF from dec survives ldi+ideref
             # ACK
             self.emit('\tddrb_imm 0x03')     # SDA LOW, SCL LOW
@@ -1364,14 +1354,13 @@ class MK1CodeGen:
                             new_code = new_code[:-3]   # remove push, ldi, ldsp
                             new_code.append(ldi_b_line) # re-add just ldi $b,N
                         # Save A and B to page3 before overlay load
-                        # Initialize overlay cache on first call (after B is saved)
-                        new_code.append(f'\tpush $a')      # save A on stack
+                        new_code.append(f'\tpush_b')       # save B (1 byte)
+                        new_code.append(f'\tldi $b,246')
+                        new_code.append(f'\tiderefp3')     # page3[246] = A (arg1)
+                        new_code.append(f'\tpop_b')        # restore B
                         new_code.append(f'\tmov $b,$a')    # A = B (arg2)
                         new_code.append(f'\tldi $b,247')
                         new_code.append(f'\tiderefp3')     # page3[247] = B (arg2)
-                        new_code.append(f'\tpop $a')       # restore A (arg1)
-                        new_code.append(f'\tldi $b,246')
-                        new_code.append(f'\tiderefp3')     # page3[246] = A (arg1)
                         # Initialize overlay cache on first call (B is free here)
                         if not cache_init_emitted:
                             new_code.append(f'\tldi $a,0xFF')
