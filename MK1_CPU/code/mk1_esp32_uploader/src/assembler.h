@@ -292,6 +292,11 @@ private:
             result.code_size++;  // advance code PC for label resolution
             return;
         }
+        if (codeEmitTarget == 1) {
+            emitData(byte, pass1);
+            result.code_size++;  // advance code PC for label resolution
+            return;
+        }
         if (!pass1 && result.code_size < CODE_SIZE)
             result.code[result.code_size] = byte;
         result.code_size++;
@@ -357,10 +362,15 @@ private:
 
             // Handle "section" directive
             if (startsWith(lp, "section")) {
-                if (strstr(lp, "page3_code")) {
-                    // Overlay code: assembled as instructions but stored in page 3
-                    bank = 0;  // parse as code (instructions)
-                    codeEmitTarget = 3;  // but emit bytes to page 3
+                if (strstr(lp, "data_code")) {
+                    // Overlay code stored in data page: instructions parsed as code
+                    // (labels resolve at code PC) but bytes emitted to data buffer.
+                    bank = 0;  // parse as code
+                    codeEmitTarget = 1;  // emit to data page
+                } else if (strstr(lp, "page3_code")) {
+                    // Overlay code stored in page 3: same but emit to page 3
+                    bank = 0;
+                    codeEmitTarget = 3;
                 } else if (strstr(lp, "page3")) {
                     bank = 3;  // raw data in page 3
                     codeEmitTarget = 0;
