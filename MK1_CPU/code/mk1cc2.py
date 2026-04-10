@@ -400,6 +400,7 @@ class MK1CodeGen:
                 'i2c_init', 'i2c_bus_reset', 'i2c_start', 'i2c_stop',
                 'i2c_ack', 'i2c_nack', 'i2c_wait_ack',
                 'ora_imm', 'orb_imm', 'ddra_imm',
+                'write_code', 'call_code', 'eeprom_read_to_code',
                 'peek3', 'poke3'}
     # NOTE: i2c_send_byte, i2c_read_byte, eeprom_write_byte, eeprom_read_byte,
     # rtc_read_seconds, rtc_read_temp, lcd_cmd, lcd_char, lcd_init are NOT builtins —
@@ -1103,6 +1104,74 @@ class MK1CodeGen:
             self.emit('\tmov $a,$d')       # D = D-1
             self.emit(f'\tj {lbl_loop}')
             self.emit(f'{lbl_done}:')
+            self.emit('\tret')
+
+        # __eeprom_r2c: bulk sequential EEPROM read → code page via istc.
+        # Params in data page: data[4]=addr_hi, data[5]=addr_lo,
+        # data[6]=code_dest, data[7]=count.
+        # Uses __i2c_sb for address setup, __i2c_rb for byte reads.
+        if '__eeprom_r2c' in helpers:
+            lbl_loop = self.label('r2c')
+            lbl_last = self.label('r2cl')
+            self.emit('__eeprom_r2c:')
+            # I2C START + device write address
+            self.emit('\texrw 2')
+            self.emit('\tddrb_imm 0x01')     # START
+            self.emit('\tddrb_imm 0x03')
+            self.emit('\tldi $a,0xAE')       # EEPROM write addr
+            self.emit('\tjal __i2c_sb')
+            # Send EEPROM address (2 bytes from data page)
+            self.emit('\tldi $a,4')
+            self.emit('\tderef')             # A = data[4] = addr_hi
+            self.emit('\tjal __i2c_sb')
+            self.emit('\tldi $a,5')
+            self.emit('\tderef')             # A = data[5] = addr_lo
+            self.emit('\tjal __i2c_sb')
+            # Repeated START + read address
+            self.emit('\tddrb_imm 0x00')     # both HIGH
+            self.emit('\tddrb_imm 0x01')     # START
+            self.emit('\tddrb_imm 0x03')
+            self.emit('\tldi $a,0xAF')       # EEPROM read addr
+            self.emit('\tjal __i2c_sb')
+            # Sequential read loop
+            self.emit(f'{lbl_loop}:')
+            self.emit('\tjal __i2c_rb')      # D = byte read
+            # istc: code[data[6]] = D. Save D, load dest from data[6].
+            self.emit('\tmov $d,$a')         # A = byte
+            self.emit('\tpush $a')           # save byte
+            self.emit('\tldi $a,6')
+            self.emit('\tderef')             # A = data[6] = code dest
+            self.emit('\tmov $a,$b')         # B = dest
+            self.emit('\tpop $a')            # A = byte
+            self.emit('\tistc')              # code[B] = A
+            # Increment dest
+            self.emit('\tmov $b,$a')         # A = dest
+            self.emit('\tinc')
+            self.emit('\tldi $b,6')
+            self.emit('\tideref')            # data[6] = dest + 1
+            # Decrement count
+            self.emit('\tldi $a,7')
+            self.emit('\tderef')             # A = data[7] = remaining
+            self.emit('\tdec')
+            self.emit('\tldi $b,7')
+            self.emit('\tideref')            # data[7] = remaining - 1
+            # ACK if more bytes, NACK if last
+            self.emit(f'\tjz {lbl_last}')    # remaining==0 → last byte
+            # ACK: SDA LOW during 9th clock
+            self.emit('\tddrb_imm 0x03')     # SDA LOW, SCL LOW
+            self.emit('\tddrb_imm 0x01')     # SDA LOW, SCL HIGH
+            self.emit('\tddrb_imm 0x03')     # SCL LOW
+            self.emit('\tddrb_imm 0x02')     # SDA released
+            self.emit(f'\tj {lbl_loop}')
+            # NACK + STOP for last byte
+            self.emit(f'{lbl_last}:')
+            self.emit('\tddrb_imm 0x02')     # SDA released, SCL LOW
+            self.emit('\tddrb_imm 0x00')     # SCL HIGH (NACK = SDA HIGH)
+            self.emit('\tddrb_imm 0x02')     # SCL LOW
+            # STOP
+            self.emit('\tddrb_imm 0x03')     # both LOW
+            self.emit('\tddrb_imm 0x01')     # SDA LOW, SCL HIGH
+            self.emit('\tddrb_imm 0x00')     # both HIGH = STOP
             self.emit('\tret')
 
         # __play_note: A = page 3 offset into note table.
@@ -2859,6 +2928,62 @@ class MK1CodeGen:
                 self.emit('\tddrb_imm 0x02')   # SDA released, SCL LOW
                 self.emit('\tddrb_imm 0x00')   # SDA released, SCL HIGH
                 self.emit('\tddrb_imm 0x02')   # SDA released, SCL LOW
+                return
+
+            if name == 'write_code':
+                # write_code(byte, addr) — write byte to code page via istc
+                # addr must be constant (reload after byte eval to avoid clobber)
+                if len(args) < 2:
+                    self.gen_error("write_code(byte, addr)")
+                c_addr = self._const_eval(args[1])
+                if c_addr is None:
+                    self.gen_error("write_code: addr must be constant")
+                self.gen_expr(args[0])           # byte → A (may clobber B)
+                self.emit(f'\tldi $b,{c_addr & 0xFF}')  # B = addr
+                self.emit('\tistc')              # code[B] = A
+                return
+
+            if name == 'eeprom_read_to_code':
+                # eeprom_read_to_code(eeprom_addr, code_addr, count)
+                # Bulk sequential I2C read from EEPROM → code page via istc.
+                # All args must be compile-time constants.
+                if len(args) < 3:
+                    self.gen_error("eeprom_read_to_code(eeprom_addr, code_addr, count)")
+                ee_addr = self._const_eval(args[0])
+                code_addr = self._const_eval(args[1])
+                count = self._const_eval(args[2])
+                if ee_addr is None or code_addr is None or count is None:
+                    self.gen_error("eeprom_read_to_code: all args must be constants")
+                if not hasattr(self, '_lcd_helpers'):
+                    self._lcd_helpers = set()
+                self._lcd_helpers.add('__i2c_sb')
+                self._lcd_helpers.add('__i2c_rb')
+                self._lcd_helpers.add('__eeprom_r2c')
+                # Set up params in data page: data[4]=addr_hi, data[5]=addr_lo,
+                # data[6]=code_dest, data[7]=count
+                self.emit(f'\tldi $a,{(ee_addr >> 8) & 0xFF}')
+                self.emit('\tldi $b,4')
+                self.emit('\tideref')          # data[4] = addr_hi
+                self.emit(f'\tldi $a,{ee_addr & 0xFF}')
+                self.emit('\tldi $b,5')
+                self.emit('\tideref')          # data[5] = addr_lo
+                self.emit(f'\tldi $a,{code_addr & 0xFF}')
+                self.emit('\tldi $b,6')
+                self.emit('\tideref')          # data[6] = code_dest
+                self.emit(f'\tldi $a,{count & 0xFF}')
+                self.emit('\tldi $b,7')
+                self.emit('\tideref')          # data[7] = count
+                self.emit('\tjal __eeprom_r2c')
+                return
+
+            if name == 'call_code':
+                # call_code(addr) — jal to a code page address
+                if args:
+                    c = self._const_eval(args[0])
+                    if c is not None:
+                        self.emit(f'\tjal {c}')
+                    else:
+                        self.gen_error("call_code requires constant address")
                 return
 
             if name in ('ora_imm', 'orb_imm', 'ddra_imm'):
