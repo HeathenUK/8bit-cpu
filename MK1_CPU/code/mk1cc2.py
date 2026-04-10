@@ -1115,48 +1115,50 @@ class MK1CodeGen:
             lbl_loop = self.label('r2c')
             lbl_last = self.label('r2cl')
             self.emit('__eeprom_r2c_loop:')
-            # Move count from stack to data[7]
+            # Entry: B = code dest, stack = [ret_addr, count, ...]
+            # Store dest in data[6], count in data[7]
+            self.emit('\tmov $b,$a')         # A = dest
+            self.emit('\tldi $b,6')
+            self.emit('\tideref')            # data[6] = dest
             self.emit('\tldsp 2')            # A = count (past ret addr)
             self.emit('\tldi $b,7')
             self.emit('\tideref')            # data[7] = count
+            # Read loop
             self.emit(f'{lbl_loop}:')
-            # Save B (dest) before __i2c_rb clobbers it
-            self.emit('\tmov $b,$a')
-            self.emit('\tpush $a')           # save dest
             self.emit('\tjal __i2c_rb')      # D = byte, A/B/C clobbered
-            # Restore dest, write byte to code page
-            self.emit('\tpop $a')            # A = dest
-            self.emit('\tmov $a,$b')         # B = dest
+            # Write byte to code page: istc needs A=byte, B=dest
             self.emit('\tmov $d,$a')         # A = byte
+            self.emit('\tpush $a')           # save byte
+            self.emit('\tldi $a,6')
+            self.emit('\tderef')             # A = data[6] = dest
+            self.emit('\tmov $a,$b')         # B = dest
+            self.emit('\tpop $a')            # A = byte
             self.emit('\tistc')              # code[B] = A
-            # B = dest (istc doesn't change B), increment for next
+            # Increment dest in data[6]
             self.emit('\tmov $b,$a')         # A = dest
             self.emit('\tinc')
-            self.emit('\tmov $a,$b')         # B = dest + 1
-            # Decrement count in data[7]
+            self.emit('\tldi $b,6')
+            self.emit('\tideref')            # data[6] = dest + 1
+            # Decrement count in data[7], branch on zero
             self.emit('\tldi $a,7')
-            self.emit('\tderef')             # A = data[7]
-            self.emit('\tdec')
-            self.emit('\tpush $a')           # save decremented count (to preserve ZF)
+            self.emit('\tderef')             # A = data[7] = remaining
+            self.emit('\tdec')               # A = remaining - 1, ZF set
             self.emit('\tldi $b,7')
-            self.emit('\tideref')            # data[7] = count - 1
-            self.emit('\tpop $a')            # restore A (and ZF from dec)
-            # ACK if more, NACK+STOP if last
-            self.emit(f'\tjz {lbl_last}')
-            # ACK: drive SDA LOW during 9th clock
+            self.emit('\tideref')            # data[7] = remaining - 1 (ZF preserved: no FI)
+            self.emit(f'\tjz {lbl_last}')    # ZF from dec survives ldi+ideref
+            # ACK
             self.emit('\tddrb_imm 0x03')     # SDA LOW, SCL LOW
             self.emit('\tddrb_imm 0x01')     # SDA LOW, SCL HIGH
             self.emit('\tddrb_imm 0x03')     # SCL LOW
             self.emit('\tddrb_imm 0x02')     # SDA released
-            # Restore B from saved value? No — B still holds dest+1 from above
             self.emit(f'\tj {lbl_loop}')
-            # NACK + STOP (already at DDRB=0x02 from __i2c_rb)
+            # NACK + STOP (DDRB already 0x02 from __i2c_rb)
             self.emit(f'{lbl_last}:')
-            self.emit('\tddrb_imm 0x00')     # SCL HIGH (NACK = SDA stays HIGH)
+            self.emit('\tddrb_imm 0x00')     # SCL HIGH (NACK)
             self.emit('\tddrb_imm 0x02')     # SCL LOW
-            self.emit('\tddrb_imm 0x03')     # SDA LOW, SCL LOW
-            self.emit('\tddrb_imm 0x01')     # SDA LOW, SCL HIGH
-            self.emit('\tddrb_imm 0x00')     # SDA HIGH → STOP
+            self.emit('\tddrb_imm 0x03')     # SDA LOW
+            self.emit('\tddrb_imm 0x01')     # SCL HIGH
+            self.emit('\tddrb_imm 0x00')     # STOP
             self.emit('\tret')
 
         # __play_note: A = page 3 offset into note table.
