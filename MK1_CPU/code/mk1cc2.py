@@ -1479,7 +1479,8 @@ class MK1CodeGen:
             '\tmov $a,$b',                  # B = arg2
             '\tldi $a,246',
             '\tderefp3',                    # A = page3[246] = arg1
-            f'\tj {OVERLAY_REGION}',           # jump to overlay with correct A,B
+            f'\tjal {OVERLAY_REGION}',         # call overlay; ret returns here
+            '\tret',                           # then return to caller of _overlay_load
         ]
 
         # ── Emit overlay code + metadata in page3, then resident code ──
