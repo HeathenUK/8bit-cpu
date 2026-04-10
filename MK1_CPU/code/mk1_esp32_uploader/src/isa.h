@@ -114,6 +114,9 @@ static const FixedInstr FIXED_INSTRUCTIONS[] = {
     // ── Overlay system ──
     { "derefp3", 0xD5,  ARGS_NONE },  // A = page3[A] (indirect page 3 read)
     { "istc",    0xDA,  ARGS_NONE },  // code[B] = A (indirect store to code page)
+    { "istc_inc",0xD9,  ARGS_NONE },  // code[B] = A; B++ (istc with auto-increment)
+    { "push_b",  0xF1,  ARGS_NONE },  // stack[SP] = B; SP-- (push B without touching A)
+    { "pop_b",   0xF2,  ARGS_NONE },  // B = stack[++SP] (pop into B without touching A)
     { "ocall",   0xDF,  ARGS_IMM  },  // overlay call: push ret, A=N, PC=0
 
     // ── 16-bit arithmetic ──

@@ -1045,22 +1045,33 @@ def run_tests():
     results.append(ok_ew)
     print(f"  [{'PASS' if ok_ew else 'FAIL'}] EXW 1 1: A=0x42 preserved after exw, A=0x{cpu_ew.A:02X} (expect 0x42)")
 
-    # ── Test: GPIO_READ (reads external bus into A) ──
-    # gpio_read = opcode 0xC5. Microcode: XI|E0|AI|U1.
-    # In sim, no external hardware — bus is undriven (0x00). Just verify it executes
-    # and modifies A (loads bus value), and doesn't crash.
+    # ── Test: EXR 1 0 stretched (reads external bus into A with XI setup step) ──
+    # exr 1 0 = opcode 0x79. Microcode: XI, XI|E1|AI (stretched).
+    # In sim, no external hardware — bus is undriven (0x00). Verify A changes.
     cpu_gr = MK1()
     code_gr = bytearray(256)
     code_gr[0] = 0x38; code_gr[1] = 0xFF    # ldi $a, 0xFF
-    code_gr[2] = 0xC5; code_gr[3] = 0       # gpio_read (A = bus value, 0 in sim)
+    code_gr[2] = 0x79; code_gr[3] = 0       # exr 1 0 (A = bus value, 0 in sim)
     code_gr[4] = 0x06; code_gr[5] = 0       # out
     code_gr[6] = 0x7F; code_gr[7] = 0       # hlt
     cpu_gr.load_program(code_gr)
     cpu_gr.run()
-    # A was 0xFF, gpio_read overwrites it. Bus undriven in sim = 0x00.
-    ok_gr = cpu_gr.A != 0xFF  # A must have changed from the pre-loaded 0xFF
+    ok_gr = cpu_gr.A != 0xFF
     results.append(ok_gr)
-    print(f"  [{'PASS' if ok_gr else 'FAIL'}] GPIO_READ: A overwritten by bus read, A=0x{cpu_gr.A:02X} (expect != 0xFF)")
+    print(f"  [{'PASS' if ok_gr else 'FAIL'}] EXR 1 0: A overwritten by bus read, A=0x{cpu_gr.A:02X} (expect != 0xFF)")
+
+    # ── Test: EXR 1 1 stretched (read with U0, for 82C55 Port B) ──
+    cpu_gr2 = MK1()
+    code_gr2 = bytearray(256)
+    code_gr2[0] = 0x38; code_gr2[1] = 0xFF
+    code_gr2[2] = 0xC5; code_gr2[3] = 0     # exr 1 1
+    code_gr2[4] = 0x06; code_gr2[5] = 0
+    code_gr2[6] = 0x7F; code_gr2[7] = 0
+    cpu_gr2.load_program(code_gr2)
+    cpu_gr2.run()
+    ok_gr2 = cpu_gr2.A != 0xFF
+    results.append(ok_gr2)
+    print(f"  [{'PASS' if ok_gr2 else 'FAIL'}] EXR 1 1: A overwritten by bus read, A=0x{cpu_gr2.A:02X} (expect != 0xFF)")
 
     # ── Test: OCALL (overlay call — jumps to address 0 with A=index) ──
     # Address 0: overlay loader stub — just output A (the index) and return
@@ -1079,6 +1090,37 @@ def run_tests():
     ok_oc = cpu_oc.output_history == [5, 5]
     results.append(ok_oc)
     print(f"  [{'PASS' if ok_oc else 'FAIL'}] OCALL: overlay call A=5, return (got {cpu_oc.output_history})")
+
+    # ── Test: ISTC_INC (code[B] = A; B++) ──
+    cpu_ii = MK1()
+    code_ii = bytearray(256)
+    code_ii[0] = 0x38; code_ii[1] = 0xAA       # ldi $a, 0xAA
+    code_ii[2] = 0x39; code_ii[3] = 200         # ldi $b, 200
+    code_ii[4] = 0xD9; code_ii[5] = 0           # istc_inc (code[200]=0xAA, B=201)
+    code_ii[6] = 0x38; code_ii[7] = 0xBB        # ldi $a, 0xBB
+    code_ii[8] = 0xD9; code_ii[9] = 0           # istc_inc (code[201]=0xBB, B=202)
+    code_ii[10] = 0x7F; code_ii[11] = 0         # hlt
+    cpu_ii.load_program(code_ii)
+    cpu_ii.run()
+    ok_ii = cpu_ii.mem[0][200] == 0xAA and cpu_ii.mem[0][201] == 0xBB and cpu_ii.B == 202
+    results.append(ok_ii)
+    print(f"  [{'PASS' if ok_ii else 'FAIL'}] ISTC_INC: code[200]=0x{cpu_ii.mem[0][200]:02X}(AA), code[201]=0x{cpu_ii.mem[0][201]:02X}(BB), B={cpu_ii.B}(202)")
+
+    # ── Test: PUSH_B / POP_B ──
+    cpu_pb = MK1()
+    code_pb = bytearray(256)
+    code_pb[0] = 0x38; code_pb[1] = 99          # ldi $a, 99
+    code_pb[2] = 0x39; code_pb[3] = 42          # ldi $b, 42
+    code_pb[4] = 0xF1; code_pb[5] = 0           # push_b (stack = [42])
+    code_pb[6] = 0x39; code_pb[7] = 0           # ldi $b, 0 (clobber B)
+    code_pb[8] = 0xF2; code_pb[9] = 0           # pop_b (B = 42)
+    code_pb[10] = 0x06; code_pb[11] = 0         # out (A should still be 99)
+    code_pb[12] = 0x7F; code_pb[13] = 0         # hlt
+    cpu_pb.load_program(code_pb)
+    cpu_pb.run()
+    ok_pb = cpu_pb.B == 42 and cpu_pb.output_history == [99]
+    results.append(ok_pb)
+    print(f"  [{'PASS' if ok_pb else 'FAIL'}] PUSH_B/POP_B: B={cpu_pb.B}(42), A preserved={cpu_pb.output_history}([99])")
 
     # ── Summary ──
     print()

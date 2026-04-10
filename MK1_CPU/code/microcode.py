@@ -291,6 +291,18 @@ ucode_template[0xD5] = ('derefp3', [MI|PO, RO|II|PE, AO|MI, STK|HL|RO|AI, RST, R
 # ISTC: code[B] = A — indirect store to code page (no HL, no STK)
 ucode_template[0xDA] = ('istc', [MI|PO, RO|II|PE, BO|MI, AO|RI, RST, RST, RST, RST], True)
 
+# ISTC_INC: code[B] = A; B++ — istc with auto-increment for bulk code writes.
+# Steps 4-7: B = B + 1 via zero-E trick (same as INC but targeting B).
+# Clobbers A (set to old B) and E (zeroed). Flags NOT set (no FI).
+# 8 steps, no RST — counter wraps 7→0 naturally, next fetch starts.
+ucode_template[0xD9] = ('istc_inc', [MI|PO, RO|II|PE, BO|MI, AO|RI, BO|AI, AO|EI, SUB|EO|EI, CINV|EO|BI], True)
+
+# PUSH_B: stack[SP] = B; SP-- — push B register without touching A.
+ucode_template[0xF1] = ('push_b', [MI|PO, RO|II|PE, SO|MI, STK|SD|BO|RI, RST, RST, RST, RST], False)
+
+# POP_B: B = stack[SP+1]; SP++ — pop into B register without touching A.
+ucode_template[0xF2] = ('pop_b', [MI|PO, RO|II|PE, SU, SO|MI, STK|RO|BI, RST, RST, RST], False)
+
 # OCALL N: overlay call — push return address, A = N, jump to address 0
 # Step 3: read immediate into A (NO PE — ret adds 1, so push addr_of_imm)
 # Step 4-5: push return address (PC = addr of immediate)
