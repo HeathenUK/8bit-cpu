@@ -1293,36 +1293,89 @@ class MK1CodeGen:
         if not overlay_funcs:
             return
 
-        # ── Overlay system ──
-        # Overlay functions are assembled at OVERLAY_REGION in page 0 (so
-        # internal labels resolve correctly). The assembler's page3_code
-        # section stores instruction bytes in page 3.
-        # At runtime, the overlay loader copies them to OVERLAY_REGION
-        # and calls via jal_r.
-        #
-        # Page 3 layout: [metadata: 3 bytes/overlay] [code bytes]
+        # ── Call graph analysis: group mutually-calling functions ──
+        # Functions that call each other MUST be in the same overlay slot,
+        # otherwise a cross-overlay call overwrites the calling function.
+        ov_names = {name for name, _, _, _ in overlay_funcs}
+        ov_by_name = {name: (start, end, fsize) for name, start, end, fsize in overlay_funcs}
 
-        # OVERLAY_REGION must satisfy two constraints:
-        # 1. OVERLAY_REGION >= resident_code_size (don't overlap resident code)
-        # 2. OVERLAY_REGION + max_overlay_size <= 256 (overlay must fit)
+        # Build adjacency: if overlay func A calls overlay func B, link them
+        adj = {name: set() for name in ov_names}
+        for name, start, end, _ in overlay_funcs:
+            for li in range(start, end):
+                s = self.code[li].strip()
+                if s.startswith('jal '):
+                    target = s.split()[1]
+                    if target in ov_names and target != name:
+                        adj[name].add(target)
+                        adj[target].add(name)
+
+        # Find connected components (BFS)
+        visited = set()
+        components = []  # list of lists of function names
+        for name in ov_names:
+            if name not in visited:
+                comp = []
+                queue = [name]
+                while queue:
+                    n = queue.pop(0)
+                    if n in visited: continue
+                    visited.add(n)
+                    comp.append(n)
+                    for nb in adj.get(n, set()):
+                        if nb not in visited:
+                            queue.append(nb)
+                components.append(comp)
+
+        # Build overlay SLOTS from components. Each slot = one overlay index.
+        # Multiple functions in the same slot are loaded together.
+        overlay_slots = []  # list of [(name, start, end, fsize), ...]
+        for comp in components:
+            slot = [(n, *ov_by_name[n]) for n in comp]
+            slot_size = sum(f for _, _, _, f in slot)
+            overlay_slots.append((slot, slot_size))
+
+        # Sort slots by size descending for OVERLAY_REGION calculation
+        overlay_slots.sort(key=lambda x: -x[1])
+        max_slot_size = overlay_slots[0][1] if overlay_slots else 0
+
+        # ── Overlay system ──
         overlay_loader_size_actual = 27
-        max_overlay_size = max(fsize for _, _, _, fsize in overlay_funcs)
         non_overlay_size = remaining_size + overlay_loader_size_actual
-        OVERLAY_REGION = 256 - max_overlay_size
+        OVERLAY_REGION = 256 - max_slot_size
         if OVERLAY_REGION < non_overlay_size + 2:
-            # Can't fit — resident code + largest overlay > 256
             import sys
             print(f"WARNING: overlay won't fit. Resident={non_overlay_size}B, "
-                  f"largest overlay={max_overlay_size}B, total={non_overlay_size+max_overlay_size}B > 256",
+                  f"largest slot={max_slot_size}B, total={non_overlay_size+max_slot_size}B > 256",
                   file=sys.stderr)
-        META_SIZE = 3
+        META_SIZE = 2
 
         overlay_meta = []
         overlay_asm_blocks = []
 
-        for idx, (name, start, end, fsize) in enumerate(overlay_funcs):
-            overlay_asm_blocks.append((name, self.code[start:end], fsize))
-            overlay_meta.append((idx, name, fsize))
+        # Build overlay metadata and code blocks from slots
+        for idx, (slot_funcs, slot_size) in enumerate(overlay_slots):
+            # Combine all functions in this slot into one overlay block
+            combined_lines = []
+            for name, start, end, fsize in slot_funcs:
+                combined_lines.extend(self.code[start:end])
+            overlay_asm_blocks.append((slot_funcs[0][0], combined_lines, slot_size))
+            overlay_meta.append((idx, slot_funcs[0][0], slot_size))
+
+        # Build name→index mapping for call rewriting
+        func_to_overlay_idx = {}
+        for idx, (slot_funcs, _) in enumerate(overlay_slots):
+            for name, _, _, _ in slot_funcs:
+                func_to_overlay_idx[name] = idx
+
+        # Replace overlay_funcs for the rewrite loop below
+        # (the rewrite needs to know which functions to remove and which jal to rewrite)
+        overlay_funcs_flat = []
+        for slot_funcs, _ in overlay_slots:
+            overlay_funcs_flat.extend(slot_funcs)
+
+        # Use the flat list for the rewrite loop (which functions to remove/rewrite)
+        overlay_funcs = overlay_funcs_flat
 
         # Remove overlay functions and rewrite calls to ocall
         remove_ranges = {(start, end) for _, start, end, _ in overlay_funcs}
@@ -1340,8 +1393,12 @@ class MK1CodeGen:
                 line = self.code[i]
                 s = line.strip()
                 rewritten = False
-                for idx, name, _ in overlay_meta:
-                    if s == f'jal {name}':
+                if s.startswith('jal '):
+                    target = s.split()[1]
+                    idx = func_to_overlay_idx.get(target)
+                else:
+                    idx = None
+                if idx is not None:
                         # Clean up ldsp pattern before overlay call:
                         # If preceding code is push $a; ldi $b,N; ldsp 1,
                         # the push+ldsp is a no-op (A unchanged). Remove them
@@ -1370,7 +1427,6 @@ class MK1CodeGen:
                         new_code.append(f'\tldi $a,{idx}')
                         new_code.append(f'\tjal _overlay_load')
                         rewritten = True
-                        break
                 if not rewritten:
                     new_code.append(line)
                 i += 1
