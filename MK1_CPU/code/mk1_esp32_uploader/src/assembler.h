@@ -289,6 +289,7 @@ private:
     void emitCode(uint8_t byte, bool pass1) {
         if (codeEmitTarget == 3) {
             emitPage3(byte, pass1);
+            result.code_size++;  // advance code PC for label resolution
             return;
         }
         if (!pass1 && result.code_size < CODE_SIZE)
@@ -436,15 +437,20 @@ private:
                 continue;
             }
             if (startsWith(lp, "org ") || startsWith(lp, "org\t")) {
-                // .org N: advance code PC to address N by padding with HLT (0x7F)
+                // .org N: set code PC to address N. Pads with HLT if advancing.
                 const char* p = lp + 4;
                 skipWs(p);
                 char tok[32]; parseToken(p, tok, sizeof(tok));
                 int target = resolveValue(tok, lineNum, pass1);
-                int current = (bank == 3) ? result.page3_size : result.code_size;
-                while (current < target) {
-                    emitCode(0x7F, pass1);  // HLT fill
-                    current++;
+                int current = result.code_size;
+                if (target > current) {
+                    // Forward: pad with HLT
+                    while (result.code_size < target) {
+                        emitCode(0x7F, pass1);
+                    }
+                } else {
+                    // Backward or same: just set PC (for overlay code that follows resident)
+                    result.code_size = target;
                 }
                 continue;
             }

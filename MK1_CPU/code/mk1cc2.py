@@ -1351,8 +1351,17 @@ class MK1CodeGen:
                 rewritten = False
                 for idx, name, _ in overlay_meta:
                     if s == f'jal {name}':
-                        new_code.append(f'	ldi $a,{idx}')
-                        new_code.append(f'	jal _overlay_load')
+                        # Save A and B (function args) to data page before overlay load
+                        # Must save B first (ldi $b,N clobbers B)
+                        new_code.append(f'\tpush $a')          # save A temporarily
+                        new_code.append(f'\tmov $b,$a')        # A = B (arg2)
+                        new_code.append(f'\tldi $b,253')
+                        new_code.append(f'\tideref')           # data[253] = arg2
+                        new_code.append(f'\tpop $a')           # A = arg1 (restored)
+                        new_code.append(f'\tldi $b,252')
+                        new_code.append(f'\tideref')           # data[252] = arg1
+                        new_code.append(f'\tldi $a,{idx}')
+                        new_code.append(f'\tjal _overlay_load')
                         rewritten = True
                         break
                 if not rewritten:
@@ -1464,7 +1473,13 @@ class MK1CodeGen:
             '\tmov $a,$b',                  # B++ (dst)
             '\tcmp $c',                     # dst == end?
             '\tjnz .copy',                  # no: keep copying
-            f'\tj {OVERLAY_REGION}',           # jump to overlay; caller's jal return addr is on stack
+            # Restore function args (saved to data page by caller) before jump
+            '\tldi $a,253',
+            '\tderef',                      # A = data[253] = arg2
+            '\tmov $a,$b',                  # B = arg2
+            '\tldi $a,252',
+            '\tderef',                      # A = data[252] = arg1
+            f'\tj {OVERLAY_REGION}',           # jump to overlay with correct A,B
         ]
 
         # Main must be at address 0 (CPU starts there).
