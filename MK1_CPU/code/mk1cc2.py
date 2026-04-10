@@ -556,11 +556,9 @@ class MK1CodeGen:
         for fn in other_fns:
             self.compile_function(*fn)
 
-        # In EEPROM mode, pre-register I2C helpers needed by the overlay loader
-        if getattr(self, 'eeprom_mode', False):
-            if not hasattr(self, '_lcd_helpers'):
-                self._lcd_helpers = set()
-            self._lcd_helpers.update({'__i2c_sb', '__i2c_rb', '__eeprom_r2c_loop'})
+        # Note: I2C helpers for EEPROM overlay tier are only registered if
+        # _eeprom_overlay_partition() is actually called (when page 3 overflows).
+        # The page 3 overlay tier doesn't need I2C at runtime.
 
         # Emit I2C/LCD helpers AFTER all functions — so all helpers needed
         # by any function are registered. Protected from overlay by _NO_OVERLAY set.
@@ -647,9 +645,8 @@ class MK1CodeGen:
                 if s.startswith(prefix):
                     target = s.split()[1]
                     refs.add(target)
-        # In EEPROM mode, keep I2C helpers alive (used by overlay loader added later)
-        if getattr(self, 'eeprom_mode', False):
-            refs.update({'__i2c_sb', '__i2c_rb', '__eeprom_r2c_loop'})
+        # Note: EEPROM I2C helpers only kept alive when EEPROM tier is active
+        # (detected by presence of __eeprom_load in code, not just eeprom_mode flag)
 
         # Identify function body ranges (global label to next global label)
         funcs = []  # (start, end, name)
