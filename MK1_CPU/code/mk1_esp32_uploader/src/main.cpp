@@ -1446,7 +1446,17 @@ static void handleSerialCommand(const String& line) {
         assembler.assemble(source.c_str());
         const AsmResult& r = assembler.result;
         if (r.error_count > 0) {
-            Serial.printf("{\"ok\":false,\"errors\":%d}\n", r.error_count);
+            Serial.printf("{\"ok\":false,\"errors\":%d,\"detail\":[", r.error_count);
+            for (int i = 0; i < r.error_count && i < 5; i++) {
+                if (i) Serial.print(',');
+                Serial.printf("{\"line\":%d,\"msg\":\"", r.errors[i].line);
+                for (const char* p = r.errors[i].message; *p; p++) {
+                    if (*p == '"') Serial.print("\\\"");
+                    else Serial.print(*p);
+                }
+                Serial.print("\"}");
+            }
+            Serial.println("]}");
             return;
         }
         int codeBytes = r.code_size < CODE_SIZE ? r.code_size : CODE_SIZE;
@@ -1515,8 +1525,14 @@ static void handleSerialCommand(const String& line) {
         digitalWrite(PIN_CLK, LOW);
 
         int actualCycles = 0;
+        bool aborted = false;
         unsigned long t0_us = micros();
         for (int i = 0; i < n; i++) {
+            // Abort if new serial data arrives (every ~130K cycles ≈ 0.5s at 248kHz)
+            if ((i & 0x1FFFF) == 0x1FFFF && Serial.available()) {
+                aborted = true;
+                break;
+            }
             actualCycles++;
             GPIO.out_w1ts = clkMask;
             if (us > 0) delayMicroseconds(us);
@@ -1551,15 +1567,16 @@ static void handleSerialCommand(const String& line) {
         busSetOutput();
         enableOutput();
 
-        // Report actual frequency: cycles / elapsed_time
+        // Report result (with abort flag)
         float actual_khz = (actualCycles > 100 && elapsed_us > 100)
             ? (float)actualCycles / elapsed_us * 1000.0f : 0;
-        Serial.printf("{\"cyc\":%d,\"val\":%d,\"cap\":%s,\"us\":%lu,\"khz\":%.1f}\n",
+        Serial.printf("{\"cyc\":%d,\"val\":%d,\"cap\":%s,\"us\":%lu,\"khz\":%.1f%s}\n",
             actualCycles,
             oiCount > 0 ? oiHistory[0] : 0,
             outputCaptured ? "true" : "false",
             elapsed_us,
-            actual_khz);
+            actual_khz,
+            aborted ? ",\"aborted\":true" : "");
     }
     else if (line == "OI") {
         uint8_t val = 0;

@@ -1240,9 +1240,11 @@ class MK1CodeGen:
             line = self.code[i]
             s = line.strip()
             # Don't overlay: _main, critical I2C helpers that are called from overlayed code
-            _NO_OVERLAY = {'_main:', '__i2c_sb:', '__i2c_st:', '__i2c_st_only:', '__i2c_sp:',
-                           '__lcd_chr:', '__lcd_cmd:', '__lcd_send:',
-                           '__delay_cal:', '__delay_Nms:', '__i2c_rb:',
+            # Functions that must NEVER be overlayed (called by the overlay loader itself
+            # or needed across all overlays). Other helpers CAN be overlayed if only
+            # called from one overlay group (e.g. __i2c_sb only needed by init_audio).
+            _NO_OVERLAY = {'_main:',
+                           '__tone_setup:', '__tone:', '__play_note:', '__delay_Nms:',
                            '__eeprom_r2c_loop:', '__eeprom_dispatch:', '__eeprom_load:',
                            '_overlay_load:'}
             if s.endswith(':') and not s.startswith('.') and s.startswith('_') and s not in _NO_OVERLAY:
@@ -1461,6 +1463,9 @@ class MK1CodeGen:
                 hi += 1
 
         for hname, (hstart, hend, hlines) in list(helper_bodies.items()):
+            # Skip helpers explicitly marked as non-overlayable
+            if f'{hname}:' in _NO_OVERLAY:
+                continue
             # Check if any resident code (non-label, non-helper-body) calls this helper
             called_from_resident = False
             for ci, cline in enumerate(new_code):
@@ -1522,7 +1527,7 @@ class MK1CodeGen:
             '\tldi $a,249',
             '\tderefp3',                    # A = page3[249] = cached index (0xFF if first call)
             '\tcmp $c',                     # cached == requested?
-            '\tjz .ov_cached',              # skip copy if already loaded
+            '\tjz __ov_cached',              # skip copy if already loaded
             # Update cache
             '\tmov $c,$a',                  # A = index
             '\tldi $b,249',
@@ -1554,7 +1559,7 @@ class MK1CodeGen:
             '\tmov $a,$b',                  # B++ (dst)
             '\tcmp $c',                     # dst == end?
             '\tjnz .copy',                  # no: keep copying
-            '.ov_cached:',
+            '__ov_cached:',
             # Restore args from page3 (saved by caller)
             '\tldi $a,247',
             '\tderefp3',                    # A = page3[247] = arg2 (B)
@@ -1575,7 +1580,9 @@ class MK1CodeGen:
         p3_offset = p3_used + meta_table_size
 
         # ── Place overlays: page 3 first, spill to page 1 ──
-        p3_capacity = 240 - p3_used - (len(overlay_meta) * META_SIZE)  # page3 code space
+        # Account for note table that will be emitted later
+        note_table_size = len(getattr(self, '_note_table', [])) * 3
+        p3_capacity = 240 - p3_used - (len(overlay_meta) * META_SIZE) - note_table_size
         p1_capacity = 256 - self.data_alloc  # page1 space after globals
 
         # Assign each overlay slot to a page
@@ -1622,16 +1629,22 @@ class MK1CodeGen:
             assembled.append(f'\tbyte {fsize}')
 
         # Phase 2: emit overlay code at OVERLAY_REGION addresses
-        assembled.append('\tsection code')
-        assembled.append(f'\torg {OVERLAY_REGION}')
-
+        # Each overlay slot gets its own org reset so labels resolve correctly
         for idx, name, asm_lines, fsize, _ in p3_overlays:
+            assembled.append('\tsection code')
+            assembled.append(f'\torg {OVERLAY_REGION}')  # reset PC per slot
             assembled.append('\tsection page3_code')
             assembled.extend(asm_lines)
 
         for idx, name, asm_lines, fsize, _ in p1_overlays:
+            assembled.append('\tsection code')
+            assembled.append(f'\torg {OVERLAY_REGION}')  # reset PC per slot
             assembled.append('\tsection data_code')
             assembled.extend(asm_lines)
+
+        # Update page3_alloc so tone note table doesn't collide with overlay data
+        total_p3_overlay = meta_table_size + sum(f for _, _, _, f, _ in p3_overlays)
+        self.page3_alloc = p3_used + total_p3_overlay
 
         # Phase 3: reset PC and emit resident code
         assembled.append('\tsection code')
@@ -1648,7 +1661,7 @@ class MK1CodeGen:
                 '\tldi $a,249',
                 '\tderefp3',
                 '\tcmp $c',
-                '\tjz .ov_cached',       # shares the cached label with p3 loader
+                '\tjz __ov_cached',       # shares the cached label with p3 loader
                 '\tmov $c,$a',
                 '\tldi $b,249',
                 '\tiderefp3',
@@ -1677,15 +1690,30 @@ class MK1CodeGen:
                 '\tpop_b',
                 '\tcmp $c',
                 '\tjnz .copy_p1',
-                '\tj .ov_cached',        # share arg restore + jal with p3 loader
+                '\tj __ov_cached',        # share arg restore + jal with p3 loader
             ]
             loader.extend(p1_loader)
 
         # Track which overlay indices are in page 1 (for call rewrite)
         self._p1_overlay_indices = {idx for idx, _, _, _, _ in p1_overlays}
 
-        # Main must be at address 0.
-        self.code = assembled + new_code + loader
+        # Fix up tone/silence note table offsets: overlay data shifted page3 allocation.
+        # Scan ALL emitted code (assembled + new_code + loader) for ldi $a,N before
+        # jal __play_note and shift the offset by total_p3_overlay.
+        all_code = assembled + new_code + loader
+        if hasattr(self, '_note_table') and total_p3_overlay > 0:
+            shift = total_p3_overlay
+            for ci in range(len(all_code) - 1):
+                s = all_code[ci].strip()
+                nxt = all_code[ci+1].strip()
+                if nxt == 'jal __play_note' and s.startswith('ldi $a,'):
+                    old_off = int(s.split(',')[1])
+                    all_code[ci] = f'\tldi $a,{old_off + shift}'
+            # Also fix _note_table for the page3 data emission at compile end
+            self._note_table = [(off + shift, r, cl, ch)
+                                for off, r, cl, ch in self._note_table]
+
+        self.code = all_code
 
     def _eeprom_overlay_partition(self):
         """EEPROM overlay mode: partition code for EEPROM-backed execution.
