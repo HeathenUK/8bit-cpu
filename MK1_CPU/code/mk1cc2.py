@@ -3184,6 +3184,8 @@ class MK1CodeGen:
                     right_reg = 'c'
                 elif loc in (('reg', 'd'), ('regvar', 'd')):
                     right_reg = 'd'
+                elif loc == ('regparam', 'b'):
+                    right_reg = 'b'
             if right_reg and op in ('+', '-', '&', '|'):
                 # Left → A, then ALU with C or D directly
                 self.gen_expr(left)
