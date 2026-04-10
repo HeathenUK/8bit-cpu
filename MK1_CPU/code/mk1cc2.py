@@ -1477,16 +1477,35 @@ class MK1CodeGen:
         meta_table_size = len(overlay_meta) * META_SIZE
         p3_offset = p3_used + meta_table_size
 
+        # Pad code section up to OVERLAY_REGION so labels resolve at correct addresses.
+        # The assembler's PC must be at OVERLAY_REGION when overlay labels are defined.
+        # Emit HLT padding bytes to advance the PC.
+        resident_estimate = sum(
+            2 if s.strip().split()[0] in two_byte else 1
+            for s in (new_code + loader) if s.strip() and not s.strip().endswith(':')
+            and not s.strip().startswith(';') and not s.strip().startswith('.')
+        )
+        pad_needed = OVERLAY_REGION - resident_estimate
+        if pad_needed > 0:
+            # Use .org to advance PC to OVERLAY_REGION (assembler pads with HLT)
+            self.code.append(f'\torg {OVERLAY_REGION}')
+
+        # Overlay code assembled into page 3 via page3_code section.
+        # Labels resolve at OVERLAY_REGION+ addresses because the code PC
+        # has been advanced to OVERLAY_REGION by the padding above.
+        for name, asm_lines, fsize in overlay_asm_blocks:
+            self.code.append('\tsection page3_code')
+            self.code.extend(asm_lines)
+
+        # Emit page 3 metadata table (AFTER padding, so it's in section page3)
         self.code.append('\tsection page3')
+        p3_used = self.page3_alloc
+        meta_table_size = len(overlay_meta) * META_SIZE
+        p3_offset = p3_used + meta_table_size
         for idx, name, fsize in overlay_meta:
             self.code.append(f'\tbyte {p3_offset}')   # absolute offset in page 3
             self.code.append(f'\tbyte {fsize}')        # length
             p3_offset += fsize
-
-        # Overlay code assembled into page 3 via page3_code section
-        for name, asm_lines, fsize in overlay_asm_blocks:
-            self.code.append('\tsection page3_code')
-            self.code.extend(asm_lines)
 
         self.code.append('\tsection code')
 
@@ -4267,7 +4286,7 @@ def peephole(lines):
     """Multi-pass peephole optimizer with register tracking."""
 
     def is_label(l): return l and not l.startswith('\t') and l.endswith(':')
-    def is_section(l): return l and 'section ' in l
+    def is_section(l): return l and ('section ' in l or l.strip().startswith('org '))
     def is_instr(l): return l and l.startswith('\t') and not is_section(l)
     def mnemonic(l): return l.strip().split()[0] if is_instr(l) else None
 

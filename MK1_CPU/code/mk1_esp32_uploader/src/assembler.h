@@ -436,7 +436,17 @@ private:
                 continue;
             }
             if (startsWith(lp, "org ") || startsWith(lp, "org\t")) {
-                continue;  // ignore org directives
+                // .org N: advance code PC to address N by padding with HLT (0x7F)
+                const char* p = lp + 4;
+                skipWs(p);
+                char tok[32]; parseToken(p, tok, sizeof(tok));
+                int target = resolveValue(tok, lineNum, pass1);
+                int current = (bank == 3) ? result.page3_size : result.code_size;
+                while (current < target) {
+                    emitCode(0x7F, pass1);  // HLT fill
+                    current++;
+                }
+                continue;
             }
 
             // Check for constant definition: NAME = expr
