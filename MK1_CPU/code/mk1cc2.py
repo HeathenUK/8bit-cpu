@@ -1351,8 +1351,18 @@ class MK1CodeGen:
                 rewritten = False
                 for idx, name, _ in overlay_meta:
                     if s == f'jal {name}':
+                        # Clean up ldsp pattern before overlay call:
+                        # If preceding code is push $a; ldi $b,N; ldsp 1,
+                        # the push+ldsp is a no-op (A unchanged). Remove them
+                        # and keep just ldi $b,N. This avoids an ldsp hardware
+                        # edge case that hangs at certain stack alignments.
+                        if (len(new_code) >= 3 and
+                            new_code[-1].strip().startswith('ldsp ') and
+                            new_code[-3].strip() == 'push $a'):
+                            ldi_b_line = new_code[-2]  # ldi $b,N
+                            new_code = new_code[:-3]   # remove push, ldi, ldsp
+                            new_code.append(ldi_b_line) # re-add just ldi $b,N
                         # Save A and B to page3 before overlay load
-                        # Save B first (through A) since ldi $b clobbers B
                         new_code.append(f'\tpush $a')      # save A on stack
                         new_code.append(f'\tmov $b,$a')    # A = B (arg2)
                         new_code.append(f'\tldi $b,247')
