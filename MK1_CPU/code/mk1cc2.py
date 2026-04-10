@@ -1425,7 +1425,12 @@ class MK1CodeGen:
                             new_code.append(f'\tiderefp3')     # page3[249] = 0xFF
                             cache_init_emitted = True
                         new_code.append(f'\tldi $a,{idx}')
-                        new_code.append(f'\tjal _overlay_load')
+                        # Use page 1 loader if this overlay is in page 1
+                        p1_indices = getattr(self, '_p1_overlay_indices', set())
+                        if idx in p1_indices:
+                            new_code.append(f'\tjal _overlay_load_p1')
+                        else:
+                            new_code.append(f'\tjal _overlay_load')
                         rewritten = True
                 if not rewritten:
                     new_code.append(line)
@@ -1569,27 +1574,117 @@ class MK1CodeGen:
         meta_table_size = len(overlay_meta) * META_SIZE_ACTUAL
         p3_offset = p3_used + meta_table_size
 
-        # Phase 1: emit metadata into page3 FIRST (so metadata is at the start)
+        # ── Place overlays: page 3 first, spill to page 1 ──
+        p3_capacity = 240 - p3_used - (len(overlay_meta) * META_SIZE)  # page3 code space
+        p1_capacity = 256 - self.data_alloc  # page1 space after globals
+
+        # Assign each overlay slot to a page
+        p3_overlays = []  # (idx, name, lines, fsize) — go to page3_code
+        p1_overlays = []  # (idx, name, lines, fsize) — go to data_code (page 1)
+        p3_code_offset = p3_used + len(overlay_meta) * META_SIZE
+        p1_code_offset = self.data_alloc
+
+        for idx, (name, asm_lines, fsize) in enumerate(overlay_asm_blocks):
+            if fsize <= p3_capacity:
+                p3_overlays.append((idx, name, asm_lines, fsize, p3_code_offset))
+                p3_code_offset += fsize
+                p3_capacity -= fsize
+            elif fsize <= p1_capacity:
+                p1_overlays.append((idx, name, asm_lines, fsize, p1_code_offset))
+                p1_code_offset += fsize
+                p1_capacity -= fsize
+            else:
+                import sys
+                print(f"WARNING: overlay {name} ({fsize}B) doesn't fit in p3 ({p3_capacity}B) "
+                      f"or p1 ({p1_capacity}B)", file=sys.stderr)
+                # Force into page 3 anyway
+                p3_overlays.append((idx, name, asm_lines, fsize, p3_code_offset))
+                p3_code_offset += fsize
+
+        has_p1 = len(p1_overlays) > 0
+
+        # Phase 1: emit metadata into page3
+        # For page 3 overlays: src_offset is in page 3
+        # For page 1 overlays: src_offset is in page 1 (data page)
+        # The loader type is determined at compile time (jal _overlay_load vs _overlay_load_p1)
         assembled = []
         assembled.append('\tsection page3')
         for idx, name, fsize in overlay_meta:
-            assembled.append(f'\tbyte {p3_offset}')   # absolute offset in page 3
-            assembled.append(f'\tbyte {fsize}')        # length
-            p3_offset += fsize
+            # Find which page this overlay is in
+            p3_match = [o for o in p3_overlays if o[0] == idx]
+            p1_match = [o for o in p1_overlays if o[0] == idx]
+            if p3_match:
+                assembled.append(f'\tbyte {p3_match[0][4]}')  # p3 src_offset
+            elif p1_match:
+                assembled.append(f'\tbyte {p1_match[0][4]}')  # p1 src_offset
+            else:
+                assembled.append(f'\tbyte 0')
+            assembled.append(f'\tbyte {fsize}')
 
-        # Phase 2: emit overlay code into page3_code at OVERLAY_REGION addresses
-        assembled.append('\tsection code')             # switch to code for org
-        assembled.append(f'\torg {OVERLAY_REGION}')    # set PC for overlay label resolution
-        for name, asm_lines, fsize in overlay_asm_blocks:
+        # Phase 2: emit overlay code at OVERLAY_REGION addresses
+        assembled.append('\tsection code')
+        assembled.append(f'\torg {OVERLAY_REGION}')
+
+        for idx, name, asm_lines, fsize, _ in p3_overlays:
             assembled.append('\tsection page3_code')
+            assembled.extend(asm_lines)
+
+        for idx, name, asm_lines, fsize, _ in p1_overlays:
+            assembled.append('\tsection data_code')
             assembled.extend(asm_lines)
 
         # Phase 3: reset PC and emit resident code
         assembled.append('\tsection code')
-        assembled.append('\torg 0')                    # reset PC for resident code
+        assembled.append('\torg 0')
 
-        # Main must be at address 0 (CPU starts there).
-        # Loader goes after main; ocall replaced with ldi+jal.
+        # Add page 1 overlay loader if needed
+        if has_p1:
+            # _overlay_load_p1: identical to _overlay_load but uses deref instead of derefp3
+            # Page 1 overlays get their own metadata indices in the SAME page3 metadata table
+            p1_loader = [
+                '; ── Page 1 overlay loader ──',
+                '_overlay_load_p1:',
+                '\tmov $a,$c',
+                '\tldi $a,249',
+                '\tderefp3',
+                '\tcmp $c',
+                '\tjz .ov_cached',       # shares the cached label with p3 loader
+                '\tmov $c,$a',
+                '\tldi $b,249',
+                '\tiderefp3',
+                '\tsll',
+            ]
+            if p3_used > 0:
+                p1_loader.append(f'\taddi {p3_used},$a')
+            p1_loader += [
+                '\tpush $a',
+                '\tderefp3',             # metadata still in page 3
+                '\tmov $a,$d',
+                '\tpop $a',
+                '\tinc',
+                '\tderefp3',
+                f'\taddi {OVERLAY_REGION},$a',
+                '\tmov $a,$c',
+                f'\tldi $b,{OVERLAY_REGION}',
+                '.copy_p1:',
+                '\tmov $d,$a',
+                '\tderef',               # read from PAGE 1 (not page 3!)
+                '\tistc_inc',
+                '\tpush_b',
+                '\tmov $d,$a',
+                '\tinc',
+                '\tmov $a,$d',
+                '\tpop_b',
+                '\tcmp $c',
+                '\tjnz .copy_p1',
+                '\tj .ov_cached',        # share arg restore + jal with p3 loader
+            ]
+            loader.extend(p1_loader)
+
+        # Track which overlay indices are in page 1 (for call rewrite)
+        self._p1_overlay_indices = {idx for idx, _, _, _, _ in p1_overlays}
+
+        # Main must be at address 0.
         self.code = assembled + new_code + loader
 
     def _eeprom_overlay_partition(self):
