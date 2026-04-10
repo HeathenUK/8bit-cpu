@@ -3183,14 +3183,30 @@ class MK1CodeGen:
                 if op not in ('^', '*'):
                     return
 
-            # General binary: eval right, push, eval left, pop into B, op
-            self.gen_expr(right)
-            self.emit('\tpush $a')
-            self.local_count += 1
-            self.gen_expr(left)
-            self.emit('\tpop $b')
-            self.local_count -= 1
-            self._emit_binop(op)
+            # Optimization: if right operand is in register C or D, use direct
+            # register-register ALU op instead of push/pop through B.
+            # This avoids clobbering B (which may hold a function parameter).
+            right_reg = None
+            if right[0] == 'var' and right[1] in self.locals:
+                loc = self.locals[right[1]]
+                if loc in (('reg', 'c'), ('regvar', 'c')):
+                    right_reg = 'c'
+                elif loc in (('reg', 'd'), ('regvar', 'd')):
+                    right_reg = 'd'
+            if right_reg and op in ('+', '-', '&', '|'):
+                # Left → A, then ALU with C or D directly
+                self.gen_expr(left)
+                alu_ops = {'+': 'add', '-': 'sub', '&': 'and', '|': 'or'}
+                self.emit(f'\t{alu_ops[op]} ${right_reg},$a')
+            else:
+                # General binary: eval right, push, eval left, pop into B, op
+                self.gen_expr(right)
+                self.emit('\tpush $a')
+                self.local_count += 1
+                self.gen_expr(left)
+                self.emit('\tpop $b')
+                self.local_count -= 1
+                self._emit_binop(op)
 
         elif kind == 'unop':
             self.gen_expr(expr[2])
@@ -4196,6 +4212,30 @@ class MK1CodeGen:
 
         if cond[0] == 'binop' and cond[1] in ('==', '!=', '<', '>', '<=', '>='):
             op, left, right = cond[1], cond[2], cond[3]
+
+            # Optimization: x > 0 → tst 0xFF; jz (avoids cmp which clobbers B)
+            # Also handles x != 0 and x == 0 similarly.
+            if right[0] == 'num' and right[1] == 0 and op in ('>', '!='):
+                self.gen_expr(left)
+                self.emit(f'\ttst 0xFF')
+                self.emit(f'\tjz {target}')
+                return
+            if right[0] == 'num' and right[1] == 0 and op == '==':
+                self.gen_expr(left)
+                self.emit(f'\ttst 0xFF')
+                self.emit(f'\tjnz {target}')
+                return
+            if left[0] == 'num' and left[1] == 0 and op in ('<', '!='):
+                self.gen_expr(right)
+                self.emit(f'\ttst 0xFF')
+                self.emit(f'\tjz {target}')
+                return
+            if left[0] == 'num' and left[1] == 0 and op == '==':
+                self.gen_expr(right)
+                self.emit(f'\ttst 0xFF')
+                self.emit(f'\tjnz {target}')
+                return
+
             if not self._b_has(right):
                 op, left, right = self._normalize_cmp(op, left, right)
             self._emit_cmp_operands(left, right)
