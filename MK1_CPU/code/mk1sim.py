@@ -1122,6 +1122,24 @@ def run_tests():
     results.append(ok_pb)
     print(f"  [{'PASS' if ok_pb else 'FAIL'}] PUSH_B/POP_B: B={cpu_pb.B}(42), A preserved={cpu_pb.output_history}([99])")
 
+    # ── Test: CMPI (compare immediate without clobbering B) ──
+    cpu_ci = MK1()
+    code_ci = bytearray(256)
+    code_ci[0] = 0x38; code_ci[1] = 10         # ldi $a, 10
+    code_ci[2] = 0x39; code_ci[3] = 99         # ldi $b, 99
+    code_ci[4] = 0xFD; code_ci[5] = 10         # cmpi 10 (A==10, ZF=1, CF=1)
+    code_ci[6] = 0xD7                           # setnz (A = ZF ? 0 : 1 = 0)
+    code_ci[7] = 0x06                           # out (should be 0)
+    code_ci[8] = 0xFD; code_ci[9] = 5          # cmpi 5 (10-5=5, ZF=0, CF=1)
+    code_ci[10] = 0xD7                          # setnz (A = 1)
+    code_ci[11] = 0x06                          # out (should be 1)
+    code_ci[12] = 0x7F                          # hlt
+    cpu_ci.load_program(code_ci)
+    cpu_ci.run()
+    ok_ci = cpu_ci.B == 99 and cpu_ci.output_history == [0, 1]
+    results.append(ok_ci)
+    print(f"  [{'PASS' if ok_ci else 'FAIL'}] CMPI: B preserved={cpu_ci.B}(99), outputs={cpu_ci.output_history}([0,1])")
+
     # ── Summary ──
     print()
     passed = sum(results)

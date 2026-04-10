@@ -619,12 +619,11 @@ private:
                     return;
                 }
             }
-            // Immediate form: expand to ldi $b, N + cmp $b
+            // Immediate form: use cmpi opcode (doesn't clobber B)
             {
                 int v = resolveValue(tok, lineNum, pass1);
-                emitCode(0x39, pass1);         // ldi $b
+                emitCode(0xFD, pass1);         // cmpi N
                 emitCode(v & 0xFF, pass1);
-                emitCode(0xAE, pass1);         // cmp $b
                 return;
             }
         }
@@ -777,7 +776,7 @@ private:
                 if (rs >= 0 && rs < 4 && rd >= 0 && rd < 4) {
                     uint8_t opc = (0b11 << 6) | (op << 4) | (rs << 2) | rd;
                     // Check for reclaimed opcodes that are now special instructions
-                    static const uint8_t reclaimed[] = {0xC1,0xC2,0xC3,0xC5,0xC6,0xC7,0xD1,0xD2,0xD3,0xD5,0xD7,0xD9,0xDA,0xDB,0xDE,0xDF,0xE1,0xE2,0xE3,0xE6,0xE7,0xE9,0xF0,0xF1,0xF2,0xF3,0xF7,0xFF,0};
+                    static const uint8_t reclaimed[] = {0xC1,0xC2,0xC3,0xC5,0xC6,0xC7,0xD1,0xD2,0xD3,0xD5,0xD7,0xD9,0xDA,0xDB,0xDE,0xDF,0xE1,0xE2,0xE3,0xE6,0xE7,0xE9,0xF0,0xF1,0xF2,0xF3,0xF7,0xFD,0xFF,0};
                     bool collision = false;
                     for (int i = 0; reclaimed[i]; i++) {
                         if (opc == reclaimed[i]) { collision = true; break; }

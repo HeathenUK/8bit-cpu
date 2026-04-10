@@ -123,8 +123,9 @@ static const FixedInstr FIXED_INSTRUCTIONS[] = {
     { "adc",     0xC1,  ARGS_NONE },  // A = A + B + CF (add with carry)
     { "sbc",     0xC2,  ARGS_NONE },  // A = A - B - !CF (subtract with borrow)
 
-    // ── Non-destructive test ──
+    // ── Non-destructive test/compare ──
     { "tst",     0xFF,  ARGS_IMM  },  // set ZF from A AND imm, A unchanged
+    { "cmpi",    0xFD,  ARGS_IMM  },  // set ZF/CF from A-imm, A and B unchanged
 
     // ── Utility ──
     { "out_imm", 0xD1,  ARGS_IMM  },  // output immediate to display, A unchanged

@@ -1337,6 +1337,7 @@ class MK1CodeGen:
         # Remove overlay functions and rewrite calls to ocall
         remove_ranges = {(start, end) for _, start, end, _ in overlay_funcs}
         new_code = []
+        cache_init_emitted = False
         i = 0
         while i < len(self.code):
             skip = False
@@ -1363,6 +1364,7 @@ class MK1CodeGen:
                             new_code = new_code[:-3]   # remove push, ldi, ldsp
                             new_code.append(ldi_b_line) # re-add just ldi $b,N
                         # Save A and B to page3 before overlay load
+                        # Initialize overlay cache on first call (after B is saved)
                         new_code.append(f'\tpush $a')      # save A on stack
                         new_code.append(f'\tmov $b,$a')    # A = B (arg2)
                         new_code.append(f'\tldi $b,247')
@@ -1370,6 +1372,12 @@ class MK1CodeGen:
                         new_code.append(f'\tpop $a')       # restore A (arg1)
                         new_code.append(f'\tldi $b,246')
                         new_code.append(f'\tiderefp3')     # page3[246] = A (arg1)
+                        # Initialize overlay cache on first call (B is free here)
+                        if not cache_init_emitted:
+                            new_code.append(f'\tldi $a,0xFF')
+                            new_code.append(f'\tldi $b,249')
+                            new_code.append(f'\tiderefp3')     # page3[249] = 0xFF
+                            cache_init_emitted = True
                         new_code.append(f'\tldi $a,{idx}')
                         new_code.append(f'\tjal _overlay_load')
                         rewritten = True
@@ -1455,8 +1463,21 @@ class MK1CodeGen:
         p3_used = self.page3_alloc  # page 3 bytes already used by globals + LCD init
 
         loader = [
-            '; ── Overlay loader ──',
+            '; ── Overlay loader with cache ──',
             '_overlay_load:',
+            # Cache check: compare requested index with page3[249]
+            # page3[249] must be initialized to 0xFF before first call.
+            # This is done by the first overlay call itself (see below).
+            '\tmov $a,$c',                  # C = index (save)
+            '\tldi $a,249',
+            '\tderefp3',                    # A = page3[249] = cached index (0xFF if first call)
+            '\tcmp $c',                     # cached == requested?
+            '\tjz .ov_cached',              # skip copy if already loaded
+            # Update cache
+            '\tmov $c,$a',                  # A = index
+            '\tldi $b,249',
+            '\tiderefp3',                   # page3[249] = index
+            # Compute metadata offset
             '\tsll',                        # A = index * 2 = metadata offset
         ]
         if p3_used > 0:
@@ -1483,6 +1504,7 @@ class MK1CodeGen:
             '\tmov $a,$b',                  # B++ (dst)
             '\tcmp $c',                     # dst == end?
             '\tjnz .copy',                  # no: keep copying
+            '.ov_cached:',
             # Restore args from page3 (saved by caller)
             '\tldi $a,247',
             '\tderefp3',                    # A = page3[247] = arg2 (B)
@@ -2225,7 +2247,9 @@ class MK1CodeGen:
 
         for _ in range(self.local_count):
             self.emit('\tpop $d')
-        self.emit('\tret')
+        # Don't emit ret if the last instruction is already ret (from a return statement)
+        if not self.code or self.code[-1].strip() != 'ret':
+            self.emit('\tret')
 
     def _sp_offset(self, name):
         kind, idx = self.locals[name]

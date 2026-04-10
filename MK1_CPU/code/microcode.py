@@ -291,6 +291,10 @@ ucode_template[0xD5] = ('derefp3', [MI|PO, RO|II|PE, AO|MI, STK|HL|RO|AI, RST, R
 # ISTC: code[B] = A — indirect store to code page (no HL, no STK)
 ucode_template[0xDA] = ('istc', [MI|PO, RO|II|PE, BO|MI, AO|RI, RST, RST, RST, RST], True)
 
+# CMPI N: compare A with immediate N. Sets ZF/CF from A-N. Doesn't clobber A or B.
+# Replaces the old cmp N expansion (ldi $b,N; cmp $b) which clobbered B.
+ucode_template[0xFD] = ('cmpi', [MI|PO, RO|II|PE, PO|MI, PE|RO|EI, SUB|EO|FI, RST, RST, RST], True)
+
 # ISTC_INC: code[B] = A; B++ — istc with auto-increment for bulk code writes.
 # Steps 4-7: B = B + 1 via zero-E trick (same as INC but targeting B).
 # Clobbers A (set to old B) and E (zeroed). Flags NOT set (no FI).
