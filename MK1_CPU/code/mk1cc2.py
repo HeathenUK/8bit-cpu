@@ -571,7 +571,11 @@ class MK1CodeGen:
 
         # Overlay partitioning
         if getattr(self, 'eeprom_mode', False):
-            self._eeprom_overlay_partition()
+            # EEPROM mode: use page 3 overlay system first (fast, big overlay region).
+            # Force overlaying even if code fits in 256 bytes.
+            self._overlay_partition()
+            # If page 3 still isn't enough, use EEPROM I2C tier as fallback.
+            # TODO: self._eeprom_overlay_partition() for overflow
         else:
             # Standard: move cold functions to page 3 if code > 256 bytes
             self._overlay_partition()
@@ -1235,7 +1239,8 @@ class MK1CodeGen:
                 size += 1
 
         # Only partition if code exceeds 240 bytes (leaving room for overlay loader)
-        if size <= 240:
+        # In EEPROM mode, always partition to move functions to overlays
+        if size <= 240 and not getattr(self, 'eeprom_mode', False):
             return
 
         # Find functions and their sizes (exclude _main)
@@ -1247,7 +1252,9 @@ class MK1CodeGen:
             # Don't overlay: _main, critical I2C helpers that are called from overlayed code
             _NO_OVERLAY = {'_main:', '__i2c_sb:', '__i2c_st:', '__i2c_st_only:', '__i2c_sp:',
                            '__lcd_chr:', '__lcd_cmd:', '__lcd_send:',
-                           '__delay_cal:', '__delay_Nms:', '__i2c_rb:'}
+                           '__delay_cal:', '__delay_Nms:', '__i2c_rb:',
+                           '__eeprom_r2c_loop:', '__eeprom_dispatch:', '__eeprom_load:',
+                           '_overlay_load:'}
             if s.endswith(':') and not s.startswith('.') and s.startswith('_') and s not in _NO_OVERLAY:
                 name = s[:-1]
                 start = i
@@ -1282,11 +1289,16 @@ class MK1CodeGen:
         remaining_size = size
         overlay_loader_size = 20  # approximate
 
-        for name, start, end, fsize in funcs:
-            if remaining_size <= (240 - overlay_loader_size):
-                break
-            overlay_funcs.append((name, start, end, fsize))
-            remaining_size -= fsize
+        if getattr(self, 'eeprom_mode', False):
+            # EEPROM mode: overlay ALL non-main, non-helper functions
+            overlay_funcs = list(funcs)
+            remaining_size = size - sum(f[3] for f in funcs)
+        else:
+            for name, start, end, fsize in funcs:
+                if remaining_size <= (240 - overlay_loader_size):
+                    break
+                overlay_funcs.append((name, start, end, fsize))
+                remaining_size -= fsize
 
         if not overlay_funcs:
             return
@@ -1613,15 +1625,11 @@ class MK1CodeGen:
                             queue.append(nb)
                 components.append(comp)
 
-        # ── Step 6: Compute overlay region size ──
-        # The overlay region = 256 - kernel_size
-        # kernel includes: user's _main code + I2C helpers + dispatcher + loader
-        # We need to compute this iteratively since it depends on how many
-        # overlays we create (which affects the dispatcher size)
-
-        # For now, estimate conservatively
-        OVERLAY_REGION_START = 0xC8  # conservative: 200 bytes for kernel
-        OVERLAY_SIZE = 256 - OVERLAY_REGION_START  # 56 bytes available
+        # ── Step 6: Compute overlay region size (two-pass) ──
+        # First pass: use a conservative estimate, generate everything,
+        # measure actual resident size, then fix up OVERLAY_REGION_START.
+        OVERLAY_REGION_START = 0xC0  # conservative first-pass estimate
+        OVERLAY_SIZE = 256 - OVERLAY_REGION_START  # will be recomputed in pass 2
 
         # ── Step 7: Bin-pack components into overlay slots ──
         func_by_name = {f['name']: f for f in funcs}
@@ -1716,47 +1724,26 @@ class MK1CodeGen:
         # ── Step 10: Generate dispatcher ──
         dispatcher = [
             '; ── EEPROM overlay dispatcher ──',
-            '; A = overlay_id, B = entry_addr within overlay',
-            '__eeprom_dispatch:',
-            # Save entry addr to data page
-            '\tmov $b,$a',          # A = entry_addr (swap to save)
-            f'\tldi $b,{OV_ENTRY_SLOT}',
-            '\tideref',             # data[254] = entry_addr
-            # Check cache: is this overlay already loaded?
-            '\tmov $a,$b',          # need to get overlay_id back... hmm
-        ]
-        # Problem: after the save, A=entry_addr, B=OV_ENTRY_SLOT.
-        # Need overlay_id. It was in A on entry but we swapped.
-        # Fix: save both to data page.
-        dispatcher = [
-            '; ── EEPROM overlay dispatcher ──',
             '; A = overlay_id, B = entry_addr',
             '__eeprom_dispatch:',
-            # Save entry addr
-            '\tpush $a',            # save overlay_id
+            '\tmov $a,$c',          # C = overlay_id
             '\tmov $b,$a',          # A = entry_addr
             f'\tldi $b,{OV_ENTRY_SLOT}',
             '\tideref',             # data[254] = entry_addr
-            '\tpop $a',             # A = overlay_id
-            # Check cache
-            '\tmov $a,$c',          # C = overlay_id (save)
-            f'\tldi $b,{OV_CACHE_SLOT}',
-            '\tpush $a',            # save overlay_id
+            # Cache check: compare data[255] with C
             f'\tldi $a,{OV_CACHE_SLOT}',
             '\tderef',              # A = data[255] = cached_id
-            '\tcmp $c',             # cached == target?
-            '\tpop $a',             # A = overlay_id (restore for loader)
-            '\tjz .ee_cached',      # skip load if cached
-            # Update cache
+            '\tcmp $c',             # cached == overlay_id?
+            '\tjz .ee_cached',
+            # Cache miss: update cache, load overlay
+            '\tmov $c,$a',          # A = overlay_id
             f'\tldi $b,{OV_CACHE_SLOT}',
             '\tideref',             # data[255] = overlay_id
-            # Load overlay
             '\tjal __eeprom_load',
             '.ee_cached:',
-            # Call overlay at entry_addr
             f'\tldi $a,{OV_ENTRY_SLOT}',
             '\tderef',              # A = data[254] = entry_addr
-            '\tjal_r',              # push ret addr, PC = A (entry_addr)
+            '\tjal_r',              # call overlay at entry_addr
             '\tret',
         ]
 
@@ -1990,7 +1977,7 @@ class MK1CodeGen:
             '\tldi $a,0xAF',
             '\tjal __i2c_sb',
             # Bulk read to code page
-            f'\tldi $b,{OVERLAY_REGION_START}',
+            f'\tldi $b,{OVERLAY_REGION_START} ;!ov_region',
             # Push count for __eeprom_r2c_loop
             '\tldi $a,8',
             '\tderef',              # A = data[8] = size
@@ -2035,6 +2022,75 @@ class MK1CodeGen:
         new_code.extend(loader)
 
         self.code = new_code
+
+        # ── Step 12b: Two-pass fixup of OVERLAY_REGION_START ──
+        # Now measure actual resident size and adjust if needed.
+        actual_resident = measure_size(new_code)
+        # Round up to next even address, plus 2 bytes padding
+        new_start = actual_resident + (actual_resident % 2) + 2
+        if new_start != OVERLAY_REGION_START:
+            old_start = OVERLAY_REGION_START
+            OVERLAY_REGION_START = new_start
+            # Fix up ldi $b,{old_start} in the loader (tagged with ;!ov_region)
+            old_ldi = f'\tldi $b,{old_start} ;!ov_region'
+            new_ldi = f'\tldi $b,{OVERLAY_REGION_START} ;!ov_region'
+            self.code = [l.replace(old_ldi, new_ldi) if old_ldi in l else l for l in self.code]
+            # Fix up overlay entry addresses
+            for ov in overlay_info:
+                slot_offset = 0
+                for fname in ov['functions']:
+                    ov['entries'][fname] = OVERLAY_REGION_START + slot_offset
+                    func_to_overlay[fname] = (ov['id'], ov['entries'][fname])
+                    slot_offset += func_by_name[fname]['size']
+            # Rewrite dispatch calls in code with updated entry addresses
+            for ci, cline in enumerate(self.code):
+                if cline.strip().startswith('ldi $b,') and ci > 0:
+                    prev = self.code[ci - 1].strip()
+                    if prev.startswith('ldi $a,') and ci + 1 < len(self.code):
+                        nxt = self.code[ci + 1].strip()
+                        if nxt == 'jal __eeprom_dispatch':
+                            # Extract overlay_id from prev line
+                            try:
+                                ov_id = int(prev.split(',')[1])
+                            except (IndexError, ValueError):
+                                continue
+                            # Find the matching overlay and get the entry for the old addr
+                            for ov in overlay_info:
+                                if ov['id'] == ov_id:
+                                    # The old entry_addr encoded in this ldi $b
+                                    # needs to be the updated one
+                                    old_entry_str = cline.strip().split(',')[1]
+                                    try:
+                                        old_entry = int(old_entry_str)
+                                    except ValueError:
+                                        continue
+                                    # Compute the function offset: old_entry - old_start
+                                    func_offset = old_entry - old_start
+                                    new_entry = OVERLAY_REGION_START + func_offset
+                                    self.code[ci] = f'\tldi $b,{new_entry}'
+                                    break
+
+        OVERLAY_SIZE = 256 - OVERLAY_REGION_START
+        if OVERLAY_SIZE < 16:
+            print(f"ERROR: overlay region too small ({OVERLAY_SIZE}B). "
+                  f"Resident code uses {actual_resident}B, leaving no room for overlays.",
+                  file=sys.stderr)
+            sys.exit(1)
+
+        # Verify overlays still fit after resize
+        for ov in overlay_info:
+            if ov['size'] > OVERLAY_SIZE:
+                print(f"ERROR: overlay {ov['id']} ({ov['functions']}, {ov['size']}B) "
+                      f"exceeds final overlay region ({OVERLAY_SIZE}B).",
+                      file=sys.stderr)
+                sys.exit(1)
+
+        if actual_resident >= 250:
+            print(f"WARNING: resident code is {actual_resident}B, dangerously close to "
+                  f"256B limit (HLT fill at 256).", file=sys.stderr)
+        elif actual_resident >= 248:
+            print(f"WARNING: resident code is {actual_resident}B, approaching 256B limit.",
+                  file=sys.stderr)
 
         # ── Step 13: Emit overlay directory in page 3 ──
         self.code.append('\tsection page3')
