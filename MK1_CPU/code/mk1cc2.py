@@ -1106,72 +1106,57 @@ class MK1CodeGen:
             self.emit(f'{lbl_done}:')
             self.emit('\tret')
 
-        # __eeprom_r2c: bulk sequential EEPROM read → code page via istc.
-        # Params in data page: data[4]=addr_hi, data[5]=addr_lo,
-        # data[6]=code_dest, data[7]=count.
-        # Uses __i2c_sb for address setup, __i2c_rb for byte reads.
-        if '__eeprom_r2c' in helpers:
+        # __eeprom_r2c_loop: sequential I2C read → code page via istc.
+        # Entry: B = code dest start addr. Count on stack (pushed by caller).
+        # I2C must already be in sequential read mode.
+        # B is saved/restored around __i2c_rb via stack.
+        # Count tracked in data[7] (set by caller's push→pop into data[7]).
+        if '__eeprom_r2c_loop' in helpers:
             lbl_loop = self.label('r2c')
             lbl_last = self.label('r2cl')
-            self.emit('__eeprom_r2c:')
-            # I2C START + device write address
-            self.emit('\texrw 2')
-            self.emit('\tddrb_imm 0x01')     # START
-            self.emit('\tddrb_imm 0x03')
-            self.emit('\tldi $a,0xAE')       # EEPROM write addr
-            self.emit('\tjal __i2c_sb')
-            # Send EEPROM address (2 bytes from data page)
-            self.emit('\tldi $a,4')
-            self.emit('\tderef')             # A = data[4] = addr_hi
-            self.emit('\tjal __i2c_sb')
-            self.emit('\tldi $a,5')
-            self.emit('\tderef')             # A = data[5] = addr_lo
-            self.emit('\tjal __i2c_sb')
-            # Repeated START + read address
-            self.emit('\tddrb_imm 0x00')     # both HIGH
-            self.emit('\tddrb_imm 0x01')     # START
-            self.emit('\tddrb_imm 0x03')
-            self.emit('\tldi $a,0xAF')       # EEPROM read addr
-            self.emit('\tjal __i2c_sb')
-            # Sequential read loop
+            self.emit('__eeprom_r2c_loop:')
+            # Move count from stack to data[7]
+            self.emit('\tldsp 2')            # A = count (past ret addr)
+            self.emit('\tldi $b,7')
+            self.emit('\tideref')            # data[7] = count
             self.emit(f'{lbl_loop}:')
-            self.emit('\tjal __i2c_rb')      # D = byte read
-            # istc: code[data[6]] = D. Save D, load dest from data[6].
-            self.emit('\tmov $d,$a')         # A = byte
-            self.emit('\tpush $a')           # save byte
-            self.emit('\tldi $a,6')
-            self.emit('\tderef')             # A = data[6] = code dest
+            # Save B (dest) before __i2c_rb clobbers it
+            self.emit('\tmov $b,$a')
+            self.emit('\tpush $a')           # save dest
+            self.emit('\tjal __i2c_rb')      # D = byte, A/B/C clobbered
+            # Restore dest, write byte to code page
+            self.emit('\tpop $a')            # A = dest
             self.emit('\tmov $a,$b')         # B = dest
-            self.emit('\tpop $a')            # A = byte
+            self.emit('\tmov $d,$a')         # A = byte
             self.emit('\tistc')              # code[B] = A
-            # Increment dest
+            # B = dest (istc doesn't change B), increment for next
             self.emit('\tmov $b,$a')         # A = dest
             self.emit('\tinc')
-            self.emit('\tldi $b,6')
-            self.emit('\tideref')            # data[6] = dest + 1
-            # Decrement count
+            self.emit('\tmov $a,$b')         # B = dest + 1
+            # Decrement count in data[7]
             self.emit('\tldi $a,7')
-            self.emit('\tderef')             # A = data[7] = remaining
+            self.emit('\tderef')             # A = data[7]
             self.emit('\tdec')
+            self.emit('\tpush $a')           # save decremented count (to preserve ZF)
             self.emit('\tldi $b,7')
-            self.emit('\tideref')            # data[7] = remaining - 1
-            # ACK if more bytes, NACK if last
-            self.emit(f'\tjz {lbl_last}')    # remaining==0 → last byte
-            # ACK: SDA LOW during 9th clock
+            self.emit('\tideref')            # data[7] = count - 1
+            self.emit('\tpop $a')            # restore A (and ZF from dec)
+            # ACK if more, NACK+STOP if last
+            self.emit(f'\tjz {lbl_last}')
+            # ACK: drive SDA LOW during 9th clock
             self.emit('\tddrb_imm 0x03')     # SDA LOW, SCL LOW
             self.emit('\tddrb_imm 0x01')     # SDA LOW, SCL HIGH
             self.emit('\tddrb_imm 0x03')     # SCL LOW
             self.emit('\tddrb_imm 0x02')     # SDA released
+            # Restore B from saved value? No — B still holds dest+1 from above
             self.emit(f'\tj {lbl_loop}')
-            # NACK + STOP for last byte
+            # NACK + STOP (already at DDRB=0x02 from __i2c_rb)
             self.emit(f'{lbl_last}:')
-            self.emit('\tddrb_imm 0x02')     # SDA released, SCL LOW
-            self.emit('\tddrb_imm 0x00')     # SCL HIGH (NACK = SDA HIGH)
+            self.emit('\tddrb_imm 0x00')     # SCL HIGH (NACK = SDA stays HIGH)
             self.emit('\tddrb_imm 0x02')     # SCL LOW
-            # STOP
-            self.emit('\tddrb_imm 0x03')     # both LOW
+            self.emit('\tddrb_imm 0x03')     # SDA LOW, SCL LOW
             self.emit('\tddrb_imm 0x01')     # SDA LOW, SCL HIGH
-            self.emit('\tddrb_imm 0x00')     # both HIGH = STOP
+            self.emit('\tddrb_imm 0x00')     # SDA HIGH → STOP
             self.emit('\tret')
 
         # __play_note: A = page 3 offset into note table.
@@ -2947,6 +2932,7 @@ class MK1CodeGen:
                 # eeprom_read_to_code(eeprom_addr, code_addr, count)
                 # Bulk sequential I2C read from EEPROM → code page via istc.
                 # All args must be compile-time constants.
+                # Emits inline I2C setup + calls __eeprom_r2c_loop for the read loop.
                 if len(args) < 3:
                     self.gen_error("eeprom_read_to_code(eeprom_addr, code_addr, count)")
                 ee_addr = self._const_eval(args[0])
@@ -2958,22 +2944,28 @@ class MK1CodeGen:
                     self._lcd_helpers = set()
                 self._lcd_helpers.add('__i2c_sb')
                 self._lcd_helpers.add('__i2c_rb')
-                self._lcd_helpers.add('__eeprom_r2c')
-                # Set up params in data page: data[4]=addr_hi, data[5]=addr_lo,
-                # data[6]=code_dest, data[7]=count
-                self.emit(f'\tldi $a,{(ee_addr >> 8) & 0xFF}')
-                self.emit('\tldi $b,4')
-                self.emit('\tideref')          # data[4] = addr_hi
-                self.emit(f'\tldi $a,{ee_addr & 0xFF}')
-                self.emit('\tldi $b,5')
-                self.emit('\tideref')          # data[5] = addr_lo
-                self.emit(f'\tldi $a,{code_addr & 0xFF}')
-                self.emit('\tldi $b,6')
-                self.emit('\tideref')          # data[6] = code_dest
+                self._lcd_helpers.add('__eeprom_r2c_loop')
+                # Inline I2C address setup (constants baked in, no data page)
+                # START + device write addr + EEPROM address + repeated START + read addr
+                self.emit('\tddrb_imm 0x01')       # START
+                self.emit('\tddrb_imm 0x03')
+                self.emit(f'\tldi $a,0xAE')        # EEPROM write
+                self.emit('\tjal __i2c_sb')
+                self.emit(f'\tldi $a,{(ee_addr >> 8) & 0xFF}')  # addr high
+                self.emit('\tjal __i2c_sb')
+                self.emit(f'\tldi $a,{ee_addr & 0xFF}')         # addr low
+                self.emit('\tjal __i2c_sb')
+                self.emit('\tddrb_imm 0x00')       # repeated START
+                self.emit('\tddrb_imm 0x01')
+                self.emit('\tddrb_imm 0x03')
+                self.emit(f'\tldi $a,0xAF')        # EEPROM read
+                self.emit('\tjal __i2c_sb')
+                # Set up loop: B = code_dest, count in data[7]
+                self.emit(f'\tldi $b,{code_addr & 0xFF}')  # B = dest start
                 self.emit(f'\tldi $a,{count & 0xFF}')
-                self.emit('\tldi $b,7')
-                self.emit('\tideref')          # data[7] = count
-                self.emit('\tjal __eeprom_r2c')
+                self.emit('\tpush $a')             # count on stack
+                self.emit('\tjal __eeprom_r2c_loop')
+                self.emit('\tpop $a')              # clean stack
                 return
 
             if name == 'call_code':

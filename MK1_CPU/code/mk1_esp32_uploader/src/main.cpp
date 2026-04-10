@@ -704,7 +704,7 @@ static void handleReadOutput() {
 static void handleRunCycles() {
     int n = 500000;
     if (server.hasArg("n")) n = server.arg("n").toInt();
-    if (n > 5000000) n = 5000000;
+    if (n > 100000000) n = 100000000;
     int halfPeriodUs = 1;  // microseconds per half-cycle (default ~500kHz — optimal for this board)
     if (server.hasArg("us")) halfPeriodUs = server.arg("us").toInt();
     if (halfPeriodUs < 0) halfPeriodUs = 0;
@@ -1488,8 +1488,9 @@ static void handleSerialCommand(const String& line) {
         int n = line.substring(4, comma1 > 0 ? comma1 : line.length()).toInt();
         int us = comma1 > 0 ? line.substring(comma1 + 1, comma2 > 0 ? comma2 : line.length()).toInt() : 1;
         int nops = comma2 > 0 ? line.substring(comma2 + 1).toInt() : 0;
-        if (n < 1) n = 1;
-        if (n > 5000000) n = 5000000;
+        if (n == 0) n = 50000000;    // n=0 = run until OI (~3.4 min at 248kHz)
+        else if (n < 1) n = 1;
+        if (n > 100000000) n = 100000000;
         if (us < 0) us = 0;
         if (nops < 0) nops = 0;
         if (nops > 10000) nops = 10000;
@@ -1602,7 +1603,7 @@ static void handleSerialCommand(const String& line) {
         int n = line.substring(7, comma > 0 ? comma : line.length()).toInt();
         int us = comma > 0 ? line.substring(comma + 1).toInt() : 1;
         if (n < 1) n = 1;
-        if (n > 5000000) n = 5000000;
+        if (n > 100000000) n = 100000000;
         if (us < 0) us = 0;
 
         stopCustomClock();
