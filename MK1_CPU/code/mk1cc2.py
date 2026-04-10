@@ -976,8 +976,8 @@ class MK1CodeGen:
             self.emit(f'\tj {lbl_chi}')
             self.emit(f'{lbl_done}:')
             self.emit('\tmov $b,$a')       # A = B (ipm)
-            self.emit('\tldi $b,0')
-            self.emit('\tideref')          # data[0] = ipm
+            self.emit('\tldi $b,240')
+            self.emit('\tiderefp3')        # page3[240] = ipm
             # Disable SQW to prevent coupling into SDA
             self.emit('\texrw 2')
             self.emit('\tddrb_imm 0x01')
@@ -1003,9 +1003,9 @@ class MK1CodeGen:
             lbl_loop = self.label('dlp')
             lbl_done = self.label('ddn')
             self.emit('__delay_Nms:')
-            # Multiply B × data[0]: result in D:C (hi:lo)
-            self.emit('\tclr $a')
-            self.emit('\tderef')           # A = ipm from data[0]
+            # Multiply B × ipm: result in D:C (hi:lo)
+            self.emit('\tldi $a,240')
+            self.emit('\tderefp3')         # A = ipm from page3[240]
             self.emit('\tmov $a,$c')       # C = ipm
             self.emit('\tldi $d,0')        # D = result high byte
             self.emit('\tclr $a')          # A = result low byte
@@ -1048,8 +1048,8 @@ class MK1CodeGen:
             lbl_mul = self.label('tsmul')
             lbl_noc = self.label('tsnoc')
             self.emit('__tone_setup:')
-            self.emit('\tclr $a')
-            self.emit('\tderef')           # A = ipm from data[0]
+            self.emit('\tldi $a,240')
+            self.emit('\tderefp3')         # A = ipm from page3[240]
             self.emit('\tmov $a,$c')       # C = ipm
             self.emit('\tldi $d,0')        # D = product high
             self.emit('\tclr $a')          # A = product low
@@ -1128,37 +1128,40 @@ class MK1CodeGen:
         if '__eeprom_r2c_loop' in helpers:
             lbl_loop = self.label('r2c')
             lbl_last = self.label('r2cl')
+            # Page 3 kernel state addresses (top of page 3, away from app data)
+            P3_DEST = 241    # overlay dest address
+            P3_COUNT = 242   # overlay byte count
             self.emit('__eeprom_r2c_loop:')
             # Entry: B = code dest, stack = [ret_addr, count, ...]
-            # Store dest in data[6], count in data[7]
+            # Store dest and count in page 3 (not data page — leave that for app)
             self.emit('\tmov $b,$a')         # A = dest
-            self.emit('\tldi $b,6')
-            self.emit('\tideref')            # data[6] = dest
+            self.emit(f'\tldi $b,{P3_DEST}')
+            self.emit('\tiderefp3')          # page3[241] = dest
             self.emit('\tldsp 2')            # A = count (past ret addr)
-            self.emit('\tldi $b,7')
-            self.emit('\tideref')            # data[7] = count
+            self.emit(f'\tldi $b,{P3_COUNT}')
+            self.emit('\tiderefp3')          # page3[242] = count
             # Read loop
             self.emit(f'{lbl_loop}:')
             self.emit('\tjal __i2c_rb')      # D = byte, A/B/C clobbered
             # Write byte to code page: istc needs A=byte, B=dest
             self.emit('\tmov $d,$a')         # A = byte
             self.emit('\tpush $a')           # save byte
-            self.emit('\tldi $a,6')
-            self.emit('\tderef')             # A = data[6] = dest
+            self.emit(f'\tldi $a,{P3_DEST}')
+            self.emit('\tderefp3')           # A = page3[241] = dest
             self.emit('\tmov $a,$b')         # B = dest
             self.emit('\tpop $a')            # A = byte
             self.emit('\tistc')              # code[B] = A
-            # Increment dest in data[6]
+            # Increment dest in page3
             self.emit('\tmov $b,$a')         # A = dest
             self.emit('\tinc')
-            self.emit('\tldi $b,6')
-            self.emit('\tideref')            # data[6] = dest + 1
-            # Decrement count in data[7], branch on zero
-            self.emit('\tldi $a,7')
-            self.emit('\tderef')             # A = data[7] = remaining
+            self.emit(f'\tldi $b,{P3_DEST}')
+            self.emit('\tiderefp3')          # page3[241] = dest + 1
+            # Decrement count in page3, branch on zero
+            self.emit(f'\tldi $a,{P3_COUNT}')
+            self.emit('\tderefp3')           # A = page3[242] = remaining
             self.emit('\tdec')               # A = remaining - 1, ZF set
-            self.emit('\tldi $b,7')
-            self.emit('\tideref')            # data[7] = remaining - 1 (ZF preserved: no FI)
+            self.emit(f'\tldi $b,{P3_COUNT}')
+            self.emit('\tiderefp3')          # page3[242] = remaining - 1 (ZF preserved)
             self.emit(f'\tjz {lbl_last}')    # ZF from dec survives ldi+ideref
             # ACK
             self.emit('\tddrb_imm 0x03')     # SDA LOW, SCL LOW
@@ -1348,15 +1351,15 @@ class MK1CodeGen:
                 rewritten = False
                 for idx, name, _ in overlay_meta:
                     if s == f'jal {name}':
-                        # Save A and B (function args) to data page before overlay load
-                        # Must save B first (ldi $b,N clobbers B)
-                        new_code.append(f'\tpush $a')          # save A temporarily
-                        new_code.append(f'\tmov $b,$a')        # A = B (arg2)
-                        new_code.append(f'\tldi $b,253')
-                        new_code.append(f'\tideref')           # data[253] = arg2
-                        new_code.append(f'\tpop $a')           # A = arg1 (restored)
-                        new_code.append(f'\tldi $b,252')
-                        new_code.append(f'\tideref')           # data[252] = arg1
+                        # Save A and B to page3 before overlay load
+                        # Save B first (through A) since ldi $b clobbers B
+                        new_code.append(f'\tpush $a')      # save A on stack
+                        new_code.append(f'\tmov $b,$a')    # A = B (arg2)
+                        new_code.append(f'\tldi $b,247')
+                        new_code.append(f'\tiderefp3')     # page3[247] = B (arg2)
+                        new_code.append(f'\tpop $a')       # restore A (arg1)
+                        new_code.append(f'\tldi $b,246')
+                        new_code.append(f'\tiderefp3')     # page3[246] = A (arg1)
                         new_code.append(f'\tldi $a,{idx}')
                         new_code.append(f'\tjal _overlay_load')
                         rewritten = True
@@ -1470,56 +1473,46 @@ class MK1CodeGen:
             '\tmov $a,$b',                  # B++ (dst)
             '\tcmp $c',                     # dst == end?
             '\tjnz .copy',                  # no: keep copying
-            # Restore function args (saved to data page by caller) before jump
-            '\tldi $a,253',
-            '\tderef',                      # A = data[253] = arg2
+            # Restore args from page3 (saved by caller)
+            '\tldi $a,247',
+            '\tderefp3',                    # A = page3[247] = arg2 (B)
             '\tmov $a,$b',                  # B = arg2
-            '\tldi $a,252',
-            '\tderef',                      # A = data[252] = arg1
+            '\tldi $a,246',
+            '\tderefp3',                    # A = page3[246] = arg1
             f'\tj {OVERLAY_REGION}',           # jump to overlay with correct A,B
         ]
 
-        # Main must be at address 0 (CPU starts there).
-        # Loader goes after main; ocall replaced with ldi+jal.
-        self.code = new_code + loader
+        # ── Emit overlay code + metadata in page3, then resident code ──
+        # Order matters: page3_code section uses org to set virtual addresses
+        # for label resolution, then org 0 resets PC for resident code.
 
-        # ── Page 3: metadata (2 bytes/overlay) + overlay code ──
-        # Account for page 3 space already used by globals + LCD init data
         p3_used = self.page3_alloc
-        meta_table_size = len(overlay_meta) * META_SIZE
+        META_SIZE_ACTUAL = 2
+        meta_table_size = len(overlay_meta) * META_SIZE_ACTUAL
         p3_offset = p3_used + meta_table_size
 
-        # Pad code section up to OVERLAY_REGION so labels resolve at correct addresses.
-        # The assembler's PC must be at OVERLAY_REGION when overlay labels are defined.
-        # Emit HLT padding bytes to advance the PC.
-        resident_estimate = sum(
-            2 if s.strip().split()[0] in two_byte else 1
-            for s in (new_code + loader) if s.strip() and not s.strip().endswith(':')
-            and not s.strip().startswith(';') and not s.strip().startswith('.')
-        )
-        pad_needed = OVERLAY_REGION - resident_estimate
-        if pad_needed > 0:
-            # Use .org to advance PC to OVERLAY_REGION (assembler pads with HLT)
-            self.code.append(f'\torg {OVERLAY_REGION}')
-
-        # Overlay code assembled into page 3 via page3_code section.
-        # Labels resolve at OVERLAY_REGION+ addresses because the code PC
-        # has been advanced to OVERLAY_REGION by the padding above.
-        for name, asm_lines, fsize in overlay_asm_blocks:
-            self.code.append('\tsection page3_code')
-            self.code.extend(asm_lines)
-
-        # Emit page 3 metadata table (AFTER padding, so it's in section page3)
-        self.code.append('\tsection page3')
-        p3_used = self.page3_alloc
-        meta_table_size = len(overlay_meta) * META_SIZE
-        p3_offset = p3_used + meta_table_size
+        # Phase 1: emit metadata into page3 FIRST (so metadata is at the start)
+        assembled = []
+        assembled.append('\tsection page3')
         for idx, name, fsize in overlay_meta:
-            self.code.append(f'\tbyte {p3_offset}')   # absolute offset in page 3
-            self.code.append(f'\tbyte {fsize}')        # length
+            assembled.append(f'\tbyte {p3_offset}')   # absolute offset in page 3
+            assembled.append(f'\tbyte {fsize}')        # length
             p3_offset += fsize
 
-        self.code.append('\tsection code')
+        # Phase 2: emit overlay code into page3_code at OVERLAY_REGION addresses
+        assembled.append('\tsection code')             # switch to code for org
+        assembled.append(f'\torg {OVERLAY_REGION}')    # set PC for overlay label resolution
+        for name, asm_lines, fsize in overlay_asm_blocks:
+            assembled.append('\tsection page3_code')
+            assembled.extend(asm_lines)
+
+        # Phase 3: reset PC and emit resident code
+        assembled.append('\tsection code')
+        assembled.append('\torg 0')                    # reset PC for resident code
+
+        # Main must be at address 0 (CPU starts there).
+        # Loader goes after main; ocall replaced with ldi+jal.
+        self.code = assembled + new_code + loader
 
     def _eeprom_overlay_partition(self):
         """EEPROM overlay mode: partition code for EEPROM-backed execution.
@@ -1535,8 +1528,9 @@ class MK1CodeGen:
         import sys, json
 
         EEPROM_BASE = getattr(self, 'eeprom_base', 0x0200)
-        OV_CACHE_SLOT = 255    # data[255] = current overlay ID
-        OV_ENTRY_SLOT = 254    # data[254] = entry offset within overlay
+        # Kernel state in page 3 (top addresses, away from app allocation)
+        OV_CACHE_SLOT = 249    # page3[249] = current overlay ID
+        OV_ENTRY_SLOT = 248    # page3[248] = entry offset within overlay
 
         # ── Step 1: Measure function sizes ──
         two_byte = {'ldsp','stsp','push_imm','jal','jc','jz','jnc','jnz','j','ldi',
@@ -1760,20 +1754,20 @@ class MK1CodeGen:
             '\tmov $a,$c',          # C = overlay_id
             '\tmov $b,$a',          # A = entry_addr
             f'\tldi $b,{OV_ENTRY_SLOT}',
-            '\tideref',             # data[254] = entry_addr
-            # Cache check: compare data[255] with C
+            '\tiderefp3',           # page3[248] = entry_addr
+            # Cache check: compare page3[249] with C
             f'\tldi $a,{OV_CACHE_SLOT}',
-            '\tderef',              # A = data[255] = cached_id
+            '\tderefp3',            # A = page3[249] = cached_id
             '\tcmp $c',             # cached == overlay_id?
             '\tjz .ee_cached',
             # Cache miss: update cache, load overlay
             '\tmov $c,$a',          # A = overlay_id
             f'\tldi $b,{OV_CACHE_SLOT}',
-            '\tideref',             # data[255] = overlay_id
+            '\tiderefp3',           # page3[249] = overlay_id
             '\tjal __eeprom_load',
             '.ee_cached:',
             f'\tldi $a,{OV_ENTRY_SLOT}',
-            '\tderef',              # A = data[254] = entry_addr
+            '\tderefp3',            # A = page3[248] = entry_addr
             '\tjal_r',              # call overlay at entry_addr
             '\tret',
         ]
@@ -1971,35 +1965,35 @@ class MK1CodeGen:
             loader.append(f'\taddi {p3_dir_base},$a')
         loader += [
             '\tmov $a,$d',          # D = dir offset
-            # Read size → data[8]
+            # Read size → page3[243]
             '\tderefp3',            # A = size
-            '\tldi $b,8',
-            '\tideref',             # data[8] = size
+            '\tldi $b,243',
+            '\tiderefp3',           # page3[243] = size
             # Read hi
             '\tmov $d,$a',
             '\tinc',
             '\tderefp3',            # A = hi
-            '\tldi $b,9',
-            '\tideref',             # data[9] = hi
+            '\tldi $b,244',
+            '\tiderefp3',           # page3[244] = hi
             # Read lo
             '\tmov $d,$a',
             '\tinc',
             '\tinc',
             '\tderefp3',            # A = lo
-            '\tldi $b,10',
-            '\tideref',             # data[10] = lo
+            '\tldi $b,245',
+            '\tiderefp3',           # page3[245] = lo
             # I2C START + device write
             '\tddrb_imm 0x01',
             '\tddrb_imm 0x03',
             '\tldi $a,0xAE',
             '\tjal __i2c_sb',
             # Send hi
-            '\tldi $a,9',
-            '\tderef',              # A = data[9] = hi
+            '\tldi $a,244',
+            '\tderefp3',            # A = page3[244] = hi
             '\tjal __i2c_sb',
             # Send lo
-            '\tldi $a,10',
-            '\tderef',              # A = data[10] = lo
+            '\tldi $a,245',
+            '\tderefp3',            # A = page3[245] = lo
             '\tjal __i2c_sb',
             # Repeated START + read addr
             '\tddrb_imm 0x00',
@@ -2010,8 +2004,8 @@ class MK1CodeGen:
             # Bulk read to code page
             f'\tldi $b,{OVERLAY_REGION_START} ;!ov_region',
             # Push count for __eeprom_r2c_loop
-            '\tldi $a,8',
-            '\tderef',              # A = data[8] = size
+            '\tldi $a,243',
+            '\tderefp3',            # A = page3[243] = size
             '\tpush $a',
             '\tjal __eeprom_r2c_loop',
             '\tpop $a',             # clean count
@@ -2030,11 +2024,11 @@ class MK1CodeGen:
         has_init = any('exw 0 0' in l for l in new_code)
 
         # Add cache initialization to _main (before user code)
-        # Insert after VIA init: data[255] = 0xFF (no overlay cached)
+        # Insert after VIA init: page3[249] = 0xFF (no overlay cached)
         cache_init = [
             f'\tldi $a,0xFF',
             f'\tldi $b,{OV_CACHE_SLOT}',
-            '\tideref',             # data[255] = 0xFF (no cache)
+            '\tiderefp3',           # page3[249] = 0xFF (no cache)
         ]
         # Find the end of VIA init in _main (after the push/pop warmup)
         insert_idx = 0
