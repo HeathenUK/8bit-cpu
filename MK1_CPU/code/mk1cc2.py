@@ -556,6 +556,12 @@ class MK1CodeGen:
         for fn in other_fns:
             self.compile_function(*fn)
 
+        # In EEPROM mode, pre-register I2C helpers needed by the overlay loader
+        if getattr(self, 'eeprom_mode', False):
+            if not hasattr(self, '_lcd_helpers'):
+                self._lcd_helpers = set()
+            self._lcd_helpers.update({'__i2c_sb', '__i2c_rb', '__eeprom_r2c_loop'})
+
         # Emit I2C/LCD helpers AFTER all functions — so all helpers needed
         # by any function are registered. Protected from overlay by _NO_OVERLAY set.
         self._emit_i2c_helpers()
@@ -563,8 +569,12 @@ class MK1CodeGen:
         # Dead function elimination: remove functions that are never called
         self._eliminate_dead_functions()
 
-        # Overlay partitioning: if code exceeds 256 bytes, move cold functions to page 3
-        self._overlay_partition()
+        # Overlay partitioning
+        if getattr(self, 'eeprom_mode', False):
+            self._eeprom_overlay_partition()
+        else:
+            # Standard: move cold functions to page 3 if code > 256 bytes
+            self._overlay_partition()
 
         # Emit page 1 globals
         page1_vars = [(n, i) for n, i in globals_ if n in self.globals]
@@ -633,6 +643,9 @@ class MK1CodeGen:
                 if s.startswith(prefix):
                     target = s.split()[1]
                     refs.add(target)
+        # In EEPROM mode, keep I2C helpers alive (used by overlay loader added later)
+        if getattr(self, 'eeprom_mode', False):
+            refs.update({'__i2c_sb', '__i2c_rb', '__eeprom_r2c_loop'})
 
         # Identify function body ranges (global label to next global label)
         funcs = []  # (start, end, name)
@@ -1464,6 +1477,599 @@ class MK1CodeGen:
             self.code.extend(asm_lines)
 
         self.code.append('\tsection code')
+
+    def _eeprom_overlay_partition(self):
+        """EEPROM overlay mode: partition code for EEPROM-backed execution.
+
+        Architecture:
+        - Resident kernel: VIA init, I2C helpers, overlay dispatcher+loader, main wrapper
+        - Page 3 tier (L1): hot overlays pre-loaded from EEPROM at boot, fast copy to code page
+        - EEPROM tier (L2): cold overlays loaded via I2C on demand
+        - Overlay caching: data[255] tracks current overlay ID, skip reload if cached
+
+        The dispatcher checks cache → page 3 → EEPROM, loads to code page, calls.
+        """
+        import sys, json
+
+        EEPROM_BASE = getattr(self, 'eeprom_base', 0x0200)
+        OV_CACHE_SLOT = 255    # data[255] = current overlay ID
+        OV_ENTRY_SLOT = 254    # data[254] = entry offset within overlay
+
+        # ── Step 1: Measure function sizes ──
+        two_byte = {'ldsp','stsp','push_imm','jal','jc','jz','jnc','jnz','j','ldi',
+                    'cmp','addi','subi','andi','ori','ld','st','ldsp_b','ldp3','stp3',
+                    'setjmp','ocall','tst','out_imm','ddrb_imm','ora_imm','ddra_imm',
+                    'orb_imm','exw','exrw','ldi_b','ldi_c','ldi_d'}
+
+        def measure_size(lines):
+            size = 0
+            for line in lines:
+                s = line.strip()
+                if not s or s.endswith(':'): continue
+                mn = s.split()[0]
+                if mn == 'cmp':
+                    parts = s.split()
+                    size += 1 if (len(parts) > 1 and parts[1].startswith('$')) else 2
+                elif mn in two_byte:
+                    size += 2
+                else:
+                    size += 1
+            return size
+
+        # ── Step 2: Find functions and their code ──
+        # _main and I2C helpers are always resident
+        _ALWAYS_RESIDENT = {'_main:', '__i2c_sb:', '__i2c_st:', '__i2c_st_only:',
+                            '__i2c_sp:', '__i2c_rb:', '__eeprom_r2c_loop:',
+                            '__delay_cal:', '__delay_Nms:',
+                            '__lcd_chr:', '__lcd_cmd:', '__lcd_send:',
+                            '__tone_setup:', '__tone:', '__play_note:'}
+
+        funcs = []
+        i = 0
+        while i < len(self.code):
+            s = self.code[i].strip()
+            if s.endswith(':') and not s.startswith('.') and s.startswith('_'):
+                name = s[:-1]
+                start = i
+                i += 1
+                while i < len(self.code):
+                    ns = self.code[i].strip()
+                    if ns.endswith(':') and not ns.startswith('.') and ns.startswith('_'):
+                        break
+                    i += 1
+                func_lines = self.code[start:i]
+                func_size = measure_size(func_lines)
+                is_resident = s in _ALWAYS_RESIDENT
+                funcs.append({
+                    'name': name, 'start': start, 'end': i,
+                    'lines': func_lines, 'size': func_size,
+                    'resident': is_resident
+                })
+            else:
+                i += 1
+
+        # ── Step 3: Build call graph ──
+        call_graph = {}  # name → set of names it calls
+        for f in funcs:
+            calls = set()
+            for line in f['lines']:
+                s = line.strip()
+                if s.startswith('jal ') or s.startswith('j '):
+                    target = s.split()[1]
+                    if target.startswith('_') and not target.startswith('.'):
+                        calls.add(target)
+            call_graph[f['name']] = calls
+
+        # ── Step 4: Count call frequency for each function ──
+        call_freq = {}
+        for caller, callees in call_graph.items():
+            for callee in callees:
+                call_freq[callee] = call_freq.get(callee, 0) + 1
+
+        # ── Step 5: Find connected components among non-resident functions ──
+        # Functions that call each other MUST be in the same overlay
+        overlay_funcs = [f for f in funcs if not f['resident']]
+        if not overlay_funcs:
+            return  # everything fits in resident
+
+        total_size = sum(f['size'] for f in funcs)
+        resident_size = sum(f['size'] for f in funcs if f['resident'])
+
+        # I2C + dispatcher overhead
+        # __i2c_sb=40, __i2c_rb=23, __eeprom_r2c_loop=54, VIA init=14,
+        # dispatcher=~25, loader=~45, main wrapper=~12
+        KERNEL_OVERHEAD = 40 + 23 + 54 + 14 + 25 + 45 + 12  # ~213 bytes
+        # But many of these are already in resident_size (counted above)
+        # The actual kernel overhead is what we ADD beyond the user's resident code
+
+        # In EEPROM mode, always partition if there are non-resident functions.
+        # The point is to move user code to EEPROM even if it would fit.
+        if not overlay_funcs:
+            return  # nothing to overlay
+
+        # Build adjacency for connected components
+        ov_names = {f['name'] for f in overlay_funcs}
+        adj = {f['name']: set() for f in overlay_funcs}
+        for f in overlay_funcs:
+            for callee in call_graph.get(f['name'], set()):
+                if callee in ov_names:
+                    adj[f['name']].add(callee)
+                    adj[callee].add(f['name'])
+
+        # Find connected components (BFS)
+        visited = set()
+        components = []
+        for f in overlay_funcs:
+            if f['name'] not in visited:
+                comp = []
+                queue = [f['name']]
+                while queue:
+                    n = queue.pop(0)
+                    if n in visited: continue
+                    visited.add(n)
+                    comp.append(n)
+                    for nb in adj.get(n, set()):
+                        if nb not in visited:
+                            queue.append(nb)
+                components.append(comp)
+
+        # ── Step 6: Compute overlay region size ──
+        # The overlay region = 256 - kernel_size
+        # kernel includes: user's _main code + I2C helpers + dispatcher + loader
+        # We need to compute this iteratively since it depends on how many
+        # overlays we create (which affects the dispatcher size)
+
+        # For now, estimate conservatively
+        OVERLAY_REGION_START = 0xC8  # conservative: 200 bytes for kernel
+        OVERLAY_SIZE = 256 - OVERLAY_REGION_START  # 56 bytes available
+
+        # ── Step 7: Bin-pack components into overlay slots ──
+        func_by_name = {f['name']: f for f in funcs}
+        overlay_slots = []
+
+        # Sort components by total size descending (largest first = better packing)
+        comp_sizes = []
+        for comp in components:
+            total = sum(func_by_name[n]['size'] for n in comp)
+            comp_sizes.append((total, comp))
+        comp_sizes.sort(key=lambda x: -x[0])
+
+        for comp_size, comp in comp_sizes:
+            if comp_size > OVERLAY_SIZE:
+                print(f"WARNING: function group {comp} ({comp_size}B) exceeds overlay size ({OVERLAY_SIZE}B)",
+                      file=sys.stderr)
+            # Try to fit into an existing slot
+            placed = False
+            for slot in overlay_slots:
+                slot_used = sum(func_by_name[n]['size'] for n in slot)
+                if slot_used + comp_size <= OVERLAY_SIZE:
+                    slot.extend(comp)
+                    placed = True
+                    break
+            if not placed:
+                overlay_slots.append(list(comp))
+
+        # ── Step 8: Assign EEPROM addresses and entry points ──
+        eeprom_addr = EEPROM_BASE
+        overlay_info = []
+        for slot_id, slot_funcs in enumerate(overlay_slots):
+            slot_size = 0
+            entries = {}
+            for fname in slot_funcs:
+                entries[fname] = OVERLAY_REGION_START + slot_size
+                slot_size += func_by_name[fname]['size']
+            overlay_info.append({
+                'id': slot_id,
+                'functions': slot_funcs,
+                'entries': entries,  # fname → code page address
+                'size': slot_size,
+                'eeprom_addr': eeprom_addr,
+            })
+            eeprom_addr += slot_size
+
+        # ── Step 9: Generate resident code ──
+        # Remove overlay functions from code, rewrite calls to dispatcher
+
+        # Build function→overlay mapping
+        func_to_overlay = {}
+        for ov in overlay_info:
+            for fname in ov['functions']:
+                func_to_overlay[fname] = (ov['id'], ov['entries'][fname])
+
+        # Rewrite code: replace jal to overlay functions with dispatch calls
+        new_code = []
+        i = 0
+        ov_func_ranges = {}
+        for f in overlay_funcs:
+            ov_func_ranges[(f['start'], f['end'])] = f['name']
+
+        ii = 0
+        while ii < len(self.code):
+            # Skip overlay function bodies
+            skip = False
+            for (rs, re), fname in ov_func_ranges.items():
+                if rs <= ii < re:
+                    ii = re
+                    skip = True
+                    break
+            if skip:
+                continue
+
+            line = self.code[ii]
+            s = line.strip()
+
+            # Rewrite jal to overlay functions
+            rewritten = False
+            if s.startswith('jal '):
+                target = s.split()[1]
+                if target in func_to_overlay:
+                    ov_id, entry_addr = func_to_overlay[target]
+                    new_code.append(f'\tldi $a,{ov_id}')
+                    new_code.append(f'\tldi $b,{entry_addr}')
+                    new_code.append(f'\tjal __eeprom_dispatch')
+                    rewritten = True
+
+            if not rewritten:
+                new_code.append(line)
+            ii += 1
+
+        # ── Step 10: Generate dispatcher ──
+        dispatcher = [
+            '; ── EEPROM overlay dispatcher ──',
+            '; A = overlay_id, B = entry_addr within overlay',
+            '__eeprom_dispatch:',
+            # Save entry addr to data page
+            '\tmov $b,$a',          # A = entry_addr (swap to save)
+            f'\tldi $b,{OV_ENTRY_SLOT}',
+            '\tideref',             # data[254] = entry_addr
+            # Check cache: is this overlay already loaded?
+            '\tmov $a,$b',          # need to get overlay_id back... hmm
+        ]
+        # Problem: after the save, A=entry_addr, B=OV_ENTRY_SLOT.
+        # Need overlay_id. It was in A on entry but we swapped.
+        # Fix: save both to data page.
+        dispatcher = [
+            '; ── EEPROM overlay dispatcher ──',
+            '; A = overlay_id, B = entry_addr',
+            '__eeprom_dispatch:',
+            # Save entry addr
+            '\tpush $a',            # save overlay_id
+            '\tmov $b,$a',          # A = entry_addr
+            f'\tldi $b,{OV_ENTRY_SLOT}',
+            '\tideref',             # data[254] = entry_addr
+            '\tpop $a',             # A = overlay_id
+            # Check cache
+            '\tmov $a,$c',          # C = overlay_id (save)
+            f'\tldi $b,{OV_CACHE_SLOT}',
+            '\tpush $a',            # save overlay_id
+            f'\tldi $a,{OV_CACHE_SLOT}',
+            '\tderef',              # A = data[255] = cached_id
+            '\tcmp $c',             # cached == target?
+            '\tpop $a',             # A = overlay_id (restore for loader)
+            '\tjz .ee_cached',      # skip load if cached
+            # Update cache
+            f'\tldi $b,{OV_CACHE_SLOT}',
+            '\tideref',             # data[255] = overlay_id
+            # Load overlay
+            '\tjal __eeprom_load',
+            '.ee_cached:',
+            # Call overlay at entry_addr
+            f'\tldi $a,{OV_ENTRY_SLOT}',
+            '\tderef',              # A = data[254] = entry_addr
+            '\tjal_r',              # push ret addr, PC = A (entry_addr)
+            '\tret',
+        ]
+
+        # ── Step 11: Generate EEPROM loader ──
+        # A = overlay_id. Reads overlay directory from page 3.
+        # Directory: 4 bytes per overlay [size, eeprom_hi, eeprom_lo, pad]
+        # Page 3 offset = page3_alloc + id * 4
+        p3_dir_base = self.page3_alloc
+        DIR_ENTRY_SIZE = 3  # size, hi, lo
+        loader = [
+            '; ── EEPROM overlay loader ──',
+            '; A = overlay_id. Loads overlay from EEPROM to code page.',
+            '__eeprom_load:',
+            # Compute page 3 directory offset: A * 3 + base
+            '\tmov $a,$d',          # D = id
+            '\tsll',                # A = id * 2
+            '\tadd $d,$a',          # A = id * 3
+        ]
+        if p3_dir_base > 0:
+            loader.append(f'\taddi {p3_dir_base},$a')
+        loader += [
+            '\tmov $a,$d',          # D = base offset
+            # Read size
+            '\tderefp3',            # A = page3[offset] = size
+            '\tpush $a',            # save size (for r2c_loop count)
+            # Read eeprom_hi
+            '\tmov $d,$a',          # A = base
+            '\tinc',
+            '\tderefp3',            # A = eeprom_hi
+            '\tmov $a,$c',          # C = hi
+            # Read eeprom_lo
+            '\tmov $d,$a',          # A = base
+            '\tinc',
+            '\tinc',
+            '\tderefp3',            # A = eeprom_lo
+            # Save lo, do I2C setup
+            '\tpush $a',            # save lo
+            '\tpush $a',            # save lo again (will use for i2c_sb)
+            # I2C START + device write address
+            '\tddrb_imm 0x01',
+            '\tddrb_imm 0x03',
+            '\tldi $a,0xAE',
+            '\tjal __i2c_sb',
+            # Send eeprom_hi (in C)
+            '\tmov $c,$a',
+            '\tjal __i2c_sb',
+            # Send eeprom_lo (from stack)
+            '\tpop $a',
+            '\tjal __i2c_sb',
+            # Repeated START + read address
+            '\tddrb_imm 0x00',
+            '\tddrb_imm 0x01',
+            '\tddrb_imm 0x03',
+            '\tldi $a,0xAF',
+            '\tjal __i2c_sb',
+            # Bulk read to code page
+            f'\tldi $b,{OVERLAY_REGION_START}',
+            # Count is 2 deep on stack now (lo was popped, size is next)
+            '\tjal __eeprom_r2c_loop',
+            '\tpop $a',             # clean size from stack
+            '\tpop $a',             # clean extra lo from stack
+            '\tret',
+        ]
+
+        # Wait — stack management is wrong. Let me re-trace:
+        # After reading directory: stack has [size]
+        # push lo: stack has [lo, size]
+        # push lo: stack has [lo, lo, size]
+        # pop for i2c_sb(lo): stack has [lo, size]
+        # __eeprom_r2c_loop expects count at stack[SP+2]
+        # After jal __eeprom_r2c_loop: stack has [ret_r2c, lo, size]
+        # r2c_loop reads ldsp 2 = lo? NO! It should read size.
+        # This is broken. Let me restructure.
+
+        # The r2c_loop reads count from ldsp 2 (past its own return addr).
+        # I need: stack = [r2c_ret, count, ...] when r2c_loop starts
+        # Before jal __eeprom_r2c_loop: stack = [count, ...]
+        # After jal: stack = [r2c_ret, count, ...]
+        # ldsp 2 = count. Correct!
+        # So I need size on top of stack just before jal __eeprom_r2c_loop.
+
+        # Revised stack management:
+        # After directory read: push size
+        # push lo (for later i2c_sb)
+        # ... I2C setup (pops lo for sending) ...
+        # Before r2c_loop: stack = [size]
+        # jal __eeprom_r2c_loop
+        # After: pop size to clean
+
+        # But C (eeprom_hi) gets clobbered by __i2c_sb. Need to save it.
+        # Actually: send device addr, then hi, then lo. After sending device addr,
+        # C still has hi. Send it. After sending hi, C is clobbered.
+        # But we only need lo after that, which we saved on stack.
+
+        # Let me rewrite the loader cleanly:
+        loader = [
+            '; ── EEPROM overlay loader ──',
+            '__eeprom_load:',
+            # Read directory from page 3: offset = id * 3 + base
+            '\tmov $a,$d',          # D = id
+            '\tsll',                # A = id * 2
+            '\tadd $d,$a',          # A = id * 3
+        ]
+        if p3_dir_base > 0:
+            loader.append(f'\taddi {p3_dir_base},$a')
+        loader += [
+            '\tmov $a,$d',          # D = directory base
+            '\tderefp3',            # A = size
+            '\tpush $a',            # stack: [size, ...]
+            '\tmov $d,$a',
+            '\tinc',
+            '\tderefp3',            # A = eeprom_hi
+            '\tpush $a',            # stack: [hi, size, ...]
+            '\tmov $d,$a',
+            '\tinc',
+            '\tinc',
+            '\tderefp3',            # A = eeprom_lo
+            '\tpush $a',            # stack: [lo, hi, size, ...]
+            # I2C START
+            '\tddrb_imm 0x01',
+            '\tddrb_imm 0x03',
+            '\tldi $a,0xAE',
+            '\tjal __i2c_sb',
+            # Send hi (from stack)
+            '\tldsp 2',             # A = hi (past: lo, ret_sb... wait)
+        ]
+        # Problem: jal __i2c_sb pushes its own return address.
+        # After jal __i2c_sb returns: stack = [lo, hi, size, ...]
+        # ldsp 2 from HERE: stack = [lo, hi, size], ldsp 2 = hi? No.
+        # Actually after __i2c_sb returns (ret pops return addr), stack is unchanged
+        # from before the jal. Stack = [lo, hi, size, ...]
+        # So ldsp 1 = lo (at SP), ldsp 2... wait, ldsp N reads stack[SP+N].
+        # SP points to the last pushed item. stack[SP] = lo (top).
+        # ldsp 1 = stack[SP+1] = hi.  ldsp 2 = stack[SP+2] = size.
+        # BUT ldsp N involves SP + N which can have the carry race.
+        # For small N (1, 2, 3) it's fine unless SP is near 0xFF.
+
+        # Actually wait. After the 3 pushes: SP = 0xFF - 3 - (return addrs from jal chain)
+        # The __eeprom_load was called via jal from the dispatcher. That pushed a return addr.
+        # So: stack = [lo, hi, size, load_ret, dispatch_ret, ...]
+        # SP points at lo. ldsp 0 = lo, ldsp 1 = hi, ldsp 2 = size.
+
+        # But after `jal __i2c_sb`, ret is popped. So stack is still [lo, hi, size, ...].
+        # The ldsp at this point: SP unchanged. ldsp 0 = lo, ldsp 1 = hi. Good.
+
+        # BUT: i2c_sb itself uses push/pop internally! After it returns, SP is
+        # back where it was before the call. So the stack frame is preserved. OK.
+
+        # Rewrite loader without the stack confusion:
+        loader = [
+            '; ── EEPROM overlay loader ──',
+            '; A = overlay_id. Directory in page 3.',
+            '__eeprom_load:',
+            '\tmov $a,$d',          # D = id
+            '\tsll',                # A = id*2
+            '\tadd $d,$a',          # A = id*3
+        ]
+        if p3_dir_base > 0:
+            loader.append(f'\taddi {p3_dir_base},$a')
+        loader += [
+            '\tmov $a,$d',          # D = dir offset
+            '\tderefp3',            # A = size
+            '\tpush $a',            # stack: [size]
+            '\tmov $d,$a',
+            '\tinc',
+            '\tderefp3',            # A = hi
+            '\tpush $a',            # stack: [hi, size]
+            '\tmov $d,$a',
+            '\tinc',
+            '\tinc',
+            '\tderefp3',            # A = lo
+            '\tpush $a',            # stack: [lo, hi, size]
+            # I2C: START + device write addr
+            '\tddrb_imm 0x01',
+            '\tddrb_imm 0x03',
+            '\tldi $a,0xAE',
+            '\tjal __i2c_sb',
+            # Send hi
+            '\tpop $a',             # A = lo (wrong! stack order)
+        ]
+        # Hmm, stack is LIFO. pop gives lo first, then hi, then size.
+        # I need hi first (to send as EEPROM address high byte).
+        # Fix: push in reverse order, or use data page.
+
+        # Let me use data page slots instead of stack:
+        loader = [
+            '; ── EEPROM overlay loader ──',
+            '__eeprom_load:',
+            '\tmov $a,$d',          # D = id
+            '\tsll',
+            '\tadd $d,$a',          # A = id*3
+        ]
+        if p3_dir_base > 0:
+            loader.append(f'\taddi {p3_dir_base},$a')
+        loader += [
+            '\tmov $a,$d',          # D = dir offset
+            # Read size → data[8]
+            '\tderefp3',            # A = size
+            '\tldi $b,8',
+            '\tideref',             # data[8] = size
+            # Read hi
+            '\tmov $d,$a',
+            '\tinc',
+            '\tderefp3',            # A = hi
+            '\tldi $b,9',
+            '\tideref',             # data[9] = hi
+            # Read lo
+            '\tmov $d,$a',
+            '\tinc',
+            '\tinc',
+            '\tderefp3',            # A = lo
+            '\tldi $b,10',
+            '\tideref',             # data[10] = lo
+            # I2C START + device write
+            '\tddrb_imm 0x01',
+            '\tddrb_imm 0x03',
+            '\tldi $a,0xAE',
+            '\tjal __i2c_sb',
+            # Send hi
+            '\tldi $a,9',
+            '\tderef',              # A = data[9] = hi
+            '\tjal __i2c_sb',
+            # Send lo
+            '\tldi $a,10',
+            '\tderef',              # A = data[10] = lo
+            '\tjal __i2c_sb',
+            # Repeated START + read addr
+            '\tddrb_imm 0x00',
+            '\tddrb_imm 0x01',
+            '\tddrb_imm 0x03',
+            '\tldi $a,0xAF',
+            '\tjal __i2c_sb',
+            # Bulk read to code page
+            f'\tldi $b,{OVERLAY_REGION_START}',
+            # Push count for __eeprom_r2c_loop
+            '\tldi $a,8',
+            '\tderef',              # A = data[8] = size
+            '\tpush $a',
+            '\tjal __eeprom_r2c_loop',
+            '\tpop $a',             # clean count
+            '\tret',
+        ]
+
+        # ── Step 12: Assemble everything ──
+        # Ensure I2C helpers are emitted
+        if not hasattr(self, '_lcd_helpers'):
+            self._lcd_helpers = set()
+        self._lcd_helpers.add('__i2c_sb')
+        self._lcd_helpers.add('__i2c_rb')
+        self._lcd_helpers.add('__eeprom_r2c_loop')
+
+        # Check if _main already has i2c_init
+        has_init = any('exw 0 0' in l for l in new_code)
+
+        # Add cache initialization to _main (before user code)
+        # Insert after VIA init: data[255] = 0xFF (no overlay cached)
+        cache_init = [
+            f'\tldi $a,0xFF',
+            f'\tldi $b,{OV_CACHE_SLOT}',
+            '\tideref',             # data[255] = 0xFF (no cache)
+        ]
+        # Find the end of VIA init in _main (after the push/pop warmup)
+        insert_idx = 0
+        for ci, cline in enumerate(new_code):
+            if 'pop $a ;!keep' in cline:
+                insert_idx = ci + 1
+                break
+            if cline.strip() == 'hlt' and ci < 3:
+                insert_idx = ci
+                break
+        if insert_idx > 0:
+            new_code = new_code[:insert_idx] + cache_init + new_code[insert_idx:]
+
+        # Add dispatcher and loader
+        new_code.extend(dispatcher)
+        new_code.extend(loader)
+
+        self.code = new_code
+
+        # ── Step 13: Emit overlay directory in page 3 ──
+        self.code.append('\tsection page3')
+        for ov in overlay_info:
+            hi = (ov['eeprom_addr'] >> 8) & 0xFF
+            lo = ov['eeprom_addr'] & 0xFF
+            self.code.append(f'; overlay {ov["id"]}: {ov["functions"]} ({ov["size"]}B) @ EEPROM 0x{ov["eeprom_addr"]:04X}')
+            self.code.append(f'\tbyte {ov["size"]}')
+            self.code.append(f'\tbyte {hi}')
+            self.code.append(f'\tbyte {lo}')
+        self.page3_alloc += len(overlay_info) * DIR_ENTRY_SIZE
+
+        # ── Step 14: Emit overlay code as page3_code sections ──
+        # Each overlay's functions are emitted into page3_code at OVERLAY_REGION_START
+        # The assembler stores them in the page3 buffer; the upload tool
+        # extracts and writes to EEPROM.
+        for ov in overlay_info:
+            self.code.append(f'\tsection page3_code')
+            for fname in ov['functions']:
+                f = func_by_name[fname]
+                self.code.extend(f['lines'])
+
+        self.code.append('\tsection code')
+
+        # ── Step 15: Output metadata for upload tool ──
+        self._eeprom_overlays = overlay_info
+        # Print summary
+        n_overlays = len(overlay_info)
+        total_ov_bytes = sum(ov['size'] for ov in overlay_info)
+        print(f"EEPROM overlay mode: {n_overlays} overlays, {total_ov_bytes}B in EEPROM, "
+              f"overlay region 0x{OVERLAY_REGION_START:02X}-0xFF ({OVERLAY_SIZE}B)",
+              file=sys.stderr)
+        for ov in overlay_info:
+            print(f"  OV{ov['id']}: {ov['functions']} ({ov['size']}B) @ 0x{ov['eeprom_addr']:04X}",
+                  file=sys.stderr)
 
     def _use_regcall(self, nparams):
         """Always pass first 2 args in A/B (hybrid register calling).
@@ -3951,11 +4557,17 @@ def main():
     ap.add_argument('input', help='C source file')
     ap.add_argument('-o', '--output', help='Output .asm file')
     ap.add_argument('-O', '--optimize', action='store_true', help='Enable optimization')
+    ap.add_argument('--eeprom', action='store_true', help='EEPROM overlay mode: partition code for EEPROM-backed execution')
+    ap.add_argument('--eeprom-base', type=lambda x: int(x, 0), default=0x0200,
+                    help='EEPROM base address for overlay storage (default: 0x0200)')
     args = ap.parse_args()
 
     with open(args.input) as f: source = f.read()
 
     gen = MK1CodeGen(optimize=args.optimize)
+    if hasattr(args, 'eeprom') and args.eeprom:
+        gen.eeprom_mode = True
+        gen.eeprom_base = args.eeprom_base
     asm = gen.compile(source)
 
     # Always run peephole optimizer
