@@ -2264,6 +2264,7 @@ class MK1CodeGen:
         # Order: init calls FIRST (VIA init, jal __delay_cal, etc.), then
         # helper function bodies (called via jal from the init sequence),
         # then note precomputation, then self-copy.
+        phase4_start = len(assembled)
         assembled.append('\tsection code')
         assembled.append('\torg 0')
 
@@ -2378,9 +2379,20 @@ class MK1CodeGen:
         # then fall through to the self-copy. If init code doesn't fill
         # up to KERNEL_SIZE, org pads with HLT and we jump over it.
         assembled.append(f'\tj __selfcopy')
-        # No org here — self-copy follows immediately after j __selfcopy.
-        # Using org KERNEL_SIZE would go BACKWARD if init code > KERNEL_SIZE,
-        # corrupting init helper code in the code buffer.
+        # Self-copy MUST be above code[KERNEL_SIZE-1] to avoid overwriting
+        # itself during the copy. Two cases:
+        #   1. Init code is SHORT (< KERNEL_SIZE): org pads forward (safe)
+        #   2. Init code is LONG (>= KERNEL_SIZE): don't org (would go backward)
+        # Count init section size (Phase 4 only, from 'section code; org 0'):
+        init_byte_est = sum(
+            2 if l.strip().split()[0] in two_byte else 1
+            for l in assembled[phase4_start:]
+            if l.strip() and not l.strip().endswith(':') and not l.strip().startswith(';')
+            and not l.strip().startswith('section') and not l.strip().startswith('org')
+            and l.strip().split()[0] not in ('byte',)
+        ) if phase4_start else 0
+        if init_byte_est < KERNEL_SIZE:
+            assembled.append(f'\torg {KERNEL_SIZE}')
         assembled.append('__selfcopy:')
         assembled.extend(self_copy)
 
