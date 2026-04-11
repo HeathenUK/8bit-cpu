@@ -1245,8 +1245,9 @@ class MK1CodeGen:
             # called from one overlay group (e.g. __i2c_sb only needed by init_audio).
             _NO_OVERLAY = {'_main:',
                            '__tone_setup:', '__tone:', '__play_note:', '__delay_Nms:',
+                           '__lcd_chr:', '__lcd_cmd:', '__lcd_send:',
                            '__eeprom_r2c_loop:', '__eeprom_dispatch:', '__eeprom_load:',
-                           '_overlay_load:'}
+                           '_overlay_load:', '_overlay_load_p1:'}
             if s.endswith(':') and not s.startswith('.') and s.startswith('_') and s not in _NO_OVERLAY:
                 name = s[:-1]
                 start = i

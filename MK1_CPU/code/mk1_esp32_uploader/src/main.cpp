@@ -1714,6 +1714,7 @@ static void handleSerialUpload() {
 // ── Setup & Loop ─────────────────────────────────────────────────────
 
 void setup() {
+    Serial.setRxBufferSize(8192);  // 8KB RX buffer for large ASM uploads
     Serial.begin(115200);
 
     pinMode(PIN_MI, OUTPUT);
