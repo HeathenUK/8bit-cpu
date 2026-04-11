@@ -1246,16 +1246,18 @@ class MK1CodeGen:
             has_silence = '__delay_Nms' in helpers
             lbl_sil = self.label('pnsil') if has_silence else None
             self.emit('__play_note:')
-            # Note table in page 1 (data page): [half_period, cyc_lo, cyc_hi]
-            # half_period was precomputed during init by the precomputation loop.
-            # If half_period=0, it's a silence note (cyc_lo = ms duration).
+            # Note table in page 1 (data page): [ratio, cyc_lo, cyc_hi]
+            # Calls tone_setup at runtime to convert ratio → half_period.
+            # If ratio=0, silence note (cyc_lo = ms duration).
             self.emit('\tmov $a,$d')       # D = base offset
-            self.emit('\tderef')           # A = data[offset] = half_period
+            self.emit('\tderef')           # A = data[offset] = ratio
             if has_silence:
                 self.emit('\ttst 0xFF')
-                self.emit(f'\tjz {lbl_sil}')   # half_period=0 → silence
-            self.emit('\tmov $a,$c')       # C = half_period (precomputed)
-            self.emit('\tmov $d,$a')       # A = offset
+                self.emit(f'\tjz {lbl_sil}')   # ratio=0 → silence
+            self.emit('\tmov $a,$b')       # B = ratio
+            self.emit('\tpush $d')         # save base offset
+            self.emit('\tjal __tone_setup') # C = half_period
+            self.emit('\tpop $a')          # A = base offset
             self.emit('\tinc')
             self.emit('\tmov $a,$d')       # D = offset+1
             self.emit('\tderef')           # A = data[offset+1] = cyc_lo
@@ -1369,7 +1371,7 @@ class MK1CodeGen:
         # Init-only functions run once during stage 1, then are discarded.
         # Runtime functions are loaded via overlay during stage 2.
         INIT_ONLY_NAMES = {
-            '__delay_cal', '__lcd_init', '__tone_setup',
+            '__delay_cal', '__lcd_init',
         }
         # I2C helpers that are init-only when no runtime I2C is needed
         I2C_INIT_ONLY = {'__i2c_sb', '__i2c_sp', '__i2c_st', '__i2c_st_only', '__i2c_rb'}
@@ -2147,6 +2149,28 @@ class MK1CodeGen:
 
         # Prepend _main: label to runtime main
         runtime_main_lines = ['_main:'] + runtime_main_lines
+
+        # ── Recompute KERNEL_SIZE after init extraction ──
+        # The kernel image = loader + runtime_helpers + runtime_main (NOT full main).
+        # The earlier sizing used main_lines (pre-extraction) which includes VIA init etc.
+        actual_main_size = measure_lines(runtime_main_lines)
+        KERNEL_SIZE = loader_size + actual_main_size + runtime_helper_size
+        OVERLAY_REGION = KERNEL_SIZE
+        meta_base = max(p3_used, KERNEL_SIZE)
+        # Recompute p3 overlay offsets
+        final_p3_start = meta_base + meta_table_size
+        if p3_overlays:
+            old_first = p3_overlays[0][4]
+            if old_first != final_p3_start:
+                delta = final_p3_start - old_first
+                p3_overlays = [(i, n, a, f, off + delta) for i, n, a, f, off in p3_overlays]
+        # Regenerate loader with correct OVERLAY_REGION
+        loader = generate_kernel_loader(OVERLAY_REGION, meta_base,
+                                        has_p1, has_p2, has_p3,
+                                        len(p3_overlays), len(p1_overlays))
+        loader_size = measure_lines(loader)
+        KERNEL_SIZE = loader_size + actual_main_size + runtime_helper_size
+        OVERLAY_REGION = KERNEL_SIZE
 
         # ── Step 17: Build the self-copy routine ──
         # Copies page3[0..KERNEL_SIZE-1] to code[0..KERNEL_SIZE-1] via derefp3+istc_inc
