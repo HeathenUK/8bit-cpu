@@ -1254,10 +1254,10 @@ class MK1CodeGen:
             if has_silence:
                 self.emit('\ttst 0xFF')
                 self.emit(f'\tjz {lbl_sil}')   # ratio=0 → silence
-            self.emit('\tmov $a,$b')       # B = ratio
-            self.emit('\tpush $d')         # save base offset
-            self.emit('\tjal __tone_setup') # C = half_period
-            self.emit('\tpop $a')          # A = base offset
+            # DEBUG: bypass tone_setup, hardcode half_period=40
+            self.emit('\tldi $a,40')
+            self.emit('\tmov $a,$c')       # C = 40 (hardcoded half_period)
+            self.emit('\tmov $d,$a')       # A = offset
             self.emit('\tinc')
             self.emit('\tmov $a,$d')       # D = offset+1
             self.emit('\tderef')           # A = data[offset+1] = cyc_lo
@@ -2339,8 +2339,11 @@ class MK1CodeGen:
         # Note precomputation: convert ratio → half_period in page 1 note table.
         # tone_setup (init-only) converts B=ratio → C=half_period using ipm from page3[240].
         # Must run AFTER delay_cal stores ipm and BEFORE self-copy.
+        # Only precompute if tone_setup is INIT-ONLY (not available at runtime).
+        # If play_note calls tone_setup at runtime, precomp is unnecessary.
         _helpers = getattr(self, '_lcd_helpers', set())
-        if hasattr(self, '_note_table') and self._note_table and '__tone_setup' in _helpers:
+        tone_setup_is_init_only = '__tone_setup' in {n for n, _, _, _ in init_only_funcs}
+        if hasattr(self, '_note_table') and self._note_table and tone_setup_is_init_only:
             unique_notes = self._note_table
             note_base = unique_notes[0][0]
             note_end = unique_notes[-1][0] + 3
@@ -2375,7 +2378,9 @@ class MK1CodeGen:
         # then fall through to the self-copy. If init code doesn't fill
         # up to KERNEL_SIZE, org pads with HLT and we jump over it.
         assembled.append(f'\tj __selfcopy')
-        assembled.append(f'\torg {KERNEL_SIZE}')
+        # No org here — self-copy follows immediately after j __selfcopy.
+        # Using org KERNEL_SIZE would go BACKWARD if init code > KERNEL_SIZE,
+        # corrupting init helper code in the code buffer.
         assembled.append('__selfcopy:')
         assembled.extend(self_copy)
 
@@ -4011,8 +4016,10 @@ class MK1CodeGen:
                 # Emits: ddra_imm 0x02 (once) + ldi $a, offset; jal __play_note.
                 # DDRA bit 1 must be set for PA1 output (i2c_init clears DDRA).
                 if not hasattr(self, '_tone_ddra_emitted'):
-                    # Mark that tone init is needed — actual code emitted in compile()
-                    # as a prefix to _main (not here, which may be inside an overlay function)
+                    # Emit ddra_imm 0x02 at the first tone() call site.
+                    # This ensures PA1 is output regardless of where the code runs
+                    # (init section, main, or overlay function).
+                    self.emit('\tddra_imm 0x02')  # PA1 = output
                     self._tone_ddra_emitted = True
                     self._needs_tone_init = True
                 if len(args) < 2:
