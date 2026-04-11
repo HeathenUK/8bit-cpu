@@ -2094,12 +2094,19 @@ class MK1CodeGen:
         # ── Step 18: Assemble everything ──
         assembled = []
 
-        # Phase 1: Emit manifest into page3 (section page3)
+        # Phase 1: Kernel image FIRST — must go to page3[0..KERNEL_SIZE-1]
+        # before manifest/overlay data advances page3_size past those addresses.
+        assembled.append('\tsection code')
+        assembled.append('\torg 0')
+        assembled.append('\tsection page3_code')
+        # Kernel = overlay_load + runtime helpers + main
+        assembled.extend(loader)
+        assembled.extend(runtime_resident_helpers)
+        assembled.extend(runtime_main_lines)
+
+        # Phase 2: Manifest in page3 (after kernel image)
         assembled.append('\tsection page3')
-        if meta_base > p3_used:
-            # Pad page3 to meta_base if kernel image takes up space
-            # Actually page3_code writes to page3 buffer at addresses 0..KERNEL_SIZE-1.
-            # The section page3 allocator is separate. We need to set org.
+        if meta_base > 0:
             assembled.append(f'\torg {meta_base}')
 
         # Emit 3-byte manifest entries: [page, src_offset, size]
@@ -2121,7 +2128,7 @@ class MK1CodeGen:
                 assembled.append(f'\tbyte 0')
             assembled.append(f'\tbyte {fsize}')
 
-        # Phase 2: Emit overlay code at OVERLAY_REGION addresses into storage pages
+        # Phase 3: Overlay code at OVERLAY_REGION addresses into storage pages
         for idx, name, asm_lines, fsize, _ in p3_overlays:
             assembled.append('\tsection code')
             assembled.append(f'\torg {OVERLAY_REGION}')
@@ -2139,16 +2146,6 @@ class MK1CodeGen:
             assembled.append(f'\torg {OVERLAY_REGION}')
             assembled.append('\tsection stack_code')
             assembled.extend(asm_lines)
-
-        # Phase 3: Emit kernel image into page3_code (stored in page3 buffer,
-        # labels resolve at code page addresses via section page3_code with org 0)
-        assembled.append('\tsection code')
-        assembled.append('\torg 0')
-        assembled.append('\tsection page3_code')
-        # Kernel = overlay_load + runtime helpers + main
-        assembled.extend(loader)
-        assembled.extend(runtime_resident_helpers)
-        assembled.extend(runtime_main_lines)
 
         # Phase 4: Emit init code in section code (the actual code page at upload)
         assembled.append('\tsection code')
@@ -2240,7 +2237,13 @@ class MK1CodeGen:
             assembled.append('\tjnz .precomp_loop')
             assembled.append('\tpop $a')                   # clean stack
 
-        # Self-copy routine
+        # Self-copy routine — placed ABOVE kernel destination to avoid
+        # overwriting itself. Init helpers run first (at low addresses),
+        # then fall through to the self-copy. If init code doesn't fill
+        # up to KERNEL_SIZE, org pads with HLT and we jump over it.
+        assembled.append(f'\tj __selfcopy')
+        assembled.append(f'\torg {KERNEL_SIZE}')
+        assembled.append('__selfcopy:')
         assembled.extend(self_copy)
 
         # Update page3_alloc
