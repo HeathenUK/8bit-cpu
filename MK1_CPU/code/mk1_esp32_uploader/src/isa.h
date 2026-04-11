@@ -113,6 +113,8 @@ static const FixedInstr FIXED_INSTRUCTIONS[] = {
 
     // ── Overlay system ──
     { "derefp3", 0xD5,  ARGS_NONE },  // A = page3[A] (indirect page 3 read)
+    { "deref2",  0xDD,  ARGS_NONE },  // A = stack_page[A] (indirect page 2 read)
+    { "ideref2", 0xED,  ARGS_NONE },  // stack_page[B] = A (indirect page 2 write)
     { "istc",    0xDA,  ARGS_NONE },  // code[B] = A (indirect store to code page)
     { "istc_inc",0xD9,  ARGS_NONE },  // code[B] = A; B++ (istc with auto-increment)
     { "push_b",  0xF1,  ARGS_NONE },  // stack[SP] = B; SP-- (push B without touching A)

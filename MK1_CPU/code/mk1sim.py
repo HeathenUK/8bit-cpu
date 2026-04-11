@@ -1140,6 +1140,36 @@ def run_tests():
     results.append(ok_ci)
     print(f"  [{'PASS' if ok_ci else 'FAIL'}] CMPI: B preserved={cpu_ci.B}(99), outputs={cpu_ci.output_history}([0,1])")
 
+    # ── Test: DEREF2 (A = stack_page[A]) ──
+    cpu_d2 = MK1()
+    cpu_d2.mem[2][20] = 0x77  # stack page addr 20 = 0x77
+    code_d2 = bytearray(256)
+    code_d2[0] = 0x38; code_d2[1] = 20         # ldi $a, 20
+    code_d2[2] = 0xDD; code_d2[3] = 0          # deref2 (A = stack[A] = stack[20] = 0x77)
+    code_d2[4] = 0x06; code_d2[5] = 0          # out
+    code_d2[6] = 0x7F; code_d2[7] = 0          # hlt
+    cpu_d2.load_program(code_d2)
+    cpu_d2.run()
+    ok_d2 = cpu_d2.output_history == [0x77]
+    results.append(ok_d2)
+    print(f"  [{'PASS' if ok_d2 else 'FAIL'}] DEREF2: A=stack[A] (got {cpu_d2.output_history}, expect [0x77])")
+
+    # ── Test: IDEREF2 (stack_page[B] = A) ──
+    cpu_id2 = MK1()
+    code_id2 = bytearray(256)
+    code_id2[0] = 0x38; code_id2[1] = 0xAB     # ldi $a, 0xAB
+    code_id2[2] = 0x39; code_id2[3] = 50       # ldi $b, 50
+    code_id2[4] = 0xED; code_id2[5] = 0        # ideref2 (stack[50] = 0xAB)
+    code_id2[6] = 0x38; code_id2[7] = 50       # ldi $a, 50
+    code_id2[8] = 0xDD; code_id2[9] = 0        # deref2 (A = stack[50] = 0xAB)
+    code_id2[10] = 0x06; code_id2[11] = 0      # out
+    code_id2[12] = 0x7F; code_id2[13] = 0      # hlt
+    cpu_id2.load_program(code_id2)
+    cpu_id2.run()
+    ok_id2 = cpu_id2.output_history == [0xAB]
+    results.append(ok_id2)
+    print(f"  [{'PASS' if ok_id2 else 'FAIL'}] IDEREF2: stack[B]=A, readback via deref2 (got {cpu_id2.output_history}, expect [0xAB])")
+
     # ── Summary ──
     print()
     passed = sum(results)

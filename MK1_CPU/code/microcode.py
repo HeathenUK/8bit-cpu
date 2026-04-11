@@ -288,6 +288,13 @@ ucode_template[0xD6] = ('exrw 3', [MI|PO, RO|II|PE, XI|U0|U1, XI|E0|E1|AI|U0|U1,
 # DEREFP3: A = page3[A] — indirect read from page 3
 ucode_template[0xD5] = ('derefp3', [MI|PO, RO|II|PE, AO|MI, STK|HL|RO|AI, RST, RST, RST, RST], True)
 
+# DEREF2: A = stack_page[A] — indirect read from page 2 (stack page bottom)
+# Same as deref but STK instead of HL. Enables using unused stack page as overlay storage.
+ucode_template[0xDD] = ('deref2', [MI|PO, RO|II|PE, AO|MI, STK|RO|AI, RST, RST, RST, RST], False)
+
+# IDEREF2: stack_page[B] = A — indirect write to page 2 (stack page bottom)
+ucode_template[0xED] = ('ideref2', [MI|PO, RO|II|PE, BO|MI, STK|AO|RI, RST, RST, RST, RST], False)
+
 # ISTC: code[B] = A — indirect store to code page (no HL, no STK)
 ucode_template[0xDA] = ('istc', [MI|PO, RO|II|PE, BO|MI, AO|RI, RST, RST, RST, RST], True)
 

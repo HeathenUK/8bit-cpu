@@ -1461,16 +1461,20 @@ static void handleSerialCommand(const String& line) {
         }
         int codeBytes = r.code_size < CODE_SIZE ? r.code_size : CODE_SIZE;
         int dataBytes = r.data_size < DATA_SIZE ? r.data_size : DATA_SIZE;
+        int stkBytes = r.stack_size < DATA_SIZE ? r.stack_size : DATA_SIZE;
         int p3Bytes = r.page3_size < DATA_SIZE ? r.page3_size : DATA_SIZE;
         memcpy(uploadBuf, r.code, CODE_SIZE);
         uploadSize = CODE_SIZE;
-        if (dataBytes > 0 || p3Bytes > 0) {
+        if (dataBytes > 0 || stkBytes > 0 || p3Bytes > 0) {
             memcpy(uploadBuf + CODE_SIZE, r.data, dataBytes);
             memset(uploadBuf + CODE_SIZE + dataBytes, 0, DATA_SIZE - dataBytes);
             uploadSize = CODE_SIZE + DATA_SIZE;
         }
-        if (p3Bytes > 0) {
-            memset(uploadBuf + CODE_SIZE + DATA_SIZE, 0, DATA_SIZE);  // page 2 = zeros
+        if (stkBytes > 0 || p3Bytes > 0) {
+            // Page 2 (stack page): overlay data at bottom, zeros at top
+            memcpy(uploadBuf + CODE_SIZE + DATA_SIZE, r.stack, stkBytes);
+            memset(uploadBuf + CODE_SIZE + DATA_SIZE + stkBytes, 0, DATA_SIZE - stkBytes);
+            // Page 3
             memcpy(uploadBuf + CODE_SIZE + DATA_SIZE + DATA_SIZE, r.page3, p3Bytes);
             memset(uploadBuf + CODE_SIZE + DATA_SIZE + DATA_SIZE + p3Bytes, 0, DATA_SIZE - p3Bytes);
             uploadSize = CODE_SIZE + DATA_SIZE + DATA_SIZE + DATA_SIZE;

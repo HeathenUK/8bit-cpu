@@ -41,9 +41,11 @@ struct AsmError {
 struct AsmResult {
     uint8_t code[CODE_SIZE];
     uint8_t data[DATA_SIZE];
+    uint8_t stack[DATA_SIZE];   // page 2 (stack page) overlay storage
     uint8_t page3[DATA_SIZE];
     int code_size;
     int data_size;
+    int stack_size;
     int page3_size;
     AsmError errors[MAX_ERRORS];
     int error_count;
@@ -294,7 +296,12 @@ private:
         }
         if (codeEmitTarget == 1) {
             emitData(byte, pass1);
-            result.code_size++;  // advance code PC for label resolution
+            result.code_size++;
+            return;
+        }
+        if (codeEmitTarget == 2) {
+            emitStack(byte, pass1);
+            result.code_size++;
             return;
         }
         if (!pass1 && result.code_size < CODE_SIZE)
@@ -306,6 +313,12 @@ private:
         if (!pass1 && result.data_size < DATA_SIZE)
             result.data[result.data_size] = byte;
         result.data_size++;
+    }
+
+    void emitStack(uint8_t byte, bool pass1) {
+        if (!pass1 && result.stack_size < DATA_SIZE)
+            result.stack[result.stack_size] = byte;
+        result.stack_size++;
     }
 
     void emitPage3(uint8_t byte, bool pass1) {
@@ -362,11 +375,14 @@ private:
 
             // Handle "section" directive
             if (startsWith(lp, "section")) {
-                if (strstr(lp, "data_code")) {
-                    // Overlay code stored in data page: instructions parsed as code
-                    // (labels resolve at code PC) but bytes emitted to data buffer.
-                    bank = 0;  // parse as code
-                    codeEmitTarget = 1;  // emit to data page
+                if (strstr(lp, "stack_code")) {
+                    // Overlay code stored in stack page: labels at code PC, bytes to stack buffer
+                    bank = 0;
+                    codeEmitTarget = 2;  // emit to stack page (page 2)
+                } else if (strstr(lp, "data_code")) {
+                    // Overlay code stored in data page: labels at code PC, bytes to data buffer
+                    bank = 0;
+                    codeEmitTarget = 1;
                 } else if (strstr(lp, "page3_code")) {
                     // Overlay code stored in page 3: same but emit to page 3
                     bank = 0;
@@ -786,7 +802,7 @@ private:
                 if (rs >= 0 && rs < 4 && rd >= 0 && rd < 4) {
                     uint8_t opc = (0b11 << 6) | (op << 4) | (rs << 2) | rd;
                     // Check for reclaimed opcodes that are now special instructions
-                    static const uint8_t reclaimed[] = {0xC1,0xC2,0xC3,0xC5,0xC6,0xC7,0xD1,0xD2,0xD3,0xD5,0xD7,0xD9,0xDA,0xDB,0xDE,0xDF,0xE1,0xE2,0xE3,0xE6,0xE7,0xE9,0xF0,0xF1,0xF2,0xF3,0xF7,0xFD,0xFF,0};
+                    static const uint8_t reclaimed[] = {0xC1,0xC2,0xC3,0xC5,0xC6,0xC7,0xD1,0xD2,0xD3,0xD5,0xD7,0xD9,0xDA,0xDB,0xDD,0xDE,0xDF,0xE1,0xE2,0xE3,0xE6,0xE7,0xE9,0xED,0xF0,0xF1,0xF2,0xF3,0xF7,0xFD,0xFF,0};
                     bool collision = false;
                     for (int i = 0; reclaimed[i]; i++) {
                         if (opc == reclaimed[i]) { collision = true; break; }
