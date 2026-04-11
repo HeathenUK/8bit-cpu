@@ -709,6 +709,7 @@ static void handleRunCycles() {
     if (server.hasArg("us")) halfPeriodUs = server.arg("us").toInt();
     if (halfPeriodUs < 0) halfPeriodUs = 0;
     if (halfPeriodUs > 1000) halfPeriodUs = 1000;
+    bool noBreak = server.hasArg("nobreak");  // don't stop on OI — for multi-output programs
 
     stopCustomClock();
     // Detach OI interrupt — we'll poll OI directly in the clock loop
@@ -755,8 +756,10 @@ static void handleRunCycles() {
             oiCount++;
             lastOutputVal = val;
             outputCaptured = true;
-            GPIO.out_w1tc = clkMask;
-            break;
+            if (!noBreak) {
+                GPIO.out_w1tc = clkMask;
+                break;
+            }
         }
 
         // CLK LOW
@@ -771,7 +774,7 @@ static void handleRunCycles() {
             oiCount++;
             lastOutputVal = val;
             outputCaptured = true;
-            break;
+            if (!noBreak) break;
         }
     }
     pinMode(PIN_CLK, INPUT);
