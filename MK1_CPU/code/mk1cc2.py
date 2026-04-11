@@ -1344,18 +1344,41 @@ class MK1CodeGen:
         overlay_slots.sort(key=lambda x: -x[1])
         max_slot_size = overlay_slots[0][1] if overlay_slots else 0
 
-        # ── Overlay system ──
-        overlay_loader_size_actual = 40  # loader + cache check + arg save/restore
-        non_overlay_size = remaining_size + overlay_loader_size_actual
-        # OVERLAY_REGION must be ABOVE all resident code AND leave room for the overlay
-        OVERLAY_REGION = max(non_overlay_size + 2, 256 - max_slot_size)
-        if OVERLAY_REGION + max_slot_size > 256:
+        # ── Overlay system: choose SRAM or EEPROM tier ──
+        p3_loader_size = 40   # page 3 loader + cache + arg save
+        ee_loader_size = 60   # EEPROM loader (I2C setup + r2c_loop call + cache + arg)
+        # Count overlay call overhead: 4 bytes base (ldi + jal) + arg save per call
+        # Void functions: no arg save. 1-arg: 4 bytes. 2-arg: 7 bytes.
+        call_overhead = 5  # cache init (first call only)
+        for slot_funcs, _ in overlay_slots:
+            for name, _, _, _ in slot_funcs:
+                nparams = self.func_params.get(name.lstrip('_'), 0)
+                per_call = 4  # ldi $a,idx + jal
+                if nparams >= 1: per_call += 4  # push_b + ldi + iderefp3 + pop_b
+                if nparams >= 2: per_call += 3  # mov + ldi + iderefp3
+                call_overhead += per_call
+        # remaining_size already includes the original jal (2 bytes each), subtract those
+        original_call_bytes = len(overlay_slots) * 2  # approximate: 1 jal per slot
+        non_overlay_size_p3 = remaining_size - original_call_bytes + call_overhead + p3_loader_size
+        non_overlay_size_ee = remaining_size - original_call_bytes + call_overhead + ee_loader_size
+
+        # Try page 3 (SRAM) first
+        OVERLAY_REGION_P3 = max(non_overlay_size_p3 + 2, 256 - max_slot_size)
+        use_eeprom_tier = (OVERLAY_REGION_P3 + max_slot_size > 256)
+
+        if use_eeprom_tier:
+            # EEPROM tier: overlays load from AT24C32 via I2C
             import sys
-            print(f"WARNING: overlay won't fit. Resident={non_overlay_size}B, "
-                  f"largest slot={max_slot_size}B, region=0x{OVERLAY_REGION:02X}, "
-                  f"need {OVERLAY_REGION + max_slot_size}B > 256",
-                  file=sys.stderr)
-        META_SIZE = 2
+            OVERLAY_REGION = max(non_overlay_size_ee + 2, 256 - max_slot_size)
+            if OVERLAY_REGION + max_slot_size > 256:
+                print(f"WARNING: even EEPROM overlay won't fit. Resident={non_overlay_size_ee}B, "
+                      f"largest slot={max_slot_size}B", file=sys.stderr)
+            META_SIZE = 3  # [addr_hi, addr_lo, size]
+            print(f"Using EEPROM overlay tier (resident={non_overlay_size_ee}B, "
+                  f"region=0x{OVERLAY_REGION:02X}, {len(overlay_slots)} slots)", file=sys.stderr)
+        else:
+            OVERLAY_REGION = OVERLAY_REGION_P3
+            META_SIZE = 2  # [offset, size]
 
         overlay_meta = []
         overlay_asm_blocks = []
@@ -1417,14 +1440,18 @@ class MK1CodeGen:
                             ldi_b_line = new_code[-2]  # ldi $b,N
                             new_code = new_code[:-3]   # remove push, ldi, ldsp
                             new_code.append(ldi_b_line) # re-add just ldi $b,N
-                        # Save A and B to page3 before overlay load
-                        new_code.append(f'\tpush_b')       # save B (1 byte)
-                        new_code.append(f'\tldi $b,246')
-                        new_code.append(f'\tiderefp3')     # page3[246] = A (arg1)
-                        new_code.append(f'\tpop_b')        # restore B
-                        new_code.append(f'\tmov $b,$a')    # A = B (arg2)
-                        new_code.append(f'\tldi $b,247')
-                        new_code.append(f'\tiderefp3')     # page3[247] = B (arg2)
+                        # Save A and B to page3 (skip for void functions)
+                        # target is '_funcname', func_params key is 'funcname'
+                        nparams = self.func_params.get(target.lstrip('_'), 0)
+                        if nparams > 0:
+                            new_code.append(f'\tpush_b')
+                            new_code.append(f'\tldi $b,246')
+                            new_code.append(f'\tiderefp3')     # page3[246] = A (arg1)
+                            new_code.append(f'\tpop_b')
+                            if nparams > 1:
+                                new_code.append(f'\tmov $b,$a')
+                                new_code.append(f'\tldi $b,247')
+                                new_code.append(f'\tiderefp3') # page3[247] = B (arg2)
                         # Initialize overlay cache on first call (B is free here)
                         if not cache_init_emitted:
                             new_code.append(f'\tldi $a,0xFF')
@@ -1519,101 +1546,205 @@ class MK1CodeGen:
         # OVERLAY_REGION. Index*2 instead of index*3 for metadata lookup.
         # Loop uses cmp $c to check dst against precomputed end address,
         # eliminating the separate counter register.
-        META_SIZE = 2
-        p3_used = self.page3_alloc  # page 3 bytes already used by globals + LCD init
-
-        loader = [
-            '; ── Overlay loader with cache ──',
-            '_overlay_load:',
-            # Cache check: compare requested index with page3[249]
-            # page3[249] must be initialized to 0xFF before first call.
-            # This is done by the first overlay call itself (see below).
-            '\tmov $a,$c',                  # C = index (save)
-            '\tldi $a,249',
-            '\tderefp3',                    # A = page3[249] = cached index (0xFF if first call)
-            '\tcmp $c',                     # cached == requested?
-            '\tjz __ov_cached',              # skip copy if already loaded
-            # Update cache
-            '\tmov $c,$a',                  # A = index
-            '\tldi $b,249',
-            '\tiderefp3',                   # page3[249] = index
-            # Compute metadata offset
-            '\tsll',                        # A = index * 2 = metadata offset
-        ]
-        if p3_used > 0:
-            loader.append(f'\taddi {p3_used},$a')  # skip past pre-existing page 3 data
-        loader += [
-            '\tpush $a',                    # save meta_offset
-            '\tderefp3',                    # A = page3[offset] = src_offset
-            '\tmov $a,$d',                  # D = src (read pointer)
-            '\tpop $a',                     # A = meta_offset
-            '\tinc',
-            '\tderefp3',                    # A = page3[offset+1] = length
-            f'\taddi {OVERLAY_REGION},$a',  # A = OVERLAY_REGION + length = end addr
-            '\tmov $a,$c',                  # C = end address
-            f'\tldi $b,{OVERLAY_REGION}',   # B = dst (write pointer)
-            '.copy:',
-            '\tmov $d,$a',                  # A = src
-            '\tderefp3',                    # A = page3[src]
-            '\tistc',                       # code[B] = A
-            '\tmov $d,$a',
-            '\tinc',
-            '\tmov $a,$d',                  # D++ (src)
-            '\tmov $b,$a',
-            '\tinc',
-            '\tmov $a,$b',                  # B++ (dst)
-            '\tcmp $c',                     # dst == end?
-            '\tjnz .copy',                  # no: keep copying
-            '__ov_cached:',
-            # Restore args from page3 (saved by caller)
-            '\tldi $a,247',
-            '\tderefp3',                    # A = page3[247] = arg2 (B)
-            '\tmov $a,$b',                  # B = arg2
-            '\tldi $a,246',
-            '\tderefp3',                    # A = page3[246] = arg1
-            f'\tjal {OVERLAY_REGION}',         # call overlay; ret returns here
-            '\tret',                           # then return to caller of _overlay_load
-        ]
-
-        # ── Emit overlay code + metadata in page3, then resident code ──
-        # Order matters: page3_code section uses org to set virtual addresses
-        # for label resolution, then org 0 resets PC for resident code.
-
         p3_used = self.page3_alloc
-        META_SIZE_ACTUAL = 2
-        meta_table_size = len(overlay_meta) * META_SIZE_ACTUAL
-        p3_offset = p3_used + meta_table_size
 
-        # ── Place overlays: page 3 first, spill to page 1 ──
-        # Account for note table that will be emitted later
+        if use_eeprom_tier:
+            # ── EEPROM overlay loader ──
+            # Metadata in page3: 3 bytes per overlay [addr_hi, addr_lo, size]
+            # Overlay code in AT24C32 EEPROM, loaded via I2C at runtime
+            P3_COUNT = 242  # kernel scratch in page3
+            loader = [
+                '; ── EEPROM overlay loader with cache ──',
+                '_overlay_load:',
+                '\tmov $a,$c',                  # C = index
+                '\tldi $a,249',
+                '\tderefp3',                    # cached index
+                '\tcmp $c',
+                '\tjz __ov_cached',
+                '\tmov $c,$a',                  # A = index
+                '\tldi $b,249',
+                '\tiderefp3',                   # cache = index
+                # Compute metadata offset: index * 3
+                '\tmov $a,$d',                  # D = index
+                '\tsll',                        # A = index * 2
+                '\tadd $d,$a',                  # A = index * 3
+            ]
+            if p3_used > 0:
+                loader.append(f'\taddi {p3_used},$a')
+            loader += [
+                '\tmov $a,$d',                  # D = meta base
+                '\tderefp3',                    # A = addr_hi
+                '\tpush $a',                    # save hi
+                '\tmov $d,$a',
+                '\tinc',
+                '\tderefp3',                    # A = addr_lo
+                '\tpush $a',                    # save lo
+                '\tmov $d,$a',
+                '\tinc',
+                '\tinc',
+                '\tderefp3',                    # A = size
+                # Store size for __eeprom_r2c_loop
+                '\tpush $a',                    # save size
+                # I2C START + device write address
+                '\tddrb_imm 0x01',              # START
+                '\tddrb_imm 0x03',
+                '\tldi $a,0xAE',
+                '\tjal __i2c_sb',
+                # Send addr_hi (from stack)
+                '\tldsp 3',                     # A = hi (past: size, lo, hi)
+                '\tjal __i2c_sb',
+                # Send addr_lo
+                '\tldsp 2',                     # A = lo (past: size, lo)
+                '\tjal __i2c_sb',
+                # Repeated START + read
+                '\tddrb_imm 0x00',
+                '\tddrb_imm 0x01',
+                '\tddrb_imm 0x03',
+                '\tldi $a,0xAF',
+                '\tjal __i2c_sb',
+                # Bulk read to code page
+                f'\tldi $b,{OVERLAY_REGION}',
+                # count is on stack (top item after the ldsp reads)
+                '\tjal __eeprom_r2c_loop',
+                # Clean stack (3 items: size, lo, hi)
+                '\tpop $a',
+                '\tpop $a',
+                '\tpop $a',
+                '__ov_cached:',
+                '\tldi $a,247',
+                '\tderefp3',
+                '\tmov $a,$b',
+                '\tldi $a,246',
+                '\tderefp3',
+                f'\tjal {OVERLAY_REGION}',
+                '\tret',
+            ]
+        else:
+            # ── Page 3 SRAM overlay loader ──
+            loader = [
+                '; ── Page 3 overlay loader with cache ──',
+                '_overlay_load:',
+                '\tmov $a,$c',
+                '\tldi $a,249',
+                '\tderefp3',
+                '\tcmp $c',
+                '\tjz __ov_cached',
+                '\tmov $c,$a',
+                '\tldi $b,249',
+                '\tiderefp3',
+                '\tsll',                        # index * 2
+            ]
+            if p3_used > 0:
+                loader.append(f'\taddi {p3_used},$a')
+            loader += [
+                '\tpush $a',
+                '\tderefp3',
+                '\tmov $a,$d',
+                '\tpop $a',
+                '\tinc',
+                '\tderefp3',
+                f'\taddi {OVERLAY_REGION},$a',
+                '\tmov $a,$c',
+                f'\tldi $b,{OVERLAY_REGION}',
+                '.copy:',
+                '\tmov $d,$a',
+                '\tderefp3',
+                '\tistc_inc',
+                '\tpush_b',
+                '\tmov $d,$a',
+                '\tinc',
+                '\tmov $a,$d',
+                '\tpop_b',
+                '\tcmp $c',
+                '\tjnz .copy',
+                '__ov_cached:',
+                '\tldi $a,247',
+                '\tderefp3',
+                '\tmov $a,$b',
+                '\tldi $a,246',
+                '\tderefp3',
+                f'\tjal {OVERLAY_REGION}',
+                '\tret',
+            ]
+
+        # ── Emit overlay code + metadata ──
+        p3_used = self.page3_alloc
+        meta_table_size = len(overlay_meta) * META_SIZE
         note_table_size = len(getattr(self, '_note_table', [])) * 3
-        p3_capacity = 240 - p3_used - (len(overlay_meta) * META_SIZE) - note_table_size
-        p1_capacity = 256 - self.data_alloc  # page1 space after globals
 
-        # Assign each overlay slot to a page
-        p3_overlays = []  # (idx, name, lines, fsize) — go to page3_code
-        p1_overlays = []  # (idx, name, lines, fsize) — go to data_code (page 1)
-        p3_code_offset = p3_used + len(overlay_meta) * META_SIZE
-        p1_code_offset = self.data_alloc
+        if use_eeprom_tier:
+            # EEPROM tier: overlay code goes to EEPROM, metadata in page3
+            EEPROM_BASE = getattr(self, 'eeprom_base', 0x0200)
+            eeprom_offset = EEPROM_BASE
 
-        for idx, (name, asm_lines, fsize) in enumerate(overlay_asm_blocks):
-            if fsize <= p3_capacity:
-                p3_overlays.append((idx, name, asm_lines, fsize, p3_code_offset))
-                p3_code_offset += fsize
-                p3_capacity -= fsize
-            elif fsize <= p1_capacity:
-                p1_overlays.append((idx, name, asm_lines, fsize, p1_code_offset))
-                p1_code_offset += fsize
-                p1_capacity -= fsize
-            else:
-                import sys
-                print(f"WARNING: overlay {name} ({fsize}B) doesn't fit in p3 ({p3_capacity}B) "
-                      f"or p1 ({p1_capacity}B)", file=sys.stderr)
-                # Force into page 3 anyway
-                p3_overlays.append((idx, name, asm_lines, fsize, p3_code_offset))
-                p3_code_offset += fsize
+            # Phase 1: metadata in page3 [addr_hi, addr_lo, size]
+            assembled = []
+            assembled.append('\tsection page3')
+            for idx, name, fsize in overlay_meta:
+                hi = (eeprom_offset >> 8) & 0xFF
+                lo = eeprom_offset & 0xFF
+                assembled.append(f'\tbyte {hi}')
+                assembled.append(f'\tbyte {lo}')
+                assembled.append(f'\tbyte {fsize}')
+                eeprom_offset += fsize
 
-        has_p1 = len(p1_overlays) > 0
+            # Phase 2: overlay code assembled for label resolution
+            # Each slot gets its own org reset to OVERLAY_REGION
+            for idx, (name, asm_lines, fsize) in enumerate(overlay_asm_blocks):
+                assembled.append('\tsection code')
+                assembled.append(f'\torg {OVERLAY_REGION}')
+                assembled.append('\tsection page3_code')  # labels at code PC, bytes to page3
+                assembled.extend(asm_lines)
+
+            # Phase 3: resident code
+            assembled.append('\tsection code')
+            assembled.append('\torg 0')
+
+            # Update page3_alloc for note table
+            total_p3 = meta_table_size  # only metadata in page3 (overlay code in EEPROM)
+            self.page3_alloc = p3_used + total_p3
+
+            # Store overlay data for upload tool to write to EEPROM
+            self._eeprom_overlay_data = []
+            for idx, (name, asm_lines, fsize) in enumerate(overlay_asm_blocks):
+                self._eeprom_overlay_data.append({
+                    'name': name, 'size': fsize,
+                    'eeprom_addr': EEPROM_BASE + sum(f for _, _, f in overlay_meta[:idx])
+                })
+
+            # p3/p1 overlay lists (empty for EEPROM tier — all go to EEPROM)
+            p3_overlays = []
+            p1_overlays = []
+            has_p1 = False
+
+        else:
+            # SRAM tier: overlay code in page3 / page1
+            p3_offset = p3_used + meta_table_size
+            p3_capacity = 240 - p3_used - meta_table_size - note_table_size
+            p1_capacity = 256 - self.data_alloc
+
+            p3_overlays = []
+            p1_overlays = []
+            p3_code_offset = p3_used + meta_table_size
+            p1_code_offset = self.data_alloc
+
+            for idx, (name, asm_lines, fsize) in enumerate(overlay_asm_blocks):
+                if fsize <= p3_capacity:
+                    p3_overlays.append((idx, name, asm_lines, fsize, p3_code_offset))
+                    p3_code_offset += fsize
+                    p3_capacity -= fsize
+                elif fsize <= p1_capacity:
+                    p1_overlays.append((idx, name, asm_lines, fsize, p1_code_offset))
+                    p1_code_offset += fsize
+                    p1_capacity -= fsize
+                else:
+                    import sys
+                    print(f"WARNING: overlay {name} ({fsize}B) doesn't fit in p3 ({p3_capacity}B) "
+                          f"or p1 ({p1_capacity}B)", file=sys.stderr)
+                    p3_overlays.append((idx, name, asm_lines, fsize, p3_code_offset))
+                    p3_code_offset += fsize
+
+            has_p1 = len(p1_overlays) > 0
 
         # Phase 1: emit metadata into page3
         # For page 3 overlays: src_offset is in page 3
