@@ -340,6 +340,7 @@ private:
             memset(result.code, 0x7F, CODE_SIZE);
             result.code_size = 0;
             result.data_size = 0;
+            result.stack_size = 0;
             result.page3_size = 0;
         }
 
