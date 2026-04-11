@@ -1244,7 +1244,9 @@ class MK1CodeGen:
             # or needed across all overlays). Other helpers CAN be overlayed if only
             # called from one overlay group (e.g. __i2c_sb only needed by init_audio).
             _NO_OVERLAY = {'_main:',
-                           '__tone_setup:', '__tone:', '__play_note:', '__delay_Nms:',
+                           '__i2c_sb:', '__i2c_st:', '__i2c_st_only:', '__i2c_sp:', '__i2c_rb:',
+                           '__delay_cal:', '__delay_Nms:',
+                           '__tone_setup:', '__tone:', '__play_note:',
                            '__lcd_chr:', '__lcd_cmd:', '__lcd_send:',
                            '__eeprom_r2c_loop:', '__eeprom_dispatch:', '__eeprom_load:',
                            '_overlay_load:', '_overlay_load_p1:'}
@@ -1343,13 +1345,15 @@ class MK1CodeGen:
         max_slot_size = overlay_slots[0][1] if overlay_slots else 0
 
         # ── Overlay system ──
-        overlay_loader_size_actual = 27
+        overlay_loader_size_actual = 40  # loader + cache check + arg save/restore
         non_overlay_size = remaining_size + overlay_loader_size_actual
-        OVERLAY_REGION = 256 - max_slot_size
-        if OVERLAY_REGION < non_overlay_size + 2:
+        # OVERLAY_REGION must be ABOVE all resident code AND leave room for the overlay
+        OVERLAY_REGION = max(non_overlay_size + 2, 256 - max_slot_size)
+        if OVERLAY_REGION + max_slot_size > 256:
             import sys
             print(f"WARNING: overlay won't fit. Resident={non_overlay_size}B, "
-                  f"largest slot={max_slot_size}B, total={non_overlay_size+max_slot_size}B > 256",
+                  f"largest slot={max_slot_size}B, region=0x{OVERLAY_REGION:02X}, "
+                  f"need {OVERLAY_REGION + max_slot_size}B > 256",
                   file=sys.stderr)
         META_SIZE = 2
 
