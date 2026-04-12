@@ -1829,6 +1829,8 @@ class MK1CodeGen:
                 loader += [
                     '\tmov $c,$a',          # A = src addr
                     f'\t{deref_op}',        # A = page[src]
+                    '\tnop',                # settle page selectors
+                    '\tnop',                # (2 NOPs = 6 extra clocks between page switch)
                     '\tistc_inc',           # code[B] = A; B++
                     '\tmov $c,$a',          # A = src (from C, still valid)
                     '\tinc',                # A = src + 1
@@ -2162,7 +2164,8 @@ class MK1CodeGen:
         # The kernel image = loader + runtime_helpers + runtime_main (NOT full main).
         # The earlier sizing used main_lines (pre-extraction) which includes VIA init etc.
         actual_main_size = measure_lines(runtime_main_lines)
-        KERNEL_SIZE = loader_size + actual_main_size + runtime_helper_size
+        RESET_STUB = 2  # j _main at code[0] for reset safety
+        KERNEL_SIZE = RESET_STUB + loader_size + actual_main_size + runtime_helper_size
         OVERLAY_REGION = KERNEL_SIZE
         meta_base = max(p3_used, KERNEL_SIZE)
         # Recompute p3 overlay offsets
@@ -2177,10 +2180,10 @@ class MK1CodeGen:
                                         has_p1, has_p2, has_p3,
                                         len(p3_overlays), len(p1_overlays))
         loader_size = measure_lines(loader)
-        KERNEL_SIZE = loader_size + actual_main_size + runtime_helper_size
+        KERNEL_SIZE = RESET_STUB + loader_size + actual_main_size + runtime_helper_size
         OVERLAY_REGION = KERNEL_SIZE
         # Verify kernel sizing
-        actual_total = measure_lines(loader + runtime_resident_helpers + runtime_main_lines)
+        actual_total = RESET_STUB + measure_lines(loader + runtime_resident_helpers + runtime_main_lines)
         if actual_total != KERNEL_SIZE:
             raise Exception(
                 f"KERNEL SIZE MISMATCH: sum components={KERNEL_SIZE} vs measured={actual_total}. "
@@ -2196,6 +2199,8 @@ class MK1CodeGen:
             '.selfcopy_loop:',
             '\tmov $d,$a',                      # A = src addr
             '\tderefp3',                        # A = page3[src]
+            '\tnop',                            # settle page selectors
+            '\tnop',
             '\tistc_inc',                       # code[B] = A; B++
             '\tmov $d,$a',                      # A = src
             '\tinc',
@@ -2214,7 +2219,12 @@ class MK1CodeGen:
         assembled.append('\tsection code')
         assembled.append('\torg 0')
         assembled.append('\tsection page3_code')
-        # Kernel = overlay_load + runtime helpers + main
+        # Kernel = j _main + overlay_load + runtime helpers + main
+        # The jump at code[0] ensures physical reset (PC=0) lands in _main,
+        # not in overlay_load (which would crash without call context).
+        # After first run, page3 has calibrated ipm and precomputed note table,
+        # so _main can replay without re-calibrating.
+        assembled.append('\tj _main')
         assembled.extend(loader)
         assembled.extend(runtime_resident_helpers)
         assembled.extend(runtime_main_lines)
@@ -4047,9 +4057,9 @@ class MK1CodeGen:
                 dur = self._const_eval(args[1])
                 if freq is None or dur is None:
                     raise Exception("tone() requires constant arguments")
-                ratio = round(8000 / freq)
+                ratio = round(4000 / freq)
                 if ratio > 255 or ratio < 1:
-                    raise Exception(f"tone frequency {freq}Hz out of range (~32Hz-8kHz)")
+                    raise Exception(f"tone frequency {freq}Hz out of range (~16Hz-4kHz)")
                 total_cycles = freq * dur // 1000
                 if total_cycles < 1:
                     return  # too short to play

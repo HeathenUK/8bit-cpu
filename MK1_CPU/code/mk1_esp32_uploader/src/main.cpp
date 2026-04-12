@@ -209,10 +209,9 @@ static void startCustomClock(int hz) {
 
     if (hz < 150) hz = 150;  // LEDC prescaler can't go lower than ~150Hz
 
-    // Use 1-bit resolution for all frequencies — gives exact 50% duty
-    // and accurate frequency via integer prescaler (80MHz / (prescaler * 2))
-    uint8_t resolution = 1;
-    uint32_t duty = 1;  // 50% at 1-bit resolution
+    // Use 8-bit resolution for proper clock output
+    uint8_t resolution = 8;
+    uint32_t duty = 128;  // 50% at 8-bit resolution
 
     ledcSetup(CLK_LEDC_CHANNEL, hz, resolution);
     ledcAttachPin(PIN_CLK, CLK_LEDC_CHANNEL);
@@ -533,9 +532,12 @@ static inline uint8_t IRAM_ATTR readBusFast() {
 }
 
 static void IRAM_ATTR onOIRising() {
+    // Verify OI is still HIGH — filters glitches and late ISR arrivals
+    // where the bus no longer holds the output value.
+    if (!(GPIO.in & oiGpioMask)) return;
     uint8_t val = readBusFast();
     if (oiCount < 256) oiHistory[oiCount] = val;
-    oiCount++;  // always count, even if value is same (for rate measurement)
+    oiCount++;
     lastOutputVal = val;
     outputCaptured = true;
 }
