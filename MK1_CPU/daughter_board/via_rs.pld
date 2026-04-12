@@ -2,23 +2,30 @@ GAL16V8    ; VIA register select latch for MK1 daughter board
 VIA_RS     ;
 
 CLK   E0    E1    D0    D1    NC    NC    NC    NC   GND
-/OE   NC    NC    NC    NC    NC    nCS2  RS3   RS2  VCC
+/OE   NC    NC    NC    NC    NC    nCS2  /RS3  /RS2 VCC
 
 
-; RS2 latch: capture D0 when E1=HIGH and E0=LOW, else hold
-; .R = registered output (clocked by CLK = MK1 system clock)
+; RS2/RS3 are ACTIVE-LOW outputs.
+; ATF16V8B registered outputs power up HIGH (non-asserted).
+; Active-low: HIGH pin = RS line LOW = registers 0-3 at power-up. CORRECT.
+;
+; To set RS2=1 (access registers 4+): capture D0=1 → register=0 → pin HIGH?
+; No — with active-low, register=0 → pin=HIGH (not asserted) → RS=1.
+; So: capture /D0 into register. D0=1 → reg=0 → pin=HIGH → RS2=1.
+;     D0=0 → reg=1 → pin=LOW → RS2=0.
+;
+; Latch when E1=HIGH and E0=LOW (new "exrs" opcode). Hold otherwise.
 
-RS2.R  =  D0 * E1 * /E0
+/RS2.R =  /D0 * E1 * /E0
         + RS2 * /E1
         + RS2 * E0
 
-; RS3 latch: capture D1 when E1=HIGH and E0=LOW, else hold
-
-RS3.R  =  D1 * E1 * /E0
+/RS3.R =  /D1 * E1 * /E0
         + RS3 * /E1
         + RS3 * E0
 
-; ~CS2: VIA selected when E0 is HIGH (active-low output)
+; ~CS2: active-low output. Currently VIA ~CS2 is wired to GND (always selected).
+; This output is available for future PHI2=CLK mode where ~CS2 must gate on E0.
 
 nCS2   =  /E0
 
@@ -28,21 +35,20 @@ DESCRIPTION
 ATF16V8B on MK1 VIA daughter board.
 Expands VIA register access from 4 to 16 registers.
 
-RS2/RS3 are latched from data bus D0/D1 when E1 rises
-without E0 (new "exrs" opcode). Normal VIA operations
-(E0 asserted) hold the latch unchanged.
+RS2/RS3 use ACTIVE-LOW polarity so power-up state (HIGH) = RS=0
+= registers 0-3 accessible immediately. No pull-downs needed.
 
-~CS2 gates VIA chip-select so it only responds when E0
-is asserted. VIA PHI2 is wired to MK1 CLK directly for
-continuous timer counting (PB7 free-run audio).
+Latch captures /D0 and /D1 when E1 asserts without E0 (exrs opcode).
+The inversion compensates for the active-low output: writing D0=1
+produces RS2=1 on the VIA.
 
 Connections:
-  Pin 1  CLK  = MK1 system clock (from TP2)
+  Pin 1  CLK  = J4 pin 15 (MK1 CLK)
   Pin 2  E0   = J4 pin 5
   Pin 3  E1   = J4 pin 7
   Pin 4  D0   = J4 pin 2 (data bus)
   Pin 5  D1   = J4 pin 4 (data bus)
   Pin 11 /OE  = GND (always enabled)
-  Pin 17 nCS2 = VIA pin 23 (~CS2, was GND)
-  Pin 18 RS3  = VIA pin 35 (was GND)
-  Pin 19 RS2  = VIA pin 36 (was GND)
+  Pin 17 nCS2 = (not connected — VIA ~CS2 on GND for now)
+  Pin 18 /RS3 = VIA pin 35 (active-low: HIGH=0, LOW=1)
+  Pin 19 /RS2 = VIA pin 36 (active-low: HIGH=0, LOW=1)

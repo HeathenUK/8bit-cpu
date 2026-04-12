@@ -1,19 +1,19 @@
 
 
-Pin 19 = RS2          XOR = 1   AC1 = 0
-  0  -x-- x--- x--- ---- ---- ---- ---- ----
-  1  --x- -x-- ---- ---- ---- ---- ---- ----
-  2  x-x- ---- ---- ---- ---- ---- ---- ----
+Pin 19 = /RS2         XOR = 1   AC1 = 0
+  0  -x-- x--- -x-- ---- ---- ---- ---- ----
+  1  ---x -x-- ---- ---- ---- ---- ---- ----
+  2  x--x ---- ---- ---- ---- ---- ---- ----
   3  xxxx xxxx xxxx xxxx xxxx xxxx xxxx xxxx
   4  xxxx xxxx xxxx xxxx xxxx xxxx xxxx xxxx
   5  xxxx xxxx xxxx xxxx xxxx xxxx xxxx xxxx
   6  xxxx xxxx xxxx xxxx xxxx xxxx xxxx xxxx
   7  xxxx xxxx xxxx xxxx xxxx xxxx xxxx xxxx
 
-Pin 18 = RS3          XOR = 1   AC1 = 0
-  8  -x-- x--- ---- x--- ---- ---- ---- ----
-  9  ---- -xx- ---- ---- ---- ---- ---- ----
- 10  x--- --x- ---- ---- ---- ---- ---- ----
+Pin 18 = /RS3         XOR = 1   AC1 = 0
+  8  -x-- x--- ---- -x-- ---- ---- ---- ----
+  9  ---- -x-x ---- ---- ---- ---- ---- ----
+ 10  x--- ---x ---- ---- ---- ---- ---- ----
  11  xxxx xxxx xxxx xxxx xxxx xxxx xxxx xxxx
  12  xxxx xxxx xxxx xxxx xxxx xxxx xxxx xxxx
  13  xxxx xxxx xxxx xxxx xxxx xxxx xxxx xxxx
