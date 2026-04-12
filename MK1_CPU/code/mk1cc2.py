@@ -857,23 +857,31 @@ class MK1CodeGen:
         # SCL dedup (2 ddrb_imm per bit instead of 3)
         if '__i2c_rb' in helpers:
             lbl_rb = self.label('rb')
+            lbl_rz = self.label('rz')
             self.emit('__i2c_rb:')
-            self.emit('\tldi $d,0')
-            self.emit('\tldi $c,8')
+            # Read one I2C byte into D (8 bits MSB first).
+            # exrw 0 clobbers A and C. Only B and D are safe.
+            # B = byte accumulator, D = counter. Result → D at end.
+            self.emit('\tldi $b,0')        # B = accumulated byte
+            self.emit('\tldi $d,8')        # D = bit counter
             self.emit(f'{lbl_rb}:')
+            self.emit('\tmov $b,$a')       # A = accumulated
+            self.emit('\tsll')             # A <<= 1
+            self.emit('\tmov $a,$b')       # B = shifted
             self.emit('\tddrb_imm 0x00')   # SCL HIGH
-            self.emit('\texrw 0')          # A = port B
-            self.emit('\tandi 0x01,$a')    # isolate SDA
-            self.emit('\tmov $a,$b')       # B = SDA bit
-            self.emit('\tmov $d,$a')       # A = accumulated byte
-            self.emit('\tsll')             # shift left
-            self.emit('\tor $b,$a')        # OR in SDA bit
-            self.emit('\tmov $a,$d')       # D = result
+            self.emit('\texrw 0')          # A = port B (clobbers C)
+            self.emit('\ttst 0x01')        # test SDA
+            self.emit(f'\tjz {lbl_rz}')
+            self.emit('\tmov $b,$a')       # A = accumulated
+            self.emit('\tori 0x01,$a')     # set bit 0
+            self.emit('\tmov $a,$b')       # B = result
+            self.emit(f'{lbl_rz}:')
             self.emit('\tddrb_imm 0x02')   # SCL LOW
-            self.emit('\tmov $c,$a')
+            self.emit('\tmov $d,$a')       # A = counter
             self.emit('\tdec')
-            self.emit('\tmov $a,$c')
+            self.emit('\tmov $a,$d')       # D--
             self.emit(f'\tjnz {lbl_rb}')
+            self.emit('\tmov $b,$d')       # D = B (result)
             self.emit('\tret')
 
         if '__lcd_init' in helpers:
