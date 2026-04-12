@@ -140,6 +140,7 @@ public:
 
         // Pass 2: emit code
         lastGlobalLabel[0] = 0;
+        codeEmitTarget = 0;  // reset — pass 1 may have left this as page3
         pass(source, false);
     }
 

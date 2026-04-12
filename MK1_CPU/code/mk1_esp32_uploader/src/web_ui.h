@@ -93,6 +93,7 @@ main { flex: 1; display: flex; flex-direction: column; overflow: hidden; min-hei
     <option value="250000">250 kHz</option>
     <option value="500000">500 kHz (max)</option>
   </select>
+  <button class="btn btn-sec" onclick="i2cScan()">I2C Scan</button>
   <button class="btn btn-run" onclick="asmRun()">Assemble &amp; Run</button>
 </header>
 <div id="cpubar">
@@ -252,6 +253,26 @@ async function asmRun() {
 async function mk1reset() {
   await fetch('/reset', { method: 'POST' });
   document.getElementById('status').textContent = 'Reset';
+}
+
+async function i2cScan() {
+  const o = document.getElementById('output');
+  o.innerHTML = '<span class="info">Scanning I2C bus (0x08-0x77)...</span>';
+  document.getElementById('status').textContent = 'I2C Scanning...';
+  try {
+    const r = await fetch('/i2cscan');
+    const j = await r.json();
+    if (j.found && j.found.length > 0) {
+      let msg = 'I2C devices found:\\n' + j.found.map(d => '  ' + d.hex + ' (7-bit)  W:' + d.write + ' R:' + d.read).join('\\n');
+      o.innerHTML = '<span class="ok">' + esc(msg) + '</span>';
+    } else {
+      o.innerHTML = '<span class="err">No I2C devices found</span>';
+    }
+    document.getElementById('status').textContent = j.found.length + ' device(s)';
+  } catch(e) {
+    o.innerHTML = '<span class="err">I2C scan failed: ' + esc(e.message) + '</span>';
+    document.getElementById('status').textContent = 'Scan failed';
+  }
 }
 
 async function mk1halt() {

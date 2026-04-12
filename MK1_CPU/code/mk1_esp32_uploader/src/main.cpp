@@ -56,6 +56,7 @@ static int uploadSize = 0;
 static void autoSaveSource(const String& source);
 static void startOIMonitor();
 static void stopOIMonitor();
+static int readDS3231Temp();
 
 // ── Clock measurement ────────────────────────────────────────────────
 
@@ -862,30 +863,157 @@ static void handleProbe() {
     enableCU();
 }
 
-// ── ESP32 direct I2C scan (bypasses MK1, uses Wire library) ─────────
-// Connect display SDA/SCL directly to ESP32 A6/A7 for this test
-static void handleI2CScan() {
-    Wire.begin(A6, A7);  // SDA=A6, SCL=A7
-    Wire.setClock(100000);  // 100kHz standard mode
+// ── MK1 VIA I2C scan — scans addresses 0x08-0x77 via daughter board ──
+static int runI2CScanAddr(uint8_t addr) {
+    // Build a scan program for a single 7-bit I2C address.
+    // Returns 1 if ACK (device found), 0 if NACK, -1 on error.
+    uint8_t writeAddr = addr << 1;  // 7-bit addr → 8-bit write addr
+    char asmBuf[2048];
+    snprintf(asmBuf, sizeof(asmBuf),
+        "; I2C scan address 0x%02X\n"
+        "    ldi $d, 0\n"
+        ".dly:\n"
+        "    dec\n"
+        "    jnz .dly\n"
+        "    clr $a\n"
+        "    exw 0 0\n"
+        "    ddrb_imm 0x00\n"
+        "    clr $a\n"
+        "    exw 0 3\n"
+        // Bus recovery
+        "    ldi $c, 9\n"
+        ".rcv:\n"
+        "    ddrb_imm 0x00\n"
+        "    ddrb_imm 0x02\n"
+        "    mov $c, $a\n"
+        "    dec\n"
+        "    mov $a, $c\n"
+        "    jnz .rcv\n"
+        "    ddrb_imm 0x03\n"
+        "    ddrb_imm 0x01\n"
+        "    ddrb_imm 0x00\n"
+        // START
+        "    exrw 2\n"
+        "    ddrb_imm 0x01\n"
+        "    ddrb_imm 0x03\n"
+        // Send address byte
+        "    ldi $a, 0x%02X\n"
+        "    jal __sb\n"
+        // Check ACK (bit 0 of last exrw 0 in __sb)
+        "    tst 0x01\n"
+        "    jnz .nack\n"
+        // STOP
+        "    ddrb_imm 0x03\n"
+        "    ddrb_imm 0x01\n"
+        "    ddrb_imm 0x00\n"
+        "    out_imm 1\n"
+        "    hlt\n"
+        ".nack:\n"
+        "    ddrb_imm 0x03\n"
+        "    ddrb_imm 0x01\n"
+        "    ddrb_imm 0x00\n"
+        "    out_imm 0\n"
+        "    hlt\n"
+        "__sb:\n"
+        "    mov $a, $b\n"
+        "    ldi $a, 8\n"
+        "    mov $a, $c\n"
+        ".isb:\n"
+        "    mov $b, $a\n"
+        "    tst 0x80\n"
+        "    jnz .isbh\n"
+        "    ddrb_imm 0x03\n"
+        "    ddrb_imm 0x01\n"
+        "    ddrb_imm 0x03\n"
+        "    j .isbn\n"
+        ".isbh:\n"
+        "    ddrb_imm 0x02\n"
+        "    ddrb_imm 0x00\n"
+        "    ddrb_imm 0x02\n"
+        ".isbn:\n"
+        "    mov $b, $a\n"
+        "    sll\n"
+        "    mov $a, $b\n"
+        "    mov $c, $a\n"
+        "    dec\n"
+        "    mov $a, $c\n"
+        "    jnz .isb\n"
+        "    ddrb_imm 0x02\n"
+        "    ddrb_imm 0x00\n"
+        "    exrw 0\n"
+        "    ddrb_imm 0x02\n"
+        "    ret\n",
+        addr, writeAddr
+    );
 
+    assembler.assemble(asmBuf);
+    const AsmResult& r = assembler.result;
+    if (r.error_count != 0) return -1;
+
+    memcpy(uploadBuf, r.code, CODE_SIZE);
+    uploadSize = CODE_SIZE;
+    uploadToMK1(uploadBuf, uploadSize);
+
+    // RESET + RUN (same proven sequence as readDS3231Temp)
+    disableClock();
+    resetPulse();
+    enableCU();
+
+    stopCustomClock();
+    if (oiMonitorActive) detachInterrupt(digitalPinToInterrupt(PIN_OI));
+    outputCaptured = false;
+    oiCount = 0;
+
+    int oiGpio = digitalPinToGPIONumber(PIN_OI);
+    if (oiGpio < 0) oiGpio = PIN_OI;
+    uint32_t oiMask = 1 << oiGpio;
+
+    busSetInput(); disableOutput();
+    digitalWrite(PIN_DIR, LOW); enableOutput();
+
+    int clkGpio = digitalPinToGPIONumber(PIN_CLK);
+    uint32_t clkMask = 1 << clkGpio;
+    pinMode(PIN_CLK, OUTPUT);
+    digitalWrite(PIN_CLK, LOW);
+
+    int result = -1;
+    for (int i = 0; i < 20000; i++) {
+        GPIO.out_w1ts = clkMask;
+        delayMicroseconds(1);
+        if (GPIO.in & oiMask) {
+            result = readBusFast();
+            GPIO.out_w1tc = clkMask;
+            break;
+        }
+        GPIO.out_w1tc = clkMask;
+        delayMicroseconds(1);
+        if (GPIO.in & oiMask) {
+            result = readBusFast();
+            break;
+        }
+    }
+    pinMode(PIN_CLK, INPUT);
+    disableOutput(); digitalWrite(PIN_DIR, HIGH);
+    busSetOutput(); enableOutput();
+
+    return result;
+}
+
+static void handleI2CScan() {
     String json = "{\"found\":[";
     bool first = true;
-    for (uint8_t addr = 1; addr < 127; addr++) {
-        Wire.beginTransmission(addr);
-        uint8_t err = Wire.endTransmission();
-        if (err == 0) {
+    for (uint8_t addr = 0x08; addr <= 0x77; addr++) {
+        int r = runI2CScanAddr(addr);
+        if (r == 1) {
             if (!first) json += ",";
-            json += String(addr);
+            json += "{\"addr\":" + String(addr) + ",\"hex\":\"0x" +
+                    String(addr, HEX) + "\",\"write\":\"0x" +
+                    String(addr << 1, HEX) + "\",\"read\":\"0x" +
+                    String((addr << 1) | 1, HEX) + "\"}";
             first = false;
         }
     }
     json += "]}";
-
-    Wire.end();
-    // Restore A6/A7 to their normal functions
-    pinMode(A6, INPUT);   // ~RO: high-Z
-    pinMode(A7, INPUT);
-
     server.send(200, "application/json", json);
 }
 
@@ -1688,6 +1816,155 @@ static void handleSerialCommand(const String& line) {
         enableCU();
         Serial.println("{\"ok\":true}");
     }
+    else if (line == "TEMP") {
+        // Read DS3231 temperature and display on 7-seg
+        int tempC = readDS3231Temp();
+        if (tempC >= 0) {
+            Serial.printf("{\"ok\":true,\"temp\":%d}\n", tempC);
+        } else {
+            Serial.println("{\"ok\":false,\"error\":\"temp read failed\"}");
+        }
+    }
+    else if (line == "NTPSYNC") {
+        // Force NTP resync + RTC set + temperature display
+        if (!staMode) {
+            Serial.println("{\"ok\":false,\"error\":\"not in STA mode\"}");
+        } else {
+            configTzTime("GMT0BST,M3.5.0/1,M10.5.0/2", "pool.ntp.org", "time.google.com");
+            // Invalidate cached time to force re-sync
+            struct timeval tv = {0, 0};
+            settimeofday(&tv, NULL);
+            Serial.print("NTP sync...");
+            int ntpTries = 0;
+            while (time(NULL) < 1000000000 && ntpTries < 20) {
+                delay(500);
+                ntpTries++;
+            }
+            if (time(NULL) > 1000000000) {
+                struct tm t;
+                getLocalTime(&t);
+                Serial.printf(" OK: %04d-%02d-%02d %02d:%02d:%02d\n",
+                    t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
+                    t.tm_hour, t.tm_min, t.tm_sec);
+                // Set RTC — reuse the same assembly as boot
+                auto toBCD = [](int v) -> uint8_t { return ((v / 10) << 4) | (v % 10); };
+                char asmBuf[2048];
+                snprintf(asmBuf, sizeof(asmBuf),
+                    "; NTP -> DS3231 RTC sync\n"
+                    "    ldi $d, 0\n"
+                    ".dly:\n"
+                    "    dec\n"
+                    "    jnz .dly\n"
+                    "    clr $a\n"
+                    "    exw 0 0\n"
+                    "    ddrb_imm 0x00\n"
+                    "    clr $a\n"
+                    "    exw 0 3\n"
+                    "    push $a\n"
+                    "    pop $a\n"
+                    "    jal __i2c_st\n"
+                    "    ldi $a, 0xD0\n"
+                    "    jal __i2c_sb\n"
+                    "    clr $a\n"
+                    "    jal __i2c_sb\n"
+                    "    ldi $a, 0x%02X\n"
+                    "    jal __i2c_sb\n"
+                    "    ldi $a, 0x%02X\n"
+                    "    jal __i2c_sb\n"
+                    "    ldi $a, 0x%02X\n"
+                    "    jal __i2c_sb\n"
+                    "    ldi $a, 0x%02X\n"
+                    "    jal __i2c_sb\n"
+                    "    ldi $a, 0x%02X\n"
+                    "    jal __i2c_sb\n"
+                    "    ldi $a, 0x%02X\n"
+                    "    jal __i2c_sb\n"
+                    "    ldi $a, 0x%02X\n"
+                    "    jal __i2c_sb\n"
+                    "    jal __i2c_sp\n"
+                    "    out_imm 0xDD\n"
+                    "    hlt\n"
+                    "__i2c_st:\n"
+                    "    exrw 2\n"
+                    "    ddrb_imm 0x01\n"
+                    "    ddrb_imm 0x03\n"
+                    "    ret\n"
+                    "__i2c_sp:\n"
+                    "    ddrb_imm 0x03\n"
+                    "    ddrb_imm 0x01\n"
+                    "    ddrb_imm 0x00\n"
+                    "    ret\n"
+                    "__i2c_sb:\n"
+                    "    mov $a, $b\n"
+                    "    ldi $a, 8\n"
+                    "    mov $a, $c\n"
+                    ".isb:\n"
+                    "    mov $b, $a\n"
+                    "    tst 0x80\n"
+                    "    jnz .isbh\n"
+                    "    ddrb_imm 0x03\n"
+                    "    ddrb_imm 0x01\n"
+                    "    ddrb_imm 0x03\n"
+                    "    j .isbn\n"
+                    ".isbh:\n"
+                    "    ddrb_imm 0x02\n"
+                    "    ddrb_imm 0x00\n"
+                    "    ddrb_imm 0x02\n"
+                    ".isbn:\n"
+                    "    mov $b, $a\n"
+                    "    sll\n"
+                    "    mov $a, $b\n"
+                    "    mov $c, $a\n"
+                    "    dec\n"
+                    "    mov $a, $c\n"
+                    "    jnz .isb\n"
+                    "    ddrb_imm 0x02\n"
+                    "    ddrb_imm 0x00\n"
+                    "    exrw 0\n"
+                    "    ddrb_imm 0x02\n"
+                    "    ret\n",
+                    toBCD(t.tm_sec), toBCD(t.tm_min), toBCD(t.tm_hour),
+                    toBCD(t.tm_wday + 1), toBCD(t.tm_mday), toBCD(t.tm_mon + 1),
+                    toBCD(t.tm_year % 100)
+                );
+                assembler.assemble(asmBuf);
+                const AsmResult& r = assembler.result;
+                if (r.error_count == 0) {
+                    memcpy(uploadBuf, r.code, CODE_SIZE);
+                    uploadSize = CODE_SIZE;
+                    uploadToMK1(uploadBuf, uploadSize);
+                    // Run RTC set
+                    stopCustomClock();
+                    if (oiMonitorActive) detachInterrupt(digitalPinToInterrupt(PIN_OI));
+                    int clkGpio = digitalPinToGPIONumber(PIN_CLK);
+                    uint32_t clkMask = 1 << clkGpio;
+                    int oiGpio = digitalPinToGPIONumber(PIN_OI);
+                    if (oiGpio < 0) oiGpio = PIN_OI;
+                    uint32_t oiMask = 1 << oiGpio;
+                    busSetInput(); disableOutput();
+                    digitalWrite(PIN_DIR, LOW); enableOutput();
+                    pinMode(PIN_CLK, OUTPUT); digitalWrite(PIN_CLK, LOW);
+                    bool rtcOk = false;
+                    for (int i = 0; i < 50000; i++) {
+                        GPIO.out_w1ts = clkMask; delayMicroseconds(1);
+                        if (GPIO.in & oiMask) { rtcOk = (readBusFast() == 0xDD); GPIO.out_w1tc = clkMask; break; }
+                        GPIO.out_w1tc = clkMask; delayMicroseconds(1);
+                        if (GPIO.in & oiMask) { rtcOk = (readBusFast() == 0xDD); break; }
+                    }
+                    pinMode(PIN_CLK, INPUT);
+                    disableOutput(); digitalWrite(PIN_DIR, HIGH);
+                    busSetOutput(); enableOutput();
+                    Serial.printf("RTC set: %s\n", rtcOk ? "OK" : "FAIL");
+                }
+                // Now read and show temperature
+                int tempC = readDS3231Temp();
+                if (tempC >= 0) Serial.printf("{\"ok\":true,\"temp\":%d}\n", tempC);
+                else Serial.println("{\"ok\":false,\"error\":\"temp read failed\"}");
+            } else {
+                Serial.println("{\"ok\":false,\"error\":\"NTP timeout\"}");
+            }
+        }
+    }
     else if (line == "P3HEX") {
         // Dump first 80 bytes of page3 from uploadBuf (for debugging overlay data)
         int p3off = CODE_SIZE + DATA_SIZE + DATA_SIZE;  // 768
@@ -1807,6 +2084,178 @@ static void handleSerialUpload() {
             serialLineBuf += c;
         }
     }
+}
+
+// ── DS3231 temperature → 7-seg ───────────────────────────────────────
+
+static int readDS3231Temp() {
+    // Assemble and run a MK1 program that reads DS3231 register 0x11
+    // (temperature integer °C) and outputs it to the 7-seg display.
+    // Returns temperature value, or -1 on failure.
+    const char* tempAsm =
+        "; DS3231 temperature read (auto-generated)\n"
+        "    ldi $d, 0\n"
+        ".dly:\n"
+        "    dec\n"
+        "    jnz .dly\n"
+        "    clr $a\n"
+        "    exw 0 0\n"
+        "    ddrb_imm 0x00\n"
+        "    clr $a\n"
+        "    exw 0 3\n"
+        // I2C bus recovery: 9 SCL clocks + STOP to clear any stuck state
+        "    ldi $c, 9\n"
+        ".rcv:\n"
+        "    ddrb_imm 0x00\n"
+        "    ddrb_imm 0x02\n"
+        "    mov $c, $a\n"
+        "    dec\n"
+        "    mov $a, $c\n"
+        "    jnz .rcv\n"
+        "    ddrb_imm 0x03\n"
+        "    ddrb_imm 0x01\n"
+        "    ddrb_imm 0x00\n"
+        // Read temperature from DS3231 register 0x11
+        "    jal __i2c_st\n"
+        "    ldi $a, 0xD0\n"
+        "    jal __i2c_sb\n"
+        "    ldi $a, 0x11\n"
+        "    jal __i2c_sb\n"
+        "    jal __i2c_sp\n"
+        "    jal __i2c_st\n"
+        "    ldi $a, 0xD1\n"
+        "    jal __i2c_sb\n"
+        "    jal __i2c_rb\n"
+        "    ddrb_imm 0x00\n"
+        "    ddrb_imm 0x02\n"
+        "    jal __i2c_sp\n"
+        "    mov $d, $a\n"
+        "    out\n"
+        "    hlt\n"
+        "__i2c_st:\n"
+        "    exrw 2\n"
+        "    ddrb_imm 0x01\n"
+        "    ddrb_imm 0x03\n"
+        "    ret\n"
+        "__i2c_sp:\n"
+        "    ddrb_imm 0x03\n"
+        "    ddrb_imm 0x01\n"
+        "    ddrb_imm 0x00\n"
+        "    ret\n"
+        "__i2c_sb:\n"
+        "    mov $a, $b\n"
+        "    ldi $a, 8\n"
+        "    mov $a, $c\n"
+        ".isb:\n"
+        "    mov $b, $a\n"
+        "    tst 0x80\n"
+        "    jnz .isbh\n"
+        "    ddrb_imm 0x03\n"
+        "    ddrb_imm 0x01\n"
+        "    ddrb_imm 0x03\n"
+        "    j .isbn\n"
+        ".isbh:\n"
+        "    ddrb_imm 0x02\n"
+        "    ddrb_imm 0x00\n"
+        "    ddrb_imm 0x02\n"
+        ".isbn:\n"
+        "    mov $b, $a\n"
+        "    sll\n"
+        "    mov $a, $b\n"
+        "    mov $c, $a\n"
+        "    dec\n"
+        "    mov $a, $c\n"
+        "    jnz .isb\n"
+        "    ddrb_imm 0x02\n"
+        "    ddrb_imm 0x00\n"
+        "    exrw 0\n"
+        "    ddrb_imm 0x02\n"
+        "    ret\n"
+        "__i2c_rb:\n"
+        "    ldi $b, 0\n"
+        "    ldi $d, 8\n"
+        ".rb:\n"
+        "    mov $b, $a\n"
+        "    sll\n"
+        "    mov $a, $b\n"
+        "    ddrb_imm 0x00\n"
+        "    nop\n"
+        "    exrw 0\n"
+        "    tst 0x01\n"
+        "    jz .rz\n"
+        "    mov $b, $a\n"
+        "    ori 0x01, $a\n"
+        "    mov $a, $b\n"
+        ".rz:\n"
+        "    ddrb_imm 0x02\n"
+        "    mov $d, $a\n"
+        "    dec\n"
+        "    mov $a, $d\n"
+        "    jnz .rb\n"
+        "    mov $b, $d\n"
+        "    ret\n";
+
+    assembler.assemble(tempAsm);
+    const AsmResult& rt = assembler.result;
+    if (rt.error_count != 0) {
+        Serial.println("Temperature program assembly failed");
+        return -1;
+    }
+
+    memcpy(uploadBuf, rt.code, CODE_SIZE);
+    uploadSize = CODE_SIZE;
+
+    // Use the exact same sequence as the serial UPLOAD → RESET → RUN path
+    uploadToMK1(uploadBuf, uploadSize);
+
+    // RESET (same as serial RESET handler)
+    disableClock();
+    resetPulse();
+    enableCU();
+
+    // RUN (same as serial RUN handler — stop on first OI)
+    stopCustomClock();
+    if (oiMonitorActive) detachInterrupt(digitalPinToInterrupt(PIN_OI));
+    outputCaptured = false;
+    oiCount = 0;
+
+    int oiGpio = digitalPinToGPIONumber(PIN_OI);
+    if (oiGpio < 0) oiGpio = PIN_OI;
+    uint32_t oiMask = 1 << oiGpio;
+
+    busSetInput();
+    disableOutput();
+    digitalWrite(PIN_DIR, LOW);
+    enableOutput();
+
+    int clkGpio = digitalPinToGPIONumber(PIN_CLK);
+    uint32_t clkMask = 1 << clkGpio;
+    pinMode(PIN_CLK, OUTPUT);
+    digitalWrite(PIN_CLK, LOW);
+
+    int tempVal = -1;
+    for (int i = 0; i < 50000; i++) {
+        GPIO.out_w1ts = clkMask;
+        delayMicroseconds(1);
+        uint32_t gpio1 = GPIO.in;
+        if (gpio1 & oiMask) {
+            tempVal = readBusFast();
+            GPIO.out_w1tc = clkMask;
+            break;
+        }
+        GPIO.out_w1tc = clkMask;
+        delayMicroseconds(1);
+        uint32_t gpio2 = GPIO.in;
+        if (gpio2 & oiMask) {
+            tempVal = readBusFast();
+            break;
+        }
+    }
+    pinMode(PIN_CLK, INPUT);
+    disableOutput(); digitalWrite(PIN_DIR, HIGH);
+    busSetOutput(); enableOutput();
+
+    return tempVal;
 }
 
 // ── Setup & Loop ─────────────────────────────────────────────────────
@@ -2040,25 +2489,34 @@ void setup() {
             } else {
                 Serial.printf("RTC program assembly failed (%d errors)\n", r.error_count);
             }
-
-            // Restore the saved program (the RTC set program overwrote RAM)
-            File f = FFat.open(AUTOSAVE_PATH, "r");
-            if (f) {
-                String source = f.readString();
-                f.close();
-                if (source.length() > 0) {
-                    assembler.assemble(source.c_str());
-                    const AsmResult& r2 = assembler.result;
-                    if (r2.error_count == 0 && r2.code_size > 0) {
-                        memcpy(uploadBuf, r2.code, CODE_SIZE);
-                        uploadSize = CODE_SIZE;
-                        uploadToMK1(uploadBuf, uploadSize);
-                        Serial.println("Restored saved program after RTC set");
-                    }
-                }
-            }
         } else {
             Serial.println(" NTP timeout");
+        }
+    }
+
+    // ── Always read DS3231 temperature on boot ───────────────────────
+    {
+        int tempC = readDS3231Temp();
+        if (tempC >= 0) {
+            Serial.printf("DS3231 temperature: %d°C (on 7-seg)\n", tempC);
+        } else {
+            Serial.println("DS3231 temperature read failed");
+        }
+        // Restore the saved program (temp read overwrote RAM)
+        File f = FFat.open(AUTOSAVE_PATH, "r");
+        if (f) {
+            String source = f.readString();
+            f.close();
+            if (source.length() > 0) {
+                assembler.assemble(source.c_str());
+                const AsmResult& r2 = assembler.result;
+                if (r2.error_count == 0 && r2.code_size > 0) {
+                    memcpy(uploadBuf, r2.code, CODE_SIZE);
+                    uploadSize = CODE_SIZE;
+                    uploadToMK1(uploadBuf, uploadSize);
+                    Serial.println("Restored saved program");
+                }
+            }
         }
     }
 

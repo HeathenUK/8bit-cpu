@@ -7,7 +7,7 @@
    3   | E1       | Input
    4   | D0       | Input
    5   | D1       | Input
-   6   | NC       | Input
+   6   | CLKIN    | Input
    7   | NC       | Input
    8   | NC       | Input
    9   | NC       | Input
@@ -18,7 +18,7 @@
   14   | NC       | NC
   15   | NC       | NC
   16   | NC       | NC
-  17   | nCS2     | Output
+  17   | PHI2     | Output
   18   | /RS3     | Output
   19   | /RS2     | Output
   20   | VCC      | VCC

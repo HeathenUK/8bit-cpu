@@ -91,8 +91,27 @@ class Parser:
                 val = self.expect('NUMBER').value; self.expect(';')
                 globals_.append((name, val))
             elif self.match('['):
-                size = self.expect('NUMBER').value; self.expect(']'); self.expect(';')
-                globals_.append((name, [0]*size))
+                if self.peek().type == 'NUMBER':
+                    size = self.expect('NUMBER').value
+                else:
+                    size = None  # infer from initializer
+                self.expect(']')
+                if self.match('='):
+                    # Array with initializer: unsigned char name[N] = {v1, v2, ...};
+                    self.expect('{')
+                    vals = []
+                    while not self.match('}'):
+                        vals.append(self.expect('NUMBER').value & 0xFF)
+                        self.match(',')  # optional trailing comma
+                    self.expect(';')
+                    if size is not None and len(vals) < size:
+                        vals.extend([0] * (size - len(vals)))
+                    globals_.append((name, vals))
+                else:
+                    self.expect(';')
+                    if size is None:
+                        raise SyntaxError(f'Line {self.peek().line}: array {name} needs size or initializer')
+                    globals_.append((name, [0]*size))
             elif self.match(';'):
                 globals_.append((name, 0))
             else: raise SyntaxError(f'Line {self.peek().line}: unexpected after {name}')
@@ -401,7 +420,8 @@ class MK1CodeGen:
                 'irq0', 'irq1', 'exr_port_a', 'exr_port_b', 'exr_port_c',
                 'via_read_porta', 'via_read_portb',
                 'i2c_init', 'i2c_bus_reset', 'i2c_start', 'i2c_stop',
-                'i2c_ack', 'i2c_nack', 'i2c_wait_ack',
+                'i2c_ack', 'i2c_nack', 'i2c_wait_ack', 'i2c_stream',
+                'i2c_stream_result',
                 'ora_imm', 'orb_imm', 'ddra_imm',
                 'write_code', 'call_code', 'eeprom_read_to_code',
                 'peek3', 'poke3'}
@@ -772,6 +792,16 @@ class MK1CodeGen:
             # I2C send/stop needed at runtime by LCD/EEPROM overlays
             no_ov.update({'__i2c_sb:', '__i2c_sp:'})
 
+        # Raw I2C helpers: if __i2c_sb or __i2c_rb are used at all, they must
+        # be resident — any overlay might call i2c_send_byte/i2c_read_byte.
+        if '__i2c_sb' in helpers:
+            no_ov.add('__i2c_sb:')
+            no_ov.add('__i2c_sp:')  # stop is always needed alongside send
+        if '__i2c_rb' in helpers:
+            no_ov.add('__i2c_rb:')
+        if '__i2c_stream' in helpers:
+            no_ov.add('__i2c_stream:')
+
         # Tone runtime helpers must be resident if used — they're called via jal
         # from every overlay that plays notes. Inlining would bloat each overlay.
         # NOTE: __tone_setup is NOT included here — it's init-only (precomputes
@@ -883,6 +913,106 @@ class MK1CodeGen:
             self.emit('\tmov $a,$d')       # D--
             self.emit(f'\tjnz {lbl_rb}')
             self.emit('\tmov $b,$d')       # D = B (result)
+            self.emit('\tret')
+
+        if '__i2c_stream' in helpers:
+            # General-purpose I2C stream interpreter.
+            # Entry: A = page3 offset of sentinel-encoded byte sequence.
+            # Sentinels: 0xFE=START, 0xFD=STOP, 0xFC N=REPEAT 0x00 N times,
+            #            0xFB=READ byte (result in C), 0xFF=END, else=send byte.
+            # Uses D as pointer, C for read result. ~60 bytes resident.
+            lbl_loop = self.label('is_lp')
+            lbl_ns = self.label('is_ns')
+            lbl_nr = self.label('is_nr')
+            lbl_send = self.label('is_sd')
+            lbl_adv = self.label('is_av')
+            lbl_done = self.label('is_dn')
+            lbl_rpt = self.label('is_rp')
+
+            self.emit('__i2c_stream:')
+            self.emit('\tmov $a,$d')          # D = offset (pointer)
+            self.emit(f'{lbl_loop}:')
+            self.emit('\tmov $d,$a')
+            self.emit('\tderefp3')            # A = page3[D]
+            self.emit('\tldi $b,0xFF')
+            self.emit('\tcmp $b')
+            self.emit(f'\tjz {lbl_done}')     # END
+            self.emit('\tldi $b,0xFE')
+            self.emit('\tcmp $b')
+            self.emit(f'\tjnz {lbl_ns}')
+            # START
+            self.emit('\texrw 2')
+            self.emit('\tddrb_imm 0x01')
+            self.emit('\tddrb_imm 0x03')
+            self.emit(f'\tj {lbl_adv}')
+            self.emit(f'{lbl_ns}:')
+            self.emit('\tldi $b,0xFD')
+            self.emit('\tcmp $b')
+            self.emit(f'\tjnz {lbl_nr}')
+            # STOP
+            self.emit('\tddrb_imm 0x03')
+            self.emit('\tddrb_imm 0x01')
+            self.emit('\tddrb_imm 0x00')
+            self.emit(f'\tj {lbl_adv}')
+            self.emit(f'{lbl_nr}:')
+            self.emit('\tldi $b,0xFB')
+            self.emit('\tcmp $b')
+            lbl_nrd = self.label('is_nrd')
+            self.emit(f'\tjnz {lbl_nrd}')
+            # READ: inline i2c_rb, result in C
+            lbl_rdb = self.label('is_rb')
+            lbl_rz = self.label('is_rz')
+            self.emit('\tpush $d')          # save pointer
+            self.emit('\tldi $b,0')
+            self.emit('\tldi $d,8')
+            self.emit(f'{lbl_rdb}:')
+            self.emit('\tmov $b,$a')
+            self.emit('\tsll')
+            self.emit('\tmov $a,$b')
+            self.emit('\tddrb_imm 0x00')    # SCL HIGH
+            self.emit('\tnop')
+            self.emit('\texrw 0')           # read port
+            self.emit('\ttst 0x01')
+            self.emit(f'\tjz {lbl_rz}')
+            self.emit('\tmov $b,$a')
+            self.emit('\tori 0x01,$a')
+            self.emit('\tmov $a,$b')
+            self.emit(f'{lbl_rz}:')
+            self.emit('\tddrb_imm 0x02')    # SCL LOW
+            self.emit('\tmov $d,$a')
+            self.emit('\tdec')
+            self.emit('\tmov $a,$d')
+            self.emit(f'\tjnz {lbl_rdb}')
+            self.emit('\tmov $b,$c')        # C = read result
+            self.emit('\tpop $d')           # restore pointer
+            self.emit(f'\tj {lbl_adv}')
+            self.emit(f'{lbl_nrd}:')
+            self.emit('\tldi $b,0xFC')
+            self.emit('\tcmp $b')
+            self.emit(f'\tjnz {lbl_send}')
+            # REPEAT: next byte = count, send 0x00 count times
+            self.emit('\tmov $d,$a')
+            self.emit('\tinc')
+            self.emit('\tmov $a,$d')          # advance pointer
+            self.emit('\tmov $d,$a')
+            self.emit('\tderefp3')            # A = count
+            self.emit('\tmov $a,$c')          # C = count
+            self.emit(f'{lbl_rpt}:')
+            self.emit('\tclr $a')
+            self.emit('\tjal __i2c_sb')       # send 0x00
+            self.emit('\tmov $c,$a')
+            self.emit('\tdec')
+            self.emit('\tmov $a,$c')
+            self.emit(f'\tjnz {lbl_rpt}')
+            self.emit(f'\tj {lbl_adv}')
+            self.emit(f'{lbl_send}:')
+            self.emit('\tjal __i2c_sb')       # send byte
+            self.emit(f'{lbl_adv}:')
+            self.emit('\tmov $d,$a')
+            self.emit('\tinc')
+            self.emit('\tmov $a,$d')
+            self.emit(f'\tj {lbl_loop}')
+            self.emit(f'{lbl_done}:')
             self.emit('\tret')
 
         if '__lcd_init' in helpers:
@@ -1350,8 +1480,8 @@ class MK1CodeGen:
         # ── Step 1: Estimate total code size ──
         size = measure_lines(self.code)
 
-        # Only partition if code exceeds 240 bytes or eeprom_mode is set
-        if size <= 240 and not getattr(self, 'eeprom_mode', False):
+        # Only partition if code exceeds 250 bytes or eeprom_mode is set
+        if size <= 250 and not getattr(self, 'eeprom_mode', False):
             return
 
         # ── Step 2: Find all functions and their sizes ──
@@ -1494,9 +1624,9 @@ class MK1CodeGen:
                 # All library (e.g., init-only group) — keep as one slot
                 overlay_slots.append((slot, slot_size))
             elif not lib_funcs:
-                # All user — one slot per user function
-                for uf in user_funcs:
-                    overlay_slots.append(([uf], uf[3]))
+                # All user — they're in the same component (call each other),
+                # so they must be in ONE overlay slot together.
+                overlay_slots.append((slot, slot_size))
             else:
                 # Mixed: create one overlay per user func + ALL lib helpers
                 for uf in user_funcs:
@@ -1718,6 +1848,80 @@ class MK1CodeGen:
                     main_lines.append(line)
             else:
                 other_resident.append(line)
+
+        # ── Step 10b: Extract init-only code from main ──
+        # Init-only code (VIA init, bus recovery, overlay calls for init functions)
+        # moves to stage 1. Runtime code stays in main (kernel).
+        INIT_MARKERS = {
+            'exw 0 0', 'exw 0 1', 'exw 0 3',
+            'push $a ;!keep', 'pop $a ;!keep',
+            'jal __delay_cal', 'jal __lcd_init',
+            'push_b', 'pop_b', 'iderefp3',
+        }
+        INIT_PREFIXES = ('ddrb_imm', 'exrw 2', 'ldi $d,', 'ddra_imm', 'push_imm')
+        # Helpers that are safe to call during init (don't end init phase)
+        INIT_COMPAT_HELPERS = {'__i2c_stream', '__i2c_st', '__i2c_sp',
+                               '__delay_cal', '__lcd_init', '__tone_setup'}
+
+        # Pre-scan: find overlay_load call sequences
+        overlay_call_lines = set()
+        for mi, ml in enumerate(main_lines):
+            if ml.strip() == 'jal _overlay_load':
+                overlay_call_lines.add(mi)
+                for bi in range(max(0, mi - 8), mi):
+                    bs = main_lines[bi].strip()
+                    if (bs.startswith('ldi ') or bs.startswith('push_b') or
+                        bs == 'pop_b' or bs == 'iderefp3' or
+                        bs.startswith('mov ')):
+                        overlay_call_lines.add(bi)
+
+        init_extracted = []
+        runtime_main = []
+        in_init_phase = True
+        for mi, line in enumerate(main_lines):
+            s = line.strip()
+            if s == '_main:':
+                continue  # handled separately
+            if in_init_phase:
+                # Pure init: VIA init builtins, bus recovery — NO function calls
+                # Overlay calls (jal _overlay_load) must stay in runtime because
+                # overlays need resident kernel functions not yet loaded in stage 1.
+                is_init = (s in INIT_MARKERS or
+                           any(s.startswith(p) for p in INIT_PREFIXES) or
+                           s.startswith('clr $a') or s.startswith('dec') or
+                           s.startswith('.via_') or s.startswith('.br_') or
+                           s.startswith('.rcv') or s.startswith('mov $c,$a') or
+                           s == 'nop')
+                if s.startswith('jnz .') or s.startswith('j .via') or s.startswith('j .br') or s.startswith('j .rcv'):
+                    is_init = True
+                # ldi before init-compatible jal is also init
+                if s.startswith('ldi $a,') or s.startswith('ldi $b,'):
+                    for nli in range(mi + 1, min(mi + 4, len(main_lines))):
+                        ns = main_lines[nli].strip()
+                        if ns.startswith('jal '):
+                            t = ns.split()[1]
+                            if t in INIT_COMPAT_HELPERS or is_init_only(t):
+                                is_init = True
+                            break
+                if s.startswith('jal '):
+                    target = s.split()[1]
+                    if is_init_only(target) or target in INIT_COMPAT_HELPERS:
+                        is_init = True
+                    else:
+                        # Any non-init jal ends the init phase
+                        in_init_phase = False
+                if is_init:
+                    init_extracted.append(line)
+                else:
+                    in_init_phase = False
+                    runtime_main.append(line)
+            else:
+                runtime_main.append(line)
+
+        # Strip trailing unreachable ret
+        while runtime_main and runtime_main[-1].strip() == 'ret':
+            runtime_main.pop()
+        main_lines = ['_main:'] + runtime_main
 
         # ── Step 11: Generate kernel assembly (overlay_load function) ──
         # This is the runtime overlay loader that lives in the code page.
@@ -2052,7 +2256,7 @@ class MK1CodeGen:
         meta_base = final_meta_base
 
         # Validate overlay region
-        if OVERLAY_REGION + max_slot_size > 256:
+        if OVERLAY_REGION + max_slot_size > 250:  # 250 not 256: last 6 bytes unreliable
             raise Exception(
                 f"largest overlay ({max_slot_size}B) exceeds overlay region "
                 f"({256 - OVERLAY_REGION}B). Kernel={KERNEL_SIZE}B "
@@ -2060,124 +2264,19 @@ class MK1CodeGen:
             )
 
         # ── Step 16: Generate init code (stage 1) ──
-        # Init code runs at upload time in the code page. It contains:
-        # 1. Init-only helper function bodies (delay_cal, lcd_init, i2c helpers)
-        # 2. User's init calls (i2c_init, delay_calibrate, lcd_init inline calls)
-        # 3. Self-copy routine to copy kernel from page3 to code page
-        # 4. Jump to _main
-        #
-        # The init calls are already in main_lines (they were in the user's main).
-        # We need to separate init-time calls from runtime main code.
-        #
-        # Actually, in the two-stage model:
-        # - main_lines contains the user's main function (with overlay calls rewritten)
-        # - Init-only calls (i2c_init, delay_calibrate, lcd_init) are already
-        #   compiled as inline code in main_lines (they're builtins, not jal calls)
-        # - The init-only HELPERS (subroutines called by those builtins) are in
-        #   init_only_funcs
-        #
-        # For stage 1, we need: init helpers + the init portion of main + self-copy.
-        # For stage 2 (kernel): overlay_load + runtime main + runtime helpers.
-        #
-        # Problem: we can't easily split main into "init part" and "runtime part"
-        # at this stage. The user's main has init calls (i2c_init etc.) followed
-        # by runtime code (loops, overlay calls).
-        #
-        # Simpler approach: init code = just the self-copy + init helpers.
-        # If the user has i2c_init/delay_calibrate/lcd_init in main, those calls
-        # stay in main_lines. The init-only helpers (__delay_cal, __lcd_init, etc.)
-        # need to be callable from main during stage 2 runtime as well... but
-        # they're init-only! This is a contradiction.
-        #
-        # Resolution: The init-only helpers are called from _main, which is in the
-        # kernel (stage 2). So they need to be either:
-        # a) In the kernel (wasteful, defeats the purpose), OR
-        # b) In an overlay (loaded on demand), OR
-        # c) Inlined into init code that runs BEFORE the kernel takes over
-        #
-        # The user's design intent is (c): init code runs first, does all init,
-        # THEN copies kernel, THEN jumps to main (which has no init calls anymore).
-        #
-        # But the compiler has already compiled main with init calls inline.
-        # We need to EXTRACT those init calls from main and put them in stage 1.
-        #
-        # Approach: scan main_lines for patterns that are init-only:
-        # - i2c_init: exw 0 0 / exw 0 1 / ddrb_imm / ... / pop $a ;!keep
-        # - jal __delay_cal
-        # - jal __lcd_init
-        # Move those to init code, keep the rest in main.
+        # Init code extracted from main in step 10b (init_extracted).
+        # Stage 1 = init helpers + extracted init code + self-copy + j _main.
 
-        init_code_lines = []   # init-only code extracted from main
-        runtime_main_lines = []  # main code for kernel
+        # Init was already extracted in step 10b
+        init_code_lines = init_extracted
+        runtime_main_lines = main_lines  # already has _main: prefix
 
-        # Pattern: extract everything from _main: up to and including the
-        # first overlay call (ldi $a,N / jal _overlay_load) or the first
-        # "runtime" instruction. Init markers:
-        #   - exw 0 0, exw 0 1: VIA init
-        #   - ddrb_imm: I2C bus setup
-        #   - push $a ;!keep / pop $a ;!keep: stack warmup
-        #   - jal __delay_cal: delay calibration
-        #   - jal __lcd_init: LCD init
-
-        INIT_MARKERS = {
-            'exw 0 0', 'exw 0 1', 'exw 0 3',
-            'push $a ;!keep', 'pop $a ;!keep',
-            'jal __delay_cal', 'jal __lcd_init',
-        }
-        INIT_PREFIXES = ('ddrb_imm', 'exrw 2', 'ldi $d,', 'ddra_imm')
-
-        in_init_phase = True
-        skip_main_label = True
-        for line in main_lines:
-            s = line.strip()
-            if skip_main_label and s == '_main:':
-                skip_main_label = False
-                continue  # don't include _main: label in either section
-
-            if in_init_phase:
-                # Check if this line is an init-only instruction
-                is_init = (s in INIT_MARKERS or
-                           any(s.startswith(p) for p in INIT_PREFIXES) or
-                           s.startswith('clr $a') or
-                           s.startswith('dec') or
-                           s.startswith('.via_') or s.startswith('.br_') or
-                           s == 'nop')
-                # Local branches within init (jnz .via_dly etc.)
-                if s.startswith('jnz .') or s.startswith('j .via') or s.startswith('j .br'):
-                    is_init = True
-                # Also include jal to init-only helpers
-                if s.startswith('jal '):
-                    target = s.split()[1]
-                    if is_init_only(target):
-                        is_init = True
-                    else:
-                        # First non-init jal means we've left init phase
-                        in_init_phase = False
-
-                if is_init:
-                    init_code_lines.append(line)
-                else:
-                    # First non-init instruction: switch to runtime
-                    in_init_phase = False
-                    runtime_main_lines.append(line)
-            else:
-                runtime_main_lines.append(line)
-
-        # Prepend _main: label to runtime main.
-        # Strip trailing ret after hlt — unreachable but inflates kernel size.
-        while runtime_main_lines and runtime_main_lines[-1].strip() == 'ret':
-            runtime_main_lines.pop()
-        runtime_main_lines = ['_main:'] + runtime_main_lines
-
-        # ── Recompute KERNEL_SIZE after init extraction ──
-        # The kernel image = loader + runtime_helpers + runtime_main (NOT full main).
-        # The earlier sizing used main_lines (pre-extraction) which includes VIA init etc.
+        # Recompute with extracted sizes (step 10b already did this via main_lines)
         actual_main_size = measure_lines(runtime_main_lines)
-        RESET_STUB = 2  # j _main at code[0] for reset safety
+        RESET_STUB = 2
         KERNEL_SIZE = RESET_STUB + loader_size + actual_main_size + runtime_helper_size
         OVERLAY_REGION = KERNEL_SIZE
         meta_base = max(p3_used, KERNEL_SIZE)
-        # Recompute p3 overlay offsets
         final_p3_start = meta_base + meta_table_size
         if p3_overlays:
             old_first = p3_overlays[0][4]
@@ -3676,6 +3775,28 @@ class MK1CodeGen:
                     self._lcd_helpers = set()
                 self._lcd_helpers.add('__lcd_init')
                 self.emit('\tjal __lcd_init')
+                return
+
+            if name == 'i2c_stream':
+                # i2c_stream(offset) — interpret sentinel-encoded I2C sequence
+                # from page3 starting at offset. Sentinels: 0xFE=START, 0xFD=STOP, 0xFF=END.
+                # Any other byte is sent via i2c_send_byte.
+                if not hasattr(self, '_lcd_helpers'):
+                    self._lcd_helpers = set()
+                self._lcd_helpers.add('__i2c_stream')
+                self._lcd_helpers.add('__i2c_sb')
+                if args:
+                    c = self._const_eval(args[0])
+                    if c is not None:
+                        self.emit(f'\tldi $a,{c & 0xFF}')
+                    else:
+                        self.gen_expr(args[0])
+                self.emit('\tjal __i2c_stream')
+                return
+
+            if name == 'i2c_stream_result':
+                # Returns the last READ result (stored in C by __i2c_stream)
+                self.emit('\tmov $c,$a')
                 return
 
             if name == 'i2c_start':
