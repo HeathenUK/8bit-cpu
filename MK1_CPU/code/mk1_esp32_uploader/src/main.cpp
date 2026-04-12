@@ -532,9 +532,6 @@ static inline uint8_t IRAM_ATTR readBusFast() {
 }
 
 static void IRAM_ATTR onOIRising() {
-    // Verify OI is still HIGH — filters glitches and late ISR arrivals
-    // where the bus no longer holds the output value.
-    if (!(GPIO.in & oiGpioMask)) return;
     uint8_t val = readBusFast();
     if (oiCount < 256) oiHistory[oiCount] = val;
     oiCount++;
