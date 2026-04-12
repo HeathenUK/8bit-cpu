@@ -932,24 +932,22 @@ def run_tests():
     cpu.mem[3][10] = 77  # page3[10] = 77
     code_dp3 = bytearray(256)
     code_dp3[0] = 0x38; code_dp3[1] = 10    # ldi $a, 10
-    code_dp3[2] = 0xD5; code_dp3[3] = 0     # derefp3 (A = page3[A] = page3[10] = 77)
-    code_dp3[4] = 0x06; code_dp3[5] = 0     # out
-    code_dp3[6] = 0x7F; code_dp3[7] = 0     # hlt
+    code_dp3[2] = 0xD5                      # derefp3 (A = page3[10] = 77)
+    code_dp3[3] = 0x06                      # out
+    code_dp3[4] = 0x7F                      # hlt
     cpu.load_program(code_dp3)
     cpu.run()
     results.append(cpu.output_history == [77])
     print(f"  [{'PASS' if results[-1] else 'FAIL'}] DEREFP3: A=page3[A] (got {cpu.output_history})")
 
     # ── Test: ISTC (indirect store to code page) ──
+    # istc is a 1-byte instruction (no immediate)
     cpu2 = MK1()
     code_istc = bytearray(256)
     code_istc[0] = 0x38; code_istc[1] = 42     # ldi $a, 42
     code_istc[2] = 0x39; code_istc[3] = 200     # ldi $b, 200
-    code_istc[4] = 0xDA; code_istc[5] = 0       # istc (code[B] = code[200] = A = 42)
-    code_istc[6] = 0x47; code_istc[7] = 200     # ld $a, 200 — wait, ld reads from data page
-    # Instead: read code page byte back by jumping to it and having it output
-    # Simpler: check memory directly
-    code_istc[6] = 0x7F; code_istc[7] = 0       # hlt
+    code_istc[4] = 0xDA                         # istc (code[200] = A = 42)
+    code_istc[5] = 0x7F                         # hlt
     cpu2.load_program(code_istc)
     cpu2.run()
     ok_istc = cpu2.mem[0][200] == 42
@@ -1019,11 +1017,11 @@ def run_tests():
     code_ip3 = bytearray(256)
     code_ip3[0] = 0x38; code_ip3[1] = 99       # ldi $a, 99
     code_ip3[2] = 0x39; code_ip3[3] = 50       # ldi $b, 50
-    code_ip3[4] = 0xF7; code_ip3[5] = 0        # iderefp3 (page3[B] = page3[50] = A = 99)
-    code_ip3[6] = 0x38; code_ip3[7] = 50       # ldi $a, 50
-    code_ip3[8] = 0xD5; code_ip3[9] = 0        # derefp3 (A = page3[50] = 99)
-    code_ip3[10] = 0x06; code_ip3[11] = 0      # out
-    code_ip3[12] = 0x7F; code_ip3[13] = 0      # hlt
+    code_ip3[4] = 0xF7                         # iderefp3 (page3[50] = 99)
+    code_ip3[5] = 0x38; code_ip3[6] = 50       # ldi $a, 50
+    code_ip3[7] = 0xD5                         # derefp3 (A = page3[50] = 99)
+    code_ip3[8] = 0x06                         # out
+    code_ip3[9] = 0x7F                         # hlt
     cpu_ip3.load_program(code_ip3)
     cpu_ip3.run()
     ok_ip3 = cpu_ip3.output_history == [99]
@@ -1092,14 +1090,15 @@ def run_tests():
     print(f"  [{'PASS' if ok_oc else 'FAIL'}] OCALL: overlay call A=5, return (got {cpu_oc.output_history})")
 
     # ── Test: ISTC_INC (code[B] = A; B++) ──
+    # istc_inc is a 1-byte instruction (no immediate)
     cpu_ii = MK1()
     code_ii = bytearray(256)
     code_ii[0] = 0x38; code_ii[1] = 0xAA       # ldi $a, 0xAA
     code_ii[2] = 0x39; code_ii[3] = 200         # ldi $b, 200
-    code_ii[4] = 0xD9; code_ii[5] = 0           # istc_inc (code[200]=0xAA, B=201)
-    code_ii[6] = 0x38; code_ii[7] = 0xBB        # ldi $a, 0xBB
-    code_ii[8] = 0xD9; code_ii[9] = 0           # istc_inc (code[201]=0xBB, B=202)
-    code_ii[10] = 0x7F; code_ii[11] = 0         # hlt
+    code_ii[4] = 0xD9                           # istc_inc (code[200]=0xAA, B=201)
+    code_ii[5] = 0x38; code_ii[6] = 0xBB        # ldi $a, 0xBB
+    code_ii[7] = 0xD9                           # istc_inc (code[201]=0xBB, B=202)
+    code_ii[8] = 0x7F                           # hlt
     cpu_ii.load_program(code_ii)
     cpu_ii.run()
     ok_ii = cpu_ii.mem[0][200] == 0xAA and cpu_ii.mem[0][201] == 0xBB and cpu_ii.B == 202

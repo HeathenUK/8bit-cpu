@@ -257,7 +257,7 @@ ucode_template[0xE7] = ('push_imm', [MI|PO, RO|II|PE, PO|MI, PE|RO|AI, SO|MI, ST
 ucode_template[0xF3] = ('ldsp_b', [MI|PO, RO|II|PE, SO|EI, PO|MI, PE|RO|AI, EO, EO|MI, STK|RO|BI], True)
 
 # IDEREFP3: page3[B] = A — indirect store to page 3
-ucode_template[0xF7] = ('iderefp3', [MI|PO, RO|II|PE, BO|MI, STK|HL|AO|RI, RST, RST, RST, RST], True)
+ucode_template[0xF7] = ('iderefp3', [MI|PO, RO|II|PE, BO|MI, STK|HL|AO|RI, RST, RST, RST, RST], False)
 
 # EXR variants for 82C55 PPI: stretched reads with XI setup step before E1 assertion.
 # Step 2 settles XI and U0/U1 (A0/A1). Step 3 asserts E1 (~RD) with stable address.
@@ -286,7 +286,7 @@ ucode_template[0xCD] = ('exrw 2', [MI|PO, RO|II|PE, XI|U1, XI|E0|E1|AI|U1, RST, 
 ucode_template[0xD6] = ('exrw 3', [MI|PO, RO|II|PE, XI|U0|U1, XI|E0|E1|AI|U0|U1, RST, RST, RST, RST], False)
 
 # DEREFP3: A = page3[A] — indirect read from page 3
-ucode_template[0xD5] = ('derefp3', [MI|PO, RO|II|PE, AO|MI, STK|HL|RO|AI, RST, RST, RST, RST], True)
+ucode_template[0xD5] = ('derefp3', [MI|PO, RO|II|PE, AO|MI, STK|HL|RO|AI, RST, RST, RST, RST], False)
 
 # DEREF2: A = stack_page[A] — indirect read from page 2 (stack page bottom)
 # Same as deref but STK instead of HL. Enables using unused stack page as overlay storage.
@@ -296,7 +296,7 @@ ucode_template[0xDD] = ('deref2', [MI|PO, RO|II|PE, AO|MI, STK|RO|AI, RST, RST, 
 ucode_template[0xED] = ('ideref2', [MI|PO, RO|II|PE, BO|MI, STK|AO|RI, RST, RST, RST, RST], False)
 
 # ISTC: code[B] = A — indirect store to code page (no HL, no STK)
-ucode_template[0xDA] = ('istc', [MI|PO, RO|II|PE, BO|MI, AO|RI, RST, RST, RST, RST], True)
+ucode_template[0xDA] = ('istc', [MI|PO, RO|II|PE, BO|MI, AO|RI, RST, RST, RST, RST], False)
 
 # CMPI N: compare A with immediate N. Sets ZF/CF from A-N. Doesn't clobber A or B.
 # Replaces the old cmp N expansion (ldi $b,N; cmp $b) which clobbered B.
@@ -306,7 +306,7 @@ ucode_template[0xFD] = ('cmpi', [MI|PO, RO|II|PE, PO|MI, PE|RO|EI, SUB|EO|FI, RS
 # Steps 4-7: B = B + 1 via zero-E trick (same as INC but targeting B).
 # Clobbers A (set to old B) and E (zeroed). Flags NOT set (no FI).
 # 8 steps, no RST — counter wraps 7→0 naturally, next fetch starts.
-ucode_template[0xD9] = ('istc_inc', [MI|PO, RO|II|PE, BO|MI, AO|RI, BO|AI, AO|EI, SUB|EO|EI, CINV|EO|BI], True)
+ucode_template[0xD9] = ('istc_inc', [MI|PO, RO|II|PE, BO|MI, AO|RI, BO|AI, AO|EI, SUB|EO|EI, CINV|EO|BI], False)
 
 # PUSH_B: stack[SP] = B; SP-- — push B register without touching A.
 ucode_template[0xF1] = ('push_b', [MI|PO, RO|II|PE, SO|MI, STK|SD|BO|RI, RST, RST, RST, RST], False)

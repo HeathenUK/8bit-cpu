@@ -581,7 +581,6 @@ class MK1CodeGen:
                         if s == 'jal __delay_cal' or s.endswith(';!keep'):
                             insert_at = j + 1
                     precomp = [
-                        '\tddra_imm 0x02',          # PA1 = output
                         '\tldi $a,0',
                         '\tmov $a,$d',               # D = note ptr
                         '.__precomp:',
@@ -589,16 +588,15 @@ class MK1CodeGen:
                         '\tderef',                   # A = data[ptr] = ratio
                         '\ttst 0xFF',
                         '\tjz .__preskip',            # silence (ratio=0)
+                        # Save D (note ptr) via push_b/pop_b (push $d + jal conflicts)
+                        '\tmov $d,$b',               # B = note ptr
+                        '\tpush_b',                  # save note ptr, SP--
                         '\tmov $a,$b',               # B = ratio
-                        '\tpush $d',
                         '\tjal __tone_setup',         # C = half_period
-                        '\tpop $d',
+                        '\tpop_b',                   # B = note ptr, SP++
                         '\tmov $c,$a',               # A = half_period
-                        '\tpush $a',
-                        '\tmov $d,$a',
-                        '\tmov $a,$b',               # B = ptr
-                        '\tpop $a',                  # A = half_period
                         '\tideref',                   # data[B] = half_period
+                        '\tmov $b,$d',               # D = note ptr (restore)
                         '.__preskip:',
                         '\tmov $d,$a',
                         '\taddi 3,$a',
@@ -773,6 +771,16 @@ class MK1CodeGen:
         if self._needs_runtime_i2c:
             # I2C send/stop needed at runtime by LCD/EEPROM overlays
             no_ov.update({'__i2c_sb:', '__i2c_sp:'})
+
+        # Tone runtime helpers must be resident if used — they're called via jal
+        # from every overlay that plays notes. Inlining would bloat each overlay.
+        # NOTE: __tone_setup is NOT included here — it's init-only (precomputes
+        # note table during init). play_note reads precomputed half_period directly.
+        tone_runtime = {'__tone', '__play_note', '__delay_Nms'}
+        if helpers & tone_runtime:
+            for h in tone_runtime:
+                if h in helpers:
+                    no_ov.add(f'{h}:')
 
         self._dynamic_no_overlay = no_ov
 
@@ -1113,7 +1121,10 @@ class MK1CodeGen:
             self.emit('\tret')
 
         # __tone_setup: B = ratio → C = half_period = (ipm × ratio) >> 4.
-        # Reads ipm from data[0]. Clobbers A, B, D.
+        # Reads ipm from page3[240]. Clobbers A, B, D.
+        # push $a / pop $a ARE safe with jal — verified from microcode:
+        # stor reg,[$sp] has SD (push), load reg,[$sp] has SU (pop).
+        # Nested jal/ret/push/pop all manage SP correctly.
         if '__tone_setup' in helpers:
             lbl_mul = self.label('tsmul')
             lbl_noc = self.label('tsnoc')
@@ -1140,7 +1151,6 @@ class MK1CodeGen:
             self.emit('\tpop $a')          # A = product low
             self.emit(f'\tjnz {lbl_mul}')
             # D:A = ipm × ratio. Shift >> 4.
-            # Result = (D << 4) | (A >> 4). Non-overlapping nibbles, so add works.
             self.emit('\tslr')
             self.emit('\tslr')
             self.emit('\tslr')
@@ -1165,6 +1175,7 @@ class MK1CodeGen:
             lbl_lo = self.label('tlo')
             lbl_done = self.label('tdn')
             self.emit('__tone:')
+            self.emit('\tddra_imm 0x02')   # PA1 = output (only during tone)
             self.emit(f'{lbl_loop}:')
             self.emit('\tora_imm 0x02')    # PA1 HIGH
             self.emit('\tmov $c,$a')       # A = half_period
@@ -1188,6 +1199,8 @@ class MK1CodeGen:
             self.emit('\tmov $a,$d')       # D = D-1
             self.emit(f'\tj {lbl_loop}')
             self.emit(f'{lbl_done}:')
+            self.emit('\tora_imm 0x00')    # PA1 LOW before disabling
+            self.emit('\tddra_imm 0x00')   # PA1 = input (stop driving bus)
             self.emit('\tret')
 
         # __eeprom_r2c_loop: sequential I2C read → code page via istc.
@@ -1238,25 +1251,24 @@ class MK1CodeGen:
             self.emit('\tddrb_imm 0x00')     # STOP
             self.emit('\tret')
 
-        # __play_note: A = page 3 offset into note table.
-        # Reads [ratio, cyc_lo, cyc_hi] from page 3.
-        # If ratio=0 and __delay_Nms available, plays silence (cyc_lo = ms).
-        # Otherwise calls __tone_setup + __tone.
+        # __play_note: A = data page offset into note table.
+        # Reads [half_period, cyc_lo, cyc_hi] from data page (page 1) via deref.
+        # Note: ratio→half_period precomputation happens during init.
+        # If half_period=0 and __delay_Nms available, plays silence (cyc_lo = ms).
+        # Otherwise sets C=half_period and calls __tone.
         if '__play_note' in helpers:
             has_silence = '__delay_Nms' in helpers
             lbl_sil = self.label('pnsil') if has_silence else None
             self.emit('__play_note:')
-            # Note table in page 1 (data page): [ratio, cyc_lo, cyc_hi]
-            # Calls tone_setup at runtime to convert ratio → half_period.
-            # If ratio=0, silence note (cyc_lo = ms duration).
+            # Note table in page 1: [half_period, cyc_lo, cyc_hi]
+            # (precomputed from ratio during init via __tone_setup)
             self.emit('\tmov $a,$d')       # D = base offset
-            self.emit('\tderef')           # A = data[offset] = ratio
+            self.emit('\tderef')           # A = data[offset] = half_period
             if has_silence:
                 self.emit('\ttst 0xFF')
-                self.emit(f'\tjz {lbl_sil}')   # ratio=0 → silence
-            # DEBUG: bypass tone_setup, hardcode half_period=40
-            self.emit('\tldi $a,40')
-            self.emit('\tmov $a,$c')       # C = 40 (hardcoded half_period)
+                self.emit(f'\tjz {lbl_sil}')   # half_period=0 → silence
+            # A = half_period (precomputed), D = base offset
+            self.emit('\tmov $a,$c')       # C = half_period
             self.emit('\tmov $d,$a')       # A = offset
             self.emit('\tinc')
             self.emit('\tmov $a,$d')       # D = offset+1
@@ -1314,7 +1326,7 @@ class MK1CodeGen:
             size = 0
             for line in lines:
                 s = line.strip()
-                if not s or s.endswith(':'):
+                if not s or s.endswith(':') or s.startswith(';'):
                     continue
                 mn = s.split()[0]
                 if mn == 'cmp':
@@ -1371,7 +1383,7 @@ class MK1CodeGen:
         # Init-only functions run once during stage 1, then are discarded.
         # Runtime functions are loaded via overlay during stage 2.
         INIT_ONLY_NAMES = {
-            '__delay_cal', '__lcd_init',
+            '__delay_cal', '__lcd_init', '__tone_setup',
         }
         # I2C helpers that are init-only when no runtime I2C is needed
         I2C_INIT_ONLY = {'__i2c_sb', '__i2c_sp', '__i2c_st', '__i2c_st_only', '__i2c_rb'}
@@ -1506,36 +1518,9 @@ class MK1CodeGen:
         for slot_funcs, _ in overlay_slots:
             overlay_funcs_flat.extend(slot_funcs)
 
-        # ── Step 6b: Validate overlay self-containment ──
-        # Every jal in an overlay must target a function in the SAME slot
-        # or a resident function (in _NO_OVERLAY or init-only).
-        # If a jal targets a function in a DIFFERENT overlay, the program
-        # is broken — that function won't be loaded when the jal executes.
-        all_overlay_names = {name for name, _, _, _ in overlay_funcs_flat}
-        init_names = {name for name, _, _, _ in init_only_funcs}
-        resident_names = {l.rstrip(':') for l in _NO_OVERLAY} | {'_main'} | init_names
-        for idx, (slot_funcs, slot_size) in enumerate(overlay_slots):
-            slot_names = {name for name, _, _, _ in slot_funcs}
-            for name, start, end, fsize in slot_funcs:
-                for li in range(start, end):
-                    s = self.code[li].strip()
-                    if s.startswith('jal '):
-                        target = s.split()[1]
-                        if target.startswith('.'):
-                            continue  # local label
-                        if target in slot_names:
-                            continue  # same overlay — OK
-                        if target in resident_names:
-                            continue  # resident — OK
-                        if target not in all_overlay_names:
-                            continue  # unknown (might be a label defined elsewhere)
-                        # Target is in a DIFFERENT overlay — broken!
-                        raise Exception(
-                            f"overlay '{name}' calls '{target}' which is in a different "
-                            f"overlay slot. This would execute garbage. The compiler's "
-                            f"overlay splitting broke a call chain. "
-                            f"Slot {idx} contains: {list(slot_names)}"
-                        )
+        # NOTE: Overlay self-containment validation moved to AFTER step 9
+        # (helper inlining). Validating here would flag cross-overlay jal
+        # targets that step 9 will inline, producing false positives.
 
         # ── Step 7: Extract main body ──
         # Find _main label and its body (everything from _main: to next global label)
@@ -1672,6 +1657,36 @@ class MK1CodeGen:
 
         # Rebuild overlay_meta with updated sizes
         overlay_meta = [(idx, name, fsize) for idx, (name, _, fsize) in enumerate(overlay_asm_blocks)]
+
+        # ── Step 9b: Validate overlay self-containment (post-inlining) ──
+        # Every jal in an overlay must target a function in the SAME overlay
+        # or a resident function. Must run AFTER helper inlining (step 9)
+        # so we validate the actual post-inlining code, not pre-inlining.
+        resident_labels = set()
+        for line in new_resident:
+            s = line.strip()
+            if s.endswith(':') and not s.startswith('.'):
+                resident_labels.add(s[:-1])
+        for idx, (oname, olines, ofsize) in enumerate(overlay_asm_blocks):
+            for oline in olines:
+                s = oline.strip()
+                if s.startswith('jal '):
+                    target = s.split()[1]
+                    if target.startswith('.'):
+                        continue  # local label
+                    if target in resident_labels:
+                        continue  # resident — OK
+                    # Check if target is defined within this overlay's own lines
+                    overlay_labels = {ol.strip()[:-1] for ol in olines
+                                     if ol.strip().endswith(':') and not ol.strip().startswith('.')}
+                    if target in overlay_labels:
+                        continue  # same overlay — OK
+                    # Target is not reachable — broken!
+                    raise Exception(
+                        f"overlay '{oname}' calls '{target}' which is not resident "
+                        f"or in this overlay. This would execute garbage after inlining. "
+                        f"Overlay contains: {list(overlay_labels)}"
+                    )
 
         # ── Step 10: Separate main from other resident code ──
         # In the new architecture, _main body goes into page3_code (kernel image).
@@ -1812,16 +1827,14 @@ class MK1CodeGen:
                 is_last = (ci == len(copy_pages) - 1)
                 loader.append(f'{label}:')
                 loader += [
-                    '\tmov $c,$a',
-                    f'\t{deref_op}',
-                    '\tistc_inc',
-                    '\tpush_b',
-                    '\tmov $c,$a',
-                    '\tinc',
-                    '\tmov $a,$c',
-                    '\tpop_b',
-                    '\tmov $b,$a',
-                    '\tcmp $d',
+                    '\tmov $c,$a',          # A = src addr
+                    f'\t{deref_op}',        # A = page[src]
+                    '\tistc_inc',           # code[B] = A; B++
+                    '\tmov $c,$a',          # A = src (from C, still valid)
+                    '\tinc',                # A = src + 1
+                    '\tmov $a,$c',          # C = src + 1
+                    '\tmov $b,$a',          # A = B (dest, auto-incremented)
+                    '\tcmp $d',             # dest == end?
                     f'\tjnz {label}',
                 ]
                 if not is_last:
@@ -1847,37 +1860,29 @@ class MK1CodeGen:
         loader_size = measure_lines(loader_pass1)
         main_size = measure_lines(main_lines)
 
-        # Also account for I2C helpers that must be in the kernel if runtime I2C is needed
+        # Extract _NO_OVERLAY helpers from other_resident into kernel.
+        # These are runtime helpers (tone, I2C, etc.) that must be callable
+        # from overlay code — they live permanently in the code page kernel.
         runtime_resident_helpers = []
-        if needs_runtime_i2c:
-            # Find __i2c_sb and __i2c_sp in other_resident and keep them in kernel
-            for line in other_resident:
-                s = line.strip()
-                # We need to extract these helper bodies
-            # Actually, runtime I2C helpers stay in other_resident which becomes
-            # part of the kernel if needed. Let's track them.
-            runtime_helper_names = set()
-            for label_s in _NO_OVERLAY:
-                name = label_s.rstrip(':')
-                if name.startswith('__'):
-                    runtime_helper_names.add(name)
-            # Extract runtime helpers from other_resident
+        runtime_helper_names = set()
+        for label_s in _NO_OVERLAY:
+            name = label_s.rstrip(':')
+            if name.startswith('__'):
+                runtime_helper_names.add(name)
+        if runtime_helper_names:
             rh_lines = []
             non_rh_lines = []
             in_helper = False
-            current_helper = None
             for line in other_resident:
                 s = line.strip()
                 if s.endswith(':') and not s.startswith('.') and s.startswith('_'):
                     hname = s[:-1]
                     if hname in runtime_helper_names:
                         in_helper = True
-                        current_helper = hname
                         rh_lines.append(line)
                         continue
                     else:
                         in_helper = False
-                        current_helper = None
                 if in_helper:
                     rh_lines.append(line)
                 else:
@@ -2147,7 +2152,10 @@ class MK1CodeGen:
             else:
                 runtime_main_lines.append(line)
 
-        # Prepend _main: label to runtime main
+        # Prepend _main: label to runtime main.
+        # Strip trailing ret after hlt — unreachable but inflates kernel size.
+        while runtime_main_lines and runtime_main_lines[-1].strip() == 'ret':
+            runtime_main_lines.pop()
         runtime_main_lines = ['_main:'] + runtime_main_lines
 
         # ── Recompute KERNEL_SIZE after init extraction ──
@@ -2171,24 +2179,28 @@ class MK1CodeGen:
         loader_size = measure_lines(loader)
         KERNEL_SIZE = loader_size + actual_main_size + runtime_helper_size
         OVERLAY_REGION = KERNEL_SIZE
+        # Verify kernel sizing
+        actual_total = measure_lines(loader + runtime_resident_helpers + runtime_main_lines)
+        if actual_total != KERNEL_SIZE:
+            raise Exception(
+                f"KERNEL SIZE MISMATCH: sum components={KERNEL_SIZE} vs measured={actual_total}. "
+                f"loader={loader_size}, main={actual_main_size}, helpers={runtime_helper_size}"
+            )
 
         # ── Step 17: Build the self-copy routine ──
         # Copies page3[0..KERNEL_SIZE-1] to code[0..KERNEL_SIZE-1] via derefp3+istc_inc
         self_copy = [
             '; ── self-copy: page3 → code page ──',
-            f'\tldi $b,0',                      # B = dest (code page addr)
-            '\tclr $a',
-            '\tmov $a,$c',                      # C = src (page3 addr) = 0
+            f'\tldi $b,0',                      # B = dest = 0
+            '\tldi $d,0',                       # D = src = 0
             '.selfcopy_loop:',
-            '\tmov $c,$a',                      # A = src addr
+            '\tmov $d,$a',                      # A = src addr
             '\tderefp3',                        # A = page3[src]
             '\tistc_inc',                       # code[B] = A; B++
-            '\tpush_b',                         # save B (dest)
-            '\tmov $c,$a',                      # A = src
+            '\tmov $d,$a',                      # A = src
             '\tinc',
-            '\tmov $a,$c',                      # C = src + 1
-            '\tpop_b',                          # B = dest (restored)
-            '\tmov $b,$a',                      # A = dest
+            '\tmov $a,$d',                      # D = src + 1
+            '\tmov $b,$a',                      # A = dest (B auto-incremented)
             f'\tcmpi {KERNEL_SIZE}',            # done?
             '\tjnz .selfcopy_loop',
             f'\tj _main',                       # jump to main in kernel
@@ -2322,12 +2334,9 @@ class MK1CodeGen:
         if init_only_funcs:
             assembled.append('__init_done:')
 
-        # Set DDRA for tone output if the program uses tone/play_note.
-        # Must happen AFTER delay_cal (which needs DDRA=0 for SQW reading)
-        # and BEFORE self-copy (so it's set before any overlay runs).
-        _helpers = getattr(self, '_lcd_helpers', set())
-        if '__tone' in _helpers:
-            assembled.append('\tddra_imm 0x02')   # PA1 = output for piezo
+        # DDRA for tone: now set inside __tone itself (bracket with ddra_imm 0x02
+        # before toggle loop, ddra_imm 0x00 after). Persistent DDRA=0x02 breaks
+        # delay loops due to VIA bus coupling (confirmed in stopwatch testing).
 
         # Note table precomputation: convert ratio → half_period during init.
         # After delay_cal stores ipm to page3[240], iterate over note entries
@@ -2357,16 +2366,16 @@ class MK1CodeGen:
             assembled.append('\tderef')                    # A = data[ptr] = ratio
             assembled.append('\ttst 0xFF')
             assembled.append('\tjz .precomp_skip')         # silence (ratio=0)
+            # A = ratio, D = note ptr
+            # tone_setup: B=ratio → C=half_period (clobbers A,B,D)
+            # push/pop manage SP correctly (verified: SD/SU in microcode)
             assembled.append('\tmov $a,$b')                # B = ratio
-            assembled.append('\tpush $d')                  # save note ptr (tone_setup clobbers D)
+            assembled.append('\tpush $d')                  # save note ptr
             assembled.append('\tjal __tone_setup')         # C = half_period
             assembled.append('\tpop $d')                   # D = note ptr (restored)
             assembled.append('\tmov $c,$a')                # A = half_period
-            assembled.append('\tpush $a')                  # save half_period
-            assembled.append('\tmov $d,$a')                # A = note ptr
-            assembled.append('\tmov $a,$b')                # B = note ptr
-            assembled.append('\tpop $a')                   # A = half_period
-            assembled.append('\tideref')                   # data[B] = A (write half_period back)
+            assembled.append('\tmov $d,$b')                # B = note ptr
+            assembled.append('\tideref')                   # data[B] = half_period
             assembled.append('.precomp_skip:')
             assembled.append('\tmov $d,$a')                # A = note ptr
             assembled.append('\taddi 3,$a')                # A += 3 (next entry)
@@ -2407,7 +2416,7 @@ class MK1CodeGen:
 
         # ── Diagnostics ──
         print(f"Two-stage boot overlay system:", file=sys.stderr)
-        print(f"  Kernel: {KERNEL_SIZE}B (loader={loader_size}B + main={main_size}B"
+        print(f"  Kernel: {KERNEL_SIZE}B (loader={loader_size}B + main={actual_main_size}B"
               f" + helpers={runtime_helper_size}B)", file=sys.stderr)
         print(f"  Overlay region: 0x{OVERLAY_REGION:02X}-0xFF ({256-OVERLAY_REGION}B)",
               file=sys.stderr)
@@ -4027,11 +4036,9 @@ class MK1CodeGen:
                 # Stores [ratio, cyc_lo, cyc_hi] in data page note table.
                 # Emits: ddra_imm 0x02 (once) + ldi $a, offset; jal __play_note.
                 # DDRA bit 1 must be set for PA1 output (i2c_init clears DDRA).
+                # DDRA is now set inside __tone itself (bracketed), not here.
+                # Persistent DDRA=0x02 breaks delay loops via VIA bus coupling.
                 if not hasattr(self, '_tone_ddra_emitted'):
-                    # Emit ddra_imm 0x02 at the first tone() call site.
-                    # This ensures PA1 is output regardless of where the code runs
-                    # (init section, main, or overlay function).
-                    self.emit('\tddra_imm 0x02')  # PA1 = output
                     self._tone_ddra_emitted = True
                     self._needs_tone_init = True
                 if len(args) < 2:
@@ -4640,7 +4647,8 @@ def peephole(lines):
                   'inc', 'dec', 'sll', 'slr', 'rll', 'rlr', 'swap',
                   'setz', 'setnz', 'setc', 'setnc', 'deref', 'derefp3',
                   'addi', 'subi', 'andi', 'ori', 'ldp3', 'stsp', 'clr',
-                  'adc', 'sbc', 'exr', 'exrw'}
+                  'adc', 'sbc', 'exr', 'exrw',
+                  'istc_inc', 'deref2', 'ideref2'}
 
     # ── Pass 1: Dead code elimination ────────────────────────────────
     changed = True

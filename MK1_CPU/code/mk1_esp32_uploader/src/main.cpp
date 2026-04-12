@@ -1585,6 +1585,80 @@ static void handleSerialCommand(const String& line) {
             actual_khz,
             aborted ? ",\"aborted\":true" : "");
     }
+    else if (line.startsWith("RUNNB:")) {
+        // RUNNB:cycles,us[,maxoi] — run N cycles, capture OI events
+        // Break early when maxoi events captured (0 = unlimited)
+        int comma1 = line.indexOf(',', 6);
+        int comma2 = comma1 > 0 ? line.indexOf(',', comma1 + 1) : -1;
+        int n = line.substring(6, comma1 > 0 ? comma1 : line.length()).toInt();
+        int us = comma1 > 0 ? line.substring(comma1 + 1, comma2 > 0 ? comma2 : line.length()).toInt() : 1;
+        int maxoi = comma2 > 0 ? line.substring(comma2 + 1).toInt() : 0;
+        if (n <= 0) n = 5000000;
+        if (n > 100000000) n = 100000000;
+        if (us < 0) us = 0;
+        if (maxoi < 0) maxoi = 0;
+
+        stopCustomClock();
+        if (oiMonitorActive) detachInterrupt(digitalPinToInterrupt(PIN_OI));
+        outputCaptured = false;
+        oiCount = 0;
+
+        int oiGpio = digitalPinToGPIONumber(PIN_OI);
+        if (oiGpio < 0) oiGpio = PIN_OI;
+        uint32_t oiMask = 1 << oiGpio;
+        busSetInput(); disableOutput();
+        digitalWrite(PIN_DIR, LOW); enableOutput();
+        int clkGpio = digitalPinToGPIONumber(PIN_CLK);
+        uint32_t clkMask = 1 << clkGpio;
+        pinMode(PIN_CLK, OUTPUT);
+        digitalWrite(PIN_CLK, LOW);
+
+        int actualCycles = 0;
+        bool aborted = false;
+        for (int i = 0; i < n; i++) {
+            if ((i & 0x1FFFF) == 0x1FFFF) {
+                if (Serial.available()) { aborted = true; break; }
+                // Heartbeat every ~131K cycles
+                if ((i & 0x7FFFF) == 0x7FFFF) {
+                    Serial.printf("{\"hb\":%d,\"oi\":%d}\n", i, oiCount);
+                }
+            }
+            actualCycles++;
+            GPIO.out_w1ts = clkMask;
+            if (us > 0) delayMicroseconds(us);
+            uint32_t gpio1 = GPIO.in;
+            if (gpio1 & oiMask) {
+                uint8_t val = readBusFast();
+                if (oiCount < 256) oiHistory[oiCount] = val;
+                oiCount++;
+                lastOutputVal = val;
+                outputCaptured = true;
+                if (maxoi > 0 && (int)oiCount >= maxoi) { actualCycles++; break; }
+            }
+            GPIO.out_w1tc = clkMask;
+            if (us > 0) delayMicroseconds(us);
+            uint32_t gpio2 = GPIO.in;
+            if (gpio2 & oiMask) {
+                uint8_t val = readBusFast();
+                if (oiCount < 256) oiHistory[oiCount] = val;
+                oiCount++;
+                lastOutputVal = val;
+                outputCaptured = true;
+                if (maxoi > 0 && (int)oiCount >= maxoi) break;
+            }
+        }
+        pinMode(PIN_CLK, INPUT);
+        disableOutput(); digitalWrite(PIN_DIR, HIGH);
+        busSetOutput(); enableOutput();
+        // Report: cycles + full history
+        Serial.printf("{\"cyc\":%d,\"cnt\":%d,\"hist\":[", actualCycles, oiCount);
+        int hmax = oiCount < 256 ? oiCount : 256;
+        for (int i = 0; i < hmax && i < 32; i++) {
+            if (i) Serial.print(',');
+            Serial.print(oiHistory[i]);
+        }
+        Serial.printf("]%s}\n", aborted ? ",\"aborted\":true" : "");
+    }
     else if (line == "OI") {
         uint8_t val = 0;
         bool found = false;
@@ -1607,6 +1681,17 @@ static void handleSerialCommand(const String& line) {
         resetPulse();
         enableCU();
         Serial.println("{\"ok\":true}");
+    }
+    else if (line == "P3HEX") {
+        // Dump first 80 bytes of page3 from uploadBuf (for debugging overlay data)
+        int p3off = CODE_SIZE + DATA_SIZE + DATA_SIZE;  // 768
+        int maxDump = 200;
+        Serial.print("{\"p3\":[");
+        for (int i = 0; i < maxDump && p3off + i < (int)uploadSize; i++) {
+            if (i) Serial.print(',');
+            Serial.print(uploadBuf[p3off + i]);
+        }
+        Serial.println("]}");
     }
     else if (line.startsWith("CLOCK:")) {
         int hz = line.substring(6).toInt();
