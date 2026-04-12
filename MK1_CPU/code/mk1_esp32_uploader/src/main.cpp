@@ -531,7 +531,14 @@ static inline uint8_t IRAM_ATTR readBusFast() {
     return val;
 }
 
+static volatile uint32_t lastOiTime = 0;
 static void IRAM_ATTR onOIRising() {
+    // Debounce: ignore OI events within 1ms of the previous one.
+    // Real out_imm events are seconds apart (during tone playback).
+    // Post-HLT bus noise fires every few microseconds.
+    uint32_t now = micros();
+    if (now - lastOiTime < 1000) return;  // 1ms debounce
+    lastOiTime = now;
     uint8_t val = readBusFast();
     if (oiCount < 256) oiHistory[oiCount] = val;
     oiCount++;

@@ -1,4 +1,6 @@
-// Twinkle with progress markers
+// Twinkle Twinkle Little Star — overlay system with heartbeat markers
+// On auto clock: cnt tracks progress (can't read values, only count).
+// Full run = cnt 8. If cnt < 8 on reset, page3 corruption likely.
 void phrase1() {
   tone(262, 400); silence(100);
   tone(262, 400); silence(100);
@@ -28,18 +30,18 @@ void phrase4() {
 void main() {
   i2c_init();
   delay_calibrate();
-  out(1);     // init done
+  out(1);       // cnt=1: init done
   phrase1();
-  out(2);     // phrase1 done
+  out(2);       // cnt=2
   phrase2();
-  out(3);     // phrase2 done
+  out(3);       // cnt=3
   phrase3();
-  out(4);     // phrase3 done
+  out(4);       // cnt=4
   phrase4();
-  out(5);     // phrase4 done
+  out(5);       // cnt=5
   phrase1();
-  out(6);     // repeat phrase1 done
+  out(6);       // cnt=6
   phrase2();
-  out(99);    // all done
-  halt();
+  out(7);       // cnt=7
+  halt();       // cnt=7 = full completion
 }
