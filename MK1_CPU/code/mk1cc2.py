@@ -869,7 +869,8 @@ class MK1CodeGen:
             self.emit('\tsll')             # A <<= 1
             self.emit('\tmov $a,$b')       # B = shifted
             self.emit('\tddrb_imm 0x00')   # SCL HIGH
-            self.emit('\texrw 0')          # A = port B (clobbers C)
+            self.emit('\tnop')             # SDA settle (margin for GAL clock noise)
+            self.emit('\texrw 0')          # A = port B
             self.emit('\ttst 0x01')        # test SDA
             self.emit(f'\tjz {lbl_rz}')
             self.emit('\tmov $b,$a')       # A = accumulated
