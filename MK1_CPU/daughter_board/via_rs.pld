@@ -1,0 +1,48 @@
+GAL16V8    ; VIA register select latch for MK1 daughter board
+VIA_RS     ;
+
+CLK   E0    E1    D0    D1    NC    NC    NC    NC   GND
+/OE   NC    NC    NC    NC    NC    nCS2  RS3   RS2  VCC
+
+
+; RS2 latch: capture D0 when E1=HIGH and E0=LOW, else hold
+; .R = registered output (clocked by CLK = MK1 system clock)
+
+RS2.R  =  D0 * E1 * /E0
+        + RS2 * /E1
+        + RS2 * E0
+
+; RS3 latch: capture D1 when E1=HIGH and E0=LOW, else hold
+
+RS3.R  =  D1 * E1 * /E0
+        + RS3 * /E1
+        + RS3 * E0
+
+; ~CS2: VIA selected when E0 is HIGH (active-low output)
+
+nCS2   =  /E0
+
+
+DESCRIPTION
+
+ATF16V8B on MK1 VIA daughter board.
+Expands VIA register access from 4 to 16 registers.
+
+RS2/RS3 are latched from data bus D0/D1 when E1 rises
+without E0 (new "exrs" opcode). Normal VIA operations
+(E0 asserted) hold the latch unchanged.
+
+~CS2 gates VIA chip-select so it only responds when E0
+is asserted. VIA PHI2 is wired to MK1 CLK directly for
+continuous timer counting (PB7 free-run audio).
+
+Connections:
+  Pin 1  CLK  = MK1 system clock (from TP2)
+  Pin 2  E0   = J4 pin 5
+  Pin 3  E1   = J4 pin 7
+  Pin 4  D0   = J4 pin 2 (data bus)
+  Pin 5  D1   = J4 pin 4 (data bus)
+  Pin 11 /OE  = GND (always enabled)
+  Pin 17 nCS2 = VIA pin 23 (~CS2, was GND)
+  Pin 18 RS3  = VIA pin 35 (was GND)
+  Pin 19 RS2  = VIA pin 36 (was GND)
