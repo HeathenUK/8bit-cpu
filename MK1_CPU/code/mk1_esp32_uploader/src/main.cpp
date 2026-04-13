@@ -2153,7 +2153,8 @@ static void writeEepromData(const uint8_t* data, int size) {
             "    jal __sb\n"
             "    ldi $a, %d\n"    // addr high
             "    jal __sb\n"
-            "    ldi $a, %d\n",   // addr low
+            "    ldi $a, %d\n"   // addr low
+            "    jal __sb\n",
             offset, pageLen, addrHi, addrLo);
 
         // Emit data bytes

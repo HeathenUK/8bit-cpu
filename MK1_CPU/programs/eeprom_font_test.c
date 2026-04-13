@@ -1,22 +1,12 @@
-// EEPROM read — exactly matching hand-written sequence, no bus_reset
+// Test EEPROM persistent storage: write font data, read back
+
+eeprom unsigned char test_data[] = { 0xDE, 0xAD };
 
 void main() {
     i2c_init();
-    // No bus_reset — just STOP
-    i2c_stop();
 
-    i2c_start();
-    i2c_send_byte(0xAE);
-    i2c_send_byte(0x00);
-    i2c_send_byte(0x00);
-    i2c_stop();
-
-    i2c_start();
-    i2c_send_byte(0xAF);
     unsigned char val;
-    val = i2c_read_byte();
-    i2c_nack();
-    i2c_stop();
+    val = test_data[0];
     out(val);
     halt();
 }
