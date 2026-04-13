@@ -38,15 +38,19 @@ struct AsmError {
     char message[80];
 };
 
+static const int EEPROM_SIZE = 4096;  // AT24C32 = 4KB
+
 struct AsmResult {
     uint8_t code[CODE_SIZE];
     uint8_t data[DATA_SIZE];
     uint8_t stack[DATA_SIZE];   // page 2 (stack page) overlay storage
     uint8_t page3[DATA_SIZE];
+    uint8_t eeprom[EEPROM_SIZE]; // AT24C32 EEPROM data for upload
     int code_size;
     int data_size;
     int stack_size;
     int page3_size;
+    int eeprom_size;
     AsmError errors[MAX_ERRORS];
     int error_count;
 };
@@ -328,9 +332,16 @@ private:
         result.page3_size++;
     }
 
+    void emitEeprom(uint8_t byte, bool pass1) {
+        if (!pass1 && result.eeprom_size < EEPROM_SIZE)
+            result.eeprom[result.eeprom_size] = byte;
+        result.eeprom_size++;
+    }
+
     // Emit to whichever bank is active (used for data directives)
     void emitBank(uint8_t byte, bool pass1, int bank) {
-        if (bank == 3) emitPage3(byte, pass1);
+        if (bank == 4) emitEeprom(byte, pass1);
+        else if (bank == 3) emitPage3(byte, pass1);
         else if (bank == 1) emitData(byte, pass1);
         else emitCode(byte, pass1);
     }
@@ -396,6 +407,9 @@ private:
                     // Overlay code stored in page 3: same but emit to page 3
                     bank = 0;
                     codeEmitTarget = 3;
+                } else if (strstr(lp, "eeprom")) {
+                    bank = 4;  // EEPROM data
+                    codeEmitTarget = 0;
                 } else if (strstr(lp, "page3")) {
                     bank = 3;  // raw data in page 3
                     codeEmitTarget = 0;

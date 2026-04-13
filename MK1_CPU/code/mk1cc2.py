@@ -31,7 +31,7 @@ TOKEN_PATTERNS = [
 ]
 KEYWORDS = {'if', 'else', 'while', 'for', 'do', 'return', 'unsigned', 'char',
             'void', 'int', 'switch', 'case', 'default', 'break', 'continue',
-            'u8', 'u16'}
+            'u8', 'u16', 'eeprom'}
 
 class Token:
     def __init__(self, type, value, line):
@@ -82,6 +82,8 @@ class Parser:
     def parse_program(self):
         functions, globals_ = [], []
         while self.peek().type != 'EOF':
+            # Check for 'eeprom' storage qualifier before type
+            storage = 'eeprom' if self.match('eeprom') else 'ram'
             typ = self.parse_type()
             name = self.expect('IDENT').value
             if self.match('('):
@@ -89,7 +91,7 @@ class Parser:
                 if fn: functions.append(fn)
             elif self.match('='):
                 val = self.expect('NUMBER').value; self.expect(';')
-                globals_.append((name, val))
+                globals_.append((name, val, storage))
             elif self.match('['):
                 if self.peek().type == 'NUMBER':
                     size = self.expect('NUMBER').value
@@ -97,7 +99,6 @@ class Parser:
                     size = None  # infer from initializer
                 self.expect(']')
                 if self.match('='):
-                    # Array with initializer: unsigned char name[N] = {v1, v2, ...};
                     self.expect('{')
                     vals = []
                     while not self.match('}'):
@@ -106,14 +107,14 @@ class Parser:
                     self.expect(';')
                     if size is not None and len(vals) < size:
                         vals.extend([0] * (size - len(vals)))
-                    globals_.append((name, vals))
+                    globals_.append((name, vals, storage))
                 else:
                     self.expect(';')
                     if size is None:
                         raise SyntaxError(f'Line {self.peek().line}: array {name} needs size or initializer')
-                    globals_.append((name, [0]*size))
+                    globals_.append((name, [0]*size, storage))
             elif self.match(';'):
-                globals_.append((name, 0))
+                globals_.append((name, 0, storage))
             else: raise SyntaxError(f'Line {self.peek().line}: unexpected after {name}')
         return globals_, functions
 
@@ -564,10 +565,20 @@ class MK1CodeGen:
 
         self.page3_globals = {}  # name → page 3 address (for overflow arrays)
         self.page3_alloc = 0
+        self.eeprom_globals = {}  # name → EEPROM address
+        self.eeprom_alloc = 0x0010  # skip 16-byte header (checksum + reserved)
+        self.eeprom_data = []  # list of (addr, bytes) for upload
 
-        for name, init in globals_:
+        for name, init, storage in globals_:
             size = len(init) if isinstance(init, list) else 1
-            if self.data_alloc + size <= 256:
+            if storage == 'eeprom':
+                # Store in EEPROM — must be initialized array
+                if not isinstance(init, list):
+                    raise Exception(f"eeprom variable '{name}' must be an initialized array")
+                self.eeprom_globals[name] = self.eeprom_alloc
+                self.eeprom_data.append((self.eeprom_alloc, init))
+                self.eeprom_alloc += size
+            elif self.data_alloc + size <= 256:
                 self.globals[name] = self.data_alloc
                 self.data_alloc += size
             else:
@@ -656,7 +667,7 @@ class MK1CodeGen:
         self._overlay_partition()
 
         # Emit page 1 globals (skip if init extraction handled everything)
-        page1_vars = [(n, i) for n, i in globals_ if n in self.globals]
+        page1_vars = [(n, i) for n, i, s in globals_ if n in self.globals]
         if page1_vars and not getattr(self, '_init_extraction_done', False):
             self.emit('\tsection data')
             for name, init in page1_vars:
@@ -669,7 +680,7 @@ class MK1CodeGen:
             self.emit('\tsection code')
 
         # Emit page 3 globals
-        page3_vars = [(n, i) for n, i in globals_ if n in self.page3_globals]
+        page3_vars = [(n, i) for n, i, s in globals_ if n in self.page3_globals]
         if page3_vars and not getattr(self, '_init_extraction_done', False):
             self.emit('\tsection page3')
             for name, init in page3_vars:
@@ -709,6 +720,26 @@ class MK1CodeGen:
                 self.emit(f'\tbyte {ratio}')
                 self.emit(f'\tbyte {cyc_lo}')
                 self.emit(f'\tbyte {cyc_hi}')
+            self.emit('\tsection code')
+
+        # Emit EEPROM data section (for ESP32 upload shim)
+        if self.eeprom_data:
+            self.emit('\tsection eeprom')
+            # Checksum at addr 0x0000-0x0001
+            all_bytes = []
+            for addr, data in self.eeprom_data:
+                all_bytes.extend(data)
+            cksum = sum(all_bytes) & 0xFFFF
+            self.emit(f'\tbyte {cksum & 0xFF}')
+            self.emit(f'\tbyte {(cksum >> 8) & 0xFF}')
+            # Pad to 0x0010 (16-byte header)
+            for _ in range(14):
+                self.emit('\tbyte 0')
+            # Data arrays
+            for addr, data in self.eeprom_data:
+                self.emit(f'; EEPROM data at 0x{addr:04X} ({len(data)} bytes)')
+                for b in data:
+                    self.emit(f'\tbyte {b}')
             self.emit('\tsection code')
 
         return '\n'.join(self.code)
@@ -825,6 +856,8 @@ class MK1CodeGen:
             no_ov.add('__i2c_sp:')  # stop is always needed alongside send
         if '__i2c_rb' in helpers:
             no_ov.add('__i2c_rb:')
+        if '__eeprom_rd' in helpers:
+            no_ov.add('__eeprom_rd:')
         if '__i2c_stream' in helpers:
             no_ov.add('__i2c_stream:')
 
@@ -939,6 +972,67 @@ class MK1CodeGen:
             self.emit('\tmov $a,$d')       # D--
             self.emit(f'\tjnz {lbl_rb}')
             self.emit('\tmov $b,$d')       # D = B (result)
+            self.emit('\tret')
+
+        # __eeprom_rd: read one byte from AT24C32 EEPROM
+        # Entry: B = addr_hi, A = addr_lo. Returns: A = byte read.
+        # AT24C32 at I2C address 0x57 (write=0xAE, read=0xAF).
+        if '__eeprom_rd' in helpers:
+            lbl_rb2 = self.label('erb')
+            lbl_rz2 = self.label('erz')
+            self.emit('__eeprom_rd:')
+            self.emit('\tmov $a,$d')       # D = addr_lo
+            self.emit('\tmov $b,$a')       # A = addr_hi (save for later)
+            self.emit('\tpush $a')         # save addr_hi
+            # START + device addr write
+            self.emit('\texrw 2')
+            self.emit('\tddrb_imm 0x01')
+            self.emit('\tddrb_imm 0x03')
+            self.emit('\tldi $a,0xAE')
+            self.emit('\tjal __i2c_sb')
+            # addr high
+            self.emit('\tpop $a')
+            self.emit('\tjal __i2c_sb')
+            # addr low
+            self.emit('\tmov $d,$a')
+            self.emit('\tjal __i2c_sb')
+            # STOP
+            self.emit('\tddrb_imm 0x03')
+            self.emit('\tddrb_imm 0x01')
+            self.emit('\tddrb_imm 0x00')
+            # START + device addr read
+            self.emit('\texrw 2')
+            self.emit('\tddrb_imm 0x01')
+            self.emit('\tddrb_imm 0x03')
+            self.emit('\tldi $a,0xAF')
+            self.emit('\tjal __i2c_sb')
+            # Read byte (inline, saves jal overhead)
+            self.emit('\tldi $b,0')
+            self.emit('\tldi $d,8')
+            self.emit(f'{lbl_rb2}:')
+            self.emit('\tmov $b,$a')
+            self.emit('\tsll')
+            self.emit('\tmov $a,$b')
+            self.emit('\tddrb_imm 0x00')
+            self.emit('\texrw 0')
+            self.emit('\ttst 0x01')
+            self.emit(f'\tjz {lbl_rz2}')
+            self.emit('\tmov $b,$a')
+            self.emit('\tori 0x01,$a')
+            self.emit('\tmov $a,$b')
+            self.emit(f'{lbl_rz2}:')
+            self.emit('\tddrb_imm 0x02')
+            self.emit('\tmov $d,$a')
+            self.emit('\tdec')
+            self.emit('\tmov $a,$d')
+            self.emit(f'\tjnz {lbl_rb2}')
+            self.emit('\tmov $b,$a')       # A = read byte
+            # NACK + STOP
+            self.emit('\tddrb_imm 0x00')
+            self.emit('\tddrb_imm 0x02')
+            self.emit('\tddrb_imm 0x03')
+            self.emit('\tddrb_imm 0x01')
+            self.emit('\tddrb_imm 0x00')
             self.emit('\tret')
 
         if '__i2c_stream' in helpers:
@@ -4602,7 +4696,30 @@ class MK1CodeGen:
         elif kind == 'index':
             base_expr, idx_expr = expr[1], expr[2]
             self.gen_expr(idx_expr)
-            if base_expr[0] == 'var' and base_expr[1] in self.page3_globals:
+            if base_expr[0] == 'var' and base_expr[1] in self.eeprom_globals:
+                # EEPROM array: A = index, read EEPROM[base + A]
+                base = self.eeprom_globals[base_expr[1]]
+                # __eeprom_rd takes 16-bit address in B:A (hi:lo)
+                # base is 16-bit EEPROM address; index is 8-bit
+                lo = base & 0xFF
+                hi = (base >> 8) & 0xFF
+                if lo:
+                    self.emit(f'\taddi {lo},$a')  # A = lo + index
+                self.emit(f'\tldi $b,{hi}')       # B = hi byte
+                # Handle carry from lo + index
+                self.emit('\tjnc .noc%d' % self.label_id)
+                self.emit('\tmov $b,$a')
+                self.emit('\tinc')
+                self.emit('\tmov $a,$b')
+                self.emit('.noc%d:' % self.label_id)
+                self.label_id += 1
+                if not hasattr(self, '_lcd_helpers'):
+                    self._lcd_helpers = set()
+                self._lcd_helpers.add('__eeprom_rd')
+                self._lcd_helpers.add('__i2c_sb')
+                self._lcd_helpers.add('__i2c_rb')
+                self.emit('\tjal __eeprom_rd')
+            elif base_expr[0] == 'var' and base_expr[1] in self.page3_globals:
                 base = self.page3_globals[base_expr[1]]
                 if base:
                     self.emit(f'\taddi {base},$a')
