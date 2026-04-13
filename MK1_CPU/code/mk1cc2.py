@@ -1665,8 +1665,10 @@ class MK1CodeGen:
                 'push $a ;!keep', 'pop $a ;!keep',
             }
             INIT_PREFIXES_SET = ('ddrb_imm', 'exrw 2', 'ldi $d,', 'ddra_imm', 'push_imm')
-            INIT_JAL_TARGETS = {'__delay_cal', '__lcd_init', '__tone_setup',
-                                '__i2c_stream', '__i2c_st', '__i2c_sp'}
+            INIT_JAL_TARGETS = {'__delay_cal', '__lcd_init', '__tone_setup'}
+            # Note: __i2c_stream, __i2c_st, __i2c_sp are NOT init-only targets —
+            # they can appear in runtime code too. Only delay_cal/lcd_init/tone_setup
+            # are definitively init-only calls that extend the init phase.
 
             init_inline = []
             runtime_main = []
@@ -1699,6 +1701,21 @@ class MK1CodeGen:
                     target = s.split()[1]
                     if target in INIT_JAL_TARGETS:
                         is_init = True
+                        # After the LAST init-only jal, end init phase.
+                        # Look ahead: if no more init-only jals follow, terminate.
+                        has_more_init_jal = False
+                        for fli in range(mi + 1, len(user_code)):
+                            fs = user_code[fli].strip()
+                            if fs.startswith('jal ') and fs.split()[1] in INIT_JAL_TARGETS:
+                                has_more_init_jal = True
+                                break
+                            if fs.startswith('jal ') and fs.split()[1] not in INIT_JAL_TARGETS:
+                                break
+                        if not has_more_init_jal:
+                            # This is the last init jal — extract it, then end init
+                            init_inline.append(line)
+                            in_init = False
+                            continue
                     else:
                         in_init = False
                 if is_init:
@@ -1746,18 +1763,21 @@ class MK1CodeGen:
                 for _ in range(pad):
                     new_code.append('\tnop')
 
+            # Self-copy: B=code dest, istc_inc does code[B]=A, B++, A=old_B.
+            # B auto-tracks both source and dest (they're the same offset).
+            # D = countdown. After istc_inc, A=old_B; next iter mov $b,$a gives A=new_B.
             copy_lbl = self.label('sc_lp')
-            new_code.append(f'\tldi $d,0')
-            new_code.append(f'\tldi $c,{kernel_size}')
+            new_code.append(f'\tldi $b,0')
+            new_code.append(f'\tldi $d,{kernel_size}')
             new_code.append(f'{copy_lbl}:')
-            new_code.append('\tmov $d,$a')
-            new_code.append('\tderefp3')
-            new_code.append('\tistc_inc')
-            new_code.append('\tmov $c,$a')
+            new_code.append('\tmov $b,$a')       # A = B (source offset)
+            new_code.append('\tderefp3')         # A = page3[B]
+            new_code.append('\tistc_inc')        # code[B]=A, B++, A=old_B
+            new_code.append('\tmov $d,$a')       # A = D (count)
             new_code.append('\tdec')
-            new_code.append('\tmov $a,$c')
+            new_code.append('\tmov $a,$d')       # D--
             new_code.append(f'\tjnz {copy_lbl}')
-            new_code.append('\tj 0')  # jump to code[0] = j _main
+            new_code.append('\tj 0')
 
             # Kernel in page3_kernel (resets code PC to 0 for self-copy)
             new_code.append('\tsection page3_kernel')

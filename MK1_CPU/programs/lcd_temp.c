@@ -1,5 +1,4 @@
 // HD44780 LCD temperature display via PCF8574 I2C on VIA
-// No delay loop — lcd_init has built-in DELAY sentinels
 
 void main() {
     i2c_init();
