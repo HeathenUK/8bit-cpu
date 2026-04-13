@@ -1,6 +1,7 @@
-; Write 4 different values to EEPROM addrs 0x0000-0x0003, read all back
-; Outputs each byte — expect 0xDE, 0xAD, 0xBE, 0xEF
-; With bus recovery + ACK polling (no fixed delay)
+; EEPROM write debug: outputs NACK bitmask then 4 read bytes
+; Bit N of bitmask = 1 if byte N NACKed. 0 = all OK.
+; After __sb, A has exrw 0 result (bit 0 = ACK).
+; We shift D left and OR in the ACK bit.
 
 ; VIA init
 ldi $d, 0
@@ -10,13 +11,11 @@ jnz .dly
 clr $a
 exw 0 0
 ddrb_imm 0x00
-; Clean STOP to end any prior transaction
 ddrb_imm 0x03
 ddrb_imm 0x01
 ddrb_imm 0x00
-
-; ACK poll: ensure EEPROM is ready (previous write cycle may be active)
-.pre_poll:
+; Pre-write ACK poll
+.pre:
 exrw 2
 ddrb_imm 0x01
 ddrb_imm 0x03
@@ -26,54 +25,95 @@ ddrb_imm 0x03
 ddrb_imm 0x01
 ddrb_imm 0x00
 tst 0x01
-jnz .pre_poll
-
-; WRITE 4 bytes starting at 0x0000 (page write)
+jnz .pre
+; WRITE with bitmask accumulation
+ldi $d, 0
 exrw 2
 ddrb_imm 0x01
 ddrb_imm 0x03
 ldi $a, 0xAE
 jal __sb
+andi 0x01, $a
+push $a
+mov $d, $a
+sll
+pop $b
+or $b, $a
+mov $a, $d
 clr $a
 jal __sb
+andi 0x01, $a
+push $a
+mov $d, $a
+sll
+pop $b
+or $b, $a
+mov $a, $d
 clr $a
 jal __sb
+andi 0x01, $a
+push $a
+mov $d, $a
+sll
+pop $b
+or $b, $a
+mov $a, $d
 ldi $a, 0xDE
 jal __sb
+andi 0x01, $a
+push $a
+mov $d, $a
+sll
+pop $b
+or $b, $a
+mov $a, $d
 ldi $a, 0xAD
 jal __sb
+andi 0x01, $a
+push $a
+mov $d, $a
+sll
+pop $b
+or $b, $a
+mov $a, $d
 ldi $a, 0xBE
 jal __sb
+andi 0x01, $a
+push $a
+mov $d, $a
+sll
+pop $b
+or $b, $a
+mov $a, $d
 ldi $a, 0xEF
 jal __sb
+andi 0x01, $a
+push $a
+mov $d, $a
+sll
+pop $b
+or $b, $a
+mov $a, $d
+; STOP
 ddrb_imm 0x03
 ddrb_imm 0x01
 ddrb_imm 0x00
-
-; ACK poll: send START + 0xAE, check ACK, repeat until ACK
-; EEPROM NACKs while write cycle is in progress
-.poll:
+; Output bitmask
+mov $d, $a
+out
+; Post-write ACK poll
+.post:
 exrw 2
 ddrb_imm 0x01
 ddrb_imm 0x03
 ldi $a, 0xAE
 jal __sb
+ddrb_imm 0x03
+ddrb_imm 0x01
+ddrb_imm 0x00
 tst 0x01
-jnz .poll_nack
-; ACK — write complete, send STOP and continue
-ddrb_imm 0x03
-ddrb_imm 0x01
-ddrb_imm 0x00
-j .read
-.poll_nack:
-; NACK — send STOP and retry
-ddrb_imm 0x03
-ddrb_imm 0x01
-ddrb_imm 0x00
-j .poll
-
-.read:
-; SET ADDR back to 0x0000
+jnz .post
+; READ
 exrw 2
 ddrb_imm 0x01
 ddrb_imm 0x03
@@ -86,46 +126,34 @@ jal __sb
 ddrb_imm 0x03
 ddrb_imm 0x01
 ddrb_imm 0x00
-
-; Sequential READ 4 bytes
 exrw 2
 ddrb_imm 0x01
 ddrb_imm 0x03
 ldi $a, 0xAF
 jal __sb
-
-; Byte 0 — ACK after each to continue sequential read
 jal __rb
 mov $d,$a
 out
 ddrb_imm 0x03
 ddrb_imm 0x01
-ddrb_imm 0x02
-
-; Byte 1
+ddrb_imm 0x03
 jal __rb
 mov $d,$a
 out
 ddrb_imm 0x03
 ddrb_imm 0x01
-ddrb_imm 0x02
-
-; Byte 2
+ddrb_imm 0x03
 jal __rb
 mov $d,$a
 out
 ddrb_imm 0x03
 ddrb_imm 0x01
-ddrb_imm 0x02
-
-; Byte 3 — NACK (no more bytes)
+ddrb_imm 0x03
 jal __rb
 mov $d,$a
 out
 ddrb_imm 0x00
 ddrb_imm 0x02
-
-; STOP
 ddrb_imm 0x03
 ddrb_imm 0x01
 ddrb_imm 0x00
