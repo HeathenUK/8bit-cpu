@@ -385,6 +385,12 @@ private:
                     // Overlay code stored in data page: labels at code PC, bytes to data buffer
                     bank = 0;
                     codeEmitTarget = 1;
+                } else if (strstr(lp, "page3_kernel")) {
+                    // Kernel code stored in page 3: resets code PC to 0 for
+                    // self-copy to code[0]. Labels at address 0+.
+                    bank = 0;
+                    codeEmitTarget = 3;
+                    result.code_size = 0;  // reset PC for kernel base address
                 } else if (strstr(lp, "page3_code")) {
                     // Overlay code stored in page 3: same but emit to page 3
                     bank = 0;
