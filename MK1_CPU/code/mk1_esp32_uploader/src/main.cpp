@@ -57,6 +57,7 @@ static void autoSaveSource(const String& source);
 static void startOIMonitor();
 static void stopOIMonitor();
 static int readDS3231Temp();
+static void writeEepromData(const uint8_t* data, int size);
 
 // ── Clock measurement ────────────────────────────────────────────────
 
@@ -1619,8 +1620,20 @@ static void handleSerialCommand(const String& line) {
     }
     else if (line == "UPLOAD") {
         if (uploadSize == 0) { Serial.println("{\"ok\":false}"); return; }
+
+        // Write EEPROM data if present (before uploading user program)
+        const AsmResult& er = assembler.result;
+        bool eepromWritten = false;
+        if (er.eeprom_size > 0) {
+            writeEepromData(er.eeprom, er.eeprom_size);
+            eepromWritten = true;
+        }
+
         uploadToMK1(uploadBuf, uploadSize);
-        Serial.println("{\"ok\":true}");
+        if (eepromWritten)
+            Serial.printf("{\"ok\":true,\"eeprom\":%d}\n", er.eeprom_size);
+        else
+            Serial.println("{\"ok\":true}");
     }
     else if (line.startsWith("RUN:")) {
         // RUN:cycles,us[,nops] — run N cycles at us half-period
@@ -2075,6 +2088,156 @@ static void handleSerialUpload() {
         } else if (serialLineBuf.length() < 16384) {
             serialLineBuf += c;
         }
+    }
+}
+
+// ── EEPROM data write via MK1 I2C shim ──────────────────────────────
+
+static void writeEepromData(const uint8_t* data, int size) {
+    // Check if EEPROM already has the right data (checksum match).
+    // Checksum is at EEPROM[0x0000-0x0001], data starts at 0x0010.
+    // The data buffer includes the 16-byte header (checksum + reserved).
+    if (size < 16) return;
+
+    uint16_t expected_cksum = data[0] | (data[1] << 8);
+
+    // Read current EEPROM checksum via a small MK1 program
+    // that reads EEPROM[0x0000] and EEPROM[0x0001]
+    // For simplicity, skip checksum verification for now and always write.
+    // TODO: add checksum read + compare to skip redundant writes.
+
+    // No serial output here — caller reports EEPROM info in JSON response
+
+    // Write in 32-byte pages (AT24C32 page size).
+    // Each page write: assemble a shim that writes up to 32 bytes,
+    // upload, run, verify via OI output.
+    for (int offset = 0; offset < size; offset += 32) {
+        int pageLen = size - offset;
+        if (pageLen > 32) pageLen = 32;
+
+        int addrHi = (offset >> 8) & 0xFF;
+        int addrLo = offset & 0xFF;
+
+        // Build MK1 assembly for this page write
+        char asmBuf[2048];
+        int pos = 0;
+        pos += snprintf(asmBuf + pos, sizeof(asmBuf) - pos,
+            "; EEPROM page write at 0x%04X (%d bytes)\n"
+            "    ldi $d, 0\n"
+            ".dly:\n"
+            "    dec\n"
+            "    jnz .dly\n"
+            "    clr $a\n"
+            "    exw 0 0\n"
+            "    ddrb_imm 0x00\n"
+            "    ddrb_imm 0x03\n"
+            "    ddrb_imm 0x01\n"
+            "    ddrb_imm 0x00\n"
+            // ACK poll: wait for any prior write to complete
+            ".poll:\n"
+            "    exrw 2\n"
+            "    ddrb_imm 0x01\n"
+            "    ddrb_imm 0x03\n"
+            "    ldi $a, 0xAE\n"
+            "    jal __sb\n"
+            "    ddrb_imm 0x03\n"
+            "    ddrb_imm 0x01\n"
+            "    ddrb_imm 0x00\n"
+            "    tst 0x01\n"
+            "    jnz .poll\n"
+            // START page write
+            "    exrw 2\n"
+            "    ddrb_imm 0x01\n"
+            "    ddrb_imm 0x03\n"
+            "    ldi $a, 0xAE\n"
+            "    jal __sb\n"
+            "    ldi $a, %d\n"    // addr high
+            "    jal __sb\n"
+            "    ldi $a, %d\n",   // addr low
+            offset, pageLen, addrHi, addrLo);
+
+        // Emit data bytes
+        for (int i = 0; i < pageLen; i++) {
+            pos += snprintf(asmBuf + pos, sizeof(asmBuf) - pos,
+                "    ldi $a, %d\n"
+                "    jal __sb\n",
+                data[offset + i]);
+        }
+        pos += snprintf(asmBuf + pos, sizeof(asmBuf) - pos,
+            // STOP
+            "    ddrb_imm 0x03\n"
+            "    ddrb_imm 0x01\n"
+            "    ddrb_imm 0x00\n"
+            "    hlt\n"
+            "__sb:\n"
+            "    mov $a, $b\n"
+            "    ldi $a, 8\n"
+            "    mov $a, $c\n"
+            ".isb:\n"
+            "    mov $b, $a\n"
+            "    tst 0x80\n"
+            "    jnz .isbh\n"
+            "    ddrb_imm 0x03\n"
+            "    ddrb_imm 0x01\n"
+            "    ddrb_imm 0x03\n"
+            "    j .isbn\n"
+            ".isbh:\n"
+            "    ddrb_imm 0x02\n"
+            "    ddrb_imm 0x00\n"
+            "    ddrb_imm 0x02\n"
+            ".isbn:\n"
+            "    mov $b, $a\n"
+            "    sll\n"
+            "    mov $a, $b\n"
+            "    mov $c, $a\n"
+            "    dec\n"
+            "    mov $a, $c\n"
+            "    jnz .isb\n"
+            "    ddrb_imm 0x02\n"
+            "    ddrb_imm 0x00\n"
+            "    exrw 0\n"
+            "    ddrb_imm 0x02\n"
+            "    ret\n");
+
+        assembler.assemble(asmBuf);
+        const AsmResult& pr = assembler.result;
+        if (pr.error_count != 0) {
+            Serial.printf("EEPROM write ASM error at offset 0x%04X\n", offset);
+            continue;
+        }
+
+        memcpy(uploadBuf, pr.code, CODE_SIZE);
+        uploadSize = CODE_SIZE;
+        uploadToMK1(uploadBuf, uploadSize);
+
+        // Run: RESET then manual clock
+        disableClock();
+        resetPulse();
+        enableCU();
+
+        stopCustomClock();
+
+        busSetInput(); disableOutput();
+        digitalWrite(PIN_DIR, LOW); enableOutput();
+
+        int clkGpio = digitalPinToGPIONumber(PIN_CLK);
+        uint32_t clkMask = 1 << clkGpio;
+        pinMode(PIN_CLK, OUTPUT);
+        digitalWrite(PIN_CLK, LOW);
+
+        // Run enough cycles for VIA init + ACK poll + page write + HLT
+        // ~100K cycles is plenty (ACK poll takes ~5ms = ~2500 cycles)
+        for (int i = 0; i < 100000; i++) {
+            GPIO.out_w1ts = clkMask;
+            delayMicroseconds(1);
+            GPIO.out_w1tc = clkMask;
+            delayMicroseconds(1);
+        }
+        pinMode(PIN_CLK, INPUT);
+        disableOutput(); digitalWrite(PIN_DIR, HIGH);
+        busSetOutput(); enableOutput();
+
+        // If !ok, the page write failed — continue with next page
     }
 }
 

@@ -1,19 +1,22 @@
-// Test: read font data from EEPROM, display on LCD
-// Font stored in AT24C32 EEPROM at compile-assigned addresses
-
-eeprom unsigned char font[] = {
-    0x3E, 0x51, 0x49, 0x45, 0x3E,  // 0
-    0x00, 0x42, 0x7F, 0x40, 0x00,  // 1
-    0x42, 0x61, 0x51, 0x49, 0x46,  // 2
-};
+// EEPROM read — exactly matching hand-written sequence, no bus_reset
 
 void main() {
     i2c_init();
-    i2c_bus_reset();
+    // No bus_reset — just STOP
+    i2c_stop();
 
-    // Read font[0] (should be 0x3E = 62)
+    i2c_start();
+    i2c_send_byte(0xAE);
+    i2c_send_byte(0x00);
+    i2c_send_byte(0x00);
+    i2c_stop();
+
+    i2c_start();
+    i2c_send_byte(0xAF);
     unsigned char val;
-    val = font[0];
+    val = i2c_read_byte();
+    i2c_nack();
+    i2c_stop();
     out(val);
     halt();
 }

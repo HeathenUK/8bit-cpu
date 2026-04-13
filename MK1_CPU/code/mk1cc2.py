@@ -958,7 +958,6 @@ class MK1CodeGen:
             self.emit('\tsll')             # A <<= 1
             self.emit('\tmov $a,$b')       # B = shifted
             self.emit('\tddrb_imm 0x00')   # SCL HIGH
-            self.emit('\tnop')             # SDA settle (margin for GAL clock noise)
             self.emit('\texrw 0')          # A = port B
             self.emit('\ttst 0x01')        # test SDA
             self.emit(f'\tjz {lbl_rz}')
@@ -4087,8 +4086,8 @@ class MK1CodeGen:
                 self.emit('\tclr $a')
                 self.emit('\texw 0 0')         # ORB = 0
                 self.emit('\tddrb_imm 0x00')   # DDRB = 0 (both lines idle/HIGH)
-                self.emit('\tclr $a')
-                self.emit('\texw 0 3')         # DDRA = 0
+                # NOTE: exw 0 3 (DDRA=0) REMOVED — it breaks EEPROM reads.
+                # The VIA bus cycle for register 3 (U0+U1) glitches the I2C bus.
                 self.emit('\tpush $a ;!keep')  # stack warmup (STK pin settling)
                 self.emit('\tpop $a ;!keep')
                 return
@@ -4103,8 +4102,6 @@ class MK1CodeGen:
                 self.emit('\tclr $a')
                 self.emit('\texw 0 0')         # ORB = 0
                 self.emit('\tddrb_imm 0x00')   # DDRB = 0 (idle)
-                self.emit('\tclr $a')
-                self.emit('\texw 0 3')         # DDRA = 0
                 self.emit('\tpush $a ;!keep')  # stack warmup
                 self.emit('\tpop $a ;!keep')
                 self.emit('\tddrb_imm 0x03')   # STOP: both LOW
