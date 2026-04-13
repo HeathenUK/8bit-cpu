@@ -1,12 +1,21 @@
 ; Write 0x42 to addr 0x0000, check ACK after each byte
-; Outputs ACK status for each of 4 bytes: 0=ACK, 1=NACK
-nop
-nop
-nop
+; Outputs ACK status for each of 4 bytes: 10=ACK, 11=NACK (etc.)
+; Then outputs 99 when done. With bus recovery.
+
+; VIA init + bus recovery
+ldi $d, 0
+.dly:
+ddrb_imm 0x00
+ddrb_imm 0x02
+dec
+jnz .dly
 clr $a
 exw 0 0
 ddrb_imm 0x00
-exw 0 3
+ddrb_imm 0x03
+ddrb_imm 0x01
+ddrb_imm 0x00
+
 ; START
 exrw 2
 ddrb_imm 0x01
@@ -57,6 +66,7 @@ ddrb_imm 0x01
 ddrb_imm 0x00
 out_imm 99
 hlt
+
 __sb:
 	mov $a,$b
 	ldi $a,8

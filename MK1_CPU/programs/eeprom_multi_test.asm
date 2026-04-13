@@ -1,12 +1,32 @@
 ; Write 4 different values to EEPROM addrs 0x0000-0x0003, read all back
 ; Outputs each byte — expect 0xDE, 0xAD, 0xBE, 0xEF
-nop
-nop
-nop
+; With bus recovery + ACK polling (no fixed delay)
+
+; VIA init
+ldi $d, 0
+.dly:
+dec
+jnz .dly
 clr $a
 exw 0 0
 ddrb_imm 0x00
-exw 0 3
+; Clean STOP to end any prior transaction
+ddrb_imm 0x03
+ddrb_imm 0x01
+ddrb_imm 0x00
+
+; ACK poll: ensure EEPROM is ready (previous write cycle may be active)
+.pre_poll:
+exrw 2
+ddrb_imm 0x01
+ddrb_imm 0x03
+ldi $a, 0xAE
+jal __sb
+ddrb_imm 0x03
+ddrb_imm 0x01
+ddrb_imm 0x00
+tst 0x01
+jnz .pre_poll
 
 ; WRITE 4 bytes starting at 0x0000 (page write)
 exrw 2
@@ -30,18 +50,29 @@ ddrb_imm 0x03
 ddrb_imm 0x01
 ddrb_imm 0x00
 
-; Wait 20ms
-ldi $d, 20
-.ww:
-clr $a
-.wi:
-dec
-jnz .wi
-mov $d,$a
-dec
-mov $a,$d
-jnz .ww
+; ACK poll: send START + 0xAE, check ACK, repeat until ACK
+; EEPROM NACKs while write cycle is in progress
+.poll:
+exrw 2
+ddrb_imm 0x01
+ddrb_imm 0x03
+ldi $a, 0xAE
+jal __sb
+tst 0x01
+jnz .poll_nack
+; ACK — write complete, send STOP and continue
+ddrb_imm 0x03
+ddrb_imm 0x01
+ddrb_imm 0x00
+j .read
+.poll_nack:
+; NACK — send STOP and retry
+ddrb_imm 0x03
+ddrb_imm 0x01
+ddrb_imm 0x00
+j .poll
 
+.read:
 ; SET ADDR back to 0x0000
 exrw 2
 ddrb_imm 0x01
@@ -67,7 +98,6 @@ jal __sb
 jal __rb
 mov $d,$a
 out
-; ACK (SDA LOW during SCL pulse)
 ddrb_imm 0x03
 ddrb_imm 0x01
 ddrb_imm 0x03
@@ -131,7 +161,6 @@ __sb:
 	ddrb_imm 0x02
 	ret
 
-; Fixed __i2c_rb: B=accum, D=counter
 __rb:
 	ldi $b,0
 	ldi $d,8
@@ -140,7 +169,6 @@ __rb:
 	sll
 	mov $a,$b
 	ddrb_imm 0x00
-	nop
 	exrw 0
 	tst 0x01
 	jz .rz
