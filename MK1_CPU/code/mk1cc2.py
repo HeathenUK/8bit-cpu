@@ -789,8 +789,14 @@ class MK1CodeGen:
         no_ov = {'_main:', '_overlay_load:', '_overlay_load_p1:'}
 
         if self._needs_runtime_i2c:
-            # I2C send/stop needed at runtime by LCD/EEPROM overlays
-            no_ov.update({'__i2c_sb:', '__i2c_sp:'})
+            # I2C + LCD helpers needed at runtime
+            no_ov.update({'__i2c_sb:', '__i2c_sp:', '__i2c_st:'})
+            # LCD send helpers must be resident if used.
+            # __lcd_send is always emitted alongside __lcd_chr/__lcd_cmd.
+            for h in ('__lcd_chr', '__lcd_cmd', '__lcd_print'):
+                if h in helpers:
+                    no_ov.add(f'{h}:')
+                    no_ov.add('__lcd_send:')  # shared by chr and cmd
 
         # Raw I2C helpers: if __i2c_sb or __i2c_rb are used at all, they must
         # be resident — any overlay might call i2c_send_byte/i2c_read_byte.
@@ -1019,17 +1025,22 @@ class MK1CodeGen:
             # Data-driven LCD init: store I2C byte sequence in page 3,
             # use compact loop to send. Keeps overlay small (~35B vs ~85B).
             # Sentinels: 0xFE=START, 0xFD=STOP, 0xFF=END, else=send byte
-            START, STOP, END = 0xFE, 0xFD, 0xFF
+            START, STOP, END, DELAY = 0xFE, 0xFD, 0xFF, 0xFC
             lcd_init_data = []
             # No PCF reset (0x00) — backlight defaults to on, reset turns it off
             BL = 0x08  # backlight bit — keep on throughout init
-            for _ in range(3):
-                lcd_init_data += [START, 0x34|BL, 0x30|BL, STOP]   # nibble 0x03 x3
-            lcd_init_data += [START, 0x24|BL, 0x20|BL, STOP]       # nibble 0x02
+            # Reset nibble 0x03 × 3 with required delays between them
+            # HD44780 spec: >4.1ms after 1st, >100µs after 2nd
+            lcd_init_data += [START, 0x34|BL, 0x30|BL, STOP, DELAY]  # 1st + 5ms delay
+            lcd_init_data += [START, 0x34|BL, 0x30|BL, STOP, DELAY]  # 2nd + 5ms delay
+            lcd_init_data += [START, 0x34|BL, 0x30|BL, STOP]         # 3rd (no delay needed)
+            lcd_init_data += [START, 0x24|BL, 0x20|BL, STOP]         # nibble 0x02 (4-bit)
             for cmd in [0x28, 0x0C, 0x01, 0x06]:             # HD44780 commands
                 hi = cmd & 0xF0
                 lo = (cmd & 0x0F) << 4
                 lcd_init_data += [START, hi|0x04|BL, hi|BL, lo|0x04|BL, lo|BL, STOP]
+                if cmd == 0x01:
+                    lcd_init_data.append(DELAY)  # clear display needs ~2ms
             lcd_init_data.append(END)
 
             p3_base = self.page3_alloc
@@ -1058,8 +1069,21 @@ class MK1CodeGen:
             self.emit(f'{lbl_ns}:')
             self.emit(f'\tldi $b,{STOP}')
             self.emit('\tcmp $b')
-            self.emit(f'\tjnz {lbl_send}')
+            lbl_nd = self.label('li_nd')
+            self.emit(f'\tjnz {lbl_nd}')
             self.emit('\tjal __i2c_sp')
+            self.emit(f'\tj {lbl_adv}')
+            self.emit(f'{lbl_nd}:')
+            self.emit(f'\tldi $b,{DELAY}')
+            self.emit('\tcmp $b')
+            self.emit(f'\tjnz {lbl_send}')
+            # Inline ~5ms delay: 256 iterations × ~20µs = ~5ms
+            self.emit('\tpush $d')
+            lbl_dly = self.label('li_dl')
+            self.emit(f'{lbl_dly}:')
+            self.emit('\tdec')
+            self.emit(f'\tjnz {lbl_dly}')
+            self.emit('\tpop $d')
             self.emit(f'\tj {lbl_adv}')
             self.emit(f'{lbl_send}:')
             self.emit('\tjal __i2c_sb')
@@ -1480,7 +1504,34 @@ class MK1CodeGen:
         # ── Step 1: Estimate total code size ──
         size = measure_lines(self.code)
 
-        # Only partition if code exceeds 250 bytes or eeprom_mode is set
+        # Estimate init-extractable code (inline builtins that will move to stage 1).
+        # These patterns are extracted from main during init extraction and don't
+        # count toward the runtime kernel size.
+        init_estimate = 0
+        in_main = False
+        for line in self.code:
+            s = line.strip()
+            if s == '_main:':
+                in_main = True; continue
+            if in_main and s.endswith(':') and not s.startswith('.') and s.startswith('_'):
+                in_main = False
+            if in_main:
+                if (s.startswith('exw 0') or s.startswith('ddrb_imm') or
+                    s.startswith('ddra_imm') or s.startswith('exrw 2') or
+                    s == 'push $a ;!keep' or s == 'pop $a ;!keep' or
+                    s.startswith('clr $a') or s.startswith('ldi $d,') or
+                    s.startswith('.via_') or s.startswith('.br_') or
+                    s.startswith('.rcv') or s == 'nop' or
+                    s.startswith('dec') or s.startswith('mov $c,$a') or
+                    (s.startswith('jnz .') and any(s.endswith(x) for x in ['dly', 'rcv', 'br_'])) or
+                    s == 'jal __delay_cal' or s == 'jal __lcd_init'):
+                    mn = s.split()[0] if s else ''
+                    init_estimate += 2 if mn in two_byte else 1
+
+        runtime_estimate = size - init_estimate
+
+        # Always proceed with partitioning if code > 250B — even if no overlays
+        # are needed, init extraction is required to fit in 256B.
         if size <= 250 and not getattr(self, 'eeprom_mode', False):
             return
 
@@ -1569,7 +1620,162 @@ class MK1CodeGen:
                 remaining_size -= fsize
 
         if not overlay_funcs:
-            return
+            # No runtime overlays, but init-only functions can be overlayed
+            # to free space for the runtime kernel.
+            if init_only_funcs and size > 250:
+                # Promote init-only functions to overlay candidates
+                overlay_funcs = list(init_only_funcs)
+                overlay_eligible = list(init_only_funcs)
+            else:
+                return
+            # to fit the runtime code in 250B. Do lightweight init extraction.
+            if size <= 250:
+                return  # fits flat, nothing to do
+
+            # Extract init-only code from main and init-only functions,
+            # emit as stage 1 (code section) with self-copy to kernel.
+            # Runtime code (main + helpers) goes to page3_code for kernel.
+            # This is the same two-stage boot but WITHOUT the overlay loader.
+
+            # Find main and separate helpers (emitted after main's hlt)
+            main_start = None
+            main_user_end = None  # end of user code (at hlt)
+            for fi in range(len(self.code)):
+                s = self.code[fi].strip()
+                if s == '_main:':
+                    main_start = fi
+                elif main_start and main_user_end is None:
+                    # Find first __ helper label after main starts
+                    if s.endswith(':') and s.startswith('__'):
+                        main_user_end = fi
+                        break
+            if main_start is None:
+                return
+            if main_user_end is None:
+                main_user_end = len(self.code)
+
+            main_lines = self.code[main_start:main_user_end]
+            other_code = self.code[main_user_end:]
+
+            # Run init extraction (same logic as step 10b)
+            INIT_MARKERS_SIMPLE = {
+                'exw 0 0', 'exw 0 1', 'exw 0 3',
+                'push $a ;!keep', 'pop $a ;!keep',
+                'jal __delay_cal', 'jal __lcd_init',
+            }
+            INIT_PREFIXES_SIMPLE = ('ddrb_imm', 'exrw 2', 'ldi $d,', 'ddra_imm', 'push_imm')
+            INIT_COMPAT = {'__i2c_stream', '__i2c_st', '__i2c_sp',
+                           '__delay_cal', '__lcd_init', '__tone_setup'}
+
+            init_lines = []
+            runtime_lines = []
+            in_init = True
+            for mi, line in enumerate(main_lines):
+                s = line.strip()
+                if s == '_main:':
+                    continue
+                if in_init:
+                    is_init = (s in INIT_MARKERS_SIMPLE or
+                               any(s.startswith(p) for p in INIT_PREFIXES_SIMPLE) or
+                               s.startswith('clr $a') or s.startswith('dec') or
+                               s.startswith('.via_') or s.startswith('.br_') or
+                               s.startswith('.rcv') or s.startswith('mov $c,$a') or
+                               s == 'nop')
+                    if s.startswith('jnz .') or s.startswith('j .via') or s.startswith('j .br') or s.startswith('j .rcv'):
+                        is_init = True
+                    if s.startswith('ldi $a,') or s.startswith('ldi $b,'):
+                        for nli in range(mi + 1, min(mi + 4, len(main_lines))):
+                            ns = main_lines[nli].strip()
+                            if ns.startswith('jal '):
+                                t = ns.split()[1]
+                                if t in INIT_COMPAT or any(t == f'__{x}' for x in ['delay_cal','lcd_init','tone_setup']):
+                                    is_init = True
+                                break
+                    if s.startswith('jal '):
+                        target = s.split()[1]
+                        if target in INIT_COMPAT or any(n in target for n in ['delay_cal', 'lcd_init']):
+                            is_init = True
+                        else:
+                            in_init = False
+                    if is_init:
+                        init_lines.append(line)
+                    else:
+                        in_init = False
+                        runtime_lines.append(line)
+                else:
+                    runtime_lines.append(line)
+
+            # Strip trailing ret
+            while runtime_lines and runtime_lines[-1].strip() == 'ret':
+                runtime_lines.pop()
+
+            # Separate init-only functions from runtime helpers
+            init_func_names = {'__delay_cal', '__lcd_init', '__tone_setup'}
+            # Also I2C helpers that are init-only when no runtime I2C
+            needs_runtime_i2c = getattr(self, '_needs_runtime_i2c', False)
+            if not needs_runtime_i2c:
+                init_func_names.update({'__i2c_sb', '__i2c_sp', '__i2c_st', '__i2c_rb'})
+
+            init_funcs = []
+            runtime_helpers = []
+            fi = 0
+            while fi < len(other_code):
+                s = other_code[fi].strip()
+                if s.endswith(':') and s.startswith('_') and not s.startswith('.'):
+                    fname = s[:-1]
+                    start = fi
+                    fi += 1
+                    while fi < len(other_code):
+                        ns = other_code[fi].strip()
+                        if ns.endswith(':') and not ns.startswith('.') and ns.startswith('_'):
+                            break
+                        fi += 1
+                    if fname in init_func_names:
+                        init_funcs.extend(other_code[start:fi])
+                    else:
+                        runtime_helpers.extend(other_code[start:fi])
+                else:
+                    fi += 1
+
+            # Check if runtime fits
+            runtime_all = ['_main:'] + runtime_lines + runtime_helpers
+            runtime_size = measure_lines(runtime_all)
+            if runtime_size > 250:
+                # Still too big — need real overlays, fall through to overlay system
+                pass  # will be caught below
+            else:
+                # Emit: init code in code section, runtime in page3_code, self-copy
+                KERNEL_SIZE = runtime_size + 2  # +2 for j _main reset stub
+                new_code = []
+                # Stage 1: init lines + init functions + self-copy
+                new_code.extend(init_lines)
+                new_code.extend(init_funcs)
+                # Self-copy loop
+                new_code.append(f'\tldi $d,0')
+                new_code.append(f'\tldi $c,{KERNEL_SIZE}')
+                copy_lbl = self.label('sc_lp')
+                new_code.append(f'{copy_lbl}:')
+                new_code.append('\tmov $d,$a')
+                new_code.append('\tderefp3')
+                new_code.append('\tnop')
+                new_code.append('\tistc_inc')
+                new_code.append('\tmov $c,$a')
+                new_code.append('\tdec')
+                new_code.append('\tmov $a,$c')
+                new_code.append(f'\tjnz {copy_lbl}')
+                new_code.append('\tj _main')
+                # page3_code: j _main at offset 0 + runtime
+                new_code.append('\tsection page3_code')
+                new_code.append(f'\tj _main')  # reset-safe entry at code[0]
+                new_code.extend(runtime_all)
+                # page3 data (lcd init table etc.)
+                if hasattr(self, '_lcd_init_p3_data'):
+                    p3_base, data = self._lcd_init_p3_data
+                    new_code.append('\tsection page3')
+                    for b in data:
+                        new_code.append(f'\tbyte {b}')
+                self.code = new_code
+                return
 
         # ── Step 4: Build connected components (BFS) ──
         # Functions that call each other must be in the same overlay slot
@@ -4278,7 +4484,7 @@ class MK1CodeGen:
                     self._lcd_print_strings.append((p3_off, s))
                     self.page3_alloc += len(s) + 1  # +1 for null terminator
                     # Emit call to shared __lcd_print helper
-                    self.emit(f'\tldi $a,{p1_off}')
+                    self.emit(f'\tldi $a,{p3_off}')
                     if not hasattr(self, '_lcd_helpers'):
                         self._lcd_helpers = set()
                     self._lcd_helpers.add('__lcd_print')
