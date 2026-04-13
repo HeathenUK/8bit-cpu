@@ -1112,45 +1112,33 @@ class MK1CodeGen:
             self.emit('__lcd_send:')
             self.emit('\tpush $a')        # push flags to stack
             self.emit('\tjal __i2c_st')   # START + addr
-            # High nibble + EN
-            self.emit('\tmov $d,$a')
-            self.emit('\tandi 0xF0,$a')
+            # High nibble: compute once, send with EN then without
+            self.emit('\tmov $d,$a')      # A = char
+            self.emit('\tandi 0xF0,$a')   # high nibble
             self.emit('\tpop $b')         # B = flags
-            self.emit('\tpush $b')
+            self.emit('\tpush $b')        # keep flags
+            self.emit('\tor $b,$a')       # A = nibble | flags
+            self.emit('\tpush $a')        # save nibble+flags
+            self.emit('\tori 0x04,$a')    # + EN
+            self.emit('\tjal __i2c_sb')   # send with EN
+            self.emit('\tpop $a')         # restore nibble+flags (no EN)
+            self.emit('\tjal __i2c_sb')   # send without EN
+            # Low nibble: shift, compute once, send with EN then without
+            self.emit('\tmov $d,$a')
+            self.emit('\tsll')
+            self.emit('\tsll')
+            self.emit('\tsll')
+            self.emit('\tsll')
+            self.emit('\tandi 0xF0,$a')
+            self.emit('\tpop $b')         # flags
             self.emit('\tor $b,$a')
+            self.emit('\tpush $a')        # save nibble+flags
             self.emit('\tori 0x04,$a')    # + EN
             self.emit('\tjal __i2c_sb')
-            # High nibble - EN
-            self.emit('\tmov $d,$a')
-            self.emit('\tandi 0xF0,$a')
-            self.emit('\tpop $b')
-            self.emit('\tpush $b')
-            self.emit('\tor $b,$a')
-            self.emit('\tjal __i2c_sb')
-            # Low nibble + EN
-            self.emit('\tmov $d,$a')
-            self.emit('\tsll')
-            self.emit('\tsll')
-            self.emit('\tsll')
-            self.emit('\tsll')
-            self.emit('\tandi 0xF0,$a')
-            self.emit('\tpop $b')
-            self.emit('\tpush $b')
-            self.emit('\tor $b,$a')
-            self.emit('\tori 0x04,$a')
-            self.emit('\tjal __i2c_sb')
-            # Low nibble - EN
-            self.emit('\tmov $d,$a')
-            self.emit('\tsll')
-            self.emit('\tsll')
-            self.emit('\tsll')
-            self.emit('\tsll')
-            self.emit('\tandi 0xF0,$a')
-            self.emit('\tpop $b')
-            self.emit('\tor $b,$a')
+            self.emit('\tpop $a')         # restore (no EN)
             self.emit('\tjal __i2c_sb')
             self.emit('\tjal __i2c_sp')
-            self.emit('\tpop $a')         # balance the push at entry
+            self.emit('\tpop $a')         # balance push at entry (discards caller A)
             self.emit('\tret')
 
         if '__lcd_print' in helpers:

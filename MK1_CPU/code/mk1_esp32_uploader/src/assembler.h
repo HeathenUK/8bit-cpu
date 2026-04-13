@@ -390,7 +390,8 @@ private:
                     // self-copy to code[0]. Labels at address 0+.
                     bank = 0;
                     codeEmitTarget = 3;
-                    result.code_size = 0;  // reset PC for kernel base address
+                    result.code_size = 0;   // reset PC for kernel base address
+                    result.page3_size = 0;  // reset page3 write pointer too
                 } else if (strstr(lp, "page3_code")) {
                     // Overlay code stored in page 3: same but emit to page 3
                     bank = 0;
