@@ -468,6 +468,22 @@ class MK1CodeGen:
                         return True
         return False
 
+    def _has_xor(self, node):
+        """Check if AST node contains any XOR (^) operations.
+        xor clobbers D (used as scratch in microcode), so D is unsafe."""
+        if not isinstance(node, tuple) or len(node) == 0:
+            return False
+        if node[0] == 'xor':
+            return True
+        for child in node[1:]:
+            if isinstance(child, tuple) and self._has_xor(child):
+                return True
+            elif isinstance(child, list):
+                for item in child:
+                    if isinstance(item, tuple) and self._has_xor(item):
+                        return True
+        return False
+
     def _collect_reg_candidates(self, stmts, candidates, depth=0):
         """Recursively collect register allocation candidates.
         Deeper-nested variables get higher priority (negative depth for sorting)."""
@@ -527,10 +543,13 @@ class MK1CodeGen:
             if name not in seen:
                 seen.add(name)
                 unique.append(name)
+        # D is unsafe if the function body has stsp (clobbers D) or xor (uses D as scratch)
+        d_unsafe = self._has_stsp(('block', stmts)) or self._has_xor(('block', stmts))
+
         for name in unique:
             if not c_var:
                 c_var = name
-            elif not d_var:
+            elif not d_var and not d_unsafe:
                 d_var = name
                 break
 
@@ -2486,7 +2505,7 @@ class MK1CodeGen:
         meta_base = final_meta_base
 
         # Validate overlay region
-        if OVERLAY_REGION + max_slot_size > 250:  # 250 not 256: last 6 bytes unreliable
+        if OVERLAY_REGION + max_slot_size > 252:  # 252: leave 4B safety margin at page end
             raise Exception(
                 f"largest overlay ({max_slot_size}B) exceeds overlay region "
                 f"({256 - OVERLAY_REGION}B). Kernel={KERNEL_SIZE}B "
@@ -5018,7 +5037,7 @@ def peephole(lines):
                   'setz', 'setnz', 'setc', 'setnc', 'deref', 'derefp3',
                   'addi', 'subi', 'andi', 'ori', 'ldp3', 'stsp', 'clr',
                   'adc', 'sbc', 'exr', 'exrw',
-                  'istc_inc', 'deref2', 'ideref2'}
+                  'istc_inc', 'deref2'}
 
     # ── Pass 1: Dead code elimination ────────────────────────────────
     changed = True
@@ -5249,6 +5268,33 @@ def peephole(lines):
         # j (unconditional jump): don't modify regs
         if mn == 'j':
             out.append(line)
+            continue
+
+        # xor: clobbers A AND D (D used as scratch in microcode)
+        if mn == 'xor':
+            out.append(line)
+            regs['a'] = fresh_unknown()
+            regs['d'] = fresh_unknown()
+            continue
+
+        # istc_inc: clobbers A (set to old B) and B (incremented)
+        if mn == 'istc_inc':
+            out.append(line)
+            regs['a'] = fresh_unknown()
+            regs['b'] = fresh_unknown()
+            continue
+
+        # push_b: doesn't modify registers but changes SP
+        if mn == 'push_b':
+            out.append(line)
+            shift_all(1)
+            continue
+
+        # pop_b: loads B from stack, changes SP
+        if mn == 'pop_b':
+            out.append(line)
+            regs['b'] = fresh_unknown()
+            shift_all(-1)
             continue
 
         # Everything else: conservatively assume A clobbered

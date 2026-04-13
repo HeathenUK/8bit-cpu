@@ -325,7 +325,7 @@ ucode_template[0xDF] = ('ocall', [MI|PO, RO|II|PE, PO|MI, RO|AI, SO|MI, STK|SD|P
 ucode_template[0xD1] = ('out_imm', [MI|PO, RO|II|PE, PO|MI, PE|RO|OI, RST, RST, RST, RST], True)
 
 # JAL_R: indirect call — push return address, jump to address in A
-ucode_template[0xE1] = ('jal_r', [MI|PO, RO|II|PE, SO|MI, STK|SD|PO|RI, AO|PI, RST, RST, RST], True)
+ucode_template[0xE1] = ('jal_r', [MI|PO, RO|II|PE, SO|MI, STK|SD|PO|RI, AO|PI, RST, RST, RST], False)
 
 # ADC: A = A + B + CF — add with carry (flag-dependent: CINV when CF=1)
 # Base template (CF=0): normal ADD. initUCode patches CF=1 to add CINV.
