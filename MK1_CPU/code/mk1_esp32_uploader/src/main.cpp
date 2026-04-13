@@ -880,15 +880,7 @@ static int runI2CScanAddr(uint8_t addr) {
         "    ddrb_imm 0x00\n"
         "    clr $a\n"
         "    exw 0 3\n"
-        // Bus recovery
-        "    ldi $c, 9\n"
-        ".rcv:\n"
-        "    ddrb_imm 0x00\n"
-        "    ddrb_imm 0x02\n"
-        "    mov $c, $a\n"
-        "    dec\n"
-        "    mov $a, $c\n"
-        "    jnz .rcv\n"
+        // Clean STOP to end any prior transaction
         "    ddrb_imm 0x03\n"
         "    ddrb_imm 0x01\n"
         "    ddrb_imm 0x00\n"
@@ -2103,15 +2095,7 @@ static int readDS3231Temp() {
         "    ddrb_imm 0x00\n"
         "    clr $a\n"
         "    exw 0 3\n"
-        // I2C bus recovery: 9 SCL clocks + STOP to clear any stuck state
-        "    ldi $c, 9\n"
-        ".rcv:\n"
-        "    ddrb_imm 0x00\n"
-        "    ddrb_imm 0x02\n"
-        "    mov $c, $a\n"
-        "    dec\n"
-        "    mov $a, $c\n"
-        "    jnz .rcv\n"
+        // Clean STOP to end any prior transaction
         "    ddrb_imm 0x03\n"
         "    ddrb_imm 0x01\n"
         "    ddrb_imm 0x00\n"
