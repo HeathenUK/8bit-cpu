@@ -374,7 +374,7 @@ class MK1CodeGen:
         self.code.append(line)
         # Invalidate B cache on B-modifying instructions
         s = line.strip()
-        if (',$b' in s and s.startswith('mov')) or s.startswith('pop $b') or s == 'swap' or s.startswith('jal'):
+        if (',$b' in s and s.startswith('mov')) or s.startswith('pop_b') or s == 'swap' or s.startswith('jal'):
             self.b_expr = None
 
     # ── Dead variable analysis ───────────────────────────────────────
@@ -432,10 +432,15 @@ class MK1CodeGen:
     # allocator must treat them as user function calls.
 
     def _has_calls(self, node):
-        """Check if AST node contains any non-builtin function calls (jal)."""
+        """Check if AST node contains any non-builtin function calls (jal).
+        Also detects eeprom array subscripts (generate jal __eeprom_rd)."""
         if not isinstance(node, tuple) or len(node) == 0:
             return False
         if node[0] == 'call' and node[1] not in self.BUILTINS:
+            return True
+        if (node[0] == 'index' and len(node) > 1
+                and isinstance(node[1], tuple) and node[1][0] == 'var'
+                and node[1][1] in self.eeprom_globals):
             return True
         for child in node[1:]:
             if isinstance(child, tuple) and self._has_calls(child):
@@ -692,15 +697,7 @@ class MK1CodeGen:
                     self.emit(f'\tbyte {init}')
             self.emit('\tsection code')
 
-        # Emit LCD init data table in page 3 (if lcd_init was used)
-        # Skip if init extraction already emitted this data
-        if hasattr(self, '_lcd_init_p3_data') and not getattr(self, '_init_extraction_done', False):
-            p3_base, data = self._lcd_init_p3_data
-            self.emit('\tsection page3')
-            self.emit(f'; LCD init I2C sequence at page3 offset {p3_base}')
-            for b in data:
-                self.emit(f'\tbyte {b}')
-            self.emit('\tsection code')
+        # LCD init data is in EEPROM — emitted via eeprom_data section
 
         # Emit lcd_print string data in page 3
         if hasattr(self, '_lcd_print_strings') and not getattr(self, '_init_extraction_done', False):
@@ -977,8 +974,6 @@ class MK1CodeGen:
         # Entry: B = addr_hi, A = addr_lo. Returns: A = byte read.
         # AT24C32 at I2C address 0x57 (write=0xAE, read=0xAF).
         if '__eeprom_rd' in helpers:
-            lbl_rb2 = self.label('erb')
-            lbl_rz2 = self.label('erz')
             self.emit('__eeprom_rd:')
             self.emit('\tmov $a,$d')       # D = addr_lo
             self.emit('\tmov $b,$a')       # A = addr_hi (save for later)
@@ -1005,27 +1000,9 @@ class MK1CodeGen:
             self.emit('\tddrb_imm 0x03')
             self.emit('\tldi $a,0xAF')
             self.emit('\tjal __i2c_sb')
-            # Read byte (inline, saves jal overhead)
-            self.emit('\tldi $b,0')
-            self.emit('\tldi $d,8')
-            self.emit(f'{lbl_rb2}:')
-            self.emit('\tmov $b,$a')
-            self.emit('\tsll')
-            self.emit('\tmov $a,$b')
-            self.emit('\tddrb_imm 0x00')
-            self.emit('\texrw 0')
-            self.emit('\ttst 0x01')
-            self.emit(f'\tjz {lbl_rz2}')
-            self.emit('\tmov $b,$a')
-            self.emit('\tori 0x01,$a')
-            self.emit('\tmov $a,$b')
-            self.emit(f'{lbl_rz2}:')
-            self.emit('\tddrb_imm 0x02')
-            self.emit('\tmov $d,$a')
-            self.emit('\tdec')
-            self.emit('\tmov $a,$d')
-            self.emit(f'\tjnz {lbl_rb2}')
-            self.emit('\tmov $b,$a')       # A = read byte
+            # Read byte via __i2c_rb (D = byte, then A = byte)
+            self.emit('\tjal __i2c_rb')
+            self.emit('\tmov $d,$a')       # A = read byte
             # NACK + STOP
             self.emit('\tddrb_imm 0x00')
             self.emit('\tddrb_imm 0x02')
@@ -1148,7 +1125,8 @@ class MK1CodeGen:
             lcd_init_data += [START, 0x34|BL, 0x30|BL, STOP, DELAY]  # 2nd + 5ms delay
             lcd_init_data += [START, 0x34|BL, 0x30|BL, STOP]         # 3rd (no delay needed)
             lcd_init_data += [START, 0x24|BL, 0x20|BL, STOP]         # nibble 0x02 (4-bit)
-            for cmd in [0x28, 0x0C, 0x01, 0x06]:             # HD44780 commands
+            # HD44780 init: Function Set, Display Off, Clear, Entry Mode, Display On
+            for cmd in [0x28, 0x0C, 0x01, 0x06]:
                 hi = cmd & 0xF0
                 lo = (cmd & 0x0F) << 4
                 lcd_init_data += [START, hi|0x04|BL, hi|BL, lo|0x04|BL, lo|BL, STOP]
@@ -1156,9 +1134,13 @@ class MK1CodeGen:
                     lcd_init_data.append(DELAY)  # clear display needs ~2ms
             lcd_init_data.append(END)
 
-            p3_base = self.page3_alloc
-            self.page3_alloc += len(lcd_init_data)
-            self._lcd_init_p3_data = (p3_base, lcd_init_data)
+            # Store LCD init data in EEPROM
+            eeprom_addr = self.eeprom_alloc
+            self.eeprom_data.append((eeprom_addr, lcd_init_data))
+            self.eeprom_alloc += len(lcd_init_data)
+            data_base = self.data_alloc
+            self.data_alloc += len(lcd_init_data)
+            self._lcd_init_eeprom = (eeprom_addr, data_base, lcd_init_data)
 
             lbl_loop = self.label('li_lp')
             lbl_ns = self.label('li_ns')
@@ -1166,11 +1148,47 @@ class MK1CodeGen:
             lbl_adv = self.label('li_av')
             lbl_done = self.label('li_dn')
 
+            # Read LCD init data from EEPROM using individual random reads
+            # into data page, then process with sentinel loop.
+            # NOTE: __eeprom_rd clobbers ALL registers (A,B,C,D).
+            # Both countdown and data_ptr survive on the stack.
+            # Stack layout: [count, ptr] with count on top.
+            count = len(lcd_init_data)
+            lbl_rd = self.label('li_rd')
+            eeprom_lo = eeprom_addr & 0xFF
+            eeprom_hi = (eeprom_addr >> 8) & 0xFF
+            eeprom_offset = eeprom_lo - data_base
             self.emit('__lcd_init:')
-            self.emit(f'\tldi $d,{p3_base}')
+            # Stack: just the data_ptr. Count in a fixed data page location.
+            # Store count at data[255] (top of data page, won't conflict)
+            self.emit(f'\tldi $a,{count}')
+            self.emit('\tldi $b,255')
+            self.emit('\tideref')             # data[255] = count
+            self.emit(f'\tpush_imm {data_base}')   # ptr on stack
+            self.emit(f'{lbl_rd}:')
+            self.emit('\tpop $a')             # A = ptr
+            self.emit('\tpush $a')            # re-save
+            self.emit(f'\taddi {eeprom_offset},$a') if eeprom_offset else None
+            self.emit(f'\tldi $b,{eeprom_hi}')
+            self.emit('\tjal __eeprom_rd')    # A = byte
+            self.emit('\tpop_b')             # B = ptr
+            self.emit('\tideref')             # data[B] = A
+            self.emit('\tmov $b,$a')          # A = ptr
+            self.emit('\tinc')                # A = ptr+1
+            self.emit('\tpush $a')            # save new ptr
+            # Decrement count from data[255]
+            self.emit('\tldi $a,255')
+            self.emit('\tderef')              # A = data[255] = count
+            self.emit('\tdec')
+            self.emit('\tldi $b,255')
+            self.emit('\tideref')             # data[255] = count-1
+            self.emit(f'\tjnz {lbl_rd}')
+            self.emit('\tpop $a')             # clean ptr from stack
+            # Process from data page
+            self.emit(f'\tldi $d,{data_base}')
             self.emit(f'{lbl_loop}:')
             self.emit('\tmov $d,$a')
-            self.emit('\tderefp3')
+            self.emit('\tderef')
             self.emit(f'\tldi $b,{END}')
             self.emit('\tcmp $b')
             self.emit(f'\tjz {lbl_done}')
@@ -1190,13 +1208,24 @@ class MK1CodeGen:
             self.emit(f'\tldi $b,{DELAY}')
             self.emit('\tcmp $b')
             self.emit(f'\tjnz {lbl_send}')
-            # Inline ~5ms delay: 256 iterations × ~20µs = ~5ms
-            self.emit('\tpush $d')
-            lbl_dly = self.label('li_dl')
-            self.emit(f'{lbl_dly}:')
+            # Calibrated ~5ms delay using ipm from page3[240]
+            # Same inner loop as __delay_cal for accuracy.
+            # Outer loop: 5 iterations × 1ms = 5ms
+            self.emit('\tpush $d')         # save sentinel pointer
+            lbl_outer = self.label('li_do')
+            lbl_inner = self.label('li_di')
+            self.emit(f'\tldi $c,5')       # 5ms outer count
+            self.emit(f'{lbl_outer}:')
+            self.emit('\tldi $a,240')
+            self.emit('\tderefp3')         # A = page3[240] = ipm
+            self.emit(f'{lbl_inner}:')
             self.emit('\tdec')
-            self.emit(f'\tjnz {lbl_dly}')
-            self.emit('\tpop $d')
+            self.emit(f'\tjnz {lbl_inner}')
+            self.emit('\tmov $c,$a')
+            self.emit('\tdec')
+            self.emit('\tmov $a,$c')
+            self.emit(f'\tjnz {lbl_outer}')
+            self.emit('\tpop $d')          # restore sentinel pointer
             self.emit(f'\tj {lbl_adv}')
             self.emit(f'{lbl_send}:')
             self.emit('\tjal __i2c_sb')
@@ -1209,25 +1238,41 @@ class MK1CodeGen:
             self.emit('\tret')
 
         # Merged __lcd_cmd / __lcd_chr — differ only in flags (EN vs EN+RS+BL)
-        if '__lcd_chr' in helpers:
+        if '__lcd_chr' in helpers and '__lcd_cmd' not in helpers:
+            # Only lcd_chr used at runtime — merge chr+send into single function
+            # Use only __lcd_chr label (no __lcd_send) to avoid stripper
+            # treating them as separate functions
             self.emit('__lcd_chr:')
             self.emit('\tpush $a')        # save caller's A (will be discarded)
+            self.emit('\tldi $a,0x09')    # flags: RS + BL (hardcoded)
+        elif '__lcd_chr' in helpers:
+            self.emit('__lcd_chr:')
+            self.emit('\tpush $a')
             self.emit('\tldi $a,0x09')    # flags: RS + BL
             self.emit('\tj __lcd_send')
-
-        if '__lcd_cmd' in helpers:
+            if '__lcd_cmd' in helpers:
+                self.emit('__lcd_cmd:')
+                self.emit('\tpush $a')
+                self.emit('\tldi $a,0x00')
+            self.emit('__lcd_send:')
+        elif '__lcd_cmd' in helpers:
             self.emit('__lcd_cmd:')
+            self.emit('__lcd_send:')
             self.emit('\tpush $a')
-            self.emit('\tldi $a,0x00')    # flags: none
+            self.emit('\tldi $a,0x00')
 
         if '__lcd_cmd' in helpers or '__lcd_chr' in helpers:
-            self.emit('__lcd_send:')
             self.emit('\tpush $a')        # push flags to stack
-            self.emit('\tjal __i2c_st')   # START + addr
+            # Inline I2C START + PCF8574 addr (saves 4B vs jal __i2c_st)
+            self.emit('\texrw 2')
+            self.emit('\tddrb_imm 0x01')
+            self.emit('\tddrb_imm 0x03')
+            self.emit('\tldi $a,0x4E')
+            self.emit('\tjal __i2c_sb')
             # High nibble: compute once, send with EN then without
             self.emit('\tmov $d,$a')      # A = char
             self.emit('\tandi 0xF0,$a')   # high nibble
-            self.emit('\tpop $b')         # B = flags
+            self.emit('\tpop_b')         # B = flags
             self.emit('\tpush $b')        # keep flags
             self.emit('\tor $b,$a')       # A = nibble | flags
             self.emit('\tpush $a')        # save nibble+flags
@@ -1242,14 +1287,18 @@ class MK1CodeGen:
             self.emit('\tsll')
             self.emit('\tsll')
             self.emit('\tandi 0xF0,$a')
-            self.emit('\tpop $b')         # flags
+            self.emit('\tpop_b')         # flags
             self.emit('\tor $b,$a')
             self.emit('\tpush $a')        # save nibble+flags
             self.emit('\tori 0x04,$a')    # + EN
             self.emit('\tjal __i2c_sb')
             self.emit('\tpop $a')         # restore (no EN)
             self.emit('\tjal __i2c_sb')
-            self.emit('\tjal __i2c_sp')
+            # Inline STOP — saves 3B vs jal __i2c_sp when __i2c_sp
+            # is the only runtime caller and can be stripped from kernel
+            self.emit('\tddrb_imm 0x03')
+            self.emit('\tddrb_imm 0x01')
+            self.emit('\tddrb_imm 0x00')
             self.emit('\tpop $a')         # balance push at entry (discards caller A)
             self.emit('\tret')
 
@@ -1839,39 +1888,219 @@ class MK1CodeGen:
             while runtime_main and runtime_main[-1].strip() == 'ret':
                 runtime_main.pop()
 
-            # Build runtime kernel: j _main + main + runtime helpers
-            runtime_kernel = ['\tj _main', '_main:'] + runtime_main + runtime_helper_lines
+            # Include runtime helpers that init code needs (e.g., __i2c_sb
+            # called by __lcd_init's EEPROM read, even when I2C is also runtime)
+            # Iteratively resolve transitive dependencies: if __eeprom_rd
+            # calls __i2c_rb, copying __eeprom_rd reveals __i2c_rb as missing.
+            # Loop until no new missing helpers are found.
+            any_missing = True
+            rename_map = {}
+            while any_missing:
+                init_jal_targets = set()
+                for line in init_inline + init_helper_lines:
+                    s = line.strip()
+                    if s.startswith('jal __'):
+                        init_jal_targets.add(s.split()[1])
+                init_helper_names = set()
+                for line in init_helper_lines:
+                    s = line.strip()
+                    if s.endswith(':') and s.startswith('__'):
+                        init_helper_names.add(s[:-1])
+                missing = init_jal_targets - init_helper_names
+                any_missing = bool(missing)
+                if not missing: break
+                # Copy needed helpers from runtime to init, renaming to avoid
+                # label conflicts with the same helpers in the kernel section.
+                # Rename __foo → __i_foo in both definitions and jal targets.
+                hi = 0
+                while hi < len(runtime_helper_lines):
+                    s = runtime_helper_lines[hi].strip()
+                    if s.endswith(':') and s.startswith('__') and not s.startswith('.'):
+                        fname = s[:-1]
+                        start = hi
+                        hi += 1
+                        while hi < len(runtime_helper_lines):
+                            ns = runtime_helper_lines[hi].strip()
+                            if ns.endswith(':') and not ns.startswith('.') and ns.startswith('_'):
+                                break
+                            hi += 1
+                        if fname in missing:
+                            iname = fname.replace('__', '__i_', 1)
+                            rename_map[fname] = iname
+                            block = list(runtime_helper_lines[start:hi])
+                            # Rename label definition, internal jal targets,
+                            # AND local labels (e.g., .rb9 → .i_rb9) to avoid
+                            # conflicts with the same labels in the kernel.
+                            # Collect local labels first
+                            local_labels = set()
+                            for line in block:
+                                s = line.strip()
+                                if s.startswith('.') and s.endswith(':'):
+                                    local_labels.add(s[:-1])  # e.g., '.rb9'
+                            renamed = []
+                            for line in block:
+                                for old, new in rename_map.items():
+                                    line = line.replace(old + ':', new + ':')
+                                    line = line.replace('jal ' + old, 'jal ' + new)
+                                # Rename local labels: .foo → .i_foo
+                                for ll in local_labels:
+                                    line = line.replace(ll, '.i_' + ll[1:])
+                                renamed.append(line)
+                            init_helper_lines.extend(renamed)
+                    else:
+                        hi += 1
+                # Also rename jal targets in init_inline and existing init_helper_lines
+                if rename_map:
+                    for idx in range(len(init_inline)):
+                        for old, new in rename_map.items():
+                            init_inline[idx] = init_inline[idx].replace('jal ' + old, 'jal ' + new)
+                    for idx in range(len(init_helper_lines)):
+                        for old, new in rename_map.items():
+                            if 'jal ' + old in init_helper_lines[idx]:
+                                init_helper_lines[idx] = init_helper_lines[idx].replace('jal ' + old, 'jal ' + new)
+
+            # Strip unreferenced helpers from runtime kernel to save bytes.
+            # Collect all jal targets from runtime_main + runtime_helper_lines.
+            runtime_refs = set()
+            for line in runtime_main + runtime_helper_lines:
+                s = line.strip()
+                if s.startswith('jal ') or (s.startswith('j ') and '__' in s):
+                    runtime_refs.add(s.split()[1])
+            # Filter runtime_helper_lines: keep only referenced functions
+            filtered_helpers = []
+            hi = 0
+            while hi < len(runtime_helper_lines):
+                s = runtime_helper_lines[hi].strip()
+                if s.endswith(':') and s.startswith('__') and not s.startswith('.'):
+                    fname = s[:-1]
+                    start = hi
+                    hi += 1
+                    while hi < len(runtime_helper_lines):
+                        ns = runtime_helper_lines[hi].strip()
+                        if ns.endswith(':') and not ns.startswith('.') and ns.startswith('_'):
+                            break
+                        hi += 1
+                    if fname in runtime_refs:
+                        filtered_helpers.extend(runtime_helper_lines[start:hi])
+                else:
+                    filtered_helpers.append(runtime_helper_lines[hi])
+                    hi += 1
+            runtime_helper_lines = filtered_helpers
+
+            # Identify SHARED helpers: functions needed by both init and kernel.
+            # These are placed ONCE in the code page at addresses above
+            # kernel_size, surviving the self-copy. Eliminates duplication.
+            init_refs = set()
+            for line in init_inline + init_helper_lines:
+                s = line.strip()
+                if s.startswith('jal __'):
+                    init_refs.add(s.split()[1])
+            # Map renamed init refs back to original names
+            init_refs_orig = set()
+            for ref in init_refs:
+                for old, new in rename_map.items():
+                    if ref == new:
+                        init_refs_orig.add(old)
+                        break
+
+            kernel_refs = set()
+            for line in runtime_main + runtime_helper_lines:
+                s = line.strip()
+                if s.startswith('jal ') or (s.startswith('j ') and '__' in s):
+                    kernel_refs.add(s.split()[1])
+
+            shared_names = init_refs_orig & kernel_refs  # helpers needed by both
+            # Extract shared helpers from runtime_helper_lines
+            shared_helper_lines = []
+            kernel_only_helpers = []
+            hi = 0
+            while hi < len(runtime_helper_lines):
+                s = runtime_helper_lines[hi].strip()
+                if s.endswith(':') and s.startswith('__') and not s.startswith('.'):
+                    fname = s[:-1]
+                    start = hi
+                    hi += 1
+                    while hi < len(runtime_helper_lines):
+                        ns = runtime_helper_lines[hi].strip()
+                        if ns.endswith(':') and not ns.startswith('.') and ns.startswith('_'):
+                            break
+                        hi += 1
+                    if fname in shared_names:
+                        shared_helper_lines.extend(runtime_helper_lines[start:hi])
+                    else:
+                        kernel_only_helpers.extend(runtime_helper_lines[start:hi])
+                else:
+                    kernel_only_helpers.append(runtime_helper_lines[hi])
+                    hi += 1
+
+            # Remove renamed copies of shared helpers from init (they'll use the shared versions)
+            if shared_names:
+                cleaned_init = []
+                hi = 0
+                while hi < len(init_helper_lines):
+                    s = init_helper_lines[hi].strip()
+                    if s.endswith(':') and s.startswith('__i_') and not s.startswith('.'):
+                        orig = s[:-1].replace('__i_', '__', 1)
+                        start = hi
+                        hi += 1
+                        while hi < len(init_helper_lines):
+                            ns = init_helper_lines[hi].strip()
+                            if ns.endswith(':') and not ns.startswith('.') and ns.startswith('_'):
+                                break
+                            hi += 1
+                        if orig in shared_names:
+                            continue  # skip this renamed copy
+                        cleaned_init.extend(init_helper_lines[start:hi])
+                    else:
+                        cleaned_init.append(init_helper_lines[hi])
+                        hi += 1
+                init_helper_lines = cleaned_init
+
+                # Update jal targets in init: __i_foo → __foo for shared helpers
+                for idx in range(len(init_inline)):
+                    for name in shared_names:
+                        renamed = name.replace('__', '__i_', 1)
+                        init_inline[idx] = init_inline[idx].replace('jal ' + renamed, 'jal ' + name)
+                for idx in range(len(init_helper_lines)):
+                    for name in shared_names:
+                        renamed = name.replace('__', '__i_', 1)
+                        init_helper_lines[idx] = init_helper_lines[idx].replace('jal ' + renamed, 'jal ' + name)
+
+            # Build runtime kernel WITHOUT shared helpers
+            runtime_kernel = ['_main:'] + runtime_main + kernel_only_helpers
             kernel_size = measure_lines(runtime_kernel)
 
             if kernel_size > 250:
-                # Still too big — can't help without overlays
                 import sys
                 print(f"Warning: runtime kernel {kernel_size}B > 248B, program may not fit",
                       file=sys.stderr)
                 return
 
-            # Build output: stage 1 (init) in code section, kernel in page3_code
+            # Build output: init code + shared helpers + copy loop
             new_code = []
 
-            # Stage 1: init inline + init helpers + self-copy + jump
+            # Stage 1: inline code, skip over init-only helpers, shared helpers, copy loop
             new_code.extend(init_inline)
+            new_code.append('\tj __init_done')
             new_code.extend(init_helper_lines)
+            # Shared helpers: survive self-copy (at addresses > kernel_size)
+            new_code.extend(shared_helper_lines)
+            new_code.append('__init_done:')
 
             # Self-copy: copy kernel from page3 to code page.
             # The copy loop must be placed AFTER the kernel's last byte
             # to avoid overwriting itself. Pad init section if needed.
-            copy_loop_size = 13  # ldi+ldi+loop(7 instr)+j = 13 bytes
+            copy_loop_size = 14  # ldi(2)+ldi(2)+loop(6×1B+jnz 2B)+j(2) = 14 bytes
             copy_addr = kernel_size  # place copy right after kernel area
             init_size = measure_lines(new_code)
             import sys
-            print(f"INIT_EXT: init_size={init_size} copy_addr={copy_addr} kernel={kernel_size}", file=sys.stderr)
+            # (init extraction size info is in the memory report)
             if init_size < copy_addr:
                 # Jump over the gap (2B for jump instruction)
                 pad = copy_addr - init_size - 2
                 # NOP sled to reach copy_addr. Label prevents peephole stripping.
-                pad_lbl = self.label('pad')
-                new_code.append(f'\tj {pad_lbl}')
-                new_code.append(f'{pad_lbl}:')
+                new_code.append('\tj __copy_start')
+                new_code.append('__copy_start:')
                 for _ in range(pad):
                     new_code.append('\tnop')
 
@@ -1895,12 +2124,7 @@ class MK1CodeGen:
             new_code.append('\tsection page3_kernel')
             new_code.extend(runtime_kernel)
 
-            # Page3 data (LCD init table, strings, etc.)
-            if hasattr(self, '_lcd_init_p3_data'):
-                p3_base, data = self._lcd_init_p3_data
-                new_code.append('\tsection page3')
-                for b in data:
-                    new_code.append(f'\tbyte {b}')
+            # LCD init data — no emission needed here (stored in EEPROM)
             if hasattr(self, '_lcd_print_strings'):
                 if not any('section page3' in l for l in new_code[-5:]):
                     new_code.append('\tsection page3')
@@ -3641,7 +3865,7 @@ class MK1CodeGen:
 
                 # Add/sub low bytes
                 self.emit('\tmov $b,$d')    # D = left_hi (save, preserves CF)
-                self.emit('\tpop $b')       # B = right_lo
+                self.emit('\tpop_b')       # B = right_lo
                 self.local_count -= 1
                 if op == '+':
                     self.emit('\tadd $b,$a')   # A = left_lo + right_lo, CF set
@@ -3940,7 +4164,7 @@ class MK1CodeGen:
                 self.emit('\tpush $a')
                 self.local_count += 1
                 self.gen_expr(left)
-                self.emit('\tpop $b')
+                self.emit('\tpop_b')
                 self.local_count -= 1
                 self._emit_binop(op)
 
@@ -4093,17 +4317,8 @@ class MK1CodeGen:
                 return
 
             if name == 'i2c_bus_reset':
-                # Full bus reset: VIA delay + init + STOP to clear stuck I2C state.
-                self.emit('\tldi $d,0')
-                lbl = self.label('br_dly')
-                self.emit(f'{lbl}:')
-                self.emit('\tdec')
-                self.emit(f'\tjnz {lbl}')
-                self.emit('\tclr $a')
-                self.emit('\texw 0 0')         # ORB = 0
-                self.emit('\tddrb_imm 0x00')   # DDRB = 0 (idle)
-                self.emit('\tpush $a ;!keep')  # stack warmup
-                self.emit('\tpop $a ;!keep')
+                # Bus recovery STOP to clear stuck I2C state.
+                # VIA delay/init already done by i2c_init — just do the STOP.
                 self.emit('\tddrb_imm 0x03')   # STOP: both LOW
                 self.emit('\tddrb_imm 0x01')   # STOP: SDA LOW, SCL HIGH
                 self.emit('\tddrb_imm 0x00')   # STOP: both HIGH (idle)
@@ -4114,6 +4329,10 @@ class MK1CodeGen:
                 if not hasattr(self, '_lcd_helpers'):
                     self._lcd_helpers = set()
                 self._lcd_helpers.add('__lcd_init')
+                # __lcd_init reads from EEPROM via __eeprom_rd
+                self._lcd_helpers.add('__eeprom_rd')
+                self._lcd_helpers.add('__i2c_sb')
+                self._lcd_helpers.add('__i2c_rb')
                 self.emit('\tjal __lcd_init')
                 return
 
@@ -5209,13 +5428,10 @@ def peephole(lines):
     out = []
     for line in lines:
         if is_label(line):
-            s = line.strip()
-            if not s.startswith('.'):
-                # Global label (function boundary): all unknown but distinct
-                invalidate_all()
-            else:
-                # Local label: A unknown, keep B/C/D
-                regs['a'] = fresh_unknown()
+            # Any label could be a jump target (loop back-edge, branch).
+            # Must invalidate ALL register tracking — subroutine calls in
+            # the loop body clobber registers that the peephole can't see.
+            invalidate_all()
             out.append(line)
             continue
         if not is_instr(line):
@@ -5536,6 +5752,126 @@ def main():
         with open(args.output, 'w') as f: f.write(asm + '\n')
     else:
         print(asm)
+
+    # Page & EEPROM utilisation report
+    import sys
+    MAX_CODE = 250  # safe code page limit
+    init_extraction = getattr(gen, '_init_extraction_done', False)
+
+    # Count assembled bytes per section from the output
+    code_bytes = 0
+    data_bytes = 0
+    p3_bytes = 0
+    eeprom_bytes = 0
+    section = 'code'
+    two_byte_set = {'ldsp','stsp','push_imm','jal','jc','jz','jnc','jnz','j','ldi',
+                    'cmp','addi','subi','andi','ori','ld','st','ldsp_b','ldp3','stp3',
+                    'setjmp','ocall','tst','out_imm','cmpi','ddrb_imm','ddra_imm',
+                    'ora_imm','orb_imm'}
+    for line in lines:
+        s = line.strip()
+        if 'section page3_kernel' in s or 'section page3_code' in s:
+            section = 'page3'; continue
+        elif 'section page3' in s and 'kernel' not in s and 'code' not in s:
+            section = 'page3_data'; continue
+        elif 'section eeprom' in s: section = 'eeprom'; continue
+        elif 'section data' in s: section = 'data'; continue
+        elif 'section code' in s: section = 'code'; continue
+        if not s or s.endswith(':') or s.startswith(';'): continue
+        mn = s.split()[0]
+        if mn == 'byte':
+            b = 1
+        elif mn == 'cmp':
+            parts = s.split()
+            b = 1 if (len(parts) > 1 and parts[1].startswith('$')) else 2
+        elif mn in two_byte_set:
+            b = 2
+        else:
+            b = 1
+        if section == 'code': code_bytes += b
+        elif section == 'data': data_bytes += b
+        elif section in ('page3', 'page3_data'): p3_bytes += b
+        elif section == 'eeprom': eeprom_bytes += b
+
+    # Stack depth estimate from locals
+    stack_depth = 0
+    if hasattr(gen, '_max_stack_depth'):
+        stack_depth = gen._max_stack_depth
+    else:
+        # Rough estimate from locals count
+        for fn_name in dir(gen):
+            pass  # can't easily get this without more tracking
+
+    # Compute kernel size for init extraction
+    kernel_bytes = 0
+    if init_extraction:
+        sec = 'skip'
+        for line in lines:
+            s = line.strip()
+            if 'section page3_kernel' in s: sec = 'kernel'; continue
+            if sec == 'kernel' and ('section ' in s): sec = 'done'; continue
+            if sec != 'kernel': continue
+            if not s or s.endswith(':') or s.startswith(';'): continue
+            mn = s.split()[0]
+            if mn == 'byte': kernel_bytes += 1
+            elif mn == 'cmp':
+                parts = s.split()
+                kernel_bytes += 1 if (len(parts) > 1 and parts[1].startswith('$')) else 2
+            elif mn in two_byte_set: kernel_bytes += 2
+            else: kernel_bytes += 1
+
+    copy_loop = 14
+    eeprom_header = 16
+    eeprom_payload = max(0, eeprom_bytes - eeprom_header)
+
+    print("\n── MK1 Memory Report ──", file=sys.stderr)
+    if init_extraction:
+        init_only = code_bytes - copy_loop
+        total = max(init_only, kernel_bytes) + copy_loop
+        print(f"  Mode:       two-stage boot (init extraction)", file=sys.stderr)
+        print(f"  Stage 1:    {init_only}B init + {copy_loop}B copy = {code_bytes}B / {MAX_CODE}B", file=sys.stderr)
+        print(f"  Stage 2:    {kernel_bytes}B kernel  (runtime code page)", file=sys.stderr)
+        runtime_free = MAX_CODE - kernel_bytes
+        print(f"  Page 0:     {kernel_bytes}B used, {runtime_free}B free at runtime", file=sys.stderr)
+    else:
+        print(f"  Mode:       single-stage (flat)", file=sys.stderr)
+        print(f"  Page 0:     {code_bytes}B / {MAX_CODE}B code", file=sys.stderr)
+
+    data_runtime = gen.data_alloc
+    n_globals = len([n for n in gen.globals if not n.startswith('_')])
+    data_temp = data_bytes - gen.data_alloc if data_bytes > gen.data_alloc else 0
+    data_desc = f"{n_globals} globals" if n_globals else "allocated"
+    print(f"  Page 1:     {data_runtime}B {data_desc}, {256 - data_runtime}B free  (data page)", file=sys.stderr)
+
+    print(f"  Page 2:     stack (grows down from 0xFF)", file=sys.stderr)
+
+    if init_extraction:
+        p3_free = 256 - kernel_bytes
+        print(f"  Page 3:     {kernel_bytes}B kernel image, {p3_free}B free", file=sys.stderr)
+        print(f"              (fully reusable at runtime via derefp3/iderefp3)", file=sys.stderr)
+    elif p3_bytes > 0:
+        print(f"  Page 3:     {p3_bytes}B / 256B", file=sys.stderr)
+    else:
+        print(f"  Page 3:     unused (256B available)", file=sys.stderr)
+
+    if eeprom_bytes > 0:
+        print(f"  EEPROM:     {eeprom_payload}B used, {4096 - eeprom_payload}B free  (AT24C32)", file=sys.stderr)
+    else:
+        print(f"  EEPROM:     unused  (4096B available)", file=sys.stderr)
+
+    if init_extraction:
+        total_free = (MAX_CODE - kernel_bytes) + (256 - data_runtime) + 256 + (4096 - eeprom_payload)
+        print(f"  Total free: {total_free}B  (code {MAX_CODE-kernel_bytes} + data {256-data_runtime} + page3 256 + eeprom {4096-eeprom_payload})", file=sys.stderr)
+
+    # Warnings
+    if code_bytes > MAX_CODE:
+        print(f"  !! CODE OVERFLOW: {code_bytes}B > {MAX_CODE}B limit", file=sys.stderr)
+    elif code_bytes > MAX_CODE - 3:
+        print(f"  !! Code page tight: only {MAX_CODE - code_bytes}B free", file=sys.stderr)
+    if gen.data_alloc > 256:
+        print(f"  !! DATA OVERFLOW: {gen.data_alloc}B > 256B", file=sys.stderr)
+
+    print("───────────────────────", file=sys.stderr)
 
 if __name__ == '__main__':
     main()

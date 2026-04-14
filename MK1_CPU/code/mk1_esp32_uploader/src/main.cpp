@@ -1623,15 +1623,14 @@ static void handleSerialCommand(const String& line) {
 
         // Write EEPROM data if present (before uploading user program)
         const AsmResult& er = assembler.result;
-        bool eepromWritten = false;
-        if (er.eeprom_size > 0) {
-            writeEepromData(er.eeprom, er.eeprom_size);
-            eepromWritten = true;
+        int eepromBytes = er.eeprom_size;  // save before writeEepromData clobbers result
+        if (eepromBytes > 0) {
+            writeEepromData(er.eeprom, eepromBytes);
         }
 
         uploadToMK1(uploadBuf, uploadSize);
-        if (eepromWritten)
-            Serial.printf("{\"ok\":true,\"eeprom\":%d}\n", er.eeprom_size);
+        if (eepromBytes > 0)
+            Serial.printf("{\"ok\":true,\"eeprom\":%d}\n", eepromBytes);
         else
             Serial.println("{\"ok\":true}");
     }
@@ -1994,6 +1993,18 @@ static void handleSerialCommand(const String& line) {
     else if (line == "OICNT") {
         Serial.println(oiCount);
     }
+    else if (line.startsWith("DUMP:")) {
+        // DUMP:offset,count — dump uploadBuf bytes as hex
+        int comma = line.indexOf(',', 5);
+        int off = line.substring(5, comma > 0 ? comma : line.length()).toInt();
+        int cnt = comma > 0 ? line.substring(comma + 1).toInt() : 16;
+        if (cnt > 64) cnt = 64;
+        for (int i = 0; i < cnt && off + i < (int)sizeof(uploadBuf); i++) {
+            if (i) Serial.print(' ');
+            Serial.printf("%02X", uploadBuf[off + i]);
+        }
+        Serial.println();
+    }
     else if (line.startsWith("RUNLOG:")) {
         // RUNLOG:cycles,us — run without stopping on OI, log all OI values
         int comma = line.indexOf(',', 7);
@@ -2094,6 +2105,17 @@ static void handleSerialUpload() {
 // ── EEPROM data write via MK1 I2C shim ──────────────────────────────
 
 static void writeEepromData(const uint8_t* data, int size) {
+    // Copy data to local buffer — the source points into assembler.result.eeprom
+    // which gets zeroed when we assemble shim programs below.
+    uint8_t localData[512];
+    if (size > (int)sizeof(localData)) size = sizeof(localData);
+    Serial.printf("EEPROM pre-copy: size=%d src[0]=%d src[16]=%d src[59]=%d\n",
+        size, data[0], size>16?data[16]:0, size>59?data[59]:0);
+    memcpy(localData, data, size);
+    data = localData;
+    Serial.printf("EEPROM post-copy: dst[0]=%d dst[16]=%d dst[59]=%d\n",
+        localData[0], size>16?localData[16]:0, size>59?localData[59]:0);
+
     // Check if EEPROM already has the right data (checksum match).
     // Checksum is at EEPROM[0x0000-0x0001], data starts at 0x0010.
     // The data buffer includes the 16-byte header (checksum + reserved).
@@ -2206,28 +2228,32 @@ static void writeEepromData(const uint8_t* data, int size) {
             Serial.printf("EEPROM write ASM error at offset 0x%04X\n", offset);
             continue;
         }
+        Serial.printf("EEPROM shim page 0x%04X: %dB code, data[0]=%d data[%d]=%d\n",
+            offset, pr.code_size, data[offset], offset+pageLen-1, data[offset+pageLen-1]);
 
-        memcpy(uploadBuf, pr.code, CODE_SIZE);
-        uploadSize = CODE_SIZE;
-        uploadToMK1(uploadBuf, uploadSize);
+        // Upload shim without using global uploadBuf
+        uint8_t shimBuf[256];
+        memcpy(shimBuf, pr.code, CODE_SIZE);
+        uploadToMK1(shimBuf, CODE_SIZE);
 
-        // Run: RESET then manual clock
-        disableClock();
-        resetPulse();
-        enableCU();
-
+        // Run shim — replicate serial RUN handler exactly
         stopCustomClock();
+        // Detach OI ISR only (don't call stopOIMonitor which reconfigures bus)
+        if (oiMonitorActive) {
+            detachInterrupt(digitalPinToInterrupt(PIN_OI));
+            oiMonitorActive = false;
+        }
 
-        busSetInput(); disableOutput();
-        digitalWrite(PIN_DIR, LOW); enableOutput();
+        busSetInput();
+        disableOutput();
+        digitalWrite(PIN_DIR, LOW);
+        enableOutput();
 
         int clkGpio = digitalPinToGPIONumber(PIN_CLK);
         uint32_t clkMask = 1 << clkGpio;
         pinMode(PIN_CLK, OUTPUT);
         digitalWrite(PIN_CLK, LOW);
 
-        // Run enough cycles for VIA init + ACK poll + page write + HLT
-        // ~100K cycles is plenty (ACK poll takes ~5ms = ~2500 cycles)
         for (int i = 0; i < 100000; i++) {
             GPIO.out_w1ts = clkMask;
             delayMicroseconds(1);
@@ -2235,10 +2261,14 @@ static void writeEepromData(const uint8_t* data, int size) {
             delayMicroseconds(1);
         }
         pinMode(PIN_CLK, INPUT);
-        disableOutput(); digitalWrite(PIN_DIR, HIGH);
-        busSetOutput(); enableOutput();
-
-        // If !ok, the page write failed — continue with next page
+        // Restore bus to ESP32-output mode for next uploadToMK1.
+        // uploadToMK1's stopOIMonitor() will skip (already inactive),
+        // so we must set the bus direction here.
+        disableOutput();
+        digitalWrite(PIN_DIR, HIGH);    // ESP32 → CPU direction
+        busSetOutput();
+        enableOutput();
+        disableClock();
     }
 }
 

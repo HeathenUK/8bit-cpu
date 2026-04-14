@@ -354,6 +354,7 @@ private:
             result.data_size = 0;
             result.stack_size = 0;
             result.page3_size = 0;
+            result.eeprom_size = 0;
         }
 
         int bank = 0;  // 0=code, 1=data, 3=page3
