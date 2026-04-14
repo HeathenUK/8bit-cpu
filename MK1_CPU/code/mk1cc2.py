@@ -3124,19 +3124,11 @@ class MK1CodeGen:
             assembled.append('\tjnz .precomp_loop')
 
         # Shared helpers + self-copy — placed ABOVE kernel destination.
-        # Shared helpers survive the self-copy (at addresses >= KERNEL_SIZE).
-        # Both init and kernel call them at the same fixed addresses.
+        # Shared helpers + self-copy placed after init code.
+        # Shared helpers survive the self-copy (which only writes bytes 0..KERNEL_SIZE-1).
+        # Both init and kernel call them at whatever address they land at.
         assembled.append(f'\tj __selfcopy')
-        init_byte_est = sum(
-            2 if l.strip().split()[0] in two_byte else 1
-            for l in assembled[phase4_start:]
-            if l.strip() and not l.strip().endswith(':') and not l.strip().startswith(';')
-            and not l.strip().startswith('section') and not l.strip().startswith('org')
-            and l.strip().split()[0] not in ('byte',)
-        ) if phase4_start else 0
-        if init_byte_est < KERNEL_SIZE:
-            assembled.append(f'\torg {KERNEL_SIZE}')
-        # Shared helpers at KERNEL_SIZE+ (survive self-copy)
+        # Shared helpers (emit naturally — no org needed, address > init code > KERNEL_SIZE)
         assembled.extend(shared_helpers_ov)
         assembled.append('__selfcopy:')
         assembled.extend(self_copy)
@@ -5828,6 +5820,8 @@ def main():
         elif 'section page3' in s and 'kernel' not in s and 'code' not in s:
             section = 'page3_data'; continue
         elif 'section eeprom' in s: section = 'eeprom'; continue
+        elif 'section data_code' in s: section = 'data'; continue
+        elif 'section stack_code' in s: section = 'stack'; continue
         elif 'section data' in s: section = 'data'; continue
         elif 'section code' in s: section = 'code'; continue
         if not s or s.endswith(':') or s.startswith(';'): continue
