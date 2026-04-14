@@ -850,11 +850,18 @@ class MK1CodeGen:
         # be resident — any overlay might call i2c_send_byte/i2c_read_byte.
         if '__i2c_sb' in helpers:
             no_ov.add('__i2c_sb:')
-            no_ov.add('__i2c_sp:')  # stop is always needed alongside send
         if '__i2c_rb' in helpers:
             no_ov.add('__i2c_rb:')
+        # __i2c_sp and __eeprom_rd: only resident if called from runtime code
+        # (not just init helpers like __lcd_init). They're often init-only.
+        # __i2c_sp: always needed alongside __i2c_sb for I2C STOP
+        if '__i2c_sp' in helpers:
+            no_ov.add('__i2c_sp:')
+        # __eeprom_rd: resident only if user code accesses eeprom arrays at runtime
         if '__eeprom_rd' in helpers:
-            no_ov.add('__eeprom_rd:')
+            if getattr(self, '_needs_runtime_eeprom_rd', False):
+                no_ov.add('__eeprom_rd:')
+            # else: init-only (LCD init), will be handled by init extraction
         if '__i2c_stream' in helpers:
             no_ov.add('__i2c_stream:')
 
@@ -1725,6 +1732,9 @@ class MK1CodeGen:
         INIT_ONLY_NAMES = {
             '__delay_cal', '__lcd_init', '__tone_setup',
         }
+        # __eeprom_rd is init-only when not used by runtime eeprom array access
+        if not getattr(self, '_needs_runtime_eeprom_rd', False):
+            INIT_ONLY_NAMES.add('__eeprom_rd')
         # I2C helpers that are init-only when no runtime I2C is needed
         I2C_INIT_ONLY = {'__i2c_sb', '__i2c_sp', '__i2c_st', '__i2c_st_only', '__i2c_rb'}
 
@@ -2671,6 +2681,48 @@ class MK1CodeGen:
             runtime_resident_helpers = rh_lines
             other_resident = non_rh_lines
 
+        # Split shared helpers (needed by both init and overlays) from
+        # kernel-only helpers. Shared helpers go in the code page tail
+        # (above KERNEL_SIZE) to survive self-copy without duplication.
+        shared_helper_names = set()
+        # Helpers called from init-only code AND from overlays/kernel
+        init_only_callers = {'__lcd_init', '__eeprom_rd', '__delay_cal', '__tone_setup'}
+        all_init_jals = set()
+        for line in self.code:
+            s = line.strip()
+            # Collect jal targets from init-compatible code
+            if s.startswith('jal __') and any(s.endswith(n) or n in s for n in []):
+                pass  # complex detection not needed — use a simpler heuristic
+        # Heuristic: __i2c_sb and __i2c_rb are almost always shared
+        # (init needs them for EEPROM/LCD, runtime for LCD char display)
+        for name in ['__i2c_sb', '__i2c_rb']:
+            if f'{name}:' in _NO_OVERLAY:
+                shared_helper_names.add(name)
+
+        shared_helpers_ov = []
+        kernel_only_helpers = []
+        hi = 0
+        while hi < len(runtime_resident_helpers):
+            s = runtime_resident_helpers[hi].strip()
+            if s.endswith(':') and s.startswith('__') and not s.startswith('.'):
+                fname = s[:-1]
+                start = hi
+                hi += 1
+                while hi < len(runtime_resident_helpers):
+                    ns = runtime_resident_helpers[hi].strip()
+                    if ns.endswith(':') and not ns.startswith('.') and ns.startswith('_'):
+                        break
+                    hi += 1
+                if fname in shared_helper_names:
+                    shared_helpers_ov.extend(runtime_resident_helpers[start:hi])
+                else:
+                    kernel_only_helpers.extend(runtime_resident_helpers[start:hi])
+            else:
+                kernel_only_helpers.append(runtime_resident_helpers[hi])
+                hi += 1
+        runtime_resident_helpers = kernel_only_helpers
+        shared_helper_size = measure_lines(shared_helpers_ov)
+
         runtime_helper_size = measure_lines(runtime_resident_helpers)
         KERNEL_SIZE_est = loader_size + main_size + runtime_helper_size
         OVERLAY_REGION_est = KERNEL_SIZE_est
@@ -2795,7 +2847,7 @@ class MK1CodeGen:
             loader_size = measure_lines(loader)
             main_size = measure_lines(main_lines)
             KERNEL_SIZE = loader_size + main_size + runtime_helper_size
-            OVERLAY_REGION = KERNEL_SIZE
+            OVERLAY_REGION = KERNEL_SIZE + shared_helper_size
             meta_base_new = max(p3_used, KERNEL_SIZE)
             if meta_base_new == meta_base and OVERLAY_REGION == OVERLAY_REGION_est:
                 break
@@ -2808,7 +2860,7 @@ class MK1CodeGen:
                                         len(p3_overlays), len(p1_overlays))
         loader_size = measure_lines(loader)
         KERNEL_SIZE = loader_size + main_size + runtime_helper_size
-        OVERLAY_REGION = KERNEL_SIZE
+        OVERLAY_REGION = KERNEL_SIZE + shared_helper_size
 
         # Fix p3 overlay offsets if meta_base changed from estimate
         final_meta_base = max(p3_used, KERNEL_SIZE)
@@ -2822,11 +2874,13 @@ class MK1CodeGen:
         meta_base = final_meta_base
 
         # Validate overlay region
-        if OVERLAY_REGION + max_slot_size > 252:  # 252: leave 4B safety margin at page end
+        # Overlay region starts after kernel + shared helpers
+        if OVERLAY_REGION + max_slot_size > 252:  # 252: leave 4B safety margin
             raise Exception(
                 f"largest overlay ({max_slot_size}B) exceeds overlay region "
-                f"({256 - OVERLAY_REGION}B). Kernel={KERNEL_SIZE}B "
+                f"({252 - OVERLAY_REGION}B). Kernel={KERNEL_SIZE}B "
                 f"(loader={loader_size}B + main={main_size}B + helpers={runtime_helper_size}B)"
+                f" + shared={shared_helper_size}B"
             )
 
         # ── Step 16: Generate init code (stage 1) ──
@@ -2841,7 +2895,7 @@ class MK1CodeGen:
         actual_main_size = measure_lines(runtime_main_lines)
         RESET_STUB = 2
         KERNEL_SIZE = RESET_STUB + loader_size + actual_main_size + runtime_helper_size
-        OVERLAY_REGION = KERNEL_SIZE
+        OVERLAY_REGION = KERNEL_SIZE + shared_helper_size
         meta_base = max(p3_used, KERNEL_SIZE)
         final_p3_start = meta_base + meta_table_size
         if p3_overlays:
@@ -2855,7 +2909,7 @@ class MK1CodeGen:
                                         len(p3_overlays), len(p1_overlays))
         loader_size = measure_lines(loader)
         KERNEL_SIZE = RESET_STUB + loader_size + actual_main_size + runtime_helper_size
-        OVERLAY_REGION = KERNEL_SIZE
+        OVERLAY_REGION = KERNEL_SIZE + shared_helper_size
         # Verify kernel sizing
         actual_total = RESET_STUB + measure_lines(loader + runtime_resident_helpers + runtime_main_lines)
         if actual_total != KERNEL_SIZE:
@@ -2994,7 +3048,8 @@ class MK1CodeGen:
                         init_needs.add(target)
 
             # Find those helpers in the original code and include them
-            needed_but_not_init = init_needs - {n for n, _, _, _ in init_only_funcs}
+            # Skip shared helpers — they're already in the code page at KERNEL_SIZE+
+            needed_but_not_init = init_needs - {n for n, _, _, _ in init_only_funcs} - shared_helper_names
             if needed_but_not_init:
                 # Find in original self.code
                 i = 0
@@ -3067,16 +3122,10 @@ class MK1CodeGen:
             assembled.append(f'\tcmpi {note_end}')         # done?
             assembled.append('\tjnz .precomp_loop')
 
-        # Self-copy routine — placed ABOVE kernel destination to avoid
-        # overwriting itself. Init helpers run first (at low addresses),
-        # then fall through to the self-copy. If init code doesn't fill
-        # up to KERNEL_SIZE, org pads with HLT and we jump over it.
+        # Shared helpers + self-copy — placed ABOVE kernel destination.
+        # Shared helpers survive the self-copy (at addresses >= KERNEL_SIZE).
+        # Both init and kernel call them at the same fixed addresses.
         assembled.append(f'\tj __selfcopy')
-        # Self-copy MUST be above code[KERNEL_SIZE-1] to avoid overwriting
-        # itself during the copy. Two cases:
-        #   1. Init code is SHORT (< KERNEL_SIZE): org pads forward (safe)
-        #   2. Init code is LONG (>= KERNEL_SIZE): don't org (would go backward)
-        # Count init section size (Phase 4 only, from 'section code; org 0'):
         init_byte_est = sum(
             2 if l.strip().split()[0] in two_byte else 1
             for l in assembled[phase4_start:]
@@ -3086,6 +3135,8 @@ class MK1CodeGen:
         ) if phase4_start else 0
         if init_byte_est < KERNEL_SIZE:
             assembled.append(f'\torg {KERNEL_SIZE}')
+        # Shared helpers at KERNEL_SIZE+ (survive self-copy)
+        assembled.extend(shared_helpers_ov)
         assembled.append('__selfcopy:')
         assembled.extend(self_copy)
 
@@ -4914,6 +4965,7 @@ class MK1CodeGen:
             self.gen_expr(idx_expr)
             if base_expr[0] == 'var' and base_expr[1] in self.eeprom_globals:
                 # EEPROM array: A = index, read EEPROM[base + A]
+                self._needs_runtime_eeprom_rd = True
                 base = self.eeprom_globals[base_expr[1]]
                 # __eeprom_rd takes 16-bit address in B:A (hi:lo)
                 # base is 16-bit EEPROM address; index is 8-bit
