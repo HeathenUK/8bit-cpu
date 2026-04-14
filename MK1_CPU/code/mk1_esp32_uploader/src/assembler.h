@@ -270,6 +270,20 @@ private:
 
     // Resolve an operand that could be a number, label, or constant
     int resolveValue(const char* tok, int line, bool pass1) {
+        // Handle simple expressions: label+N or label-N
+        const char* plus = strchr(tok, '+');
+        const char* minus = (plus == nullptr) ? strchr(tok, '-') : nullptr;
+        if (plus || minus) {
+            const char* op = plus ? plus : minus;
+            char left[48]; int llen = op - tok;
+            if (llen > 0 && llen < (int)sizeof(left)) {
+                strncpy(left, tok, llen); left[llen] = 0;
+                int lv = resolveValue(left, line, pass1);
+                bool rok; int rv = parseNumber(op + 1, rok);
+                if (rok) return plus ? (lv + rv) : (lv - rv);
+            }
+        }
+
         bool ok;
         int v = parseNumber(tok, ok);
         if (ok) return v;
@@ -327,8 +341,11 @@ private:
     }
 
     void emitPage3(uint8_t byte, bool pass1) {
-        if (!pass1 && result.page3_size < DATA_SIZE)
+        if (!pass1 && result.page3_size < DATA_SIZE) {
             result.page3[result.page3_size] = byte;
+            if (result.page3_size >= 179 && result.page3_size <= 190)
+                Serial.printf("P3[%d]=0x%02X\n", result.page3_size, byte);
+        }
         result.page3_size++;
     }
 
@@ -475,7 +492,11 @@ private:
             // Handle vasm-style data directives (without # prefix)
             if (startsWith(lp, "byte ") || startsWith(lp, "byte\t")) {
                 lp += 4; skipWs(lp);
-                char tok[32]; parseToken(lp, tok, sizeof(tok));
+                // Read full expression (including +/-) not just an ident token
+                char tok[48]; int ti = 0;
+                while (*lp && *lp != ',' && *lp != ' ' && *lp != '\t' && *lp != ';' && ti < 47)
+                    tok[ti++] = *lp++;
+                tok[ti] = 0;
                 int v = resolveValue(tok, lineNum, pass1);
                 emitBank(v & 0xFF, pass1, bank);
                 continue;

@@ -2563,8 +2563,9 @@ class MK1CodeGen:
                 # Compute manifest offset: index * 2 + meta_base
                 '\tsll',                        # A = index * 2
             ]
-            if meta_base > 0:
-                loader.append(f'\taddi {meta_base},$a')
+            # Use __manifest label for meta_base — resolves to the ACTUAL
+            # kernel byte count (not the measure_lines estimate).
+            loader.append('\taddi __manifest,$a')
             loader += [
                 # Read manifest entry [src_offset, size]
                 '\tmov $a,$d',                  # D = manifest addr
@@ -2958,12 +2959,15 @@ class MK1CodeGen:
         assembled.extend(runtime_resident_helpers)
         assembled.extend(runtime_main_lines)
 
-        # Phase 2: Manifest in page3 (after kernel image)
-        assembled.append('\tsection page3')
-        if meta_base > 0:
-            assembled.append(f'\torg {meta_base}')
+        # Phase 2: Manifest — stay in page3_code (same section as kernel).
+        # 'byte' in page3_code goes through emitCode→emitPage3, keeping
+        # code_size and page3_size in sync. The loader's meta_base (from
+        # code_size) then matches the actual page3 data position.
+        # (DO NOT switch to 'section page3' — that desynchs them.)
 
         # Emit 2-byte manifest entries: [src_offset, size]
+        # Label prevents peephole dead-code elimination (manifest follows kernel's hlt)
+        assembled.append('__manifest:')
         # Overlays ordered: page3 first, then page1, then page2.
         # Page determined at runtime by index range vs p3_count/p1_count.
         all_placed_ordered = list(p3_overlays) + list(p1_overlays) + list(p2_overlays)
@@ -2988,9 +2992,41 @@ class MK1CodeGen:
                 except ValueError:
                     pass
 
+        # Compute cumulative offsets from page3_size (not KERNEL_SIZE).
+        # The assembler's page3_size is: actual_kernel_bytes + meta_table_size + cumulative_overlay_bytes.
+        # At this point, page3_size = actual_kernel_bytes (from Phase 1).
+        # After manifest (meta_table_size bytes), overlays start.
+        # But we don't know actual_kernel_bytes — so compute overlay offsets
+        # using a placeholder (KERNEL_SIZE) and let the loader adjust.
+        # Actually: use cumulative offsets from manifest end.
+        # overlay_data_start = actual_kernel + meta_table_size.
+        # We can't know actual_kernel, but we CAN compute relative to manifest end:
+        # entry 0 offset = manifest_end = actual_kernel + meta_table_size
+        # entry 1 offset = entry 0 offset + entry 0 size
+        # etc.
+        # For the loader: meta_base = actual_kernel_bytes (from page3 layout).
+        # But the loader has meta_base hard-coded as KERNEL_SIZE.
+        # If KERNEL_SIZE != actual: meta_base is wrong → manifest read fails.
+        #
+        # REAL FIX: compute meta_base from page3_size at runtime.
+        # But we can't — it's a compile-time constant in the loader.
+        #
+        # WORKAROUND: adjust overlay offsets to account for the discrepancy.
+        # The discrepancy is: KERNEL_SIZE - actual_kernel_bytes.
+        # All offsets should be reduced by this amount.
+        # But we don't KNOW the discrepancy at compile time.
+        #
+        # PRAGMATIC FIX: emit meta_base_marker label and use assembler address.
+        # This requires the assembler to support label-as-byte-value.
+        # The assembler DOES support this: 'byte <label>' might work.
+        #
+        # Emit manifest with expression-based offsets: __manifest + meta_table_size + cumulative.
+        # The __manifest label resolves to the ACTUAL kernel byte count (not measure_lines).
+        cumulative = meta_table_size  # first overlay starts after manifest entries
         for _, name, asm_lines, fsize, offset in all_placed_ordered:
-            assembled.append(f'\tbyte {offset}')
+            assembled.append(f'\tbyte __manifest+{cumulative}')
             assembled.append(f'\tbyte {fsize}')
+            cumulative += fsize
 
         # Phase 3: Overlay code at OVERLAY_REGION addresses into storage pages
         for idx, name, asm_lines, fsize, _ in p3_overlays:
