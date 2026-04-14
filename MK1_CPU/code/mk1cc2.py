@@ -836,27 +836,23 @@ class MK1CodeGen:
         # Always resident: main and overlay loader
         no_ov = {'_main:', '_overlay_load:', '_overlay_load_p1:'}
 
+        # LCD helpers: must be resident because overlays can't call other overlays
+        # (the caller gets overwritten when the callee overlay loads).
         if self._needs_runtime_i2c:
-            # I2C + LCD helpers needed at runtime
-            no_ov.update({'__i2c_sb:', '__i2c_sp:', '__i2c_st:'})
-            # LCD send helpers must be resident if used.
-            # __lcd_send is always emitted alongside __lcd_chr/__lcd_cmd.
             for h in ('__lcd_chr', '__lcd_cmd', '__lcd_print'):
                 if h in helpers:
                     no_ov.add(f'{h}:')
                     no_ov.add('__lcd_send:')  # shared by chr and cmd
 
-        # Raw I2C helpers: if __i2c_sb or __i2c_rb are used at all, they must
-        # be resident — any overlay might call i2c_send_byte/i2c_read_byte.
+        # I2C byte-level helpers: resident if called from runtime code.
+        # __i2c_sb and __i2c_rb are called from overlays + resident LCD code.
+        # __i2c_st and __i2c_sp are init-only: __lcd_chr inlines the START,
+        # and STOP is inlined in __lcd_send. Only the init sentinel loop
+        # calls them as standalone functions.
         if '__i2c_sb' in helpers:
             no_ov.add('__i2c_sb:')
         if '__i2c_rb' in helpers:
             no_ov.add('__i2c_rb:')
-        # __i2c_sp and __eeprom_rd: only resident if called from runtime code
-        # (not just init helpers like __lcd_init). They're often init-only.
-        # __i2c_sp: always needed alongside __i2c_sb for I2C STOP
-        if '__i2c_sp' in helpers:
-            no_ov.add('__i2c_sp:')
         # __eeprom_rd: resident only if user code accesses eeprom arrays at runtime
         if '__eeprom_rd' in helpers:
             if getattr(self, '_needs_runtime_eeprom_rd', False):
@@ -1731,6 +1727,7 @@ class MK1CodeGen:
         # Runtime functions are loaded via overlay during stage 2.
         INIT_ONLY_NAMES = {
             '__delay_cal', '__lcd_init', '__tone_setup',
+            '__i2c_st', '__i2c_sp',  # START/STOP inlined in __lcd_chr at runtime
         }
         # __eeprom_rd is init-only when not used by runtime eeprom array access
         if not getattr(self, '_needs_runtime_eeprom_rd', False):
@@ -2535,7 +2532,7 @@ class MK1CodeGen:
         OVERLAY_REGION = 128  # initial estimate, will be refined
 
         def generate_kernel_loader(overlay_region, meta_base, has_p1, has_p2, has_p3,
-                                     p3_count=0, p1_count=0):
+                                     p3_count=0, p1_count=0, use_cache=True):
             """Generate the overlay loader assembly.
             Page is determined by overlay index range (not stored in manifest):
               idx < p3_count → page 3
@@ -2546,16 +2543,24 @@ class MK1CodeGen:
             loader = [
                 '; ── overlay loader (kernel) ──',
                 '_overlay_load:',
-                '\tmov $a,$c',                  # C = index
-                '\tldi $a,249',
-                '\tderefp3',                    # A = cached id
-                '\tcmp $c',
-                '\tjz __ov_cached',             # cache hit
-                '\tmov $c,$a',                  # A = new index
-                '\tldi $b,249',
-                '\tiderefp3',                   # update cache
+            ]
+            if use_cache:
+                loader += [
+                    '\tmov $a,$c',                  # C = index
+                    '\tldi $a,249',
+                    '\tderefp3',                    # A = cached id
+                    '\tcmp $c',
+                    '\tjz __ov_cached',             # cache hit
+                    '\tmov $c,$a',                  # A = new index
+                    '\tldi $b,249',
+                    '\tiderefp3',                   # update cache
+                ]
+            else:
+                loader += [
+                    '\tmov $a,$c',                  # C = index
+                ]
+            loader += [
                 # Compute manifest offset: index * 2 + meta_base
-                # (2-byte manifest: [src_offset, size], page determined by index range)
                 '\tsll',                        # A = index * 2
             ]
             if meta_base > 0:
@@ -2618,9 +2623,7 @@ class MK1CodeGen:
                 loader += [
                     '\tmov $c,$a',          # A = src addr
                     f'\t{deref_op}',        # A = page[src]
-                    '\tnop',                # settle page selectors
-                    '\tnop',                # (2 NOPs = 6 extra clocks between page switch)
-                    '\tistc_inc',           # code[B] = A; B++
+                    '\tistc_inc',           # code[B] = A; B++ (page selectors reset by fetch)
                     '\tmov $c,$a',          # A = src (from C, still valid)
                     '\tinc',                # A = src + 1
                     '\tmov $a,$c',          # C = src + 1
@@ -2645,9 +2648,9 @@ class MK1CodeGen:
             return loader
 
         # ── Step 13: Two-pass sizing ──
-        # Pass 1: estimate with placeholder values
-        # Estimate with p3+p1 (most common), no p2 (deref2 may not be flashed)
-        loader_pass1 = generate_kernel_loader(OVERLAY_REGION, 0, True, False, True, 2, 2)
+        # Pass 1: optimistic estimate (page3 only → smallest loader)
+        # If overlays don't fit in page3, we'll re-estimate with more pages
+        loader_pass1 = generate_kernel_loader(OVERLAY_REGION, 0, False, False, True, 2, 0, use_cache=False)
         loader_size = measure_lines(loader_pass1)
         main_size = measure_lines(main_lines)
 
@@ -2769,6 +2772,7 @@ class MK1CodeGen:
         p3_code_offset = meta_base + meta_table_size
         p3_capacity = 240 - p3_code_offset - note_table_size
 
+
         p1_code_offset = self.data_alloc
         p1_capacity = 256 - self.data_alloc
         p2_code_offset = 0
@@ -2841,9 +2845,10 @@ class MK1CodeGen:
         # ── Step 15: Final kernel sizing ──
         # Generate kernel with only the page copy loops actually needed
         for _pass in range(3):
+
             loader = generate_kernel_loader(OVERLAY_REGION_est, meta_base,
                                             has_p1, has_p2, has_p3,
-                                            len(p3_overlays), len(p1_overlays))
+                                            len(p3_overlays), len(p1_overlays), use_cache=False)
             loader_size = measure_lines(loader)
             main_size = measure_lines(main_lines)
             KERNEL_SIZE = loader_size + main_size + runtime_helper_size
@@ -2857,7 +2862,7 @@ class MK1CodeGen:
         # Final regeneration with converged values
         loader = generate_kernel_loader(OVERLAY_REGION, meta_base,
                                         has_p1, has_p2, has_p3,
-                                        len(p3_overlays), len(p1_overlays))
+                                        len(p3_overlays), len(p1_overlays), use_cache=False)
         loader_size = measure_lines(loader)
         KERNEL_SIZE = loader_size + main_size + runtime_helper_size
         OVERLAY_REGION = KERNEL_SIZE + shared_helper_size
@@ -2906,7 +2911,7 @@ class MK1CodeGen:
         # Regenerate loader with correct OVERLAY_REGION
         loader = generate_kernel_loader(OVERLAY_REGION, meta_base,
                                         has_p1, has_p2, has_p3,
-                                        len(p3_overlays), len(p1_overlays))
+                                        len(p3_overlays), len(p1_overlays), use_cache=False)
         loader_size = measure_lines(loader)
         KERNEL_SIZE = RESET_STUB + loader_size + actual_main_size + runtime_helper_size
         OVERLAY_REGION = KERNEL_SIZE + shared_helper_size
@@ -2922,21 +2927,17 @@ class MK1CodeGen:
         # Copies page3[0..KERNEL_SIZE-1] to code[0..KERNEL_SIZE-1] via derefp3+istc_inc
         self_copy = [
             '; ── self-copy: page3 → code page ──',
-            f'\tldi $b,0',                      # B = dest = 0
-            '\tldi $d,0',                       # D = src = 0
+            f'\tldi $b,0',                      # B = dest/src = 0
+            f'\tldi $d,{KERNEL_SIZE}',          # D = byte count
             '.selfcopy_loop:',
-            '\tmov $d,$a',                      # A = src addr
-            '\tderefp3',                        # A = page3[src]
-            '\tnop',                            # settle page selectors
-            '\tnop',
+            '\tmov $b,$a',                      # A = B (offset for derefp3)
+            '\tderefp3',                        # A = page3[B]
             '\tistc_inc',                       # code[B] = A; B++
-            '\tmov $d,$a',                      # A = src
-            '\tinc',
-            '\tmov $a,$d',                      # D = src + 1
-            '\tmov $b,$a',                      # A = dest (B auto-incremented)
-            f'\tcmpi {KERNEL_SIZE}',            # done?
+            '\tmov $d,$a',                      # A = D (count)
+            '\tdec',
+            '\tmov $a,$d',                      # D--
             '\tjnz .selfcopy_loop',
-            f'\tj _main',                       # jump to main in kernel
+            '\tj 0',                            # jump to kernel at code[0]
         ]
 
         # ── Step 18: Assemble everything ──
