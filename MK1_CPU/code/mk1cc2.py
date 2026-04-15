@@ -3137,7 +3137,7 @@ class MK1CodeGen:
         p1_code_offset = self.data_alloc
         p1_capacity = 256 - self.data_alloc
         p2_code_offset = 0
-        p2_capacity = 0  # deref2 works but overlay path has a bug
+        p2_capacity = 0
 
         p3_overlays = []
         p1_overlays = []
@@ -3587,8 +3587,24 @@ class MK1CodeGen:
             assembled.append(f'\tcmpi {note_end}')         # done?
             assembled.append('\tjnz .precomp_loop')
 
-        # Self-copy — shared helpers are in page3 (bootstrapped via mini-copy above).
-        # No need to emit them in init code section. Just jump to self-copy.
+        # Self-copy must start at or after KERNEL_SIZE to avoid overwriting itself.
+        # The copy writes to code[0..KERNEL_SIZE-1], so the loop code must be
+        # at addresses >= KERNEL_SIZE. Pad with a jump + NOPs if init is short.
+        init_size = measure_lines([l for l in assembled[phase4_start:]
+                                   if l.strip() and not l.strip().startswith(';')
+                                   and 'section' not in l and 'org' not in l])
+        if init_size < KERNEL_SIZE:
+            pad_needed = KERNEL_SIZE - init_size
+            if pad_needed > 2:
+                assembled.append('\tj __selfcopy')
+                # Label prevents peephole dead-code elimination of padding
+                assembled.append('__pad:')
+                for _ in range(pad_needed - 2):
+                    assembled.append('\tnop')
+            elif pad_needed > 0:
+                for _ in range(pad_needed):
+                    assembled.append('\tnop')
+
         assembled.append('__selfcopy:')
         assembled.extend(self_copy)
 
