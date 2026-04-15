@@ -608,11 +608,28 @@ class MK1CodeGen:
             else:
                 other_fns.append(fn)
 
+        # Pre-scan: check if any function calls lcd_cmd (needs calibrated delays)
+        # Must know this BEFORE compilation so lcd_init can auto-insert delay_cal.
+        all_fn_bodies = [main_fn] + other_fns if main_fn else other_fns
+        for fn in all_fn_bodies:
+            # fn = (name, params, body, ret_type)
+            src_str = str(fn[2])  # crude but effective
+            if 'lcd_cmd' in src_str:
+                self._needs_delay_calibrate = True
+                break
+
         if main_fn:
             self.compile_function(*main_fn)
 
         for fn in other_fns:
             self.compile_function(*fn)
+
+        # If lcd_cmd was used, ensure delay_cal helper is emitted
+        # (auto-inserted into init later, but helper body needed now)
+        if getattr(self, '_needs_delay_calibrate', False):
+            if not hasattr(self, '_lcd_helpers'):
+                self._lcd_helpers = set()
+            self._lcd_helpers.add('__delay_cal')
 
         # Emit I2C/LCD helpers AFTER all functions
         self._emit_i2c_helpers()
@@ -1231,8 +1248,7 @@ class MK1CodeGen:
             lbl_inner = self.label('li_di')
             self.emit(f'\tldi $c,5')       # 5ms outer count
             self.emit(f'{lbl_outer}:')
-            self.emit('\tldi $a,240')
-            self.emit('\tderefp3')         # A = page3[240] = ipm
+            self.emit('\tldi $a,0')        # 256 iterations ≈ 1ms at any clock
             self.emit(f'{lbl_inner}:')
             self.emit('\tdec')
             self.emit(f'\tjnz {lbl_inner}')
@@ -2104,21 +2120,7 @@ class MK1CodeGen:
             new_code = []
 
             # Init extraction path doesn't use page2 overlays — no SP init needed.
-            # Auto-insert delay_calibrate if calibrated delays needed
-            if getattr(self, '_needs_delay_calibrate', False):
-                has_delay_cal = any('jal __delay_cal' in l for l in init_inline)
-                if not has_delay_cal:
-                    insert_at = len(init_inline)
-                    for ci, cl in enumerate(init_inline):
-                        if cl.strip().endswith(';!keep') or cl.strip() == 'jal __delay_cal':
-                            insert_at = ci + 1
-                    init_inline = (init_inline[:insert_at] +
-                                   ['\tjal __delay_cal'] +
-                                   init_inline[insert_at:])
-                    if not hasattr(self, '_lcd_helpers'):
-                        self._lcd_helpers = set()
-                    self._lcd_helpers.add('__delay_cal')
-
+            # delay_calibrate auto-insertion now handled in lcd_init builtin
             # Stage 1: inline code, skip over init-only helpers, shared helpers, copy loop
             new_code.extend(init_inline)
             new_code.append('\tj __init_done')
@@ -3510,23 +3512,7 @@ class MK1CodeGen:
                 if s.endswith(':') and s.startswith('__'):
                     mini_copied_helpers.add(s[:-1])
 
-        # Auto-insert delay_calibrate if calibrated delays are needed
-        # (e.g., lcd_cmd uses __delay_Nms) but user didn't call delay_calibrate()
-        if getattr(self, '_needs_delay_calibrate', False):
-            has_delay_cal = any('jal __delay_cal' in l for l in init_code_lines)
-            if not has_delay_cal:
-                # Add delay_calibrate after i2c_init (after the ;!keep markers)
-                insert_at = len(init_code_lines)
-                for ci, cl in enumerate(init_code_lines):
-                    if cl.strip().endswith(';!keep') or cl.strip() == 'jal __delay_cal':
-                        insert_at = ci + 1
-                init_code_lines = (init_code_lines[:insert_at] +
-                                   ['\tjal __delay_cal'] +
-                                   init_code_lines[insert_at:])
-                if not hasattr(self, '_lcd_helpers'):
-                    self._lcd_helpers = set()
-                self._lcd_helpers.add('__delay_cal')
-
+        # delay_calibrate auto-insertion now handled in lcd_init builtin
         # Init sequence extracted from main (VIA init, calibration calls, etc.)
         assembled.extend(init_code_lines)
         # Jump past helper bodies to note precomputation / self-copy
@@ -4943,7 +4929,11 @@ class MK1CodeGen:
                 self.emit("\tclr $a")
                 self.emit('\texw 0 0')         # ORB = 0 (A=0)
                 self.emit('\tddrb_imm 0x00')   # DDRB = 0 (both lines idle/HIGH)
-                # NOTE: exw 0 3 (DDRA=0) REMOVED — it breaks EEPROM reads.
+                # Bus recovery: EEPROM write shim during UPLOAD may leave
+                # I2C bus dirty. Send STOP to clear before any I2C.
+                self.emit('\tddrb_imm 0x03')   # SCL low, SDA low
+                self.emit('\tddrb_imm 0x01')   # SCL high, SDA low
+                self.emit('\tddrb_imm 0x00')   # both high (STOP)
                 self.emit('\tpush $a ;!keep')  # stack warmup (STK pin settling)
                 self.emit('\tpop $a ;!keep')
                 return
