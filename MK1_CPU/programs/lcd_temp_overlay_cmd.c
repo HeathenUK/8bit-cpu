@@ -7,6 +7,7 @@ unsigned char read_temp() {
 void show_temp(unsigned char temp) {
     unsigned char tens;
     unsigned char ones;
+    lcd_cmd(0x01);
     tens = 0;
     ones = temp;
     while (ones >= 10) {

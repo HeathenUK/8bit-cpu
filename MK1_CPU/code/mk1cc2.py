@@ -3469,10 +3469,32 @@ class MK1CodeGen:
         assembled.append('\torg 0')
 
         # SP init: only needed when page2 stores overlay data.
-        # CPU reset leaves SP=0, first push writes to page2[0] (overlay data).
         if has_p2:
             assembled.append('\tldi $a,0xFF')
             assembled.append('\tmov $a,$sp')
+
+        # Mini-copy: copy resident kernel helpers from page3 to their code
+        # addresses so init code can call them directly (no _init copies needed).
+        # Saves ~30B by eliminating duplicated helper code in init.
+        helper_start = RESET_STUB + loader_size  # helpers come after j_main + loader
+        mini_copied_helpers = set()
+        if runtime_helper_size > 0:
+            mc_lbl = self.label('mc')
+            assembled.append(f'\tldi $b,{helper_start}')
+            assembled.append(f'\tldi $d,{runtime_helper_size}')
+            assembled.append(f'{mc_lbl}:')
+            assembled.append('\tmov $b,$a')
+            assembled.append('\tderefp3')
+            assembled.append('\tistc_inc')
+            assembled.append('\tmov $d,$a')
+            assembled.append('\tdec')
+            assembled.append('\tmov $a,$d')
+            assembled.append(f'\tjnz {mc_lbl}')
+            for line in runtime_resident_helpers:
+                s = line.strip()
+                if s.endswith(':') and s.startswith('__'):
+                    mini_copied_helpers.add(s[:-1])
+
         # Init sequence extracted from main (VIA init, calibration calls, etc.)
         assembled.extend(init_code_lines)
         # Jump past helper bodies to note precomputation / self-copy
@@ -3493,6 +3515,8 @@ class MK1CodeGen:
             s = line.strip()
             if s.endswith(':') and s.startswith('__'):
                 kernel_helper_names.add(s[:-1])
+        # Exclude mini-copied helpers — they're available at kernel addresses
+        kernel_helper_names -= mini_copied_helpers
         init_rename_set = shared_helper_names | set(bundleable_helpers) | kernel_helper_names
         def _rename_shared_refs(lines):
             """Rename helper labels/refs to _init suffix for init code."""
@@ -3544,6 +3568,8 @@ class MK1CodeGen:
                         init_needs.add(target)
 
             needed_but_not_init = init_needs - {n for n, _, _, _ in init_only_funcs}
+            # Exclude mini-copied helpers (available at kernel addresses)
+            needed_but_not_init -= mini_copied_helpers
             # Exclude helpers that are still resident (don't need init copies)
             needed_but_not_init -= {n for n in needed_but_not_init
                                     if f'{n}:' in _NO_OVERLAY and n not in init_rename_set}
@@ -5398,6 +5424,19 @@ class MK1CodeGen:
                     self._lcd_helpers = set()
                 self._lcd_helpers.add(helper)
                 self.emit(f'\tjal {helper}')
+                # HD44780 execution delay after lcd_cmd (not needed for lcd_char)
+                # Uses calibrated delay_ms via same ipm value at page3[240]
+                if not is_char:
+                    if not hasattr(self, '_lcd_helpers'):
+                        self._lcd_helpers = set()
+                    self._lcd_helpers.add('__delay_Nms')
+                    # Clear display (0x01) and return home (0x02): 1.52ms → delay(2)
+                    # All other commands: 37µs → delay(1) (minimum)
+                    if c is not None and c in (0x01, 0x02):
+                        self.emit('\tldi $b,2')    # 2ms delay
+                    else:
+                        self.emit('\tldi $b,1')    # 1ms delay
+                    self.emit('\tjal __delay_Nms')
                 return
 
             if name == 'lcd_print':
