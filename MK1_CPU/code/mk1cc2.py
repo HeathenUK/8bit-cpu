@@ -2103,6 +2103,7 @@ class MK1CodeGen:
             # Build output: init code + shared helpers + copy loop
             new_code = []
 
+            # Init extraction path doesn't use page2 overlays — no SP init needed.
             # Stage 1: inline code, skip over init-only helpers, shared helpers, copy loop
             new_code.extend(init_inline)
             new_code.append('\tj __init_done')
@@ -3127,7 +3128,11 @@ class MK1CodeGen:
 
         # Shared helpers go into page3 at [KERNEL_SIZE..OVERLAY_REGION-1].
         # This reserves page3 space for them — overlay data must start after.
-        meta_base = max(p3_used, KERNEL_SIZE_est + shared_helper_size)
+        # Conservative kernel estimate: the knapsack may keep helpers resident
+        # (adding up to ~100B), and multi-page dispatch adds ~20B to the loader.
+        # Use a generous estimate to avoid page3 overflow after sizing converges.
+        kernel_max_est = KERNEL_SIZE_est + shared_helper_size + 60  # headroom for knapsack
+        meta_base = max(p3_used, kernel_max_est)
         p3_code_offset = meta_base + meta_table_size
         p3_capacity = 256 - p3_code_offset - note_table_size
         # When shared helpers occupy page3, force ALL overlays to page1.
@@ -3140,7 +3145,7 @@ class MK1CodeGen:
         p1_code_offset = self.data_alloc
         p1_capacity = 256 - self.data_alloc
         p2_code_offset = 0
-        p2_capacity = 0  # page2 overlay bug still open
+        p2_capacity = 196
 
         p3_overlays = []
         p1_overlays = []
@@ -3457,6 +3462,9 @@ class MK1CodeGen:
         assembled.append('\tsection code')
         assembled.append('\torg 0')
 
+        # SP init: CPU reset leaves SP=0, first push corrupts page2[0]
+        assembled.append("\tldi $a,0xFF")
+        assembled.append("\tmov $a,$sp")
         # Init sequence extracted from main (VIA init, calibration calls, etc.)
         assembled.extend(init_code_lines)
         # Jump past helper bodies to note precomputation / self-copy
@@ -4859,17 +4867,17 @@ class MK1CodeGen:
 
             if name == 'i2c_init':
                 # VIA init for I2C: delay for VIA ~RES settle (RC = 1ms),
-                # then set ORB=0, DDRB=0, DDRA=0.
+                # then set ORB=0, DDRB=0, DDRA=0, init SP.
                 self.emit('\tldi $d,0')
                 lbl = self.label('via_dly')
                 self.emit(f'{lbl}:')
                 self.emit('\tdec')
                 self.emit(f'\tjnz {lbl}')
-                self.emit('\tclr $a')
-                self.emit('\texw 0 0')         # ORB = 0
+                # After delay loop: A=0
+                self.emit("\tclr $a")
+                self.emit('\texw 0 0')         # ORB = 0 (A=0)
                 self.emit('\tddrb_imm 0x00')   # DDRB = 0 (both lines idle/HIGH)
                 # NOTE: exw 0 3 (DDRA=0) REMOVED — it breaks EEPROM reads.
-                # The VIA bus cycle for register 3 (U0+U1) glitches the I2C bus.
                 self.emit('\tpush $a ;!keep')  # stack warmup (STK pin settling)
                 self.emit('\tpop $a ;!keep')
                 return
