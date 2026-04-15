@@ -2104,6 +2104,21 @@ class MK1CodeGen:
             new_code = []
 
             # Init extraction path doesn't use page2 overlays — no SP init needed.
+            # Auto-insert delay_calibrate if calibrated delays needed
+            if getattr(self, '_needs_delay_calibrate', False):
+                has_delay_cal = any('jal __delay_cal' in l for l in init_inline)
+                if not has_delay_cal:
+                    insert_at = len(init_inline)
+                    for ci, cl in enumerate(init_inline):
+                        if cl.strip().endswith(';!keep') or cl.strip() == 'jal __delay_cal':
+                            insert_at = ci + 1
+                    init_inline = (init_inline[:insert_at] +
+                                   ['\tjal __delay_cal'] +
+                                   init_inline[insert_at:])
+                    if not hasattr(self, '_lcd_helpers'):
+                        self._lcd_helpers = set()
+                    self._lcd_helpers.add('__delay_cal')
+
             # Stage 1: inline code, skip over init-only helpers, shared helpers, copy loop
             new_code.extend(init_inline)
             new_code.append('\tj __init_done')
@@ -3494,6 +3509,23 @@ class MK1CodeGen:
                 s = line.strip()
                 if s.endswith(':') and s.startswith('__'):
                     mini_copied_helpers.add(s[:-1])
+
+        # Auto-insert delay_calibrate if calibrated delays are needed
+        # (e.g., lcd_cmd uses __delay_Nms) but user didn't call delay_calibrate()
+        if getattr(self, '_needs_delay_calibrate', False):
+            has_delay_cal = any('jal __delay_cal' in l for l in init_code_lines)
+            if not has_delay_cal:
+                # Add delay_calibrate after i2c_init (after the ;!keep markers)
+                insert_at = len(init_code_lines)
+                for ci, cl in enumerate(init_code_lines):
+                    if cl.strip().endswith(';!keep') or cl.strip() == 'jal __delay_cal':
+                        insert_at = ci + 1
+                init_code_lines = (init_code_lines[:insert_at] +
+                                   ['\tjal __delay_cal'] +
+                                   init_code_lines[insert_at:])
+                if not hasattr(self, '_lcd_helpers'):
+                    self._lcd_helpers = set()
+                self._lcd_helpers.add('__delay_cal')
 
         # Init sequence extracted from main (VIA init, calibration calls, etc.)
         assembled.extend(init_code_lines)
@@ -5424,18 +5456,20 @@ class MK1CodeGen:
                     self._lcd_helpers = set()
                 self._lcd_helpers.add(helper)
                 self.emit(f'\tjal {helper}')
-                # HD44780 execution delay after lcd_cmd (not needed for lcd_char)
-                # Uses calibrated delay_ms via same ipm value at page3[240]
+                # HD44780 execution delay after lcd_cmd (not needed for lcd_char).
+                # MUST use calibrated __delay_Nms — clock speed varies.
+                # Clear display (0x01) / return home (0x02): 1.52ms → delay(2)
+                # All other commands: 37µs → delay(1)
                 if not is_char:
                     if not hasattr(self, '_lcd_helpers'):
                         self._lcd_helpers = set()
                     self._lcd_helpers.add('__delay_Nms')
-                    # Clear display (0x01) and return home (0x02): 1.52ms → delay(2)
-                    # All other commands: 37µs → delay(1) (minimum)
+                    # Flag that delay calibration is needed in init
+                    self._needs_delay_calibrate = True
                     if c is not None and c in (0x01, 0x02):
-                        self.emit('\tldi $b,2')    # 2ms delay
+                        self.emit('\tldi $b,2')    # 2ms
                     else:
-                        self.emit('\tldi $b,1')    # 1ms delay
+                        self.emit('\tldi $b,1')    # 1ms
                     self.emit('\tjal __delay_Nms')
                 return
 
