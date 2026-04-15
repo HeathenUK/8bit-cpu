@@ -3129,7 +3129,7 @@ class MK1CodeGen:
         # This reserves page3 space for them — overlay data must start after.
         meta_base = max(p3_used, KERNEL_SIZE_est + shared_helper_size)
         p3_code_offset = meta_base + meta_table_size
-        p3_capacity = 240 - p3_code_offset - note_table_size
+        p3_capacity = 256 - p3_code_offset - note_table_size
         # When shared helpers occupy page3, force ALL overlays to page1.
         # Mixing page3+page1 overlays requires multi-page dispatch in the loader
         # (adds ~19B), which shrinks the overlay region and often doesn't fit.
@@ -3140,7 +3140,7 @@ class MK1CodeGen:
         p1_code_offset = self.data_alloc
         p1_capacity = 256 - self.data_alloc
         p2_code_offset = 0
-        p2_capacity = 0
+        p2_capacity = 0  # page2 overlay bug still open
 
         p3_overlays = []
         p1_overlays = []
@@ -6302,10 +6302,13 @@ def main():
         gen.eeprom_base = args.eeprom_base
     asm = gen.compile(source)
 
-    # Always run peephole optimizer
+    # Run peephole optimizer — but NOT for overlay programs where
+    # manifest offsets are already computed from pre-peepholed component sizes.
+    # A final peephole would shrink the kernel, making offsets wrong.
     lines = asm.split('\n')
-    lines = peephole(lines)
-    asm = '\n'.join(lines)
+    if not getattr(gen, '_overlay_kernel_size', None):
+        lines = peephole(lines)
+        asm = '\n'.join(lines)
 
     if args.output:
         with open(args.output, 'w') as f: f.write(asm + '\n')
