@@ -876,11 +876,14 @@ class MK1CodeGen:
         # Conditionally resident: helpers that are marked _NO_OVERLAY now but
         # might be bundled into overlays later (step 8b) if they're never
         # called from non-helper resident code (i.e., _main or loader).
+        # ALL helpers in _NO_OVERLAY are conditionally resident — the knapsack
+        # + deferred classification (step 8b) decides which to keep resident vs
+        # bundle. This handles LCD, I2C, tone, delay, and any future helpers.
         self._conditionally_resident = set()
-        bundleable = {'__lcd_chr', '__lcd_cmd', '__lcd_send', '__i2c_sb', '__i2c_rb'}
-        for h in bundleable:
-            if f'{h}:' in no_ov:
-                self._conditionally_resident.add(h)
+        for label in no_ov:
+            name = label.rstrip(':')
+            if name.startswith('__'):
+                self._conditionally_resident.add(name)
 
     def _emit_i2c_helpers(self):
         """Emit I2C/LCD helper subroutines if any lcd_cmd/lcd_char builtins were used."""
@@ -2597,7 +2600,7 @@ class MK1CodeGen:
             # and the kernel doesn't grow too much (leave at least 80B overlay region)
             est_kernel = est_kernel_base + est_kernel_growth + hsize
             est_overlay_region = 250 - est_kernel
-            if est_overlay_region >= 40 and value > hsize:
+            if est_overlay_region >= 40 and value >= hsize:
                 keep_resident.add(hname)
                 est_kernel_growth += hsize
                 # Re-add to _NO_OVERLAY
@@ -3169,7 +3172,12 @@ class MK1CodeGen:
                 p2_code_offset += fsize; p2_capacity -= fsize
             return True
 
-        for idx, (name, asm_lines, fsize) in enumerate(overlay_asm_blocks):
+        _placement_retries = 0
+        _retry_bundling = False
+        # Sort by size descending — largest overlays first for better bin-packing
+        sorted_overlays = sorted(enumerate(overlay_asm_blocks),
+                                  key=lambda x: x[1][2], reverse=True)
+        for idx, (name, asm_lines, fsize) in sorted_overlays:
             placed = place_overlay(idx, name, asm_lines, fsize)
             if not placed:
                 caps = [(p3_capacity, 3), (p1_capacity, 1), (p2_capacity, 2)]
@@ -3191,6 +3199,33 @@ class MK1CodeGen:
                         placed = True
                         break
                 if not placed:
+                    # Placement failed. Find the largest bundled helper in this
+                    # overlay and force it resident to shrink the overlay.
+                    biggest_helper = None
+                    biggest_size = 0
+                    for oline in asm_lines:
+                        os = oline.strip()
+                        if os.endswith(':') and os.startswith('__') and not os.startswith('.'):
+                            hname_check = os[:-1]
+                            # Strip overlay suffix to get base name
+                            for suffix in [f'_ov{i}' for i in range(len(overlay_asm_blocks))]:
+                                if hname_check.endswith(suffix):
+                                    hname_check = hname_check[:-len(suffix)]
+                                    break
+                            if hname_check in bundleable_helpers:
+                                hsize_check = measure_lines(helper_bodies.get(hname_check, (0, 0, []))[2])
+                                if hsize_check > biggest_size:
+                                    biggest_size = hsize_check
+                                    biggest_helper = hname_check
+                    if biggest_helper and _placement_retries < 3:
+                        import sys
+                        print(f"  Placement retry: making {biggest_helper} ({biggest_size}B) resident to fit {name} ({fsize}B)",
+                              file=sys.stderr)
+                        _NO_OVERLAY.add(f'{biggest_helper}:')
+                        bundleable_helpers = [h for h in bundleable_helpers if h != biggest_helper]
+                        _placement_retries += 1
+                        _retry_bundling = True
+                        break  # break out of placement loop to retry
                     raise Exception(
                         f"overlay '{name}' ({fsize}B) exceeds ALL SRAM cache. "
                         f"p3={p3_capacity}B free, p1={p1_capacity}B free, p2={p2_capacity}B free"
