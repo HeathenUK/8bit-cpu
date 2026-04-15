@@ -3145,7 +3145,13 @@ class MK1CodeGen:
         p1_code_offset = self.data_alloc
         p1_capacity = 256 - self.data_alloc
         p2_code_offset = 0
-        p2_capacity = 196
+        # Page 2 needs SP init (3B) which increases init code. Estimate if
+        # init code can afford it (must stay ≤ 250B including selfcopy).
+        # If the program has LCD init (heavy init helpers), init is ~240B
+        # without SP init. Adding 3B pushes to 243B + selfcopy 14B = 257B > 250.
+        # In that case, disable page 2 to avoid the SP init overhead.
+        has_heavy_init = hasattr(self, '_lcd_helpers') and '__lcd_init' in getattr(self, '_lcd_helpers', set())
+        p2_capacity = 196 if not has_heavy_init else 0
 
         p3_overlays = []
         p1_overlays = []
@@ -3462,9 +3468,11 @@ class MK1CodeGen:
         assembled.append('\tsection code')
         assembled.append('\torg 0')
 
-        # SP init: CPU reset leaves SP=0, first push corrupts page2[0]
-        assembled.append("\tldi $a,0xFF")
-        assembled.append("\tmov $a,$sp")
+        # SP init: only needed when page2 stores overlay data.
+        # CPU reset leaves SP=0, first push writes to page2[0] (overlay data).
+        if has_p2:
+            assembled.append('\tldi $a,0xFF')
+            assembled.append('\tmov $a,$sp')
         # Init sequence extracted from main (VIA init, calibration calls, etc.)
         assembled.extend(init_code_lines)
         # Jump past helper bodies to note precomputation / self-copy
