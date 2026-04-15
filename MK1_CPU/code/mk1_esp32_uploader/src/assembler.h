@@ -279,8 +279,12 @@ private:
             if (llen > 0 && llen < (int)sizeof(left)) {
                 strncpy(left, tok, llen); left[llen] = 0;
                 int lv = resolveValue(left, line, pass1);
-                bool rok; int rv = parseNumber(op + 1, rok);
-                if (rok) return plus ? (lv + rv) : (lv - rv);
+                // Right operand: resolve as number, constant, or label
+                char right[48];
+                strncpy(right, op + 1, sizeof(right) - 1);
+                right[sizeof(right) - 1] = 0;
+                int rv = resolveValue(right, line, pass1);
+                return plus ? (lv + rv) : (lv - rv);
             }
         }
 
@@ -343,8 +347,7 @@ private:
     void emitPage3(uint8_t byte, bool pass1) {
         if (!pass1 && result.page3_size < DATA_SIZE) {
             result.page3[result.page3_size] = byte;
-            if (result.page3_size >= 179 && result.page3_size <= 190)
-                Serial.printf("P3[%d]=0x%02X\n", result.page3_size, byte);
+
         }
         result.page3_size++;
     }
