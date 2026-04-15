@@ -2158,12 +2158,14 @@ class MK1CodeGen:
             self._init_extraction_done = True
             return
 
-        # ── Step 4: Build connected components (BFS) ──
-        # Functions that call each other must be in the same overlay slot
+        # ── Step 4: Build overlay slots via SCC (Tarjan's algorithm) ──
+        # Only mutually recursive functions MUST share an overlay slot.
+        # A calls B (one-way) → B can be a separate overlay, loaded before A,
+        # or bundled into A's overlay. This is decided by the knapsack/bundling.
         ov_names = {name for name, _, _, _ in overlay_funcs}
         ov_by_name = {name: (start, end, fsize) for name, start, end, fsize in overlay_funcs}
 
-        # Build adjacency
+        # Build DIRECTED adjacency (A→B means A calls B)
         adj = {name: set() for name in ov_names}
         for name, start, end, _ in overlay_funcs:
             for li in range(start, end):
@@ -2172,25 +2174,42 @@ class MK1CodeGen:
                     target = s.split()[1]
                     if target in ov_names and target != name:
                         adj[name].add(target)
-                        adj[target].add(name)
+                        # NOTE: no reverse edge — unidirectional
 
-        # Find connected components
-        visited = set()
+        # Tarjan's SCC algorithm
+        scc_index = [0]
+        scc_stack = []
+        scc_on_stack = set()
+        scc_indices = {}
+        scc_lowlinks = {}
         components = []
-        for name in ov_names:
-            if name not in visited:
+
+        def strongconnect(v):
+            scc_indices[v] = scc_lowlinks[v] = scc_index[0]
+            scc_index[0] += 1
+            scc_stack.append(v)
+            scc_on_stack.add(v)
+
+            for w in adj.get(v, set()):
+                if w not in scc_indices:
+                    strongconnect(w)
+                    scc_lowlinks[v] = min(scc_lowlinks[v], scc_lowlinks[w])
+                elif w in scc_on_stack:
+                    scc_lowlinks[v] = min(scc_lowlinks[v], scc_indices[w])
+
+            if scc_lowlinks[v] == scc_indices[v]:
                 comp = []
-                queue = [name]
-                while queue:
-                    n = queue.pop(0)
-                    if n in visited:
-                        continue
-                    visited.add(n)
-                    comp.append(n)
-                    for nb in adj.get(n, set()):
-                        if nb not in visited:
-                            queue.append(nb)
+                while True:
+                    w = scc_stack.pop()
+                    scc_on_stack.discard(w)
+                    comp.append(w)
+                    if w == v:
+                        break
                 components.append(comp)
+
+        for v in ov_names:
+            if v not in scc_indices:
+                strongconnect(v)
 
         # ── Step 5: Build overlay slots via library inlining ──
         # Each user function gets its own overlay containing ALL library helpers
@@ -2840,7 +2859,7 @@ class MK1CodeGen:
         # appropriate page's copy loop, restores args, and calls the overlay.
 
         p3_used = self.page3_alloc
-        META_SIZE = 2   # [src_offset, size] per overlay (page from index range)
+        META_SIZE = 3   # [offset, size] + [page] = 2+1 bytes per overlay
         meta_table_size = len(overlay_meta) * META_SIZE
         note_table_size = 0  # notes now in page 1, not page 3
 
@@ -2870,92 +2889,86 @@ class MK1CodeGen:
         OVERLAY_REGION = 128  # initial estimate, will be refined
 
         def generate_kernel_loader(overlay_region, meta_base, has_p1, has_p2, has_p3,
-                                     p3_count=0, p1_count=0, use_cache=True):
+                                     p3_count=0, p1_count=0, use_cache=False):
             """Generate the overlay loader assembly.
-            Page is determined by overlay index range (not stored in manifest):
-              idx < p3_count → page 3
-              idx < p3_count + p1_count → page 1
-              else → page 2
-            Manifest entries are 2 bytes: [src_offset, size]
+            Layout in page3 after kernel:
+              __manifest: [offset0, size0, offset1, size1, ...]  (2B each)
+              __pages:    [page0, page1, ...]                     (1B each)
+            Page values: 3=derefp3, 1=deref, 2=deref2 (future: 0=EEPROM)
+            The loader reads page from __pages[index] and dispatches.
+            No index-range tracking needed — trivial to add new page types.
             """
             num_pages = sum([has_p3, has_p1, has_p2])
             loader = [
                 '; ── overlay loader (kernel) ──',
                 '_overlay_load:',
-            ]
-            if use_cache:
-                loader += [
-                    '\tmov $a,$c',                  # C = index
-                    '\tldi $a,249',
-                    '\tderefp3',                    # A = cached id
-                    '\tcmp $c',
-                    '\tjz __ov_cached',             # cache hit
-                    '\tmov $c,$a',                  # A = new index
-                    '\tldi $b,249',
-                    '\tiderefp3',                   # update cache
-                ]
-            else:
-                loader += [
-                    '\tmov $a,$c',                  # C = index
-                ]
-            # Save index for multi-page dispatch (C gets clobbered by manifest read)
-            if num_pages > 1:
-                loader.append('\tpush $a')          # save index on stack
-            loader += [
-                # Compute manifest offset: index * 2 + meta_base
+                '\tmov $a,$c',                  # C = index
                 '\tsll',                        # A = index * 2
-            ]
-            # Use __manifest label for meta_base — resolves to the ACTUAL
-            # kernel byte count (not the measure_lines estimate).
-            loader.append('\taddi __manifest,$a')
-            loader += [
-                # Read manifest entry [src_offset, size]
+                '\taddi __manifest,$a',          # A = __manifest + index*2
+                # Read manifest entry [offset, size]
                 '\tmov $a,$d',                  # D = manifest addr
                 '\tderefp3',                    # A = src_offset
-                '\tmov $a,$c',                  # C = src
-                '\tmov $d,$a',
-                '\tinc',
+                '\tmov $a,$c',                  # C = src offset
+                '\tmov $d,$a',                  # A = manifest addr
+                '\tinc',                        # A = manifest addr + 1
                 '\tderefp3',                    # A = size
-                f'\taddi {overlay_region},$a',
+                f'\taddi {overlay_region},$a',  # A = overlay_region + size = end
                 '\tmov $a,$d',                  # D = end addr
-                f'\tldi $b,{overlay_region}',
+                f'\tldi $b,{overlay_region}',   # B = dest start
             ]
 
-            # Page dispatch by overlay index range
-            # Overlays are ordered: page3 first, then page1, then page2.
-            # Determine page from index vs compiled-in counts.
-            # Page dispatch: page 3 is default (fall-through for indices < p3_count).
-            # Jump to page 1 or page 2 for larger indices.
-            # cmpi N; jc = jump if A >= N (carry = no borrow).
+            # Page dispatch: read __pages[index] to determine which deref to use
             if num_pages > 1:
                 loader += [
-                    '\tpop $a',                 # A = overlay index (saved earlier)
+                    '\tpush $d',                # save end addr
+                    '\tpush $c',                # save src offset
+                    # Reload index from original argument (it's still in the
+                    # return address area... no, we need it fresh).
+                    # Actually C was clobbered. But we saved index*2 earlier.
+                    # Simpler: re-derive index from B and manifest layout.
+                    # Or: just read __pages + index. We need index.
+                    # Index was in C at entry, then C was overwritten with src_offset.
+                    # We need to save index somewhere. Use the stack:
                 ]
-                if has_p3 and has_p1 and has_p2:
-                    # idx >= p3_count+p1_count → page 2
-                    loader.append(f'\tcmpi {p3_count + p1_count}')
-                    loader.append('\tjc .copy_p2')
-                    # idx >= p3_count → page 1
-                    loader.append(f'\tcmpi {p3_count}')
-                    loader.append('\tjc .copy_p1')
-                    # else: fall through to page 3
-                elif has_p3 and has_p1:
-                    # idx >= p3_count → page 1
-                    loader.append(f'\tcmpi {p3_count}')
-                    loader.append('\tjc .copy_p1')
-                    # else: fall through to page 3
-                elif has_p3 and has_p2:
-                    loader.append(f'\tcmpi {p3_count}')
-                    loader.append('\tjc .copy_p2')
-                elif has_p1 and has_p2:
-                    loader.append(f'\tcmpi {p1_count}')
-                    loader.append('\tjc .copy_p2')
-                    # else: fall through to page 1
+                # Hmm, we lost the index. Let me restructure to save it earlier.
+                # Restart the loader with index preservation:
+                loader = [
+                    '; ── overlay loader (kernel) ──',
+                    '_overlay_load:',
+                    '\tpush $a',                    # save index for page lookup
+                    '\tmov $a,$c',                  # C = index
+                    '\tsll',                        # A = index * 2
+                    '\taddi __manifest,$a',          # A = __manifest + index*2
+                    '\tmov $a,$d',                  # D = manifest addr
+                    '\tderefp3',                    # A = src_offset
+                    '\tmov $a,$c',                  # C = src offset
+                    '\tmov $d,$a',                  # A = manifest addr
+                    '\tinc',
+                    '\tderefp3',                    # A = size
+                    f'\taddi {overlay_region},$a',
+                    '\tmov $a,$d',                  # D = end addr
+                    f'\tldi $b,{overlay_region}',   # B = dest start
+                    # Now read page: __pages[index]
+                    '\tpop $a',                     # A = index (saved at entry)
+                    '\taddi __pages,$a',             # A = __pages + index
+                    '\tderefp3',                    # A = page number (1,2,3)
+                    # Dispatch on page number
+                    '\tcmpi 2',                     # page >= 2?
+                ]
+                if has_p2:
+                    loader.append('\tjz .copy_p2')  # page == 2
+                    loader.append('\tjc .copy_p3')  # page == 3 (>2)
+                else:
+                    loader.append('\tjc .copy_p3')  # page >= 2 means page 3
+                # Fall through to page 1 (default)
+            else:
+                # Single page — no dispatch needed, no push/pop
+                pass
 
-            # Emit copy loops. LAST falls through to __ov_cached.
+            # Emit copy loops
             copy_pages = []
-            if has_p3: copy_pages.append(('.copy_p3', 'derefp3'))
             if has_p1: copy_pages.append(('.copy_p1', 'deref'))
+            if has_p3: copy_pages.append(('.copy_p3', 'derefp3'))
             if has_p2: copy_pages.append(('.copy_p2', 'deref2'))
 
             for ci, (label, deref_op) in enumerate(copy_pages):
@@ -2964,23 +2977,19 @@ class MK1CodeGen:
                 loader += [
                     '\tmov $c,$a',          # A = src addr
                     f'\t{deref_op}',        # A = page[src]
-                    '\tistc_inc',           # code[B] = A; B++ (page selectors reset by fetch)
-                    '\tmov $c,$a',          # A = src (from C, still valid)
-                    '\tinc',                # A = src + 1
+                    '\tistc_inc',           # code[B] = A; B++
+                    '\tmov $c,$a',          # A = src (from C)
+                    '\tinc',
                     '\tmov $a,$c',          # C = src + 1
-                    '\tmov $b,$a',          # A = B (dest, auto-incremented)
+                    '\tmov $b,$a',          # A = B (dest)
                     '\tcmp $d',             # dest == end?
                     f'\tjnz {label}',
                 ]
                 if not is_last:
                     loader.append('\tj .ov_done')
 
-            # Load-only: just return. Caller handles args + jal OVERLAY_REGION.
-            if use_cache:
-                loader.append('__ov_cached:')
+            # Bus recovery + return
             loader.append('.ov_done:')
-            # Bus recovery: overlay copy toggles E0/SCL via deref/derefp3.
-            # Reset I2C bus to idle before caller's jal to overlay.
             loader.append('\tddrb_imm 0x03')
             loader.append('\tddrb_imm 0x01')
             loader.append('\tddrb_imm 0x00')
@@ -3347,11 +3356,27 @@ class MK1CodeGen:
                 except ValueError:
                     pass
 
-        # Manifest offsets are now correct because self.code was pre-peepholed
-        # at the start of _overlay_partition. measure_lines matches assembler.
+        # Manifest: [offset, size] per overlay (2 bytes each)
         for _, name, asm_lines, fsize, offset in all_placed_ordered:
             assembled.append(f'\tbyte {offset}')
             assembled.append(f'\tbyte {fsize}')
+
+        # Page table: [page] per overlay (1 byte each)
+        # page values: 3=page3(derefp3), 1=page1(deref), 2=page2(deref2)
+        assembled.append('__pages:')
+        # Determine which page each overlay is on
+        p3_set = {name for _, name, _, _, _ in p3_overlays}
+        p1_set = {name for _, name, _, _, _ in p1_overlays}
+        p2_set = {name for _, name, _, _, _ in p2_overlays}
+        for _, name, asm_lines, fsize, offset in all_placed_ordered:
+            if name in p3_set:
+                assembled.append('\tbyte 3')
+            elif name in p1_set:
+                assembled.append('\tbyte 1')
+            elif name in p2_set:
+                assembled.append('\tbyte 2')
+            else:
+                assembled.append('\tbyte 0')  # future: EEPROM
 
         # __ov_entry: marks the start of the overlay region (address OVERLAY_REGION).
         # Emitted after manifest so it resolves to the correct code address.
