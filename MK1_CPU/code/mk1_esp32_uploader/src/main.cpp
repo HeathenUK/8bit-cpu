@@ -1629,7 +1629,61 @@ static void handleSerialCommand(const String& line) {
         }
 
         uploadToMK1(uploadBuf, uploadSize);
-        if (eepromBytes > 0)
+
+        // Page3 post-init patch: if EEPROM-backed overlays exist, run init
+        // (self-copy) then overwrite freed page3 addresses with overlay data.
+        int patchBytes = er.p3patch_size;
+        if (patchBytes > 0) {
+            int patchCycles = er.p3patch_cycles > 0 ? er.p3patch_cycles : 10000;
+            // Run init: provide clock cycles for self-copy to complete.
+            // The CPU runs init code (VIA init + mini-copy + self-copy).
+            // After enough cycles, self-copy is done and the CPU is in _main.
+            int clkGpio = digitalPinToGPIONumber(PIN_CLK);
+            uint32_t clkMask = 1 << clkGpio;
+            pinMode(PIN_CLK, OUTPUT);
+            digitalWrite(PIN_CLK, LOW);
+            for (int i = 0; i < patchCycles; i++) {
+                GPIO.out_w1ts = clkMask;
+                delayMicroseconds(1);
+                GPIO.out_w1tc = clkMask;
+                delayMicroseconds(1);
+            }
+            // STOP the clock — freeze CPU before taking bus control.
+            // CPU is mid-execution (in _main after self-copy) but frozen.
+            digitalWrite(PIN_CLK, LOW);
+            delayMicroseconds(10);
+            // Disable CU — prevents CPU from responding to any clock edges
+            // while we write to the bus. No reset (preserves VIA state).
+            disableCU();
+            delayMicroseconds(2);
+            enableClock();  // static HIGH for bus writes
+            delayMicroseconds(2);
+            // Write patch data to page3 (addresses 0x300+)
+            pinMode(PIN_HL, OUTPUT);
+            pinMode(PIN_STK, OUTPUT);
+            busSetOutput();
+            enableOutput();
+            for (int i = 0; i < patchBytes && i < DATA_SIZE; i++) {
+                setAddress(0x300 + i);
+                delayMicroseconds(2);
+                writeInstruction(er.p3patch[i]);
+                delayMicroseconds(2);
+            }
+            // Release bus and re-enable CPU (resumes from where it froze)
+            disableClock();
+            busSetInput();
+            disableOutput();
+            pinMode(PIN_HL, INPUT);
+            pinMode(PIN_STK, INPUT);
+            // Reset + re-enable CU: CPU restarts from code[0] = j _main.
+            // Self-copy already ran, so code page has the kernel.
+            // VIA state persists (no hardware reset of VIA).
+            resetPulse();
+            enableCU();
+            startOIMonitor();
+            cpuState = CPU_RUNNING;
+            Serial.printf("{\"ok\":true,\"p3patch\":%d,\"eeprom\":%d}\n", patchBytes, eepromBytes);
+        } else if (eepromBytes > 0)
             Serial.printf("{\"ok\":true,\"eeprom\":%d}\n", eepromBytes);
         else
             Serial.println("{\"ok\":true}");
@@ -2439,7 +2493,7 @@ static int readDS3231Temp() {
 // ── Setup & Loop ─────────────────────────────────────────────────────
 
 void setup() {
-    Serial.setRxBufferSize(8192);  // 8KB RX buffer for large ASM uploads
+    Serial.setRxBufferSize(16384);  // 16KB RX buffer for large ASM uploads
     Serial.begin(115200);
 
     pinMode(PIN_MI, OUTPUT);

@@ -490,6 +490,239 @@ class MK1CodeGen:
                         return True
         return False
 
+    # ── Phase 7: Auto function splitting ──────────────────────────────
+
+    I2C_CALLS = {'i2c_start', 'i2c_stop', 'i2c_send_byte', 'i2c_read_byte',
+                 'i2c_nack', 'i2c_ack', 'i2c_bus_reset', 'i2c_stream',
+                 'rtc_read_temp', 'rtc_read_seconds', 'eeprom_read_byte'}
+    LCD_CALLS = {'lcd_cmd', 'lcd_char', 'lcd_print', 'delay', 'tone', 'silence'}
+
+    def _stmt_domain(self, stmt):
+        """Classify a statement as 'i2c', 'lcd', or None (neutral)."""
+        if not isinstance(stmt, tuple) or len(stmt) == 0:
+            return None
+        kind = stmt[0]
+        if kind == 'expr_stmt':
+            return self._expr_domain(stmt[1])
+        if kind == 'return' and stmt[1]:
+            return self._expr_domain(stmt[1])
+        if kind in ('if', 'while', 'do_while', 'for'):
+            # Check condition + body
+            domains = set()
+            for sub in stmt[1:]:
+                if isinstance(sub, tuple) and sub[0] == 'block':
+                    for s in sub[1]:
+                        d = self._stmt_domain(s)
+                        if d: domains.add(d)
+                elif isinstance(sub, tuple):
+                    d = self._expr_domain(sub) if sub[0] != 'block' else None
+                    if d: domains.add(d)
+            if 'lcd' in domains: return 'lcd'
+            if 'i2c' in domains: return 'i2c'
+        return None
+
+    def _expr_domain(self, expr):
+        """Classify an expression by which helper domain it uses."""
+        if not isinstance(expr, tuple) or len(expr) == 0:
+            return None
+        if expr[0] == 'call':
+            name = expr[1]
+            if name in self.I2C_CALLS: return 'i2c'
+            if name in self.LCD_CALLS: return 'lcd'
+            # User function calls: check if the function uses I2C
+            if name in self.func_bodies:
+                body_str = str(self.func_bodies[name][1])
+                if any(c in body_str for c in self.I2C_CALLS): return 'i2c'
+                if any(c in body_str for c in self.LCD_CALLS): return 'lcd'
+        if expr[0] == 'assign':
+            return self._expr_domain(expr[3])
+        for sub in expr[1:]:
+            if isinstance(sub, tuple):
+                d = self._expr_domain(sub)
+                if d: return d
+        return None
+
+    def _find_vars_in_expr(self, expr, result):
+        """Collect all variable names referenced in an expression."""
+        if not isinstance(expr, tuple): return
+        if expr[0] == 'var':
+            result.add(expr[1])
+        for sub in expr[1:]:
+            if isinstance(sub, tuple):
+                self._find_vars_in_expr(sub, result)
+            elif isinstance(sub, list):
+                for item in sub:
+                    if isinstance(item, tuple):
+                        self._find_vars_in_expr(item, result)
+
+    def _find_vars_in_stmt(self, stmt, assigned, used):
+        """Collect assigned and used variable names in a statement."""
+        if not isinstance(stmt, tuple): return
+        kind = stmt[0]
+        if kind == 'local':
+            assigned.add(stmt[1])
+            if stmt[2]: self._find_vars_in_expr(stmt[2], used)
+        elif kind == 'expr_stmt':
+            e = stmt[1]
+            if e[0] == 'assign' and e[2][0] == 'var':
+                assigned.add(e[2][1])
+                self._find_vars_in_expr(e[3], used)
+            else:
+                self._find_vars_in_expr(e, used)
+        elif kind == 'return':
+            if stmt[1]: self._find_vars_in_expr(stmt[1], used)
+        elif kind in ('if', 'while', 'do_while', 'for'):
+            for sub in stmt[1:]:
+                if isinstance(sub, tuple) and sub[0] == 'block':
+                    for s in sub[1]:
+                        self._find_vars_in_stmt(s, assigned, used)
+                elif isinstance(sub, tuple):
+                    self._find_vars_in_expr(sub, used)
+
+    def _auto_split_functions(self, functions):
+        """Split functions spanning I2C + LCD domains into separate phases."""
+        new_functions = []
+        main_rewrites = {}  # original_name → [(phase1_name, phase2_name)]
+
+        for name, params, body, ret_type in functions:
+            if name == 'main' or body[0] != 'block':
+                new_functions.append((name, params, body, ret_type))
+                continue
+
+            stmts = body[1]
+            # Classify each statement
+            domains = [(i, self._stmt_domain(s)) for i, s in enumerate(stmts)]
+
+            # Find I2C→LCD transition
+            last_i2c = -1
+            first_lcd = len(stmts)
+            for i, d in domains:
+                if d == 'i2c': last_i2c = i
+            for i, d in domains:
+                if d == 'lcd':
+                    first_lcd = i
+                    break
+
+            if last_i2c < 0 or first_lcd >= len(stmts) or last_i2c >= first_lcd:
+                # No clear I2C→LCD transition
+                new_functions.append((name, params, body, ret_type))
+                continue
+
+            # Split point: after last_i2c, before first_lcd
+            split = last_i2c + 1
+
+            # Find live variables at the split point
+            before_assigned = set()
+            before_used = set()
+            for s in stmts[:split]:
+                self._find_vars_in_stmt(s, before_assigned, before_used)
+
+            after_used = set()
+            after_assigned = set()
+            for s in stmts[split:]:
+                self._find_vars_in_stmt(s, after_assigned, after_used)
+
+            live_vars = list(before_assigned & after_used - set(params))
+
+            if len(live_vars) == 0:
+                # No live vars → phase1 is void, phase2 takes no extra params
+                new_functions.append((name, params, body, ret_type))
+                continue
+
+            # Only split if the function has enough statements to benefit.
+            # Small functions (< 8 statements) are better left unsplit — the
+            # overlay call overhead from splitting outweighs the helper savings.
+            if len(stmts) < 8:
+                new_functions.append((name, params, body, ret_type))
+                continue
+
+            import sys
+            print(f"  Phase 7: splitting {name} at stmt {split} "
+                  f"(live: {live_vars})", file=sys.stderr)
+
+            if len(live_vars) <= 2:
+                p1_name = f'{name}_p1'
+                p2_name = f'{name}_p2'
+                p1_stmts = list(stmts[:split])
+
+                if len(live_vars) == 1:
+                    # Phase 1 returns the live var
+                    p1_stmts.append(('return', ('var', live_vars[0])))
+                    p1_body = ('block', p1_stmts)
+                    new_functions.append((p1_name, list(params), p1_body, 'u8'))
+                    # Phase 2 takes it as parameter
+                    p2_stmts = list(stmts[split:])
+                    p2_body = ('block', p2_stmts)
+                    new_functions.append((p2_name, [live_vars[0]], p2_body, ret_type))
+
+                elif len(live_vars) == 2:
+                    # Phase 1: return second var, output first via out_imm
+                    # Use a data page global as the transfer slot
+                    xfer_name = f'__xfer_{name}'
+                    self.globals[xfer_name] = self.data_alloc
+                    self.data_alloc += 1
+                    # Store first var to global, return second
+                    p1_stmts.append(('expr_stmt',
+                        ('assign', '=',
+                         ('index', ('var', xfer_name), ('num', 0)),
+                         ('var', live_vars[0]))))
+                    p1_stmts.append(('return', ('var', live_vars[1])))
+                    p1_body = ('block', p1_stmts)
+                    new_functions.append((p1_name, list(params), p1_body, 'u8'))
+                    # Phase 2 takes second var as param, reads first from global
+                    p2_stmts = [
+                        ('local', live_vars[0],
+                         ('index', ('var', xfer_name), ('num', 0)), 'u8')
+                    ] + list(stmts[split:])
+                    p2_body = ('block', p2_stmts)
+                    new_functions.append((p2_name, [live_vars[1]], p2_body, ret_type))
+
+                main_rewrites[name] = (p1_name, p2_name, len(live_vars))
+
+                # Determine phase2 params
+                p2_actual_params = [live_vars[0]] if len(live_vars) == 1 else [live_vars[1]]
+                # Update func_params for the new functions
+                self.func_params[p1_name] = len(params)
+                self.func_params[p2_name] = len(p2_actual_params)
+                self.func_bodies[p1_name] = (list(params), p1_body)
+                self.func_bodies[p2_name] = (p2_actual_params, p2_body)
+            else:
+                import sys
+                print(f"  Phase 7: {name} has {len(live_vars)} live vars "
+                      f"at split — too many, keeping unsplit", file=sys.stderr)
+                new_functions.append((name, params, body, ret_type))
+                continue
+
+        # Rewrite main's calls to split functions
+        if main_rewrites:
+            for i, (name, params, body, ret_type) in enumerate(new_functions):
+                if name == 'main' and body[0] == 'block':
+                    new_stmts = []
+                    for s in body[1]:
+                        rewritten = False
+                        if s[0] == 'expr_stmt' and s[1][0] == 'call':
+                            call_name = s[1][1]
+                            if call_name in main_rewrites:
+                                p1, p2, n_live = main_rewrites[call_name]
+                                call_args = s[1][2]
+                                # Phase 1: result = p1(args)
+                                # Phase 2: p2(result) or p2(result, peek(254))
+                                if n_live == 1:
+                                    # temp = p1(args); p2(temp)
+                                    new_stmts.append(('local', '__split_tmp', ('call', p1, call_args), 'u8'))
+                                    new_stmts.append(('expr_stmt', ('call', p2, [('var', '__split_tmp')])))
+                                elif n_live == 2:
+                                    # tmp2 = p1(args); p2(tmp2)
+                                    # (p1 stores first var to data[254], returns second)
+                                    new_stmts.append(('local', '__split_tmp', ('call', p1, call_args), 'u8'))
+                                    new_stmts.append(('expr_stmt', ('call', p2, [('var', '__split_tmp')])))
+                                rewritten = True
+                        if not rewritten:
+                            new_stmts.append(s)
+                    new_functions[i] = (name, params, ('block', new_stmts), ret_type)
+
+        return new_functions
+
     def _collect_reg_candidates(self, stmts, candidates, depth=0):
         """Recursively collect register allocation candidates.
         Deeper-nested variables get higher priority (negative depth for sorting)."""
@@ -598,6 +831,11 @@ class MK1CodeGen:
             self.func_params[name] = len(params)
             self.func_bodies[name] = (params, body)
 
+        # ── Phase 7: Auto function splitting ──
+        # Split functions that span both I2C and LCD domains into separate
+        # phases, each needing fewer helpers → smaller overlay slots.
+        functions = self._auto_split_functions(functions)
+
         # Compile main first (starts at address 0, no j _main jump needed)
         # Then compile other functions after main
         main_fn = None
@@ -624,12 +862,26 @@ class MK1CodeGen:
         for fn in other_fns:
             self.compile_function(*fn)
 
-        # If lcd_cmd was used, ensure delay_cal helper is emitted
-        # (auto-inserted into init later, but helper body needed now)
+        # Auto-insert delay_calibrate when lcd_cmd uses calibrated delays.
+        # The call is inserted into _main (after VIA/LCD init, before user code).
+        # In overlay mode, __delay_cal becomes an overlay-eligible function.
         if getattr(self, '_needs_delay_calibrate', False):
             if not hasattr(self, '_lcd_helpers'):
                 self._lcd_helpers = set()
             self._lcd_helpers.add('__delay_cal')
+            # delay_cal inlines STOP — no __i2c_sp dependency
+            # Insert jal __delay_cal into _main after the last init-compatible call
+            for mi in range(len(self.code) - 1, -1, -1):
+                s = self.code[mi].strip()
+                if s == 'jal __lcd_init' or s == 'jal __delay_cal':
+                    self.code.insert(mi + 1, '\tjal __delay_cal')
+                    break
+            else:
+                # No lcd_init found — insert at _main start
+                for mi in range(len(self.code)):
+                    if self.code[mi].strip() == '_main:':
+                        self.code.insert(mi + 1, '\tjal __delay_cal')
+                        break
 
         # Emit I2C/LCD helpers AFTER all functions
         self._emit_i2c_helpers()
@@ -714,7 +966,14 @@ class MK1CodeGen:
                     self.emit(f'\tbyte {init}')
             self.emit('\tsection code')
 
-        # LCD init data is in EEPROM — emitted via eeprom_data section
+        # LCD init data pre-populated in data page (compile-time)
+        if hasattr(self, '_lcd_init_data'):
+            data_base, lcd_bytes = self._lcd_init_data
+            self.emit('\tsection data')
+            self.emit(f'; LCD init data at data[{data_base}..{data_base+len(lcd_bytes)-1}]')
+            for b in lcd_bytes:
+                self.emit(f'\tbyte {b}')
+            self.emit('\tsection code')
 
         # Emit lcd_print string data in page 3
         if hasattr(self, '_lcd_print_strings') and not getattr(self, '_init_extraction_done', False):
@@ -771,8 +1030,15 @@ class MK1CodeGen:
         # Keep __tone_setup alive if notes exist (called by __play_note at runtime)
         if hasattr(self, '_note_table') and self._note_table:
             refs.add('__tone_setup')
-        # Note: EEPROM I2C helpers only kept alive when EEPROM tier is active
-        # (detected by presence of __eeprom_load in code, not just eeprom_mode flag)
+        # Keep I2C helpers alive when i2c_init() was called — they may be
+        # needed for EEPROM preload (generated later in _overlay_partition)
+        if getattr(self, '_i2c_init_called', False):
+            refs.add('__i2c_sb')
+            refs.add('__i2c_rb')
+        # __lcd_send is reached via fall-through from __lcd_cmd — keep alive
+        # when __lcd_cmd is referenced (merge may make it a sub-label)
+        if '__lcd_cmd' in refs:
+            refs.add('__lcd_send')
 
         # Identify function body ranges (global label to next global label)
         funcs = []  # (start, end, name)
@@ -893,13 +1159,20 @@ class MK1CodeGen:
         # Conditionally resident: helpers that are marked _NO_OVERLAY now but
         # might be bundled into overlays later (step 8b) if they're never
         # called from non-helper resident code (i.e., _main or loader).
-        # ALL helpers in _NO_OVERLAY are conditionally resident — the knapsack
+        # Helpers in _NO_OVERLAY are conditionally resident — the knapsack
         # + deferred classification (step 8b) decides which to keep resident vs
-        # bundle. This handles LCD, I2C, tone, delay, and any future helpers.
+        # bundle. Exception: helpers needed for I2C infrastructure (EEPROM preload)
+        # are unconditionally resident when i2c_init() was called.
         self._conditionally_resident = set()
+        unconditional = set()
+        if getattr(self, '_i2c_init_called', False) and not self._needs_runtime_i2c:
+            # i2c_init() called without LCD → __i2c_sb needed for EEPROM preload.
+            unconditional.add('__i2c_sb')
+        # __lcd_send's residency is handled by step 8b propagation (scans
+        # resident __lcd_cmd body for 'j __lcd_send' reference)
         for label in no_ov:
             name = label.rstrip(':')
-            if name.startswith('__'):
+            if name.startswith('__') and name not in unconditional:
                 self._conditionally_resident.add(name)
 
     def _emit_i2c_helpers(self):
@@ -1166,13 +1439,13 @@ class MK1CodeGen:
                     lcd_init_data.append(DELAY)  # clear display needs ~2ms
             lcd_init_data.append(END)
 
-            # Store LCD init data in EEPROM
-            eeprom_addr = self.eeprom_alloc
-            self.eeprom_data.append((eeprom_addr, lcd_init_data))
-            self.eeprom_alloc += len(lcd_init_data)
+            # Store LCD init data in data page (populated at compile time).
+            # Previously stored in EEPROM and read at runtime via __eeprom_rd,
+            # but that adds 72B to init (__eeprom_rd + __i2c_rb_init).
+            # Pre-populating the data page eliminates the EEPROM read loop.
             data_base = self.data_alloc
             self.data_alloc += len(lcd_init_data)
-            self._lcd_init_eeprom = (eeprom_addr, data_base, lcd_init_data)
+            self._lcd_init_data = (data_base, lcd_init_data)
 
             lbl_loop = self.label('li_lp')
             lbl_ns = self.label('li_ns')
@@ -1180,43 +1453,10 @@ class MK1CodeGen:
             lbl_adv = self.label('li_av')
             lbl_done = self.label('li_dn')
 
-            # Read LCD init data from EEPROM using individual random reads
-            # into data page, then process with sentinel loop.
-            # NOTE: __eeprom_rd clobbers ALL registers (A,B,C,D).
-            # Both countdown and data_ptr survive on the stack.
-            # Stack layout: [count, ptr] with count on top.
-            count = len(lcd_init_data)
-            lbl_rd = self.label('li_rd')
-            eeprom_lo = eeprom_addr & 0xFF
-            eeprom_hi = (eeprom_addr >> 8) & 0xFF
-            eeprom_offset = eeprom_lo - data_base
+            # LCD init data is pre-populated in the data page at compile time.
+            # No EEPROM read needed — saves ~72B of init code (__eeprom_rd + __i2c_rb).
             self.emit('__lcd_init:')
-            # Stack: just the data_ptr. Count in a fixed data page location.
-            # Store count at data[255] (top of data page, won't conflict)
-            self.emit(f'\tldi $a,{count}')
-            self.emit('\tldi $b,255')
-            self.emit('\tideref')             # data[255] = count
-            self.emit(f'\tpush_imm {data_base}')   # ptr on stack
-            self.emit(f'{lbl_rd}:')
-            self.emit('\tpop $a')             # A = ptr
-            self.emit('\tpush $a')            # re-save
-            self.emit(f'\taddi {eeprom_offset},$a') if eeprom_offset else None
-            self.emit(f'\tldi $b,{eeprom_hi}')
-            self.emit('\tjal __eeprom_rd')    # A = byte
-            self.emit('\tpop_b')             # B = ptr
-            self.emit('\tideref')             # data[B] = A
-            self.emit('\tmov $b,$a')          # A = ptr
-            self.emit('\tinc')                # A = ptr+1
-            self.emit('\tpush $a')            # save new ptr
-            # Decrement count from data[255]
-            self.emit('\tldi $a,255')
-            self.emit('\tderef')              # A = data[255] = count
-            self.emit('\tdec')
-            self.emit('\tldi $b,255')
-            self.emit('\tideref')             # data[255] = count-1
-            self.emit(f'\tjnz {lbl_rd}')
-            self.emit('\tpop $a')             # clean ptr from stack
-            # Process from data page
+            # Process sentinel-encoded init data from data page
             self.emit(f'\tldi $d,{data_base}')
             self.emit(f'{lbl_loop}:')
             self.emit('\tmov $d,$a')
@@ -1375,7 +1615,10 @@ class MK1CodeGen:
             self.emit('\tjal __i2c_sb')
             self.emit('\tclr $a')
             self.emit('\tjal __i2c_sb')
-            self.emit('\tjal __i2c_sp')
+            # Inline I2C STOP (avoids __i2c_sp dependency for overlay-eligible delay_cal)
+            self.emit('\tddrb_imm 0x03')   # both LOW
+            self.emit('\tddrb_imm 0x01')   # SDA LOW, SCL HIGH
+            self.emit('\tddrb_imm 0x00')   # both HIGH (idle)
             self.emit('\tclr $a')
             self.emit('\texw 0 3')         # clear DDRA before sync
             # Sync: wait LOW then HIGH (rising edge)
@@ -1705,7 +1948,7 @@ class MK1CodeGen:
                     s.startswith('.rcv') or s == 'nop' or
                     s.startswith('dec') or s.startswith('mov $c,$a') or
                     (s.startswith('jnz .') and any(s.endswith(x) for x in ['dly', 'rcv', 'br_'])) or
-                    s == 'jal __delay_cal' or s == 'jal __lcd_init'):
+                    s == 'jal __lcd_init'):
                     mn = s.split()[0] if s else ''
                     init_estimate += 2 if mn in two_byte else 1
 
@@ -1759,9 +2002,11 @@ class MK1CodeGen:
         # Init-only functions run once during stage 1, then are discarded.
         # Runtime functions are loaded via overlay during stage 2.
         INIT_ONLY_NAMES = {
-            '__delay_cal', '__lcd_init', '__tone_setup',
+            '__lcd_init', '__tone_setup',
             '__i2c_st', '__i2c_sp',  # START/STOP inlined in __lcd_chr at runtime
         }
+        # __delay_cal is NOT init-only: it becomes an overlay in the overlay system,
+        # freeing ~57B of init space. Called at _main start via overlay dispatch.
         # __eeprom_rd is init-only when not used by runtime eeprom array access
         if not getattr(self, '_needs_runtime_eeprom_rd', False):
             INIT_ONLY_NAMES.add('__eeprom_rd')
@@ -1803,11 +2048,20 @@ class MK1CodeGen:
             overlay_funcs = list(overlay_eligible)
             remaining_size = size - sum(f[3] for f in overlay_eligible)
         else:
-            for name, start, end, fsize in overlay_eligible:
-                if remaining_size <= (240 - kernel_estimate - main_overhead):
-                    break
-                overlay_funcs.append((name, start, end, fsize))
-                remaining_size -= fsize
+            # Overlay functions until remaining code fits in the code page.
+            # When total code is very large (>350B), overlay ALL eligible functions
+            # to keep the kernel as small as possible.
+            target = 240 - kernel_estimate - main_overhead
+            if size > 350:
+                # Large program: overlay everything, keep kernel minimal
+                overlay_funcs = list(overlay_eligible)
+                remaining_size = size - sum(f[3] for f in overlay_eligible)
+            else:
+                for name, start, end, fsize in overlay_eligible:
+                    if remaining_size <= target:
+                        break
+                    overlay_funcs.append((name, start, end, fsize))
+                    remaining_size -= fsize
 
         if not overlay_funcs:
             if size <= 250:
@@ -1834,7 +2088,7 @@ class MK1CodeGen:
             helpers = self.code[helper_start:]
 
             # Classify helpers as init-only or runtime
-            init_only_names = {'__delay_cal', '__lcd_init', '__tone_setup'}
+            init_only_names = {'__lcd_init', '__tone_setup'}
             if not getattr(self, '_needs_runtime_i2c', False):
                 init_only_names.update({'__i2c_sb', '__i2c_sp', '__i2c_st', '__i2c_rb'})
 
@@ -1866,7 +2120,8 @@ class MK1CodeGen:
                 'push $a ;!keep', 'pop $a ;!keep',
             }
             INIT_PREFIXES_SET = ('ddrb_imm', 'exrw 2', 'ldi $d,', 'ddra_imm', 'push_imm')
-            INIT_JAL_TARGETS = {'__delay_cal', '__lcd_init', '__tone_setup'}
+            INIT_JAL_TARGETS = {'__lcd_init', '__tone_setup'}
+            # __delay_cal excluded: runs as overlay at _main start (not init)
             # Note: __i2c_stream, __i2c_st, __i2c_sp are NOT init-only targets —
             # they can appear in runtime code too. Only delay_cal/lcd_init/tone_setup
             # are definitively init-only calls that extend the init phase.
@@ -2232,6 +2487,35 @@ class MK1CodeGen:
             if v not in scc_indices:
                 strongconnect(v)
 
+        # Post-SCC merge: if any function in component X calls a function in
+        # component Y, merge X and Y. This handles user-calls-user cases where
+        # A→B is one-way but B must be in A's overlay (can't call across overlays).
+        comp_of = {}
+        for ci, comp in enumerate(components):
+            for name in comp:
+                comp_of[name] = ci
+        parent = list(range(len(components)))
+        def _find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+        def _union(x, y):
+            px, py = _find(x), _find(y)
+            if px != py:
+                parent[py] = px
+        for ci, comp in enumerate(components):
+            for name in comp:
+                for called in adj.get(name, set()):
+                    called_ci = comp_of.get(called)
+                    if called_ci is not None and called_ci != ci:
+                        _union(ci, called_ci)
+        merged = {}
+        for ci, comp in enumerate(components):
+            root = _find(ci)
+            merged.setdefault(root, []).extend(comp)
+        components = list(merged.values())
+
         # ── Step 5: Build overlay slots via library inlining ──
         # Each user function gets its own overlay containing ALL library helpers
         # it depends on. Library helpers are never split from their callers.
@@ -2534,16 +2818,19 @@ class MK1CodeGen:
             for ci, cline in enumerate(new_resident):
                 if ci >= hstart and ci < hend:
                     continue
-                # Skip other helper bodies too (they might also be bundled)
-                in_other_helper = False
+                # Skip helper bodies that are already confirmed bundleable
+                # (removed from _NO_OVERLAY). But scan bodies of helpers still
+                # in _NO_OVERLAY — if they call us, we must stay resident.
+                in_removed_helper = False
                 for oh, (ohs, ohe, _) in helper_bodies.items():
                     if oh != hname and ohs <= ci < ohe:
-                        in_other_helper = True
-                        break
-                if in_other_helper:
+                        if f'{oh}:' not in _NO_OVERLAY:
+                            in_removed_helper = True
+                            break
+                if in_removed_helper:
                     continue
                 cs = cline.strip()
-                if f'jal {hname}' in cs:
+                if f'jal {hname}' in cs or f'j {hname}' in cs:
                     called_from_resident = True
                     break
             if not called_from_resident:
@@ -2627,14 +2914,77 @@ class MK1CodeGen:
                 print(f"  Knapsack: keeping {hname} resident ({hsize}B, used by {helper_usage_count[hname]} overlays, saves {value}B)",
                       file=sys.stderr)
 
-        # Remove kept-resident helpers from bundleable list
-        if keep_resident:
-            bundleable_helpers = [h for h in bundleable_helpers if h not in keep_resident]
-            # Also remove from deps (they're now resident, not bundled)
-            for h in keep_resident:
+        # ── Phase 6: Wrapping-aware helper promotion ──
+        # Estimate post-bundling overlay sizes. If any would wrap (exceed the
+        # estimated overlay region), force the most-shared bundled helper resident.
+        # This reduces overlay sizes at the cost of kernel growth.
+        est_overlay_avail = 250 - (est_kernel_base + est_kernel_growth)
+        for _wrap_retry in range(3):
+            # Estimate post-bundling size for each overlay
+            wrapping_overlays = []
+            for oi, (oname, olines, ofsize) in enumerate(overlay_asm_blocks):
+                # Estimate bundled size: function size + sum of all bundleable helpers it needs
+                needed_helpers = set()
+                for ol in olines:
+                    os2 = ol.strip()
+                    if os2.startswith('jal '):
+                        target = os2.split()[1]
+                        if target in bundleable_helpers:
+                            needed_helpers.add(target)
+                            needed_helpers |= transitive_deps(target)
+                bundled_size = ofsize + sum(
+                    measure_lines(helper_bodies[h][2]) + 1 for h in needed_helpers
+                    if h in helper_bodies and h not in keep_resident)
+                if bundled_size > est_overlay_avail:
+                    wrapping_overlays.append((oi, oname, bundled_size, needed_helpers - keep_resident))
+            if not wrapping_overlays:
+                break
+            # Find the bundled helper that, if promoted, would reduce the most wrapping
+            helper_impact = {}
+            for _, _, bsize, helpers in wrapping_overlays:
+                for h in helpers:
+                    if h in helper_bodies:
+                        hsize = measure_lines(helper_bodies[h][2]) + 1
+                        helper_impact[h] = helper_impact.get(h, 0) + hsize
+            if not helper_impact:
+                break
+            best = max(helper_impact, key=helper_impact.get)
+            best_size = measure_lines(helper_bodies[best][2]) + 1
+            # Check that promoting this helper doesn't make kernel too large
+            new_kernel = est_kernel_base + est_kernel_growth + best_size
+            if new_kernel > 230:  # leave at least 20B overlay region
+                break
+            keep_resident.add(best)
+            est_kernel_growth += best_size
+            est_overlay_avail = 250 - (est_kernel_base + est_kernel_growth)
+            _NO_OVERLAY.add(f'{best}:')
+            import sys
+            print(f"  Phase 6: promoting {best} ({best_size}B) to resident (reduces wrapping by {helper_impact[best]}B)",
+                  file=sys.stderr)
+
+        # Remove kept-resident helpers from bundleable list.
+        # Identify helpers merged into other helpers via fall-through.
+        # When __lcd_cmd is kept resident, __lcd_send must follow in the kernel
+        # (fall-through linkage via `j __lcd_send` at end of __lcd_cmd body).
+        merged_into_resident = set()
+        for hname in keep_resident:
+            if hname in helper_bodies:
+                _, _, hlines = helper_bodies[hname]
+                for hl in hlines:
+                    hs = hl.strip()
+                    if hs.endswith(':') and hs.startswith('__') and not hs.startswith('.'):
+                        sub_name = hs[:-1]
+                        if sub_name != hname and sub_name in bundleable_helpers:
+                            merged_into_resident.add(sub_name)
+        # Remove both kept-resident AND merged-sub helpers from bundleable.
+        # Merged sub-helpers are part of the resident helper's body.
+        remove_from_bundleable = keep_resident | merged_into_resident
+        if remove_from_bundleable:
+            bundleable_helpers = [h for h in bundleable_helpers if h not in remove_from_bundleable]
+            for h in remove_from_bundleable:
                 deps.pop(h, None)
             for h in deps:
-                deps[h] -= keep_resident
+                deps[h] -= remove_from_bundleable
 
         # For each overlay, find all bundleable helpers it needs (transitively).
         # Then append them all. Order: leaves first (deps before dependents).
@@ -2738,6 +3088,8 @@ class MK1CodeGen:
 
         # Rebuild overlay_meta with updated sizes
         overlay_meta = [(idx, name, fsize) for idx, (name, _, fsize) in enumerate(overlay_asm_blocks)]
+        # Track post-bundling max for diagnostics (may exceed overlay region due to wrapping)
+        max_bundled_size = max((fsize for _, _, fsize in overlay_asm_blocks), default=0)
 
         # ── Step 9b: Validate overlay self-containment (post-inlining) ──
         # Every jal in an overlay must target a function in the SAME overlay
@@ -2797,13 +3149,13 @@ class MK1CodeGen:
         INIT_MARKERS = {
             'exw 0 0', 'exw 0 1', 'exw 0 3',
             'push $a ;!keep', 'pop $a ;!keep',
-            'jal __delay_cal', 'jal __lcd_init',
+            'jal __lcd_init',
             'push_b', 'pop_b', 'iderefp3',
         }
         INIT_PREFIXES = ('ddrb_imm', 'exrw 2', 'ldi $d,', 'ddra_imm', 'push_imm')
         # Helpers that are safe to call during init (don't end init phase)
         INIT_COMPAT_HELPERS = {'__i2c_stream', '__i2c_st', '__i2c_sp',
-                               '__delay_cal', '__lcd_init', '__tone_setup'}
+                               '__lcd_init', '__tone_setup'}
 
         # Pre-scan: find overlay_load call sequences
         overlay_call_lines = set()
@@ -2910,14 +3262,15 @@ class MK1CodeGen:
         OVERLAY_REGION = 128  # initial estimate, will be refined
 
         def generate_kernel_loader(overlay_region, meta_base, has_p1, has_p2, has_p3,
-                                     p3_count=0, p1_count=0, use_cache=False):
+                                     p3_count=0, p1_count=0, use_cache=False,
+                                     has_eeprom_tier=False, eeprom_addr_hi=0):
             """Generate the overlay loader assembly.
             Layout in page3 after kernel:
               __manifest: [offset0, size0, offset1, size1, ...]  (2B each)
               __pages:    [page0, page1, ...]                     (1B each)
-            Page values: 3=derefp3, 1=deref, 2=deref2 (future: 0=EEPROM)
-            The loader reads page from __pages[index] and dispatches.
-            No index-range tracking needed — trivial to add new page types.
+            Page values: 3=derefp3, 1=deref, 2=deref2
+            EEPROM-backed overlays are preloaded into freed page3 space during init,
+            so the runtime loader only needs SRAM copy paths.
             """
             num_pages = sum([has_p3, has_p1, has_p2])
             loader = [
@@ -2940,19 +3293,7 @@ class MK1CodeGen:
 
             # Page dispatch: read __pages[index] to determine which deref to use
             if num_pages > 1:
-                loader += [
-                    '\tpush $d',                # save end addr
-                    '\tpush $c',                # save src offset
-                    # Reload index from original argument (it's still in the
-                    # return address area... no, we need it fresh).
-                    # Actually C was clobbered. But we saved index*2 earlier.
-                    # Simpler: re-derive index from B and manifest layout.
-                    # Or: just read __pages + index. We need index.
-                    # Index was in C at entry, then C was overwritten with src_offset.
-                    # We need to save index somewhere. Use the stack:
-                ]
-                # Hmm, we lost the index. Let me restructure to save it earlier.
-                # Restart the loader with index preservation:
+                # Restart with index preservation (need index for __pages lookup)
                 loader = [
                     '; ── overlay loader (kernel) ──',
                     '_overlay_load:',
@@ -2976,10 +3317,13 @@ class MK1CodeGen:
                     # Dispatch on page number
                     '\tcmpi 2',                     # page >= 2?
                 ]
-                if has_p2:
+                if has_p2 and has_p3:
                     loader.append('\tjz .copy_p2')  # page == 2
                     loader.append('\tjc .copy_p3')  # page == 3 (>2)
-                else:
+                elif has_p2:
+                    loader.append('\tjz .copy_p2')  # page == 2
+                    # no page 3: fall through to page 1
+                elif has_p3:
                     loader.append('\tjc .copy_p3')  # page >= 2 means page 3
                 # Fall through to page 1 (default)
             else:
@@ -3020,20 +3364,30 @@ class MK1CodeGen:
         # ── Step 13: Two-pass sizing ──
         # Pass 1: optimistic estimate (page3 only → smallest loader)
         # If overlays don't fit in page3, we'll re-estimate with more pages
-        loader_pass1 = generate_kernel_loader(OVERLAY_REGION, 0, False, False, True, 2, 0, use_cache=False)
+        loader_pass1 = generate_kernel_loader(OVERLAY_REGION, 0, False, False, True, 2, 0, use_cache=False,
+                                                has_eeprom_tier=False, eeprom_addr_hi=0)
         loader_size = measure_lines(loader_pass1)
         main_size = measure_lines(main_lines)
 
-        # Extract _NO_OVERLAY helpers from other_resident into kernel.
-        # These are runtime helpers (tone, I2C, etc.) that must be callable
-        # from overlay code — they live permanently in the code page kernel.
+        # Extract _NO_OVERLAY helpers AND resident user functions from other_resident.
+        # These live permanently in the code page kernel.
         runtime_resident_helpers = []
         runtime_helper_names = set()
         for label_s in _NO_OVERLAY:
             name = label_s.rstrip(':')
             if name.startswith('__'):
                 runtime_helper_names.add(name)
-        if runtime_helper_names:
+        # Also include non-overlayed functions (both user and helper) that were
+        # overlay-eligible but not selected for overlay — they stay resident.
+        overlay_func_names = {name for name, _, _, _ in overlay_funcs_flat}
+        init_only_func_names = {name for name, _, _, _ in init_only_funcs}
+        resident_funcs = set()
+        for name, _, _, _ in overlay_eligible:
+            if name not in overlay_func_names:
+                resident_funcs.add(name)
+
+        all_kernel_names = runtime_helper_names | resident_funcs | merged_into_resident
+        if all_kernel_names:
             rh_lines = []
             non_rh_lines = []
             in_helper = False
@@ -3041,7 +3395,7 @@ class MK1CodeGen:
                 s = line.strip()
                 if s.endswith(':') and not s.startswith('.') and s.startswith('_'):
                     hname = s[:-1]
-                    if hname in runtime_helper_names:
+                    if hname in all_kernel_names:
                         in_helper = True
                         rh_lines.append(line)
                         continue
@@ -3059,7 +3413,7 @@ class MK1CodeGen:
         # (above KERNEL_SIZE) to survive self-copy without duplication.
         shared_helper_names = set()
         # Helpers called from init-only code AND from overlays/kernel
-        init_only_callers = {'__lcd_init', '__eeprom_rd', '__delay_cal', '__tone_setup'}
+        init_only_callers = {'__lcd_init', '__eeprom_rd', '__tone_setup'}
         all_init_jals = set()
         for line in self.code:
             s = line.strip()
@@ -3148,7 +3502,7 @@ class MK1CodeGen:
         # Conservative kernel estimate: the knapsack may keep helpers resident
         # (adding up to ~100B), and multi-page dispatch adds ~20B to the loader.
         # Use a generous estimate to avoid page3 overflow after sizing converges.
-        kernel_max_est = KERNEL_SIZE_est + shared_helper_size + 60  # headroom for knapsack
+        kernel_max_est = KERNEL_SIZE_est + shared_helper_size + 35  # headroom for multi-page dispatch
         meta_base = max(p3_used, kernel_max_est)
         p3_code_offset = meta_base + meta_table_size
         p3_capacity = 256 - p3_code_offset - note_table_size
@@ -3173,10 +3527,21 @@ class MK1CodeGen:
         p3_overlays = []
         p1_overlays = []
         p2_overlays = []
+        ee_overlays = []  # EEPROM overflow tier
+
+        # EEPROM overlay tier: align base to 256B boundary so addr_hi is constant
+        # and manifest offset = addr_lo directly.
+        ee_overlay_base = (self.eeprom_alloc + 0xFF) & ~0xFF  # align up to 256B
+        if ee_overlay_base == 0:
+            ee_overlay_base = 0x0100  # minimum: page 1
+        ee_overlay_hi = (ee_overlay_base >> 8) & 0xFF
+        ee_code_offset = 0  # offset from ee_overlay_base (= addr_lo)
+        ee_capacity = 256   # 8-bit offset range
 
         # Best-fit placement: for each overlay, pick the page with least remaining waste
         def place_overlay(idx, name, asm_lines, fsize):
             nonlocal p3_code_offset, p3_capacity, p1_code_offset, p1_capacity, p2_code_offset, p2_capacity
+            nonlocal ee_code_offset, ee_capacity
             candidates = []
             if fsize <= p3_capacity:
                 candidates.append((p3_capacity - fsize, 3))
@@ -3185,6 +3550,11 @@ class MK1CodeGen:
             if fsize <= p2_capacity:
                 candidates.append((p2_capacity - fsize, 2))
             if not candidates:
+                # SRAM full — try EEPROM overflow tier
+                if fsize <= ee_capacity:
+                    ee_overlays.append((idx, name, asm_lines, fsize, ee_code_offset))
+                    ee_code_offset += fsize; ee_capacity -= fsize
+                    return True
                 return False
             # Best fit: smallest remaining space after placement
             candidates.sort()
@@ -3226,6 +3596,12 @@ class MK1CodeGen:
                             p2_capacity -= fsize
                         placed = True
                         break
+                # Try EEPROM overflow tier
+                if not placed and fsize <= ee_capacity:
+                    ee_overlays.append((idx, name, asm_lines, fsize, ee_code_offset))
+                    ee_code_offset += fsize
+                    ee_capacity -= fsize
+                    placed = True
                 if not placed:
                     # Placement failed. Find the largest bundled helper in this
                     # overlay and force it resident to shrink the overlay.
@@ -3255,16 +3631,43 @@ class MK1CodeGen:
                         _retry_bundling = True
                         break  # break out of placement loop to retry
                     raise Exception(
-                        f"overlay '{name}' ({fsize}B) exceeds ALL SRAM cache. "
-                        f"p3={p3_capacity}B free, p1={p1_capacity}B free, p2={p2_capacity}B free"
+                        f"overlay '{name}' ({fsize}B) exceeds ALL storage. "
+                        f"p3={p3_capacity}B, p1={p1_capacity}B, p2={p2_capacity}B, "
+                        f"eeprom={ee_capacity}B free"
                     )
 
         has_p1 = len(p1_overlays) > 0
         has_p2 = len(p2_overlays) > 0
         has_p3 = len(p3_overlays) > 0
+        has_eeprom = len(ee_overlays) > 0
 
-        if not has_p1 and not has_p2 and not has_p3:
+        if not has_p1 and not has_p2 and not has_p3 and not has_eeprom:
             return  # nothing placed
+
+        # EEPROM-backed overlays: stored in EEPROM, preloaded into freed page3
+        # space during init (after self-copy frees page3[0..KERNEL_SIZE-1]).
+        # At runtime they're accessed via derefp3, same as regular page3 overlays.
+        # Re-assign EEPROM overlay offsets to page3 addresses in the freed range.
+        if has_eeprom:
+            # Freed page3 range after self-copy: [0 .. meta_base-1]
+            # (kernel image is no longer needed after self-copy copies it to code)
+            # Place EEPROM-backed overlays at page3[0..].
+            p3_ee_offset = 0
+            for ei in range(len(ee_overlays)):
+                idx, name, asm_lines, fsize, _ee_offset = ee_overlays[ei]
+                ee_overlays[ei] = (idx, name, asm_lines, fsize, p3_ee_offset)
+                p3_ee_offset += fsize
+            # These are now page3 overlays from the loader's perspective
+            p3_overlays = list(ee_overlays) + list(p3_overlays)
+            has_p3 = True
+            # EEPROM preload runs after self-copy. __i2c_sb is typically
+            # resident (mini-copied). __i2c_rb uses _init copy (at init
+            # addresses, intact after self-copy). Preload code in self_copy
+            # uses _init suffixed labels set below.
+            import sys
+            print(f"  EEPROM-backed: {len(ee_overlays)} overlays ({p3_ee_offset}B) "
+                  f"preloaded from EEPROM 0x{ee_overlay_base:04X} → page3[0..{p3_ee_offset-1}]",
+                  file=sys.stderr)
 
         # ── Step 15: Final kernel sizing ──
         # Generate kernel with only the page copy loops actually needed
@@ -3272,7 +3675,8 @@ class MK1CodeGen:
 
             loader = generate_kernel_loader(OVERLAY_REGION_est, meta_base,
                                             has_p1, has_p2, has_p3,
-                                            len(p3_overlays), len(p1_overlays), use_cache=False)
+                                            len(p3_overlays), len(p1_overlays), use_cache=False,
+                                            has_eeprom_tier=has_eeprom, eeprom_addr_hi=ee_overlay_hi)
             loader_size = measure_lines(loader)
             main_size = measure_lines(main_lines)
             KERNEL_SIZE = loader_size + main_size + runtime_helper_size
@@ -3286,7 +3690,8 @@ class MK1CodeGen:
         # Final regeneration with converged values
         loader = generate_kernel_loader(OVERLAY_REGION, meta_base,
                                         has_p1, has_p2, has_p3,
-                                        len(p3_overlays), len(p1_overlays), use_cache=False)
+                                        len(p3_overlays), len(p1_overlays), use_cache=False,
+                                        has_eeprom_tier=has_eeprom, eeprom_addr_hi=ee_overlay_hi)
         loader_size = measure_lines(loader)
         KERNEL_SIZE = loader_size + main_size + runtime_helper_size
         OVERLAY_REGION = KERNEL_SIZE + shared_helper_size
@@ -3304,7 +3709,7 @@ class MK1CodeGen:
 
         # Validate overlay region
         # Overlay region starts after kernel + shared helpers
-        if OVERLAY_REGION + max_slot_size > 252:  # 252: leave 4B safety margin
+        if max_slot_size > 250:  # single overlay can't exceed entire code page
             raise Exception(
                 f"largest overlay ({max_slot_size}B) exceeds overlay region "
                 f"({252 - OVERLAY_REGION}B). Kernel={KERNEL_SIZE}B "
@@ -3335,7 +3740,8 @@ class MK1CodeGen:
         # Regenerate loader with correct OVERLAY_REGION
         loader = generate_kernel_loader(OVERLAY_REGION, meta_base,
                                         has_p1, has_p2, has_p3,
-                                        len(p3_overlays), len(p1_overlays), use_cache=False)
+                                        len(p3_overlays), len(p1_overlays), use_cache=False,
+                                        has_eeprom_tier=has_eeprom, eeprom_addr_hi=ee_overlay_hi)
         loader_size = measure_lines(loader)
         KERNEL_SIZE = RESET_STUB + loader_size + actual_main_size + runtime_helper_size
         OVERLAY_REGION = KERNEL_SIZE + shared_helper_size
@@ -3361,8 +3767,13 @@ class MK1CodeGen:
             '\tdec',
             '\tmov $a,$d',                      # D--
             '\tjnz .selfcopy_loop',
-            '\tj 0',                            # jump to kernel at code[0]
         ]
+
+        # EEPROM-backed overlays: page3 patching handled by ESP32 during upload.
+        # No init-time I2C preload needed. The ESP32 runs init (self-copy) via
+        # clock cycles, then writes overlay data to page3 via bus before RUN.
+        # No init preload — ESP32 handles page3 patching via bus after self-copy
+        self_copy.append('\tj 0')                        # jump to kernel at code[0]
 
         # ── Step 18: Assemble everything ──
         assembled = []
@@ -3395,8 +3806,8 @@ class MK1CodeGen:
         # Emit 2-byte manifest entries: [src_offset, size]
         # Label prevents peephole dead-code elimination (manifest follows kernel's hlt)
         assembled.append('__manifest:')
-        # Overlays ordered: page3 first, then page1, then page2.
-        # Page determined at runtime by index range vs p3_count/p1_count.
+        # Overlays ordered: page3 first (includes EEPROM-backed), then page1, then page2.
+        # EEPROM-backed overlays were already merged into p3_overlays above.
         all_placed_ordered = list(p3_overlays) + list(p1_overlays) + list(p2_overlays)
 
         # Rebuild func_to_overlay_idx with new ordering
@@ -3426,8 +3837,8 @@ class MK1CodeGen:
 
         # Page table: [page] per overlay (1 byte each)
         # page values: 3=page3(derefp3), 1=page1(deref), 2=page2(deref2)
+        # EEPROM-backed overlays are preloaded into page3, so they're page 3.
         assembled.append('__pages:')
-        # Determine which page each overlay is on
         p3_set = {name for _, name, _, _, _ in p3_overlays}
         p1_set = {name for _, name, _, _, _ in p1_overlays}
         p2_set = {name for _, name, _, _, _ in p2_overlays}
@@ -3439,7 +3850,7 @@ class MK1CodeGen:
             elif name in p2_set:
                 assembled.append('\tbyte 2')
             else:
-                assembled.append('\tbyte 0')  # future: EEPROM
+                assembled.append('\tbyte 3')  # fallback: page3
 
         # __ov_entry: marks the start of the overlay region (address OVERLAY_REGION).
         # Emitted after manifest so it resolves to the correct code address.
@@ -3450,7 +3861,11 @@ class MK1CodeGen:
         assembled.append('__ov_entry:')
 
         # Phase 3: Overlay code at OVERLAY_REGION addresses into storage pages
+        # Skip EEPROM-backed overlays (they go to EEPROM section, not page3_code)
+        ee_names = {name for _, name, _, _, _ in ee_overlays} if has_eeprom else set()
         for idx, name, asm_lines, fsize, _ in p3_overlays:
+            if name in ee_names:
+                continue  # emitted in EEPROM section below
             assembled.append('\tsection code')
             assembled.append(f'\torg {OVERLAY_REGION}')
             assembled.append('\tsection page3_code')
@@ -3476,6 +3891,17 @@ class MK1CodeGen:
             assembled.append(f'\torg {OVERLAY_REGION}')
             assembled.append('\tsection stack_code')
             assembled.extend(asm_lines)
+
+        # EEPROM-backed overlay code: emitted to p3patch section.
+        # The ESP32 runs init (self-copy) then writes patch data to page3
+        # via bus, before the user's RUN command. No init-time I2C needed.
+        if ee_overlays:
+            for idx, name, asm_lines, fsize, p3_offset in ee_overlays:
+                assembled.append(f'; p3patch overlay: {name} → page3[{p3_offset}] ({fsize}B)')
+                assembled.append('\tsection code')
+                assembled.append(f'\torg {OVERLAY_REGION}')
+                assembled.append('\tsection p3patch')
+                assembled.extend(asm_lines)
 
         # Phase 4: Emit init code in section code (the actual code page at upload)
         # Order: init calls FIRST (VIA init, jal __delay_cal, etc.), then
@@ -3685,9 +4111,10 @@ class MK1CodeGen:
         # Self-copy must start at or after KERNEL_SIZE to avoid overwriting itself.
         # The copy writes to code[0..KERNEL_SIZE-1], so the loop code must be
         # at addresses >= KERNEL_SIZE. Pad with a jump + NOPs if init is short.
-        init_size = measure_lines([l for l in assembled[phase4_start:]
-                                   if l.strip() and not l.strip().startswith(';')
-                                   and 'section' not in l and 'org' not in l])
+        init_lines_filtered = [l for l in assembled[phase4_start:]
+                               if l.strip() and not l.strip().startswith(';')
+                               and 'section' not in l and 'org' not in l]
+        init_size = measure_lines(init_lines_filtered)
         if init_size < KERNEL_SIZE:
             pad_needed = KERNEL_SIZE - init_size
             if pad_needed > 2:
@@ -3699,6 +4126,8 @@ class MK1CodeGen:
             elif pad_needed > 0:
                 for _ in range(pad_needed):
                     assembled.append('\tnop')
+
+        # EEPROM-backed overlays use ESP32 page3 patching (no init preload needed)
 
         assembled.append('__selfcopy:')
         assembled.extend(self_copy)
@@ -3722,7 +4151,46 @@ class MK1CodeGen:
               f" + shared={shared_helper_size}B", file=sys.stderr)
         print(f"  Overlay region: 0x{OVERLAY_REGION:02X}-0xFF ({256-OVERLAY_REGION}B)",
               file=sys.stderr)
-        print(f"  {len(overlay_slots)} overlay slots, largest={max_slot_size}B", file=sys.stderr)
+        print(f"  {len(overlay_slots)} overlay slots, largest={max_bundled_size}B"
+              f" (func={max_slot_size}B + bundled helpers)", file=sys.stderr)
+        avail = 250 - OVERLAY_REGION
+        if max_bundled_size > avail:
+            wrap = max_bundled_size - avail
+            # Find which overlay(s) wrap and check if they're loaded last
+            wrapping_overlays = [(n, fs) for _, n, fs in overlay_meta
+                                 if fs > avail]  # pre-bundling check
+            # Check assembled code for overlay call order
+            call_order = []
+            for ci, line in enumerate(assembled):
+                s = line.strip()
+                if s == 'jal _overlay_load' and ci > 0:
+                    prev = assembled[ci - 1].strip()
+                    if prev.startswith('ldi $a,'):
+                        try:
+                            idx = int(prev.split(',')[1])
+                            call_order.append(idx)
+                        except ValueError:
+                            pass
+            # Find wrapping overlay indices
+            wrapping_indices = set()
+            for oi, (_, olines, ofsize) in enumerate(overlay_asm_blocks):
+                if ofsize > avail:
+                    wrapping_indices.add(oi)
+            # Map old indices to new indices (after placement reordering)
+            wrapping_new = {old_to_new.get(oi, oi) for oi in wrapping_indices}
+            safe = True
+            if call_order and wrapping_new:
+                last_call_idx = call_order[-1]
+                for wi in wrapping_new:
+                    if wi in call_order and call_order.index(wi) < len(call_order) - 1:
+                        safe = False
+            if safe:
+                print(f"  WARNING: largest overlay wraps {wrap}B (safe: loaded last)",
+                      file=sys.stderr)
+            else:
+                print(f"  WARNING: wrapping overlay NOT loaded last! "
+                      f"{wrap}B wrap may corrupt kernel for subsequent loads",
+                      file=sys.stderr)
         print(f"  Init-only: {[n for n,_,_,_ in init_only_funcs]}", file=sys.stderr)
         if has_p3:
             print(f"  Page 3: {len(p3_overlays)} overlays, "
@@ -3733,6 +4201,10 @@ class MK1CodeGen:
         if has_p2:
             print(f"  Page 2: {len(p2_overlays)} overlays, "
                   f"{sum(f for _,_,_,f,_ in p2_overlays)}B", file=sys.stderr)
+        if has_eeprom:
+            print(f"  EEPROM: {len(ee_overlays)} overlays, "
+                  f"{sum(f for _,_,_,f,_ in ee_overlays)}B [ESP32 p3patch]",
+                  file=sys.stderr)
 
 
     def _use_regcall(self, nparams):
@@ -3759,19 +4231,31 @@ class MK1CodeGen:
             # Param 0 (A) is fragile — A gets clobbered by almost everything.
             # Save to D at entry if param 0 is used and D is available.
             # Param 1 (B) is safer — only clobbered by explicit mov/pop to B.
-            # Only save A→D if function has locals or complex expressions that
-            # will clobber A between uses of param 0. Simple heuristic: save
-            # if function body declares any local variables.
+            # If D is taken by a local but the param needs saving, evict the
+            # local from D (it'll go to stack instead). Parameter preservation
+            # takes priority over local register allocation.
             has_locals = any(s[0] == 'local' for s in body[1]) if body[0] == 'block' else False
-            save_a_to_d = (len(params) >= 1
-                           and params[0] in self.read_vars
-                           and self.reg_d_var is None
-                           and (has_locals or len(params) > 2
-                                or self._has_calls(body)))
+            needs_save = (len(params) >= 1
+                          and params[0] in self.read_vars
+                          and self.reg_d_var is None
+                          and (has_locals or len(params) > 2
+                               or self._has_calls(body)))
+            save_a_to_d = needs_save
+            # If D is unavailable but param needs saving (used in/after loops),
+            # save to stack instead. regparam 'a' is unsafe when loops clobber A.
+            save_a_to_stack = (not save_a_to_d
+                               and len(params) >= 1
+                               and params[0] in self.read_vars
+                               and (has_locals or self._has_calls(body)))
             for i, pname in enumerate(params):
                 if i == 0:
                     if save_a_to_d:
                         self.locals[pname] = ('reg', 'd')  # will be saved at entry
+                    elif save_a_to_stack:
+                        # Save to stack: emit push at entry, track as local
+                        self.emit('\tpush $a')
+                        self.local_count += 1
+                        self.locals[pname] = ('local', self.local_count - 1)
                     else:
                         self.locals[pname] = ('regparam', 'a')
                 elif i == 1:
@@ -4918,6 +5402,15 @@ class MK1CodeGen:
             # ── VIA I2C builtins (emit known-good assembly patterns) ──
 
             if name == 'i2c_init':
+                # Ensure I2C helpers are available (needed for EEPROM preload
+                # even if program doesn't explicitly use I2C send/read).
+                if not hasattr(self, '_lcd_helpers'):
+                    self._lcd_helpers = set()
+                self._lcd_helpers.add('__i2c_sb')
+                self._lcd_helpers.add('__i2c_rb')
+                # Mark that i2c_init was called — ensures I2C helpers are
+                # available for EEPROM preload (unconditionally resident).
+                self._i2c_init_called = True
                 # VIA init for I2C: delay for VIA ~RES settle (RC = 1ms),
                 # then set ORB=0, DDRB=0, DDRA=0, init SP.
                 self.emit('\tldi $d,0')
@@ -4947,14 +5440,13 @@ class MK1CodeGen:
                 return
 
             if name == 'lcd_init':
-                # Complete LCD init sequence as one jal call
+                # Complete LCD init sequence as one jal call.
+                # LCD init data is pre-populated in data page (no EEPROM read needed).
                 if not hasattr(self, '_lcd_helpers'):
                     self._lcd_helpers = set()
                 self._lcd_helpers.add('__lcd_init')
-                # __lcd_init reads from EEPROM via __eeprom_rd
-                self._lcd_helpers.add('__eeprom_rd')
                 self._lcd_helpers.add('__i2c_sb')
-                self._lcd_helpers.add('__i2c_rb')
+                # __i2c_rb NOT needed: LCD init data pre-populated in data page
                 self.emit('\tjal __lcd_init')
                 return
 
@@ -5739,8 +6231,27 @@ class MK1CodeGen:
                 elif loc[0] == 'dead':
                     return  # don't store to dead vars
                 off = self._sp_offset(name)
-                self.emit(f'\tstsp {off}')
-                self.emit('\tmov $d,$a')  # D = original A after stsp
+                # stsp clobbers D (microcode: D = A before write).
+                # If D holds a parameter or register variable, save/restore it.
+                # Must preserve BOTH A (value to store) AND D (register var).
+                d_in_use = any(v == ('reg', 'd') for v in self.locals.values())
+                if d_in_use:
+                    # Save A to B, save D via stack, restore A, do stsp, restore D
+                    self.emit('\tpush_b')      # save B (might be in use)
+                    self.emit('\tmov $a,$b')   # B = value to store (save A)
+                    self.emit('\tmov $d,$a')   # A = D (register var)
+                    self.emit('\tpush $a')     # push D value
+                    self.local_count += 2      # two extra stack entries
+                    off = self._sp_offset(name)
+                    self.emit('\tmov $b,$a')   # A = value to store (from B)
+                    self.emit(f'\tstsp {off}') # store value (D clobbered)
+                    self.emit('\tpop $a')      # A = saved D
+                    self.emit('\tmov $a,$d')   # D = restored
+                    self.emit('\tpop_b')       # B = restored
+                    self.local_count -= 2
+                else:
+                    self.emit(f'\tstsp {off}')
+                    self.emit('\tmov $d,$a')   # D = original A after stsp
             elif name in self.globals:
                 self.emit(f'\tst $a,_{name}')
             elif name in self.page3_globals:
@@ -6416,6 +6927,7 @@ def main():
             section = 'page3'; continue
         elif 'section page3' in s and 'kernel' not in s and 'code' not in s:
             section = 'page3_data'; continue
+        elif 'section p3patch' in s: section = 'p3patch'; continue
         elif 'section eeprom' in s: section = 'eeprom'; continue
         elif 'section data_code' in s: section = 'data'; continue
         elif 'section stack_code' in s: section = 'stack'; continue

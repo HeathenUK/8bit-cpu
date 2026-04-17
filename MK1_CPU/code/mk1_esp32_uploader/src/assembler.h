@@ -46,11 +46,14 @@ struct AsmResult {
     uint8_t stack[DATA_SIZE];   // page 2 (stack page) overlay storage
     uint8_t page3[DATA_SIZE];
     uint8_t eeprom[EEPROM_SIZE]; // AT24C32 EEPROM data for upload
+    uint8_t p3patch[DATA_SIZE]; // page3 patch: written AFTER init self-copy
     int code_size;
     int data_size;
     int stack_size;
     int page3_size;
     int eeprom_size;
+    int p3patch_size;           // bytes to patch in page3 after self-copy
+    int p3patch_cycles;         // clock cycles needed for init before patching
     AsmError errors[MAX_ERRORS];
     int error_count;
 };
@@ -327,6 +330,16 @@ private:
             result.code_size++;
             return;
         }
+        if (codeEmitTarget == 4) {
+            emitEeprom(byte, pass1);
+            result.code_size++;  // advance code PC for label resolution
+            return;
+        }
+        if (codeEmitTarget == 5) {
+            emitP3Patch(byte, pass1);
+            result.code_size++;  // advance code PC for label resolution
+            return;
+        }
         if (!pass1 && result.code_size < CODE_SIZE)
             result.code[result.code_size] = byte;
         result.code_size++;
@@ -358,6 +371,12 @@ private:
         result.eeprom_size++;
     }
 
+    void emitP3Patch(uint8_t byte, bool pass1) {
+        if (!pass1 && result.p3patch_size < DATA_SIZE)
+            result.p3patch[result.p3patch_size] = byte;
+        result.p3patch_size++;
+    }
+
     // Emit to whichever bank is active (used for data directives)
     void emitBank(uint8_t byte, bool pass1, int bank) {
         if (bank == 4) emitEeprom(byte, pass1);
@@ -375,6 +394,7 @@ private:
             result.stack_size = 0;
             result.page3_size = 0;
             result.eeprom_size = 0;
+            result.p3patch_size = 0;
         }
 
         int bank = 0;  // 0=code, 1=data, 3=page3
@@ -428,9 +448,14 @@ private:
                     // Overlay code stored in page 3: same but emit to page 3
                     bank = 0;
                     codeEmitTarget = 3;
-                } else if (strstr(lp, "eeprom")) {
-                    bank = 4;  // EEPROM data
-                    codeEmitTarget = 0;
+                } else if (strstr(lp, "p3patch")) {
+                    // Page3 post-init patch: overlay data written after self-copy.
+                    // Instructions and bytes go to p3patch buffer at code PC.
+                    bank = 0;
+                    codeEmitTarget = 5;  // emit to p3patch buffer
+            } else if (strstr(lp, "eeprom")) {
+                    bank = 0;  // bank=0 so instructions are parsed normally
+                    codeEmitTarget = 4;  // emit assembled bytes to EEPROM buffer
                 } else if (strstr(lp, "page3")) {
                     bank = 3;  // raw data in page 3
                     codeEmitTarget = 0;
@@ -501,7 +526,12 @@ private:
                     tok[ti++] = *lp++;
                 tok[ti] = 0;
                 int v = resolveValue(tok, lineNum, pass1);
-                emitBank(v & 0xFF, pass1, bank);
+                // Use emitCode when codeEmitTarget is active (page3_code, data_code,
+                // stack_code, eeprom sections). Otherwise use bank-based emit.
+                if (codeEmitTarget != 0)
+                    emitCode(v & 0xFF, pass1);
+                else
+                    emitBank(v & 0xFF, pass1, bank);
                 continue;
             }
             if (startsWith(lp, "ds ") || startsWith(lp, "ds\t")) {

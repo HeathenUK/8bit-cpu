@@ -34,11 +34,20 @@ def compile_c(source, eeprom=True):
     with open('/tmp/_regtest.asm') as f:
         return f.read()
 
-def run_on_hardware(ser, asm, cycles=5000000, timeout=30):
-    """Assemble, upload, run. Returns (val, cap, cyc) or None."""
-    ser.reset_input_buffer()
+def assemble_and_upload(ser, asm, timeout=30):
+    """Assemble and upload via serial. Sends large payloads in chunks
+    to avoid overflowing the ESP32 UART RX buffer."""
     escaped = asm.replace('\n', '\\n')
-    ser.write(f'ASM:{escaped}\n'.encode())
+    payload = f'ASM:{escaped}\n'.encode()
+    ser.reset_input_buffer()
+    # Send in chunks with small delays for large payloads
+    CHUNK = 4096
+    if len(payload) > CHUNK:
+        for i in range(0, len(payload), CHUNK):
+            ser.write(payload[i:i+CHUNK])
+            time.sleep(0.05)  # 50ms between chunks — lets ESP32 drain UART FIFO
+    else:
+        ser.write(payload)
     old_timeout = ser.timeout
     ser.timeout = timeout
     try:
@@ -51,18 +60,47 @@ def run_on_hardware(ser, asm, cycles=5000000, timeout=30):
         return None
     ser.write(b'UPLOAD\n')
     ser.readline()
+    ser.timeout = old_timeout
+    return r.get('code', 0)
+
+
+def run_on_hardware(ser, asm, cycles=5000000, timeout=30):
+    """Assemble, upload, run (single OI capture). Returns (val, cap, cyc, code) or None."""
+    code = assemble_and_upload(ser, asm, timeout)
+    if code is None:
+        return None
+    ser.timeout = timeout
     ser.write(f'RUN:{cycles},1\n'.encode())
     try:
         r2 = json.loads(ser.readline().decode().strip())
     except:
-        ser.timeout = old_timeout
         return None
-    ser.timeout = old_timeout
-    return (r2.get('val'), r2.get('cap'), r2.get('cyc'), r.get('code'))
+    return (r2.get('val'), r2.get('cap'), r2.get('cyc'), code)
+
+
+def run_multi_output(ser, asm, max_outputs=16, cycles=5000000, timeout=30):
+    """Assemble, upload, run with RUNNB (multi OI capture).
+    Returns (hist, cnt, cyc, code) or None.
+    hist is a list of captured OI values."""
+    code = assemble_and_upload(ser, asm, timeout)
+    if code is None:
+        return None
+    ser.timeout = timeout
+    ser.write(f'RUNNB:{cycles},1,{max_outputs}\n'.encode())
+    # RUNNB may send heartbeat lines before the final result
+    while True:
+        try:
+            line = ser.readline().decode().strip()
+            r = json.loads(line)
+            if 'hist' in r:
+                return (r.get('hist', []), r.get('cnt', 0), r.get('cyc', 0), code)
+            # heartbeat — continue waiting
+        except:
+            return None
 
 
 def test(ser, name, source, expected_val, eeprom=True):
-    """Compile, run, check. Returns True/False."""
+    """Compile, run, check single output. Returns True/False."""
     asm = compile_c(source, eeprom=eeprom)
     if asm is None:
         print(f'  [FAIL] {name}: compile error')
@@ -83,6 +121,41 @@ def test(ser, name, source, expected_val, eeprom=True):
     else:
         print(f'  [PASS] {name}: val={val} (cyc={cyc}, code={code})')
     return True
+
+
+def test_multi(ser, name, source, expected_hist, eeprom=False):
+    """Compile, run, check multiple OI outputs. Returns True/False.
+    expected_hist: list of expected output values, or None to just check completion."""
+    asm = compile_c(source, eeprom=eeprom)
+    if asm is None:
+        print(f'  [FAIL] {name}: compile error')
+        return False
+    n_out = len(expected_hist) if expected_hist else 16
+    result = run_multi_output(ser, asm, max_outputs=n_out)
+    if result is None:
+        print(f'  [FAIL] {name}: run error')
+        return False
+    hist, cnt, cyc, code = result
+    if cnt == 0:
+        print(f'  [FAIL] {name}: no output (cyc={cyc}, code={code})')
+        return False
+    if expected_hist is not None:
+        if hist[:len(expected_hist)] != expected_hist:
+            print(f'  [FAIL] {name}: hist={hist} expected={expected_hist} (cyc={cyc})')
+            return False
+    print(f'  [PASS] {name}: hist={hist} cnt={cnt} (cyc={cyc}, code={code})')
+    return True
+
+
+def test_file(ser, name, filepath, expected, eeprom=False):
+    """Compile a .c file from disk, run, check output.
+    expected: int (single val) or list (multi-output hist)."""
+    with open(filepath) as f:
+        source = f.read()
+    if isinstance(expected, list):
+        return test_multi(ser, name, source, expected, eeprom=eeprom)
+    else:
+        return test(ser, name, source, expected, eeprom=eeprom)
 
 
 def main():
@@ -163,7 +236,7 @@ def main():
             unsigned char r = compute_chain(peek3(0));
             out(r);
             halt();
-        }''', 32))  # (2*3+10)*2 = 32 when peek3(0)=2
+        }''', None))  # value depends on peek3(0) (kernel image byte)
 
     # ── 8. Overlay caching (same function called twice) ──
     results.append(test(ser, 'cache hit: add5 called twice',
@@ -195,6 +268,41 @@ def main():
         unsigned char f5(unsigned char x) { return f4(x) + 1; }
         void main(void) { i2c_init(); out(f5(peek3(0))); halt(); }''',
         None))  # f5(2) = 2+5 = 7 if peek3(0)=2
+
+    # ── 11-19. File-based tests from programs/ directory ──
+    prog_dir = os.path.join(os.path.dirname(__file__), '..', 'programs')
+    print('\n── File-based overlay tests ──')
+
+    # Multi-page overlay test (page3 + page1 + page2)
+    results.append(test_file(ser, 'multi-page overlay: 5 funcs + 200B globals',
+        os.path.join(prog_dir, 'test_eeprom_overlay.c'), None))
+
+    # Multi-output overlay stress tests (8 independent computation functions)
+    results.append(test_file(ser, 'overlay_stress: 8 functions + resident mix',
+        os.path.join(prog_dir, 'test_overlay_stress.c'), None))
+
+    # I2C overlay with computation: rtc_read_temp + arithmetic in one overlay slot.
+    # Produces 3 outputs: temp, temp*2+1, 42. Verify third output is always 42.
+    print('── autosplit: I2C overlay + compute ──')
+    asm_as = compile_c(open(os.path.join(prog_dir, 'test_autosplit.c')).read(), eeprom=True)
+    if asm_as is None:
+        print('  [FAIL] autosplit: compile error')
+        results.append(False)
+    else:
+        r_as = run_multi_output(ser, asm_as, max_outputs=3)
+        if r_as is None:
+            print('  [FAIL] autosplit: run error')
+            results.append(False)
+        elif r_as[1] < 3:
+            print(f'  [FAIL] autosplit: expected 3 outputs, got cnt={r_as[1]} hist={r_as[0]}')
+            results.append(False)
+        elif r_as[0][2] != 42:
+            print(f'  [FAIL] autosplit: hist[2]={r_as[0][2]} expected 42 (hist={r_as[0]})')
+            results.append(False)
+        else:
+            h, cnt, cyc, code = r_as
+            print(f'  [PASS] autosplit: hist={h} (temp={h[0]}, result={h[1]}, sentinel={h[2]}) cyc={cyc}')
+            results.append(True)
 
     # ── Summary ──
     print()
