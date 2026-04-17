@@ -2371,17 +2371,15 @@ class MK1CodeGen:
                       file=sys.stderr)
                 return
 
-            # Build output: init code + shared helpers + copy loop
+            # Build output: init code + copy loop + shared helpers (at safe addresses)
             new_code = []
 
             # Init extraction path doesn't use page2 overlays — no SP init needed.
             # delay_calibrate auto-insertion now handled in lcd_init builtin
-            # Stage 1: inline code, skip over init-only helpers, shared helpers, copy loop
+            # Stage 1: inline code, skip over init-only helpers, copy loop, shared helpers
             new_code.extend(init_inline)
             new_code.append('\tj __init_done')
             new_code.extend(init_helper_lines)
-            # Shared helpers: survive self-copy (at addresses > kernel_size)
-            new_code.extend(shared_helper_lines)
             new_code.append('__init_done:')
 
             # Self-copy: copy kernel from page3 to code page.
@@ -2416,6 +2414,10 @@ class MK1CodeGen:
             new_code.append('\tmov $a,$d')       # D--
             new_code.append(f'\tjnz {copy_lbl}')
             new_code.append('\tj 0')
+            # Shared helpers: placed AFTER copy loop at addresses >= kernel_size.
+            # Self-copy only writes code_page[0..kernel_size-1], so these survive.
+            # Stage 2 jal targets resolve to these code_page addresses correctly.
+            new_code.extend(shared_helper_lines)
 
             # Kernel in page3_kernel (resets code PC to 0 for self-copy)
             new_code.append('\tsection page3_kernel')
