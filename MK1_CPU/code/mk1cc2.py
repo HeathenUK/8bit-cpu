@@ -1539,9 +1539,9 @@ class MK1CodeGen:
             self.emit('\tddrb_imm 0x01')
             self.emit('\tddrb_imm 0x03')
             self.emit('\tldi $a,0x4E')
-            self.emit('\tout')           # empirically required — see comment
+            self.emit('\tnop')           # inter-I2C-byte timing (was `out`)
             self.emit('\tjal __i2c_sb')
-            self.emit('\tout')
+            self.emit('\tnop')
             # High nibble: compute once, send with EN then without
             self.emit('\tmov $d,$a')      # A = char
             self.emit('\tandi 0xF0,$a')   # high nibble
@@ -1550,13 +1550,13 @@ class MK1CodeGen:
             self.emit('\tor $b,$a')       # A = nibble | flags
             self.emit('\tpush $a')        # save nibble+flags
             self.emit('\tori 0x04,$a')    # + EN
-            self.emit('\tout')
+            self.emit('\tnop')
             self.emit('\tjal __i2c_sb')   # send with EN
-            self.emit('\tout')
+            self.emit('\tnop')
             self.emit('\tpop $a')         # restore nibble+flags (no EN)
-            self.emit('\tout')
+            self.emit('\tnop')
             self.emit('\tjal __i2c_sb')   # send without EN
-            self.emit('\tout')
+            self.emit('\tnop')
             # Low nibble: shift, compute once, send with EN then without
             self.emit('\tmov $d,$a')
             self.emit('\tsll')
@@ -1568,13 +1568,13 @@ class MK1CodeGen:
             self.emit('\tor $b,$a')
             self.emit('\tpush $a')        # save nibble+flags
             self.emit('\tori 0x04,$a')    # + EN
-            self.emit('\tout')
+            self.emit('\tnop')
             self.emit('\tjal __i2c_sb')
-            self.emit('\tout')
+            self.emit('\tnop')
             self.emit('\tpop $a')         # restore (no EN)
-            self.emit('\tout')
+            self.emit('\tnop')
             self.emit('\tjal __i2c_sb')
-            self.emit('\tout')
+            self.emit('\tnop')
             # Inline STOP — saves 3B vs jal __i2c_sp when __i2c_sp
             # is the only runtime caller and can be stripped from kernel
             self.emit('\tddrb_imm 0x03')
