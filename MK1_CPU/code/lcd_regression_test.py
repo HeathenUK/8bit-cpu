@@ -125,13 +125,16 @@ def upload_and_run(ser, asm, cycles=5000000):
     return send_command(ser, f'RUN:{cycles},1\n'.encode(), response_timeout=30)
 
 
-def prompt_user(expected):
+def prompt_user(expected, previous=None):
     """Ask user what they see on the LCD. Returns 'pass'/'fail'/'skip'.
 
     Take your time — the test stays paused while you read the LCD. The
     serial connection is idle (no data flowing) so it can wait indefinitely.
     """
     print(f'  Expected on LCD: {expected!r}')
+    if previous is not None:
+        print(f'  (Before this test, LCD was showing: {previous!r}.')
+        print(f'   If you still see that, the test silently failed.)')
     print('  (take your time looking at the LCD — connection stays idle)')
     while True:
         try:
@@ -158,6 +161,8 @@ def prompt_user(expected):
 
 
 # Test programs: (name, c_source, expected_lcd_output, eeprom_mode)
+# IMPORTANT: each test must display a UNIQUE string. Otherwise residual content
+# from a previous test could be mistaken for the current test passing.
 TESTS = [
     (
         'flat-tiny: lcd_init + 4 chars (flat mode)',
@@ -165,12 +170,12 @@ TESTS = [
 void main() {
     i2c_init();
     lcd_init();
-    lcd_char('A'); lcd_char('B'); lcd_char('C'); lcd_char('D');
+    lcd_char('F'); lcd_char('L'); lcd_char('A'); lcd_char('T');
     out(42);
     halt();
 }
 ''',
-        'ABCD',
+        'FLAT',
         False,
     ),
     (
@@ -179,7 +184,7 @@ void main() {
 void main() {
     i2c_init();
     lcd_init();
-    lcd_char('A'); lcd_char('B'); lcd_char('C'); lcd_char('D');
+    lcd_char('I'); lcd_char('N'); lcd_char('I'); lcd_char('T');
     unsigned char a; a = 1;
     a=a+1; a=a+1; a=a+1; a=a+1; a=a+1; a=a+1; a=a+1; a=a+1;
     a=a+1; a=a+1; a=a+1; a=a+1; a=a+1; a=a+1; a=a+1; a=a+1;
@@ -188,7 +193,7 @@ void main() {
     halt();
 }
 ''',
-        'ABCD',
+        'INIT',
         False,
     ),
     (
@@ -219,6 +224,7 @@ def main():
     ser.reset_input_buffer()
 
     results = []
+    previous_expected = None  # what the LCD was showing before the current test
     for name, source, expected, eeprom in TESTS:
         print(f'── {name} ──')
         asm, mode = compile_c(source, eeprom=eeprom)
@@ -237,13 +243,17 @@ def main():
                 break
             print(f'  Run: cyc={result.get("cyc")}, val={result.get("val")}')
 
-            verdict = prompt_user(expected)
+            verdict = prompt_user(expected, previous=previous_expected)
             if verdict == 'rerun':
                 print('  Rerunning...')
                 continue
             status = {'pass': 'PASS', 'fail': 'FAIL', 'skip': 'SKIP'}[verdict]
             results.append((name, status))
             print(f'  → {status}')
+            # Only update "previous" if the test actually wrote something new.
+            # On FAIL, the LCD likely still shows whatever it was before.
+            if status == 'PASS':
+                previous_expected = expected
             break
         print()
 
