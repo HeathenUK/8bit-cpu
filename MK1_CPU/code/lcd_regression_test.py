@@ -140,7 +140,7 @@ def prompt_user(expected):
                 '<paste actual content>: '
             ).strip()
         except (EOFError, KeyboardInterrupt):
-            print('\n  → SKIP (interrupted)')
+            print()
             return 'skip'
         if not ans:
             continue
