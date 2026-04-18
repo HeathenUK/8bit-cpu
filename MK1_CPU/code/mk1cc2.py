@@ -2328,6 +2328,42 @@ class MK1CodeGen:
                     kernel_only_helpers.append(runtime_helper_lines[hi])
                     hi += 1
 
+            # Catch helpers classified as init-only that are ALSO called from
+            # runtime code. Without this, runtime jal targets resolve to the
+            # init-only helper's address, which gets overwritten by self-copy
+            # → silent corruption (e.g. jal __i2c_sb hangs in stage 2).
+            # Move any such helper from init_helper_lines to shared_helper_lines.
+            init_only_runtime_called = set()
+            for line in runtime_main + kernel_only_helpers:
+                s = line.strip()
+                if s.startswith('jal __') or (s.startswith('j __')):
+                    init_only_runtime_called.add(s.split()[1])
+            extra_shared_lines = []
+            cleaned_init_again = []
+            hi = 0
+            while hi < len(init_helper_lines):
+                s = init_helper_lines[hi].strip()
+                if s.endswith(':') and s.startswith('__') and not s.startswith('.') and not s.startswith('__i_'):
+                    fname = s[:-1]
+                    start = hi
+                    hi += 1
+                    while hi < len(init_helper_lines):
+                        ns = init_helper_lines[hi].strip()
+                        if ns.endswith(':') and not ns.startswith('.') and ns.startswith('_'):
+                            break
+                        hi += 1
+                    if fname in init_only_runtime_called and fname not in shared_names:
+                        # Move from init to shared so runtime jal targets are valid.
+                        extra_shared_lines.extend(init_helper_lines[start:hi])
+                        shared_names = shared_names | {fname}
+                    else:
+                        cleaned_init_again.extend(init_helper_lines[start:hi])
+                else:
+                    cleaned_init_again.append(init_helper_lines[hi])
+                    hi += 1
+            init_helper_lines = cleaned_init_again
+            shared_helper_lines = shared_helper_lines + extra_shared_lines
+
             # Remove renamed copies of shared helpers from init (they'll use the shared versions)
             if shared_names:
                 cleaned_init = []
