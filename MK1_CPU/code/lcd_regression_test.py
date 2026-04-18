@@ -48,45 +48,113 @@ def compile_c(source, eeprom=False):
     return asm, mode
 
 
-def upload_and_run(ser, asm, cycles=5000000):
-    """Upload and run an assembly program. Returns RUN response dict or None."""
-    # Drain any pending serial data
-    ser.timeout = 2
-    while ser.read(8192):
-        pass
-    ser.timeout = 30
+def drain(ser, settle_secs=0.5):
+    """Drain everything from serial buffer until quiet for `settle_secs`."""
+    ser.timeout = 0.1
+    quiet_start = None
+    while True:
+        data = ser.read(8192)
+        if data:
+            quiet_start = None
+        else:
+            if quiet_start is None:
+                quiet_start = time.time()
+            elif time.time() - quiet_start > settle_secs:
+                return
 
+
+def send_command(ser, cmd_bytes, response_timeout=30):
+    """Send a command, wait for one JSON response line. Returns dict or None.
+
+    Tolerates non-JSON heartbeat lines and accumulated garbage from previous
+    commands (e.g. when a long-running RUN was still printing when the user
+    was reading the LCD).
+    """
+    ser.write(cmd_bytes)
+    deadline = time.time() + response_timeout
+    while time.time() < deadline:
+        ser.timeout = max(0.5, deadline - time.time())
+        line = ser.readline().decode(errors='replace').strip()
+        if not line:
+            continue
+        if line.startswith('{'):
+            try:
+                return json.loads(line)
+            except json.JSONDecodeError:
+                continue  # garbage, keep reading
+    return None
+
+
+def upload_and_run(ser, asm, cycles=5000000):
+    """Upload and run an assembly program. Returns RUN response dict or None.
+
+    Resilient to: garbage in the serial buffer left from previous slow-response
+    interactions, mid-stream heartbeat lines, partial output from prior RUNs.
+    """
+    # First, kill anything still running and drain everything
+    ser.write(b'\n')   # break any pending input on ESP32 side
+    drain(ser, settle_secs=0.5)
+
+    # Send ASM. Chunked to avoid overflowing the ESP32 UART RX buffer.
     escaped = asm.replace('\n', '\\n')
     payload = f'ASM:{escaped}\n'.encode()
-    for i in range(0, len(payload), 4096):
-        ser.write(payload[i:i+4096])
+    CHUNK = 4096
+    for i in range(0, len(payload), CHUNK):
+        ser.write(payload[i:i+CHUNK])
         time.sleep(0.05)
-    try:
-        resp = json.loads(ser.readline().decode().strip())
-    except (json.JSONDecodeError, UnicodeDecodeError):
+
+    # Wait for ASM response — large programs can take a few seconds to assemble.
+    resp = None
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        ser.timeout = max(0.5, deadline - time.time())
+        line = ser.readline().decode(errors='replace').strip()
+        if line.startswith('{'):
+            try:
+                resp = json.loads(line)
+                break
+            except json.JSONDecodeError:
+                continue
+    if resp is None or not resp.get('ok'):
         return None
-    if not resp.get('ok'):
+
+    # UPLOAD then RUN
+    upload_resp = send_command(ser, b'UPLOAD\n', response_timeout=20)
+    if upload_resp is None or not upload_resp.get('ok'):
         return None
-    ser.write(b'UPLOAD\n')
-    ser.readline()
-    ser.write(f'RUN:{cycles},1\n'.encode())
-    try:
-        return json.loads(ser.readline().decode().strip())
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return None
+    return send_command(ser, f'RUN:{cycles},1\n'.encode(), response_timeout=30)
 
 
 def prompt_user(expected):
-    """Ask user what they see on the LCD. Returns True if it matches."""
+    """Ask user what they see on the LCD. Returns 'pass'/'fail'/'skip'.
+
+    Take your time — the test stays paused while you read the LCD. The
+    serial connection is idle (no data flowing) so it can wait indefinitely.
+    """
     print(f'  Expected on LCD: {expected!r}')
+    print('  (take your time looking at the LCD — connection stays idle)')
     while True:
-        ans = input('  What do you see? [type the actual content, or "ok"/"no"]: ').strip()
-        if ans.lower() == 'ok':
-            return True
-        if ans.lower() == 'no' or ans == '':
-            return False
-        # Accept any user-typed content; pass if it matches expected
-        return ans == expected
+        try:
+            ans = input(
+                '  Enter result: [p]ass / [f]ail / [s]kip / [r]erun / '
+                '<paste actual content>: '
+            ).strip()
+        except (EOFError, KeyboardInterrupt):
+            print('\n  → SKIP (interrupted)')
+            return 'skip'
+        if not ans:
+            continue
+        c = ans[0].lower()
+        if c == 'p':
+            return 'pass'
+        if c == 'f':
+            return 'fail'
+        if c == 's':
+            return 'skip'
+        if c == 'r':
+            return 'rerun'
+        # Anything else: treat as user-pasted LCD content. Compare to expected.
+        return 'pass' if ans == expected else 'fail'
 
 
 # Test programs: (name, c_source, expected_lcd_output, eeprom_mode)
@@ -160,16 +228,23 @@ def main():
             continue
         print(f'  Compiled in {mode} mode')
 
-        result = upload_and_run(ser, asm)
-        if result is None:
-            print('  [FAIL] upload/run failed')
-            results.append((name, 'FAIL'))
-            continue
-        print(f'  Run: cyc={result.get("cyc")}, val={result.get("val")}')
+        # Loop allows the user to request a rerun if they missed the LCD update.
+        while True:
+            result = upload_and_run(ser, asm)
+            if result is None:
+                print('  [FAIL] upload/run failed')
+                results.append((name, 'FAIL'))
+                break
+            print(f'  Run: cyc={result.get("cyc")}, val={result.get("val")}')
 
-        passed = prompt_user(expected)
-        results.append((name, 'PASS' if passed else 'FAIL'))
-        print(f'  → {"PASS" if passed else "FAIL"}')
+            verdict = prompt_user(expected)
+            if verdict == 'rerun':
+                print('  Rerunning...')
+                continue
+            status = {'pass': 'PASS', 'fail': 'FAIL', 'skip': 'SKIP'}[verdict]
+            results.append((name, status))
+            print(f'  → {status}')
+            break
         print()
 
     print('── Summary ──')
@@ -177,8 +252,11 @@ def main():
         marker = {'PASS': '✓', 'FAIL': '✗', 'SKIP': '–'}[status]
         print(f'  {marker} [{status}] {name}')
     pass_count = sum(1 for _, s in results if s == 'PASS')
-    print(f'\nResults: {pass_count}/{len(results)} passed')
-    return 0 if pass_count == len(results) else 1
+    fail_count = sum(1 for _, s in results if s == 'FAIL')
+    skip_count = sum(1 for _, s in results if s == 'SKIP')
+    print(f'\nResults: {pass_count} pass, {fail_count} fail, {skip_count} skip '
+          f'(of {len(results)} total)')
+    return 0 if fail_count == 0 else 1
 
 
 if __name__ == '__main__':
