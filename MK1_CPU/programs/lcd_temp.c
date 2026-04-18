@@ -7,7 +7,6 @@ void main() {
     /* Bus recovery: clears any slave confused by RTC transaction before
      * we write to LCD. Required when switching between slaves. */
     i2c_bus_reset();
-    out(temp);
     unsigned char tens;
     tens = 0;
     while (temp >= 10) {
@@ -18,5 +17,7 @@ void main() {
     lcd_char(temp + 48);
     lcd_char(0xDF);
     lcd_char('C');
+    /* out after lcd_chars so RUN captures temp once display is drawn. */
+    out(temp);
     halt();
 }

@@ -1723,8 +1723,20 @@ static void handleSerialCommand(const String& line) {
         pinMode(PIN_CLK, OUTPUT);
         digitalWrite(PIN_CLK, LOW);
 
+        // Also monitor HLT — on auto clock, HLT stops the 555 via AND gate;
+        // when ESP32 drives clock we must replicate that behavior or the CPU
+        // keeps advancing past HLT (PC wraps, program re-executes).
+        // Skip HLT check for first ~100K cycles to avoid reset-glitch false
+        // positives and let CPU warm up. Programs that truly halt that fast
+        // would also be too short to matter.
+        int hltGpio = digitalPinToGPIONumber(PIN_HLT);
+        if (hltGpio < 0) hltGpio = PIN_HLT;
+        uint32_t hltMask = 1 << hltGpio;
+        const int HLT_GRACE_CYCLES = 100000;
+
         int actualCycles = 0;
         bool aborted = false;
+        bool halted = false;
         unsigned long t0_us = micros();
         for (int i = 0; i < n; i++) {
             // Abort if new serial data arrives (every ~130K cycles ≈ 0.5s at 248kHz)
@@ -1746,6 +1758,7 @@ static void handleSerialCommand(const String& line) {
                 GPIO.out_w1tc = clkMask;
                 break;
             }
+            if (i > HLT_GRACE_CYCLES && (gpio1 & hltMask)) { halted = true; GPIO.out_w1tc = clkMask; break; }
             GPIO.out_w1tc = clkMask;
             if (us > 0) delayMicroseconds(us);
             else if (nops > 0) { for (volatile int j = 0; j < nops; j++) __asm__ __volatile__("nop"); }
@@ -1758,6 +1771,7 @@ static void handleSerialCommand(const String& line) {
                 outputCaptured = true;
                 break;
             }
+            if (i > HLT_GRACE_CYCLES && (gpio2 & hltMask)) { halted = true; break; }
         }
         unsigned long elapsed_us = micros() - t0_us;
         pinMode(PIN_CLK, INPUT);
@@ -1769,13 +1783,14 @@ static void handleSerialCommand(const String& line) {
         // Report result (with abort flag)
         float actual_khz = (actualCycles > 100 && elapsed_us > 100)
             ? (float)actualCycles / elapsed_us * 1000.0f : 0;
-        Serial.printf("{\"cyc\":%d,\"val\":%d,\"cap\":%s,\"us\":%lu,\"khz\":%.1f%s}\n",
+        Serial.printf("{\"cyc\":%d,\"val\":%d,\"cap\":%s,\"us\":%lu,\"khz\":%.1f%s%s}\n",
             actualCycles,
             oiCount > 0 ? oiHistory[0] : 0,
             outputCaptured ? "true" : "false",
             elapsed_us,
             actual_khz,
-            aborted ? ",\"aborted\":true" : "");
+            aborted ? ",\"aborted\":true" : "",
+            halted ? ",\"halted\":true" : "");
     }
     else if (line.startsWith("RUNNB:")) {
         // RUNNB:cycles,us[,maxoi] — run N cycles, capture OI events
@@ -1807,6 +1822,14 @@ static void handleSerialCommand(const String& line) {
 
         int actualCycles = 0;
         bool aborted = false;
+        // Monitor HLT — CPU halt should stop clocking (mirrors auto-clock
+        // AND gate which blocks 555 oscillator when HLT is asserted).
+        // Grace period for reset glitches (as in RUN).
+        int hltGpio = digitalPinToGPIONumber(PIN_HLT);
+        if (hltGpio < 0) hltGpio = PIN_HLT;
+        uint32_t hltMask = 1 << hltGpio;
+        const int HLT_GRACE_CYCLES = 100000;
+        bool halted = false;
         for (int i = 0; i < n; i++) {
             if ((i & 0x1FFFF) == 0x1FFFF) {
                 if (Serial.available()) { aborted = true; break; }
@@ -1827,6 +1850,7 @@ static void handleSerialCommand(const String& line) {
                 outputCaptured = true;
                 if (maxoi > 0 && (int)oiCount >= maxoi) { actualCycles++; break; }
             }
+            if (i > HLT_GRACE_CYCLES && (gpio1 & hltMask)) { halted = true; GPIO.out_w1tc = clkMask; break; }
             GPIO.out_w1tc = clkMask;
             if (us > 0) delayMicroseconds(us);
             uint32_t gpio2 = GPIO.in;
@@ -1838,12 +1862,15 @@ static void handleSerialCommand(const String& line) {
                 outputCaptured = true;
                 if (maxoi > 0 && (int)oiCount >= maxoi) break;
             }
+            if (i > HLT_GRACE_CYCLES && (gpio2 & hltMask)) { halted = true; break; }
         }
         pinMode(PIN_CLK, INPUT);
         disableOutput(); digitalWrite(PIN_DIR, HIGH);
         busSetOutput(); enableOutput();
         // Report: cycles + full history
-        Serial.printf("{\"cyc\":%d,\"cnt\":%d,\"hist\":[", actualCycles, oiCount);
+        (void)halted;  // halted flag reported below
+        Serial.printf("{\"cyc\":%d,\"cnt\":%d,\"halted\":%s,\"hist\":[",
+            actualCycles, oiCount, halted ? "true" : "false");
         int hmax = oiCount < 256 ? oiCount : 256;
         for (int i = 0; i < hmax && i < 32; i++) {
             if (i) Serial.print(',');
