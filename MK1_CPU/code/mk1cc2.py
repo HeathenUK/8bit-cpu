@@ -1422,16 +1422,16 @@ class MK1CodeGen:
             # Sentinels: 0xFE=START, 0xFD=STOP, 0xFF=END, else=send byte
             START, STOP, END, DELAY = 0xFE, 0xFD, 0xFF, 0xFC
             lcd_init_data = []
-            # No PCF reset (0x00) — backlight defaults to on, reset turns it off
             BL = 0x08  # backlight bit — keep on throughout init
+            # 2-write per nibble: pulse (EN=1) then latch (EN=0).
             # Reset nibble 0x03 × 3 with required delays between them
             # HD44780 spec: >4.1ms after 1st, >100µs after 2nd
             lcd_init_data += [START, 0x34|BL, 0x30|BL, STOP, DELAY]  # 1st + 5ms delay
             lcd_init_data += [START, 0x34|BL, 0x30|BL, STOP, DELAY]  # 2nd + 5ms delay
             lcd_init_data += [START, 0x34|BL, 0x30|BL, STOP]         # 3rd (no delay needed)
             lcd_init_data += [START, 0x24|BL, 0x20|BL, STOP]         # nibble 0x02 (4-bit)
-            # HD44780 init: Function Set, Display Off, Clear, Entry Mode, Display On
-            for cmd in [0x28, 0x0C, 0x01, 0x06]:
+            # HD44780 standard init: Function Set → Display OFF → Clear → Entry Mode → Display ON
+            for cmd in [0x28, 0x08, 0x01, 0x06, 0x0C]:
                 hi = cmd & 0xF0
                 lo = (cmd & 0x0F) << 4
                 lcd_init_data += [START, hi|0x04|BL, hi|BL, lo|0x04|BL, lo|BL, STOP]
@@ -1539,7 +1539,9 @@ class MK1CodeGen:
             self.emit('\tddrb_imm 0x01')
             self.emit('\tddrb_imm 0x03')
             self.emit('\tldi $a,0x4E')
+            self.emit('\tout')           # empirically required — see comment
             self.emit('\tjal __i2c_sb')
+            self.emit('\tout')
             # High nibble: compute once, send with EN then without
             self.emit('\tmov $d,$a')      # A = char
             self.emit('\tandi 0xF0,$a')   # high nibble
@@ -1548,9 +1550,13 @@ class MK1CodeGen:
             self.emit('\tor $b,$a')       # A = nibble | flags
             self.emit('\tpush $a')        # save nibble+flags
             self.emit('\tori 0x04,$a')    # + EN
+            self.emit('\tout')
             self.emit('\tjal __i2c_sb')   # send with EN
+            self.emit('\tout')
             self.emit('\tpop $a')         # restore nibble+flags (no EN)
+            self.emit('\tout')
             self.emit('\tjal __i2c_sb')   # send without EN
+            self.emit('\tout')
             # Low nibble: shift, compute once, send with EN then without
             self.emit('\tmov $d,$a')
             self.emit('\tsll')
@@ -1562,9 +1568,13 @@ class MK1CodeGen:
             self.emit('\tor $b,$a')
             self.emit('\tpush $a')        # save nibble+flags
             self.emit('\tori 0x04,$a')    # + EN
+            self.emit('\tout')
             self.emit('\tjal __i2c_sb')
+            self.emit('\tout')
             self.emit('\tpop $a')         # restore (no EN)
+            self.emit('\tout')
             self.emit('\tjal __i2c_sb')
+            self.emit('\tout')
             # Inline STOP — saves 3B vs jal __i2c_sp when __i2c_sp
             # is the only runtime caller and can be stripped from kernel
             self.emit('\tddrb_imm 0x03')
@@ -5470,11 +5480,20 @@ class MK1CodeGen:
                 return
 
             if name == 'i2c_bus_reset':
-                # Bus recovery STOP to clear stuck I2C state.
-                # VIA delay/init already done by i2c_init — just do the STOP.
-                self.emit('\tddrb_imm 0x03')   # STOP: both LOW
-                self.emit('\tddrb_imm 0x01')   # STOP: SDA LOW, SCL HIGH
-                self.emit('\tddrb_imm 0x00')   # STOP: both HIGH (idle)
+                # I2C bus recovery: N SCL pulses with SDA released, then STOP.
+                # Clears any slave stuck mid-transaction. 9 is the standard
+                # "worst case of 8 pending bits + 1 margin", but looped version
+                # ~15 bytes inline — can be tuned down if space-constrained.
+                self.emit('\tldi $a,9')
+                lbl_br = self.label('i2cbr')
+                self.emit(f'{lbl_br}:')
+                self.emit('\tddrb_imm 0x02')   # SCL drive LOW, SDA INPUT
+                self.emit('\tddrb_imm 0x00')   # SCL release (rises via pullup)
+                self.emit('\tdec')
+                self.emit(f'\tjnz {lbl_br}')
+                self.emit('\tddrb_imm 0x03')   # drive both low
+                self.emit('\tddrb_imm 0x01')   # SCL HIGH, SDA LOW
+                self.emit('\tddrb_imm 0x00')   # SDA rises = STOP
                 return
 
             if name == 'lcd_init':
@@ -5702,9 +5721,10 @@ class MK1CodeGen:
                 self.emit('\tldi $a,0xD1')
                 self.emit('\tjal __i2c_sb')
                 self.emit('\tjal __i2c_rb')
-                self.emit('\tmov $d,$a')
+                self.emit('\tmov $d,$a')       # A=byte, D=byte backup
                 self.emit('\tddrb_imm 0x02')
                 self.emit('\tddrb_imm 0x00')
+                self.emit('\tddrb_imm 0x02')
                 self.emit('\tddrb_imm 0x03')
                 self.emit('\tddrb_imm 0x01')
                 self.emit('\tddrb_imm 0x00')
@@ -5734,9 +5754,10 @@ class MK1CodeGen:
                 self.emit('\tldi $a,0xD1')
                 self.emit('\tjal __i2c_sb')
                 self.emit('\tjal __i2c_rb')
-                self.emit('\tmov $d,$a')
+                self.emit('\tmov $d,$a')       # A=byte, D=byte backup
                 self.emit('\tddrb_imm 0x02')
                 self.emit('\tddrb_imm 0x00')
+                self.emit('\tddrb_imm 0x02')
                 self.emit('\tddrb_imm 0x03')
                 self.emit('\tddrb_imm 0x01')
                 self.emit('\tddrb_imm 0x00')
@@ -5984,7 +6005,6 @@ class MK1CodeGen:
                     if not hasattr(self, '_lcd_helpers'):
                         self._lcd_helpers = set()
                     self._lcd_helpers.add('__delay_Nms')
-                    # Flag that delay calibration is needed in init
                     self._needs_delay_calibrate = True
                     if c is not None and c in (0x01, 0x02):
                         self.emit('\tldi $b,2')    # 2ms
