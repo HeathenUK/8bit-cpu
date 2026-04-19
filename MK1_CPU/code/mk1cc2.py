@@ -374,6 +374,17 @@ class MK1CodeGen:
         # program (when the device is active). Builtins that toggle
         # direction per-transaction (e.g. I2C SDA) don't claim their
         # toggling bits — they manage those explicitly.
+        #
+        # ASSUMPTION: claimed bits mean "this bit must stay as OUTPUT
+        # (DDR=1) while the device is active." The shadow mask is OR'd
+        # into every emission, which preserves output direction but
+        # cannot force a bit to input (DDR=0). This is correct for all
+        # current and planned devices (buzzer push-pull, keypad rows as
+        # outputs). It would NOT work for a hypothetical second
+        # DDR-only open-drain device on the same port, whose idle state
+        # is DDR=0. We don't have such a device — I2C is the only
+        # open-drain user, and it manages PB0/PB1 directly without
+        # shadow claims. Revisit this if that changes.
         self._port_claims = {'DDRB': {}, 'DDRA': {}, 'ORB': {}, 'ORA': {}}
 
     def _claim_port_bits(self, reg, mask, device):
@@ -1274,8 +1285,10 @@ class MK1CodeGen:
                     self.emit(f'\tbyte {init}')
             self.emit('\tsection code')
 
-        # LCD init data pre-populated in data page (compile-time)
-        if hasattr(self, '_lcd_init_data'):
+        # LCD init data pre-populated in data page (compile-time).
+        # Skip if overlay partition already emitted it at the right offset
+        # (see _lcd_init_already_emitted flag set in overlay path).
+        if hasattr(self, '_lcd_init_data') and not getattr(self, '_lcd_init_already_emitted', False):
             data_base, lcd_bytes = self._lcd_init_data
             self.emit('\tsection data')
             self.emit(f'; LCD init data at data[{data_base}..{data_base+len(lcd_bytes)-1}]')
@@ -1565,6 +1578,8 @@ class MK1CodeGen:
             no_ov.add('__i2c_sb:')
         if '__i2c_rb' in helpers:
             no_ov.add('__i2c_rb:')
+        if '__i2c_rs' in helpers:
+            no_ov.add('__i2c_rs:')
         # __eeprom_rd: resident only if user code accesses eeprom arrays at
         # runtime. In --eeprom overlay mode it's called only by the init-time
         # preload (before self-copy), so it stays init-only.
@@ -1613,7 +1628,26 @@ class MK1CodeGen:
                 self._conditionally_resident.add(name)
 
     def _emit_i2c_helpers(self):
-        """Emit I2C/LCD helper subroutines if any lcd_cmd/lcd_char builtins were used."""
+        """Emit I2C/LCD helper subroutines if any lcd_cmd/lcd_char builtins were used.
+
+        DEVICE HELPER CONTRACT (mirrors Arduino Wire / MicroPython machine.I2C):
+          - ENTRY: bus idle (DDRB=0x00 — both SDA and SCL floating HIGH via pullups)
+          - EXIT:  bus idle (DDRB=0x00 via __i2c_sp or merged STOP)
+          - Within a multi-phase transaction (e.g. DS3231 register read,
+            EEPROM random read: write-address-then-read-data), use
+            __i2c_rs (repeated START) between phases. Do NOT emit STOP +
+            new START — that releases the bus momentarily, is slower, and
+            lets a confused slave (or SQW-coupled SDA) glitch the edge.
+          - Every device builtin (rtc_read_*, eeprom_read_byte, lcd_*) is
+            self-contained: it assumes bus is idle on entry, returns it
+            to idle on exit, and owns nothing persistent between calls.
+            This lets the caller interleave calls to different devices
+            (e.g. rtc_read_temp() then lcd_char()) without per-device
+            cleanup — the protocol IS the cleanup.
+
+        Adding a new I2C device builtin? Follow the contract. Use
+        __i2c_rs for any multi-phase transaction the device supports.
+        """
         helpers = getattr(self, '_lcd_helpers', set())
         if not helpers:
             return
@@ -1680,6 +1714,28 @@ class MK1CodeGen:
         self.emit_ddrb(0x00)
         self.emit('\tret')
 
+        # __i2c_rs: REPEATED START. Emits the start edge without first
+        # issuing a STOP, so the master keeps ownership of the bus across
+        # a write-then-read transaction (DS3231 register read, EEPROM
+        # random read). Saves ~6B per call site vs. STOP+START.
+        #
+        # Entry assumption: previous __i2c_sb left DDRB=0x02 (SCL LOW,
+        # SDA released) after ACK clock. Protocol requires:
+        #   SCL released HIGH while SDA HIGH → then SDA falls while SCL
+        #   HIGH → then SCL falls LOW for data bits. The defensive
+        #   ddrb_imm 0x02 at entry guarantees the precondition even if
+        #   a future path enters from a different state.
+        # Goes through emit_ddrb so port shadow claims (buzzer on PB6,
+        # etc.) are preserved across the repeated-START edges.
+        if '__i2c_rs' in helpers:
+            self.emit('__i2c_rs:')
+            self.emit('\texrw 2')           # VIA read before DDRB writes
+            self.emit_ddrb(0x02)            # ensure SCL LOW, SDA released
+            self.emit_ddrb(0x00)            # SCL rises → momentary idle
+            self.emit_ddrb(0x01)            # SDA falls with SCL HIGH → REP START
+            self.emit_ddrb(0x03)            # SCL falls → ready for address byte
+            self.emit('\tret')
+
         # __i2c_rb: read one I2C byte into D (8 bits MSB first)
         # Optimized: zero NOPs, no push/pop (uses B for SDA bit),
         # SCL dedup (2 ddrb_imm per bit instead of 3)
@@ -1732,14 +1788,8 @@ class MK1CodeGen:
             # addr low
             self.emit('\tmov $d,$a')
             self.emit('\tjal __i2c_sb')
-            # STOP
-            self.emit_ddrb(0x03)
-            self.emit_ddrb(0x01)
-            self.emit_ddrb(0x00)
-            # START + device addr read
-            self.emit('\texrw 2')
-            self.emit_ddrb(0x01)
-            self.emit_ddrb(0x03)
+            # Repeated START (keeps bus owned, saves ~6B vs STOP+START)
+            self.emit('\tjal __i2c_rs')
             self.emit('\tldi $a,0xAF')
             self.emit('\tjal __i2c_sb')
             # Read byte via __i2c_rb (D = byte, then A = byte)
@@ -1893,7 +1943,24 @@ class MK1CodeGen:
             # LCD init data is pre-populated in the data page at compile time.
             # No EEPROM read needed — saves ~72B of init code (__eeprom_rd + __i2c_rb).
             self.emit('__lcd_init:')
-            # Process sentinel-encoded init data from data page
+            # Bus recovery: stage-1 mini-copy uses derefp3 which toggles SCL
+            # (per project_i2c_debug.md), leaving PCF8574 in confused mid-byte
+            # state. Without this, lcd_init's Clear Display can land wrong,
+            # leaving stale chars from prior programs. 9 SCL clocks + STOP.
+            lbl_br = self.label('li_br')
+            self.emit('\tldi $a,9')
+            self.emit(f'{lbl_br}:')
+            self.emit_ddrb(0x02)   # SCL LOW, SDA released
+            self.emit_ddrb(0x00)   # SCL HIGH, SDA released
+            self.emit('\tdec')
+            self.emit(f'\tjnz {lbl_br}')
+            self.emit_ddrb(0x01)   # SDA LOW, SCL HIGH (STOP prep)
+            self.emit_ddrb(0x00)   # SDA HIGH = STOP
+            # Process sentinel-encoded init data from data page.
+            # CRITICAL: __i2c_sb / __i2c_st / __i2c_sp all clobber $d (used
+            # internally as bit counter since the "uses D as counter" opt).
+            # We use $d as the outer loop index, so save/restore around the
+            # whole dispatch. Applies to all branches including delay.
             self.emit(f'\tldi $d,{data_base}')
             self.emit(f'{lbl_loop}:')
             self.emit('\tmov $d,$a')
@@ -1901,6 +1968,7 @@ class MK1CodeGen:
             self.emit(f'\tldi $b,{END}')
             self.emit('\tcmp $b')
             self.emit(f'\tjz {lbl_done}')
+            self.emit('\tpush $d')          # save index across helper calls
             self.emit(f'\tldi $b,{START}')
             self.emit('\tcmp $b')
             self.emit(f'\tjnz {lbl_ns}')
@@ -1917,10 +1985,7 @@ class MK1CodeGen:
             self.emit(f'\tldi $b,{DELAY}')
             self.emit('\tcmp $b')
             self.emit(f'\tjnz {lbl_send}')
-            # Calibrated ~5ms delay using ipm from page3[240]
-            # Same inner loop as __delay_cal for accuracy.
-            # Outer loop: 5 iterations × 1ms = 5ms
-            self.emit('\tpush $d')         # save sentinel pointer
+            # Calibrated ~5ms delay — outer loop 5 × 256 inner iterations.
             lbl_outer = self.label('li_do')
             lbl_inner = self.label('li_di')
             self.emit(f'\tldi $c,5')       # 5ms outer count
@@ -1933,14 +1998,14 @@ class MK1CodeGen:
             self.emit('\tdec')
             self.emit('\tmov $a,$c')
             self.emit(f'\tjnz {lbl_outer}')
-            self.emit('\tpop $d')          # restore sentinel pointer
             self.emit(f'\tj {lbl_adv}')
             self.emit(f'{lbl_send}:')
             self.emit('\tjal __i2c_sb')
             self.emit(f'{lbl_adv}:')
+            self.emit('\tpop $d')          # restore index after helper call
             self.emit('\tmov $d,$a')
             self.emit('\tinc')
-            self.emit('\tmov $a,$d')
+            self.emit('\tmov $a,$d')       # peephole → incd
             self.emit(f'\tj {lbl_loop}')
             self.emit(f'{lbl_done}:')
             self.emit('\tret')
@@ -1971,6 +2036,7 @@ class MK1CodeGen:
 
         if '__lcd_cmd' in helpers or '__lcd_chr' in helpers:
             self.emit('\tpush $a')        # push flags to stack
+            # Stack now: [char, flags]. SP points at flags. char at ldsp 2.
             # Inline I2C START + PCF8574 addr (saves 4B vs jal __i2c_st)
             self.emit('\texrw 2')
             self.emit_ddrb(0x01)
@@ -1979,8 +2045,9 @@ class MK1CodeGen:
             self.emit('\tnop')           # inter-I2C-byte timing (was `out`)
             self.emit('\tjal __i2c_sb')
             self.emit('\tnop')
-            # High nibble: compute once, send with EN then without
-            self.emit('\tmov $d,$a')      # A = char
+            # High nibble: reload char from stack (A clobbered by __i2c_sb).
+            # Stack = [char, flags], SP at flags, char at SP+2.
+            self.emit('\tldsp 2')         # A = char
             self.emit('\tandi 0xF0,$a')   # high nibble
             self.emit('\tpop_b')         # B = flags
             self.emit('\tpush $b')        # keep flags
@@ -1994,8 +2061,9 @@ class MK1CodeGen:
             self.emit('\tnop')
             self.emit('\tjal __i2c_sb')   # send without EN
             self.emit('\tnop')
-            # Low nibble: shift, compute once, send with EN then without
-            self.emit('\tmov $d,$a')
+            # Low nibble: reload char from stack, shift into high position.
+            # Stack still [char, flags], SP at flags, char at SP+2.
+            self.emit('\tldsp 2')         # A = char
             self.emit('\tsll')
             self.emit('\tsll')
             self.emit('\tsll')
@@ -2458,7 +2526,7 @@ class MK1CodeGen:
         if not getattr(self, '_needs_runtime_eeprom_rd', False):
             INIT_ONLY_NAMES.add('__eeprom_rd')
         # I2C helpers that are init-only when no runtime I2C is needed
-        I2C_INIT_ONLY = {'__i2c_sb', '__i2c_sp', '__i2c_st', '__i2c_st_only', '__i2c_rb'}
+        I2C_INIT_ONLY = {'__i2c_sb', '__i2c_sp', '__i2c_st', '__i2c_st_only', '__i2c_rb', '__i2c_rs'}
 
         needs_runtime_i2c = getattr(self, '_needs_runtime_i2c', False)
 
@@ -2537,7 +2605,7 @@ class MK1CodeGen:
             # Classify helpers as init-only or runtime
             init_only_names = {'__lcd_init', '__tone_setup'}
             if not getattr(self, '_needs_runtime_i2c', False):
-                init_only_names.update({'__i2c_sb', '__i2c_sp', '__i2c_st', '__i2c_rb'})
+                init_only_names.update({'__i2c_sb', '__i2c_sp', '__i2c_st', '__i2c_rb', '__i2c_rs'})
 
             init_helper_lines = []
             runtime_helper_lines = []
@@ -3116,25 +3184,25 @@ class MK1CodeGen:
                         ldi_b_line = new_resident[-2]
                         new_resident = new_resident[:-3]
                         new_resident.append(ldi_b_line)
-                    # Thin dispatch: save args, load overlay, restore args, call directly.
-                    # This avoids page3 scratch and keeps the loader minimal.
-                    nparams = self.func_params.get(target.lstrip('_'), 0)
-                    if nparams >= 2:
-                        new_resident.append('\tpush $b')        # save arg2
-                        new_resident.append('\tpush $a')        # save arg1
-                    elif nparams == 1:
-                        new_resident.append('\tpush $a')        # save arg1
-                    # (cache init removed — the loader is always generated
-                    # with use_cache=False so page3[249] is never read. The
-                    # 5-byte init was dead code on every overlay-using program.)
+                    # UNIFORM OVERLAY CALL CONVENTION (task #38):
+                    # Always save $a and $b before loading the overlay, always
+                    # restore after. _overlay_load clobbers all four GPRs during
+                    # its copy loop, so any caller that wants arg values (or even
+                    # just a stable A) to survive the load MUST save/restore.
+                    # The old code branched on `func_params.get(target.lstrip('_'), 0)`
+                    # which returned 0 for bundled-helper overlays like
+                    # __lcd_chr_ov0 (because the key 'lcd_chr_ov0' is not a user
+                    # function), emitting the broken no-save pattern for helpers
+                    # that actually expect A=char at entry. Uniform save/restore
+                    # costs +4B per call site but fixes the class of bug for all
+                    # overlay targets regardless of origin (user fn, helper,
+                    # bundled wrapper, auto-split phase).
+                    new_resident.append('\tpush $b')            # save $b (arg2 or scratch)
+                    new_resident.append('\tpush $a')            # save $a (arg1 or scratch)
                     new_resident.append(f'\tldi $a,{idx}')
                     new_resident.append('\tjal _overlay_load')  # load only, returns
-                    # Restore args and call overlay directly
-                    if nparams >= 2:
-                        new_resident.append('\tpop $a')         # restore arg1
-                        new_resident.append('\tpop $b')         # restore arg2
-                    elif nparams == 1:
-                        new_resident.append('\tpop $a')         # restore arg1
+                    new_resident.append('\tpop $a')             # restore $a
+                    new_resident.append('\tpop $b')             # restore $b
                     new_resident.append(f'\tjal __ov_entry')    # call overlay
                     rewritten = True
                 if not rewritten:
@@ -3847,6 +3915,7 @@ class MK1CodeGen:
             INIT_PREFIXES = ('ddrb_imm', 'exrw 2', 'ldi $d,', 'ddra_imm', 'push_imm')
             # Helpers that are safe to call during init (don't end init phase)
             INIT_COMPAT_HELPERS = {'__i2c_stream', '__i2c_st', '__i2c_sp',
+                                   '__i2c_rs',
                                    '__lcd_init', '__tone_setup'}
 
             # Pre-scan: find overlay_load call sequences
@@ -3911,12 +3980,34 @@ class MK1CodeGen:
             # derefp3/deref which toggle control signals (E0=SCL), corrupting
             # the I2C bus. A STOP condition resets the bus to idle before any
             # runtime I2C transactions.
-            bus_recovery = [
-                '\tddrb_imm 0x03',   # SCL low, SDA low
+            # Main preamble: always runs, including on reset (which lands at
+            # code[0] = `j _main` after self-copy overwrote stage 1).
+            #
+            # SP init: must re-run on every reset because stage-1's SP init
+            # is discarded after self-copy. Without this, a reset re-enters
+            # main with SP at whatever the halt trap left it — subsequent
+            # push/pop walks the wrong memory. +4B kernel, required for the
+            # "reset = PC=0 clean restart" invariant.
+            #
+            # Use $b (not $a) to stage the SP value: the compiler relies on
+            # A=0 at main entry (MK1 CPU resets GPRs to 0) for `peek3(0)` etc.
+            # to elide an explicit `clr $a`. Using $a here would clobber that.
+            #
+            # EEPROM preload: if any overlays are EEPROM-tier, their bytes
+            # must be freshly read into page3 overlay slots before main uses
+            # them. Done via kernel helper so it re-runs on every reset.
+            preamble = [
+                '\tldi $b,0xFF',     # SP init via $b to keep $a = 0 (reset state)
+                '\tmov $b,$sp',
+            ]
+            if getattr(self, '_ee_preload_bytes', 0) > 0:
+                preamble.append('\tjal __eeprom_preload')
+            preamble.extend([
+                '\tddrb_imm 0x03',   # bus recovery: SCL low, SDA low
                 '\tddrb_imm 0x01',   # SCL high, SDA low
                 '\tddrb_imm 0x00',   # SCL high, SDA high (STOP/idle)
-            ]
-            main_lines = ['_main:'] + bus_recovery + runtime_main
+            ])
+            main_lines = ['_main:'] + preamble + runtime_main
 
             # ── Step 11: Generate kernel assembly (overlay_load function) ──
             # This is the runtime overlay loader that lives in the code page.
@@ -4045,11 +4136,22 @@ class MK1CodeGen:
                     if not is_last:
                         loader.append('\tj .ov_done')
 
-                # Bus recovery + return
+                # Bus recovery + return.
+                # The copy loop uses `deref` which toggles SCL
+                # (per project_i2c_debug.md). Each iteration generates a
+                # phantom clock edge on the I2C bus. After copying an
+                # overlay the PCF8574 LCD backpack is in a confused mid-
+                # transaction state. Flush it with 9 SCL clocks (loop, not
+                # inline — saves ~27B vs the unrolled version) + STOP.
                 loader.append('.ov_done:')
-                loader.append('\tddrb_imm 0x03')
-                loader.append('\tddrb_imm 0x01')
-                loader.append('\tddrb_imm 0x00')
+                loader.append('\tldi $a,9')
+                loader.append('.ov_br:')
+                loader.append('\tddrb_imm 0x02')   # SCL LOW, SDA released
+                loader.append('\tddrb_imm 0x00')   # SCL HIGH, SDA released
+                loader.append('\tdec')
+                loader.append('\tjnz .ov_br')
+                loader.append('\tddrb_imm 0x01')   # SDA LOW, SCL HIGH (STOP prep)
+                loader.append('\tddrb_imm 0x00')   # SDA HIGH = STOP
                 loader.append('\tret')
                 return loader
 
@@ -4564,22 +4666,19 @@ class MK1CodeGen:
         ]
 
         # EEPROM-backed overlays: MK1 reads them from EEPROM at init time.
-        # Uses sequential read + inline byte-accumulation to avoid __eeprom_rd
-        # and __i2c_rb helpers (which would need 74B of tail region to survive
-        # self-copy). Only __i2c_sb (resident, mini-copied) is called.
-        #
-        # Register plan (during the byte loop):
-        #   A = scratch
-        #   B = byte accumulator during read, then reused for iderefp3 offset
-        #   C = page3 destination offset (preserved across iterations)
-        #   D = bytes remaining counter (from N down to 1)
-        #   Stack[top] = bit counter (8 → 0)
+        # Kept in stage 1 (inline), not moved to kernel helper because:
+        # (a) moving to kernel bloats the kernel image past 200B, which
+        #     pushes overlay slots out of page 3 (256B total budget)
+        # (b) page 3 overlay slots are not written to at runtime, so they
+        #     survive reset — preload doesn't NEED to re-run on reset for
+        #     correctness (only for robustness against theoretical corruption)
+        # Reset reliability is achieved by the SP-init preamble in main,
+        # which DOES re-run on reset — sufficient for correctness.
         ee_preload_bytes = sum(fsize for _, _, _, fsize, _ in ee_overlays)
         if ee_preload_bytes > 0:
             ee_hi_byte = (ee_overlay_base >> 8) & 0xFF
             self_copy.extend([
                 '; ── EEPROM preload (inline sequential read) ──',
-                # --- Setup: START + write-addr + hi + lo, STOP+START + read-addr ---
                 '\texrw 2',
                 '\tddrb_imm 0x01',
                 '\tddrb_imm 0x03',
@@ -4589,64 +4688,60 @@ class MK1CodeGen:
                 '\tjal __i2c_sb',
                 '\tclr $a',
                 '\tjal __i2c_sb',
-                '\tddrb_imm 0x03',      # STOP
+                '\tddrb_imm 0x03',
                 '\tddrb_imm 0x01',
                 '\tddrb_imm 0x00',
-                '\texrw 2',             # RESTART (re-set OUT direction)
+                '\texrw 2',
                 '\tddrb_imm 0x01',
                 '\tddrb_imm 0x03',
                 '\tldi $a,0xAF',
                 '\tjal __i2c_sb',
-                # --- Outer: init byte counter and page3 offset ---
                 f'\tldi $d,{ee_preload_bytes}',
                 '\tldi $c,0',
                 '.ee_byte:',
-                # --- Inner: inline 8-bit read into B ---
-                '\tldi $b,0',           # accumulator
-                '\tpush_imm 8',         # bit counter on stack
+                # Sentinel-bit inner loop: B starts at 0x01. Each iteration
+                # rotates B left through CF and ORs in the SDA bit. After
+                # 8 iterations the sentinel (original bit 0) has been shifted
+                # out into CF — `jc` exits. Saves the push/pop counter
+                # dance (~12B per call). Relies on sll setting CF post-flash.
+                '\tldi $b,0x01',          # sentinel at bit 0
                 '.ee_bit:',
-                '\tmov $b,$a',          # A = accum
-                '\tsll',                # A <<= 1
-                '\tmov $a,$b',          # B = shifted
-                '\tddrb_imm 0x00',      # SCL HIGH (release, slave drives SDA)
-                '\texrw 0',             # A = port (bit 0 = SDA)
+                '\tmov $b,$a',
+                '\tsll',                  # A = B << 1, CF = old bit 7
+                '\tmov $a,$b',            # B = shifted
+                '\tjc .ee_byte_end',      # sentinel shifted out → 8 bits done
+                '\tddrb_imm 0x00',        # SCL HIGH (release, slave drives SDA)
+                '\texrw 0',               # A = port B (bit 0 = SDA)
                 '\ttst 0x01',
                 '\tjz .ee_bz',
                 '\tmov $b,$a',
-                '\tori 0x01,$a',
+                '\tori 0x01,$a',          # B |= 1
                 '\tmov $a,$b',
                 '.ee_bz:',
-                '\tddrb_imm 0x02',      # SCL LOW
-                '\tpop $a',             # bit counter
-                '\tdec',
+                '\tddrb_imm 0x02',        # SCL LOW
+                '\tj .ee_bit',
+                '.ee_byte_end:',
+                '\tmov $b,$a',
                 '\tpush $a',
-                '\tjnz .ee_bit',
-                '\tpop $a',             # discard 0 counter
-                # --- Store byte (B) to page3[C]. Need A=byte, B=offset. ---
-                '\tmov $b,$a',          # A = byte
-                '\tpush $a',            # save byte on stack
-                '\tmov $c,$a',          # A = offset (from C)
-                '\tmov $a,$b',          # B = offset
-                '\tpop $a',             # A = byte
-                '\tiderefp3',           # page3[B] = A
-                # --- ACK (SDA low, clock one bit, SDA low again) ---
+                '\tmov $c,$a',
+                '\tmov $a,$b',
+                '\tpop $a',
+                '\tiderefp3',
                 '\tddrb_imm 0x03',
                 '\tddrb_imm 0x01',
                 '\tddrb_imm 0x03',
-                # --- Increment offset (C) ---
                 '\tmov $c,$a',
                 '\tinc',
                 '\tmov $a,$c',
-                # --- Decrement byte counter (D) ---
                 '\tmov $d,$a',
                 '\tdec',
                 '\tmov $a,$d',
                 '\tjnz .ee_byte',
-                # --- Final STOP (I2C bus idle) ---
                 '\tddrb_imm 0x03',
                 '\tddrb_imm 0x01',
                 '\tddrb_imm 0x00',
             ])
+        self._ee_preload_bytes = 0  # disable kernel-side preload emission
         self_copy.append('\tj 0')                        # jump to kernel at code[0]
 
         # ── Step 18: Assemble everything ──
@@ -4663,6 +4758,85 @@ class MK1CodeGen:
         assembled.append('\tj _main')
         assembled.extend(loader)
         assembled.extend(runtime_resident_helpers)
+        # EEPROM preload helper: reads ee_preload_bytes from EEPROM
+        # sequentially and stores them in page3[0..ee_preload_bytes-1] as
+        # overlay slots. Called from main's preamble on every entry
+        # (including reset). Uses __i2c_sb (resident) for address bytes.
+        if getattr(self, '_ee_preload_bytes', 0) > 0:
+            _ee_hi_byte = (self._ee_overlay_base >> 8) & 0xFF
+            assembled.extend([
+                '; ── EEPROM preload (kernel helper; called from main preamble) ──',
+                '__eeprom_preload:',
+                '\tout_imm 250',   # DEBUG: preload entered
+                # Setup: START + write-addr + hi + lo, STOP, RESTART + read-addr
+                '\texrw 2',
+                '\tddrb_imm 0x01',
+                '\tddrb_imm 0x03',
+                '\tldi $a,0xAE',
+                '\tjal __i2c_sb',
+                f'\tldi $a,{_ee_hi_byte}',
+                '\tjal __i2c_sb',
+                '\tclr $a',
+                '\tjal __i2c_sb',
+                '\tddrb_imm 0x03',
+                '\tddrb_imm 0x01',
+                '\tddrb_imm 0x00',
+                '\texrw 2',
+                '\tddrb_imm 0x01',
+                '\tddrb_imm 0x03',
+                '\tldi $a,0xAF',
+                '\tjal __i2c_sb',
+                # Outer: init byte counter + page3 offset
+                f'\tldi $d,{self._ee_preload_bytes}',
+                '\tldi $c,0',
+                '.eepl_byte:',
+                # Inner: 8-bit read into $b
+                '\tldi $b,0',
+                '\tpush_imm 8',
+                '.eepl_bit:',
+                '\tmov $b,$a',
+                '\tsll',
+                '\tmov $a,$b',
+                '\tddrb_imm 0x00',
+                '\texrw 0',
+                '\ttst 0x01',
+                '\tjz .eepl_bz',
+                '\tmov $b,$a',
+                '\tori 0x01,$a',
+                '\tmov $a,$b',
+                '.eepl_bz:',
+                '\tddrb_imm 0x02',
+                '\tpop $a',
+                '\tdec',
+                '\tpush $a',
+                '\tjnz .eepl_bit',
+                '\tpop $a',
+                # Store: page3[$c] = $b. Need A=byte, B=offset for iderefp3.
+                '\tmov $b,$a',
+                '\tpush $a',
+                '\tmov $c,$a',
+                '\tmov $a,$b',
+                '\tpop $a',
+                '\tiderefp3',
+                # ACK pulse
+                '\tddrb_imm 0x03',
+                '\tddrb_imm 0x01',
+                '\tddrb_imm 0x03',
+                # C++
+                '\tmov $c,$a',
+                '\tinc',
+                '\tmov $a,$c',
+                # D--
+                '\tmov $d,$a',
+                '\tdec',
+                '\tmov $a,$d',
+                '\tjnz .eepl_byte',
+                # Final STOP
+                '\tddrb_imm 0x03',
+                '\tddrb_imm 0x01',
+                '\tddrb_imm 0x00',
+                '\tret',
+            ])
         assembled.extend(runtime_main_lines)
         # Shared helpers in page3 at [KERNEL_SIZE..OVERLAY_REGION-1].
         # These survive self-copy (self-copy copies OVERLAY_REGION bytes).
@@ -4749,14 +4923,17 @@ class MK1CodeGen:
         # and push globals out to the tail of the buffer, breaking every
         # `ld $a,_global` read in the program.
         if p1_overlays and self.data_alloc > 0:
+            # Emit page-1 storage in the order the allocator assigned:
+            # user globals first, then LCD init data (if any), then padding.
+            # Previously the LCD init data was emitted SEPARATELY later in the
+            # compile pipeline, which pushed it past data_alloc into a later
+            # offset — __lcd_init's ldi $d,{data_base} then read zeros at
+            # data[data_base], never hitting the real LCD init bytes.
             assembled.append('\tsection data')
+            lcd_init_info = getattr(self, '_lcd_init_data', None)
             page1_vars = getattr(self, '_page1_globals_cache', None)
-            if page1_vars is None:
-                # Fall back to zero-pad if the globals cache wasn't built.
-                for _ in range(self.data_alloc):
-                    assembled.append('\tbyte 0')
-            else:
-                emitted = 0
+            emitted = 0
+            if page1_vars is not None:
                 for name, init in page1_vars:
                     assembled.append(f'_{name}:')
                     if isinstance(init, list):
@@ -4766,9 +4943,22 @@ class MK1CodeGen:
                     else:
                         assembled.append(f'\tbyte {init}')
                         emitted += 1
-                # Any remainder (unused allocation slots) → zero-fill.
-                for _ in range(max(0, self.data_alloc - emitted)):
+            # Pad up to data_base (where LCD init data is expected) with zeros.
+            if lcd_init_info is not None:
+                lcd_base, lcd_bytes = lcd_init_info
+                for _ in range(max(0, lcd_base - emitted)):
                     assembled.append('\tbyte 0')
+                    emitted += 1
+                assembled.append(f'; LCD init data at data[{lcd_base}..{lcd_base+len(lcd_bytes)-1}]')
+                for b in lcd_bytes:
+                    assembled.append(f'\tbyte {b}')
+                    emitted += 1
+                # Mark that we've already emitted LCD init data here, so the
+                # later emission in compile() can skip.
+                self._lcd_init_already_emitted = True
+            # Any remaining slots → zero-fill
+            for _ in range(max(0, self.data_alloc - emitted)):
+                assembled.append('\tbyte 0')
 
         for idx, name, asm_lines, fsize, _ in p1_overlays:
             assembled.append('\tsection code')
@@ -4848,9 +5038,13 @@ class MK1CodeGen:
         # delay_calibrate auto-insertion now handled in lcd_init builtin
         # Init sequence extracted from main (VIA init, calibration calls, etc.)
         assembled.extend(init_code_lines)
-        # Jump past helper bodies to note precomputation / self-copy
+        # Jump past helper bodies to self-copy. Previously jumped to __init_done
+        # (which just did `j __selfcopy`), but the assembler was resolving
+        # __init_done to a broken address when multi-overlay + resident-helper
+        # config shifts label positions. Direct jump bypasses the issue entirely.
+        # __init_done label still emitted below for any stale references.
         if init_only_funcs:
-            assembled.append('\tj __init_done')
+            assembled.append('\tj __selfcopy')
 
         # Init-only helpers (their function bodies, called via jal from above)
         # Rename bundled/shared helper references to _init versions so init code
@@ -4884,6 +5078,52 @@ class MK1CodeGen:
 
         # All init-only funcs emitted normally — the inline preload doesn't
         # need any of them at code[>= KERNEL_SIZE].
+        # CRITICAL: pad the stage-1 code here so init-only helper bodies land
+        # AT OR AFTER the mini-copy target range end. Otherwise mini-copy
+        # (which writes code[helper_start..helper_start+runtime_helper_size-1]
+        # with page3 kernel helpers at boot) overwrites the middle of init-only
+        # helpers. When init code does `jal __lcd_init` at runtime, the CPU
+        # executes the first few un-overwritten bytes of __lcd_init, then falls
+        # into mini-copied garbage. Symptom: __lcd_init "half works" — enters
+        # correctly, may fire early out_imm, but can't reach the loop body.
+        if init_only_funcs:
+            _mc_end = helper_start + runtime_helper_size
+            # Measure only bytes in section `code` (stage 1). Page3_code bytes
+            # don't contribute to the code-page address space at stage 1.
+            def _measure_code_section(lns):
+                sz = 0
+                sec = 'code'
+                for ln in lns:
+                    s = ln.strip()
+                    if s.startswith('section '):
+                        sec = s.split()[1]
+                        continue
+                    if s.startswith('org '):
+                        if sec == 'code':
+                            sz = int(s.split()[1])
+                        continue
+                    if sec != 'code':
+                        continue
+                    if not s or s.endswith(':') or s.startswith(';'):
+                        continue
+                    mn = s.split()[0]
+                    if mn == 'cmp':
+                        parts = s.split()
+                        sz += 1 if (len(parts) > 1 and parts[1].startswith('$')) else 2
+                    elif mn in two_byte:
+                        sz += 2
+                    else:
+                        sz += 1
+                return sz
+            _cur_addr = _measure_code_section(assembled)
+            import sys
+            if _cur_addr < _mc_end:
+                _pad_needed = _mc_end - _cur_addr
+                print(f"  Init-helper placement: padding {_pad_needed}B so init helpers"
+                      f" land past mini-copy target ({_mc_end}B, currently at {_cur_addr})", file=sys.stderr)
+                for _ in range(_pad_needed):
+                    assembled.append('\tnop')
+
         _deferred_init_only_bodies = []
         for name, start, end, fsize in init_only_funcs:
             body = _rename_shared_refs(self.code[start:end])
@@ -6341,7 +6581,20 @@ class MK1CodeGen:
                 # Release I2C bus before halting — prevents ESP32 upload from
                 # creating spurious I2C activity via VIA's retained DDRB state
                 self.emit_ddrb(0x00)   # DDRB = 0 (SDA/SCL idle)
+                # Safety trap: if the ESP32 clock keeps ticking past hlt
+                # (HLT_GRACE_CYCLES=100000 ignores HLT for short programs),
+                # PC would advance, fall through helpers, wrap around the
+                # code page and re-run _main — which re-runs lcd_init and
+                # CLEARS the display. The label-after-hlt shields the
+                # backward `j` from peephole dead-code elimination so it
+                # survives into the final asm. PC hits hlt, advances one
+                # byte, hits j, loops back — infinite self-halt.
+                lbl_trap = self.label('hlt_trap')
+                lbl_after = self.label('hlt_after')
+                self.emit(f'{lbl_trap}:')
                 self.emit('\thlt')
+                self.emit(f'{lbl_after}:')
+                self.emit(f'\tj {lbl_trap}')
                 return
             if name == 'nop':
                 n = 1
@@ -6484,6 +6737,11 @@ class MK1CodeGen:
             if name == 'lcd_init':
                 # Complete LCD init sequence as one jal call.
                 # LCD init data is pre-populated in data page (no EEPROM read needed).
+                # Bus recovery happens inside __lcd_init itself — keeping it inline
+                # here would break init extraction (the recovery loop's `ldi $a,N`
+                # isn't in INIT_PREFIXES, so init extraction bails out before
+                # reaching `jal __lcd_init`, leaving the call in runtime main
+                # pointing at a stage-1-only helper).
                 if not hasattr(self, '_lcd_helpers'):
                     self._lcd_helpers = set()
                 self._lcd_helpers.add('__lcd_init')
@@ -6506,7 +6764,7 @@ class MK1CodeGen:
                     self._lcd_helpers = set()
                 self._lcd_helpers.add('__lcd_cmd')
                 self._lcd_helpers.add('__i2c_sb')
-                self.emit('\tldi $d,1')        # D = cmd byte (Clear)
+                self.emit('\tldi $a,1')        # A = cmd byte (Clear) — __lcd_cmd reads caller's $a
                 self.emit('\tjal __lcd_cmd')
                 # ~3ms raw delay for HD44780 Clear (needs 1.52ms min).
                 lbl_c = self.label('lcclr_d')
@@ -6671,7 +6929,11 @@ class MK1CodeGen:
                     addr_lo_c = self._const_eval(args[1])
                     addr_hi = addr_hi_c & 0xFF if addr_hi_c is not None else None
                     addr_lo = addr_lo_c & 0xFF if addr_lo_c is not None else None
-                # Set address: START + 0xAE + addr_hi + addr_lo + STOP
+                # Register __i2c_rs — used for repeated START between write and read phases
+                if not hasattr(self, '_lcd_helpers'):
+                    self._lcd_helpers = set()
+                self._lcd_helpers.add('__i2c_rs')
+                # Set address: START + 0xAE + addr_hi + addr_lo
                 self.emit('\texrw 2')
                 self.emit_ddrb(0x01)
                 self.emit_ddrb(0x03)
@@ -6687,13 +6949,8 @@ class MK1CodeGen:
                 else:
                     self.gen_expr(args[1])
                 self.emit('\tjal __i2c_sb')
-                self.emit_ddrb(0x03)
-                self.emit_ddrb(0x01)
-                self.emit_ddrb(0x00)
-                # Read: START + 0xAF + read byte + NACK + STOP
-                self.emit('\texrw 2')
-                self.emit_ddrb(0x01)
-                self.emit_ddrb(0x03)
+                # Repeated START (no STOP) + 0xAF + read byte + NACK + STOP
+                self.emit('\tjal __i2c_rs')
                 self.emit('\tldi $a,0xAF')
                 self.emit('\tjal __i2c_sb')
                 self.emit('\tjal __i2c_rb')
@@ -6707,12 +6964,16 @@ class MK1CodeGen:
                 return
 
             if name == 'rtc_read_seconds':
-                # Read DS3231 seconds register (0x00), returns BCD in A
+                # Read DS3231 seconds register (0x00), returns BCD in A.
+                # Uses repeated START between register-pointer write and
+                # data read — keeps bus owned across the two phases, more
+                # robust than STOP+START and saves ~6B.
                 if not hasattr(self, '_lcd_helpers'):
                     self._lcd_helpers = set()
                 self._lcd_helpers.add('__i2c_sb')
                 self._lcd_helpers.add('__i2c_rb')
-                # Set register pointer: START + 0xD0 + 0x00 + STOP
+                self._lcd_helpers.add('__i2c_rs')
+                # Set register pointer: START + 0xD0 + 0x00
                 self.emit('\texrw 2')
                 self.emit_ddrb(0x01)
                 self.emit_ddrb(0x03)
@@ -6720,13 +6981,8 @@ class MK1CodeGen:
                 self.emit('\tjal __i2c_sb')
                 self.emit('\tclr $a')
                 self.emit('\tjal __i2c_sb')
-                self.emit_ddrb(0x03)
-                self.emit_ddrb(0x01)
-                self.emit_ddrb(0x00)
-                # Read: START + 0xD1 + read byte + NACK + STOP
-                self.emit('\texrw 2')
-                self.emit_ddrb(0x01)
-                self.emit_ddrb(0x03)
+                # Repeated START (no STOP) + 0xD1 + read byte + NACK + STOP
+                self.emit('\tjal __i2c_rs')
                 self.emit('\tldi $a,0xD1')
                 self.emit('\tjal __i2c_sb')
                 self.emit('\tjal __i2c_rb')
@@ -6740,11 +6996,13 @@ class MK1CodeGen:
                 return
 
             if name == 'rtc_read_temp':
-                # Read DS3231 temperature MSB (register 0x11), returns signed °C in A
+                # Read DS3231 temperature MSB (register 0x11), returns signed °C in A.
+                # Uses repeated START between register-pointer write and data read.
                 if not hasattr(self, '_lcd_helpers'):
                     self._lcd_helpers = set()
                 self._lcd_helpers.add('__i2c_sb')
                 self._lcd_helpers.add('__i2c_rb')
+                self._lcd_helpers.add('__i2c_rs')
                 # Set register pointer to 0x11
                 self.emit('\texrw 2')
                 self.emit_ddrb(0x01)
@@ -6753,13 +7011,8 @@ class MK1CodeGen:
                 self.emit('\tjal __i2c_sb')
                 self.emit('\tldi $a,0x11')
                 self.emit('\tjal __i2c_sb')
-                self.emit_ddrb(0x03)
-                self.emit_ddrb(0x01)
-                self.emit_ddrb(0x00)
-                # Read MSB
-                self.emit('\texrw 2')
-                self.emit_ddrb(0x01)
-                self.emit_ddrb(0x03)
+                # Repeated START (no STOP) + 0xD1 + read MSB + NACK + STOP
+                self.emit('\tjal __i2c_rs')
                 self.emit('\tldi $a,0xD1')
                 self.emit('\tjal __i2c_sb')
                 self.emit('\tjal __i2c_rb')
@@ -7008,10 +7261,9 @@ class MK1CodeGen:
                 if args:
                     c = self._const_eval(args[0])
                     if c is not None:
-                        self.emit(f'\tldi $d,{c & 0xFF}')
+                        self.emit(f'\tldi $a,{c & 0xFF}')  # char in A
                     else:
-                        self.gen_expr(args[0])
-                        self.emit('\tmov $a,$d')
+                        self.gen_expr(args[0])              # result in A
                 helper = f'__lcd_{"chr" if is_char else "cmd"}'
                 if not hasattr(self, '_lcd_helpers'):
                     self._lcd_helpers = set()
@@ -7142,6 +7394,7 @@ class MK1CodeGen:
                 self._lcd_helpers.add('__eeprom_rd')
                 self._lcd_helpers.add('__i2c_sb')
                 self._lcd_helpers.add('__i2c_rb')
+                self._lcd_helpers.add('__i2c_rs')
                 self.emit('\tjal __eeprom_rd')
             elif base_expr[0] == 'var' and base_expr[1] in self.page3_globals:
                 base = self.page3_globals[base_expr[1]]
@@ -7990,6 +8243,88 @@ def peephole(lines):
     return lines
 
 
+def _validate_section_jumps(lines):
+    """Catch jal/j from runtime sections to stage-1-only labels.
+
+    MK1 layout at boot:
+      - `section code` (stage 1) runs from address 0 at power-on. Its bytes
+        get OVERWRITTEN when self-copy blits the kernel from page3 to code[0..].
+      - `section page3_code` holds the kernel image in page 3, copied to code
+        page 0 by self-copy. This is what runs at runtime.
+      - `section data_code` holds overlay bodies in the data page, copied to
+        the overlay region at runtime via _overlay_load.
+
+    If a runtime caller (in page3_code or data_code) does `jal FOO` where FOO
+    is defined only in section `code`, the call resolves to FOO's address —
+    but code[FOO_addr] has been overwritten by self-copy. The CPU executes
+    garbage.
+
+    This validator scans the emitted assembly, builds a label → section map,
+    and flags any runtime→stage-1 jal that would hit that trap.
+    """
+    import sys
+    # First pass: build label → section map.
+    label_section = {}
+    section = 'code'
+    for line in lines:
+        s = line.strip()
+        if s.startswith('section '):
+            section = s.split()[1]
+            continue
+        if s.endswith(':') and not s.startswith('.'):
+            label_section[s[:-1]] = section
+
+    # Runtime sections (code that runs AFTER self-copy):
+    #   page3_code  = overlay-mode kernel (separate from stage-1 `code`)
+    #   data_code   = overlay bodies stored in page 1, copied to overlay region at runtime
+    #   stack_code  = overlay bodies stored in page 2, copied to overlay region at runtime
+    # Sections EXCLUDED from validation:
+    #   page3_kernel = init-extraction kernel, which INTENTIONALLY calls helpers
+    #     placed in stage-1 `code` at addresses past kernel_size (so they survive
+    #     self-copy). Validator can't distinguish those from stage-1-only helpers
+    #     without address tracking — exclude to avoid false positives.
+    RUNTIME_SECTIONS = {'page3_code', 'data_code', 'stack_code'}
+    STAGE1_ONLY = 'code'
+
+    # Second pass: for each jal/j in a runtime section, check the target.
+    section = 'code'
+    errors = []
+    for line in lines:
+        s = line.strip()
+        if s.startswith('section '):
+            section = s.split()[1]
+            continue
+        if section not in RUNTIME_SECTIONS:
+            continue
+        # Check jal/j (not conditional branches — those take local labels)
+        for op in ('jal ', 'j '):
+            if s.startswith(op):
+                target = s[len(op):].strip().split()[0]
+                if target.startswith('.'):
+                    break  # local label, same function
+                if target in label_section and label_section[target] == STAGE1_ONLY:
+                    errors.append(
+                        f"{op.strip()} {target}: caller is in '{section}' "
+                        f"(runtime), target is in '{STAGE1_ONLY}' (stage-1 only). "
+                        f"After self-copy, the target address is overwritten "
+                        f"by kernel code — this jal will execute garbage."
+                    )
+                break
+
+    if errors:
+        print("  !! SECTION-MISMATCH ERROR: runtime code references stage-1-only labels:",
+              file=sys.stderr)
+        for e in errors:
+            print(f"     - {e}", file=sys.stderr)
+        print("     The compiler extracted a helper to stage 1 but its caller ",
+              file=sys.stderr)
+        print("     remained in runtime main. Check init_extraction logic or ",
+              file=sys.stderr)
+        print("     force the helper resident. Aborting to prevent broken output.",
+              file=sys.stderr)
+        sys.exit(1)
+
+
 def main():
     ap = argparse.ArgumentParser(description='MK1 C Compiler v2')
     ap.add_argument('input', help='C source file')
@@ -8007,6 +8342,14 @@ def main():
         gen.eeprom_mode = True
         gen.eeprom_base = args.eeprom_base
     asm = gen.compile(source)
+
+    # ── Section-mismatch validator ──
+    # Catch the class of bug where runtime code (page3_code or data_code,
+    # i.e. anything that runs AFTER self-copy) calls a label defined only
+    # in section `code` (stage-1-only helpers whose bytes get overwritten
+    # by self-copy's kernel blit). These bugs produce "jal to nonsense"
+    # and are nearly impossible to debug from hardware symptoms alone.
+    _validate_section_jumps(asm.split('\n'))
 
     # Run peephole optimizer — but NOT for overlay programs where
     # manifest offsets are already computed from pre-peepholed component sizes.
