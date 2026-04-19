@@ -4492,8 +4492,10 @@ class MK1CodeGen:
                     if save_a_to_d:
                         self.locals[pname] = ('reg', 'd')  # will be saved at entry
                     elif save_a_to_stack:
-                        # Save to stack: emit push at entry, track as local
-                        self.emit('\tpush $a')
+                        # Track as local; the push $a is emitted AFTER the
+                        # function label (below) so the peephole's dead-code
+                        # pass doesn't strip it as unreachable code between
+                        # the previous function's terminator and this label.
                         self.local_count += 1
                         self.locals[pname] = ('local', self.local_count - 1)
                     else:
@@ -4516,6 +4518,10 @@ class MK1CodeGen:
             loc = self.locals[params[0]]
             if loc == ('reg', 'd'):
                 self.emit('\tmov $a,$d')  # save param 0 before A gets clobbered
+            elif loc[0] == 'local' and loc[1] == 0:
+                # save_a_to_stack path: emit the push HERE, after the label,
+                # so dead-code elimination can't strip it.
+                self.emit('\tpush $a')
 
         self.compile_stmt(body)
 
