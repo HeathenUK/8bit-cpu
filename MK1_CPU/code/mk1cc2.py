@@ -3252,19 +3252,52 @@ class MK1CodeGen:
                       file=sys.stderr)
 
             # Remove kept-resident helpers from bundleable list.
-            # Identify helpers merged into other helpers via fall-through.
-            # When __lcd_cmd is kept resident, __lcd_send must follow in the kernel
-            # (fall-through linkage via `j __lcd_send` at end of __lcd_cmd body).
+            # Identify helpers that must be resident because the kernel
+            # (including its helpers) references them. Two patterns:
+            #   1. Fall-through merge: resident helper body contains another
+            #      helper's label (__foo:) — the sub-helper is merged in.
+            #   2. Jump reference: resident helper does `j __bar` — __bar
+            #      is not a call (no ret boundary) so __bar MUST be next
+            #      in the kernel's code layout OR reachable as a global.
+            # Both must be pulled into the kernel.
+            resident_helpers_for_merge = set(keep_resident)
+            for label in _NO_OVERLAY:
+                if label.endswith(':'):
+                    hn = label[:-1]
+                    if hn.startswith('__') and hn in helper_bodies:
+                        resident_helpers_for_merge.add(hn)
             merged_into_resident = set()
-            for hname in keep_resident:
-                if hname in helper_bodies:
+            # Iteratively close the "pulled into kernel" set — if A is
+            # resident and refs __B (via fall-through or j/jal), __B is too,
+            # and then __B's references also propagate.
+            frontier = set(resident_helpers_for_merge)
+            while frontier:
+                next_frontier = set()
+                for hname in frontier:
+                    if hname not in helper_bodies:
+                        continue
                     _, _, hlines = helper_bodies[hname]
                     for hl in hlines:
                         hs = hl.strip()
+                        # Fall-through: label inside the helper body
                         if hs.endswith(':') and hs.startswith('__') and not hs.startswith('.'):
-                            sub_name = hs[:-1]
-                            if sub_name != hname and sub_name in bundleable_helpers:
-                                merged_into_resident.add(sub_name)
+                            sub = hs[:-1]
+                            if sub != hname and sub in helper_bodies \
+                                    and sub not in merged_into_resident \
+                                    and sub not in resident_helpers_for_merge:
+                                merged_into_resident.add(sub)
+                                next_frontier.add(sub)
+                        # `j __foo` / `jal __foo` to a helper — pull it along
+                        for prefix in ('j __', 'jal __'):
+                            if hs.startswith(prefix):
+                                tgt = hs.split()[1]
+                                if tgt in helper_bodies \
+                                        and tgt != hname \
+                                        and tgt not in merged_into_resident \
+                                        and tgt not in resident_helpers_for_merge:
+                                    merged_into_resident.add(tgt)
+                                    next_frontier.add(tgt)
+                frontier = next_frontier
             # Remove both kept-resident AND merged-sub helpers from bundleable.
             # Merged sub-helpers are part of the resident helper's body.
             remove_from_bundleable = keep_resident | merged_into_resident
@@ -3374,6 +3407,166 @@ class MK1CodeGen:
                     new_resident[ri] = ''
 
             new_resident = [l for l in new_resident if l != '']
+
+            # ── Phase 6: Procedure abstraction (within-overlay dedup) ──
+            # For each overlay, find repeated contiguous instruction sequences
+            # and extract them as local thunks. A pattern of N occurrences of
+            # S bytes becomes 1 thunk (S+1 bytes) + N jal calls (2 bytes each).
+            # Profitable when (N-1) * S > 2*N + 1, i.e., S ≥ 4 AND N ≥ 2.
+            # Thunks live at the tail of the overlay so they're loaded together.
+            def _phase6_byte_size(line):
+                sline = line.strip()
+                if not sline or sline.endswith(':') or sline.startswith(';'):
+                    return 0
+                mn = sline.split()[0]
+                if mn == 'cmp':
+                    parts = sline.split()
+                    return 1 if (len(parts) > 1 and parts[1].startswith('$')) else 2
+                elif mn in two_byte:
+                    return 2
+                else:
+                    return 1
+
+            def _phase6_is_extractable(instr):
+                """Instructions that are safe inside a thunk body — no local
+                label branches, no absolute stack-relative ops (ldsp/stsp),
+                no unconditional jumps that would skip the thunk's ret."""
+                for jtype in ['j ', 'jnz ', 'jz ', 'jc ', 'jnc ']:
+                    if instr.startswith(jtype):
+                        tgt = instr[len(jtype):].strip()
+                        if tgt.startswith('.'):
+                            return False  # local branch — target might be outside
+                if instr in ('ret', 'hlt'):
+                    return False
+                if instr.startswith('j ') and not instr.startswith('jal'):
+                    return False
+                mn = instr.split()[0] if instr.split() else ''
+                # Stack-relative: jal-pushed return address shifts SP by 2,
+                # so ldsp/stsp offsets would read/write the wrong slot.
+                if mn in ('ldsp', 'stsp'):
+                    return False
+                return True
+
+            def _phase6_seq_stack_balanced(seq_texts):
+                """A sequence is extractable only if its push/pop operations
+                are balanced — unbalanced pushes (or pops) inside a thunk
+                break the caller's stack discipline because the thunk's ret
+                pops whatever is at SP's top (which must be the jal-pushed
+                return address)."""
+                balance = 0
+                for t in seq_texts:
+                    mn = t.split()[0] if t.split() else ''
+                    if mn in ('push', 'push_b', 'push_imm', 'exw'):
+                        # push/push_b/push_imm add 1. `exw` reads IO into stack.
+                        if mn == 'exw':
+                            # exw depends on args — conservatively reject
+                            return False
+                        balance += 1
+                    elif mn in ('pop', 'pop_b'):
+                        balance -= 1
+                        if balance < 0:
+                            return False  # pop without matching push
+                return balance == 0
+
+            def _phase6_extract(olines, oi_tag):
+                """Find + extract the best repeated sequence. Returns (new_olines,
+                num_thunks_added)."""
+                # Index instructions
+                instr_idx = [i for i, l in enumerate(olines)
+                             if l.strip() and not l.strip().startswith(';')
+                             and not l.strip().endswith(':')
+                             and not l.strip().startswith('section')
+                             and not l.strip().startswith('org')]
+                texts = [olines[i].strip() for i in instr_idx]
+                if len(texts) < 8:
+                    return olines, 0
+                # Build hash index
+                MIN_LEN, MAX_LEN = 4, 10
+                seqs = {}
+                for i in range(len(texts)):
+                    for L in range(MIN_LEN, min(MAX_LEN, len(texts) - i) + 1):
+                        ok = True
+                        for k in range(L):
+                            if not _phase6_is_extractable(texts[i + k]):
+                                ok = False; break
+                        if not ok:
+                            continue
+                        key = tuple(texts[i:i + L])
+                        if not _phase6_seq_stack_balanced(key):
+                            continue
+                        seqs.setdefault(key, []).append(i)
+                # Score candidates
+                best = None  # (savings, key, non_overlap_positions, L, S)
+                for key, poses in seqs.items():
+                    if len(poses) < 2:
+                        continue
+                    L = len(key)
+                    # Non-overlapping greedy
+                    sp = sorted(poses)
+                    accepted = []
+                    last_end = -1
+                    for p in sp:
+                        if p >= last_end:
+                            accepted.append(p); last_end = p + L
+                    N = len(accepted)
+                    if N < 2:
+                        continue
+                    # Byte size of the sequence
+                    S = sum(_phase6_byte_size(olines[instr_idx[accepted[0] + k]])
+                            for k in range(L))
+                    if S < 4:
+                        continue
+                    savings = (N - 1) * S - 1 - 2 * N
+                    if savings <= 0:
+                        continue
+                    if best is None or savings > best[0]:
+                        best = (savings, key, accepted, L, S)
+                if best is None:
+                    return olines, 0
+                savings, key, accepted, L, S = best
+                # Extract
+                thunk_name = f'__ovthunk_{oi_tag}'
+                thunk_body = [f'{thunk_name}:']
+                for k in range(L):
+                    thunk_body.append(olines[instr_idx[accepted[0] + k]])
+                thunk_body.append('\tret')
+                # Build the new overlay: instructions we're replacing become
+                # `jal __ovthunk_N`; the rest stay as-is. The thunk itself is
+                # appended to the overlay tail.
+                replace_set = set()
+                for start in accepted:
+                    for k in range(L):
+                        replace_set.add(instr_idx[start + k])
+                call_at = set(instr_idx[start] for start in accepted)
+                new_lines = []
+                for li, line in enumerate(olines):
+                    if li in call_at:
+                        new_lines.append(f'\tjal {thunk_name}')
+                    elif li in replace_set:
+                        continue  # drop — part of the extracted sequence
+                    else:
+                        new_lines.append(line)
+                new_lines.extend(thunk_body)
+                import sys
+                print(f"  Phase 6 abstract: overlay {oi_tag} — extracted "
+                      f"{L}-instr {S}B sequence × {len(accepted)} "
+                      f"(saves {savings}B) as {thunk_name}",
+                      file=sys.stderr)
+                return new_lines, 1
+
+            # Iterate: extract the best thunk, re-scan, repeat until no gains
+            _thunk_counter = 0
+            for oi, (oname, olines, ofsize) in enumerate(overlay_asm_blocks):
+                cur_lines = olines
+                for _iter in range(4):  # up to 4 thunks per overlay
+                    new_lines, added = _phase6_extract(cur_lines,
+                                                        f'{oi}_{_thunk_counter}')
+                    if added == 0:
+                        break
+                    _thunk_counter += 1
+                    cur_lines = new_lines
+                if cur_lines is not olines:
+                    overlay_asm_blocks[oi] = (oname, cur_lines, measure_lines(cur_lines))
 
             # Rebuild overlay_meta with updated sizes
             overlay_meta = [(idx, name, fsize) for idx, (name, _, fsize) in enumerate(overlay_asm_blocks)]
