@@ -4132,8 +4132,12 @@ class MK1CodeGen:
             # If the program has LCD init (heavy init helpers), init is ~240B
             # without SP init. Adding 3B pushes to 243B + selfcopy 14B = 257B > 250.
             # In that case, disable page 2 to avoid the SP init overhead.
-            has_heavy_init = hasattr(self, '_lcd_helpers') and '__lcd_init' in getattr(self, '_lcd_helpers', set())
-            p2_capacity = 196 if not has_heavy_init else 0
+            # Page 2 always available for overlays: 196B at low addresses
+            # (stack grows down from 0xFF into the top ~60B). The 3B SP init
+            # is emitted when has_p2 is True and is tiny compared to unlocking
+            # 196B of fast SRAM. Previously disabled for LCD programs due to
+            # a stale fit-calculation heuristic that is now obsolete.
+            p2_capacity = 196
 
             p3_overlays = []
             p1_overlays = []
