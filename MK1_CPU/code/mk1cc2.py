@@ -5442,9 +5442,10 @@ class MK1CodeGen:
             assembled.append('\tmov $b,$a')
             assembled.append('\tderefp3')
             assembled.append('\tistc_inc')
-            assembled.append('\tmov $d,$a')
-            assembled.append('\tdec')
-            assembled.append('\tmov $a,$d')
+            # Pre-collapsed: was `mov $d,$a; dec; mov $a,$d` (3B) → `decd` (1B).
+            # The final peephole is skipped for overlay programs (it would
+            # shift kernel offsets), so we have to fold the pattern here.
+            assembled.append('\tdecd')
             assembled.append(f'\tjnz {mc_lbl}')
             for line in runtime_resident_helpers:
                 s = line.strip()
@@ -7122,7 +7123,11 @@ class MK1CodeGen:
                 self._i2c_init_called = True
                 # VIA init for I2C: delay for VIA ~RES settle (RC = 1ms),
                 # then set ORB=0, DDRB=0, DDRA=0, init SP.
-                self.emit('\tldi $d,0')
+                # Loop counter lives in $a: dec underflows 0 → 0xFF, iterates
+                # 256 times (~2ms @ 1MHz). CPU reset leaves $a=0 so no pre-load
+                # needed. (On a soft reset $a may be non-zero, giving a shorter
+                # delay, but by that point the VIA is already powered-up and
+                # the RC delay is unnecessary.)
                 lbl = self.label('via_dly')
                 self.emit(f'{lbl}:')
                 self.emit('\tdec')
