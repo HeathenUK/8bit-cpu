@@ -848,13 +848,17 @@ class MK1CodeGen:
 
         # Pre-scan: check if any function calls lcd_cmd (needs calibrated delays)
         # Must know this BEFORE compilation so lcd_init can auto-insert delay_cal.
+        # Skip this detection if the user has defined their own `lcd_cmd` —
+        # the builtin's calibrated delay isn't needed for a user implementation.
         all_fn_bodies = [main_fn] + other_fns if main_fn else other_fns
-        for fn in all_fn_bodies:
-            # fn = (name, params, body, ret_type)
-            src_str = str(fn[2])  # crude but effective
-            if 'lcd_cmd' in src_str:
-                self._needs_delay_calibrate = True
-                break
+        user_fn_names = {fn[0] for fn in all_fn_bodies}
+        if 'lcd_cmd' not in user_fn_names:
+            for fn in all_fn_bodies:
+                # fn = (name, params, body, ret_type)
+                src_str = str(fn[2])  # crude but effective
+                if 'lcd_cmd' in src_str:
+                    self._needs_delay_calibrate = True
+                    break
 
         if main_fn:
             self.compile_function(*main_fn)
@@ -1085,6 +1089,123 @@ class MK1CodeGen:
                 i += 1
 
         self.code = new_code
+        # After dead-code removal, fold duplicate function bodies.
+        self._dedupe_identical_functions()
+
+    def _dedupe_identical_functions(self):
+        """Merge functions with identical bodies. Redirects callers of the
+        duplicate to the canonical function and removes the duplicate body.
+        Label-renaming inside the body is normalized before comparison so
+        two functions that only differ in label names are still folded.
+        """
+        # Locate global functions
+        funcs = []  # (name, start, end)
+        i = 0
+        while i < len(self.code):
+            s = self.code[i].strip()
+            if s.endswith(':') and not s.startswith('.') and s.startswith('_'):
+                name = s[:-1]
+                start = i
+                i += 1
+                while i < len(self.code):
+                    ns = self.code[i].strip()
+                    if ns.endswith(':') and not ns.startswith('.') and ns.startswith('_'):
+                        break
+                    i += 1
+                funcs.append((name, start, i))
+            else:
+                i += 1
+
+        def normalize_body(lines):
+            """Strip comments and rename internal .labels to ".L0", ".L1", ... so
+            two functions with identical instructions but different label suffixes
+            (common across codegen) compare equal.
+            """
+            # Collect local labels in order of appearance
+            label_map = {}
+            counter = [0]
+            def map_label(lbl):
+                if lbl not in label_map:
+                    label_map[lbl] = f'.L{counter[0]}'
+                    counter[0] += 1
+                return label_map[lbl]
+            out = []
+            for line in lines:
+                s = line.strip()
+                if not s or s.startswith(';'):
+                    continue
+                # Local label definition
+                if s.endswith(':') and s.startswith('.'):
+                    out.append(map_label(s[:-1]) + ':')
+                    continue
+                # Global label definition — skip (we compare body only)
+                if s.endswith(':'):
+                    continue
+                # Rewrite any .local label reference in the instruction
+                parts = s.split()
+                for pi, p in enumerate(parts):
+                    if p.startswith('.'):
+                        parts[pi] = map_label(p)
+                out.append(' '.join(parts))
+            return tuple(out)
+
+        # Skip entry points and helpers reached by fall-through (not just jal).
+        # __lcd_send is reached via fall-through from __lcd_cmd, so merging its
+        # body with another function would break the fall-through linkage.
+        SKIP = {'_main', '_overlay_load', '_overlay_load_p1',
+                '__lcd_send'}
+        body_by_sig = {}  # normalized body → canonical name
+        rename_map = {}   # duplicate name → canonical name
+        for name, start, end in funcs:
+            if name in SKIP:
+                continue
+            body = self.code[start:end]
+            sig = normalize_body(body)
+            if not sig:
+                continue
+            if sig in body_by_sig:
+                rename_map[name] = body_by_sig[sig]
+            else:
+                body_by_sig[sig] = name
+
+        if not rename_map:
+            return
+
+        import sys
+        n_merged = len(rename_map)
+        total_saved = 0
+        for dup, canonical in rename_map.items():
+            # find dup's body range to sum size
+            for name, start, end in funcs:
+                if name == dup:
+                    total_saved += (end - start)
+                    break
+        if n_merged:
+            print(f"  Dedup: merged {n_merged} function(s), "
+                  f"saved ~{total_saved} lines "
+                  f"({', '.join(f'{d}→{c}' for d, c in sorted(rename_map.items()))})",
+                  file=sys.stderr)
+
+        # Drop bodies of duplicate functions from self.code
+        drop_ranges = []
+        for name, start, end in funcs:
+            if name in rename_map:
+                drop_ranges.append((start, end))
+        drop_ranges.sort(reverse=True)
+        new_code = list(self.code)
+        for start, end in drop_ranges:
+            del new_code[start:end]
+        self.code = new_code
+
+        # Redirect all jal/j references from duplicate → canonical
+        for i, line in enumerate(self.code):
+            s = line.strip()
+            for prefix in ('jal ', 'j ', 'ocall '):
+                if s.startswith(prefix):
+                    target = s.split()[1]
+                    if target in rename_map:
+                        self.code[i] = line.replace(target, rename_map[target])
+                    break
 
     @staticmethod
     def _chunk_funcs(funcs, max_size):
@@ -2687,12 +2808,9 @@ class MK1CodeGen:
                         new_resident.append('\tpush $a')        # save arg1
                     elif nparams == 1:
                         new_resident.append('\tpush $a')        # save arg1
-                    # Initialize overlay cache on first call
-                    if not cache_init_emitted:
-                        new_resident.append('\tldi $a,0xFF')
-                        new_resident.append('\tldi $b,249')
-                        new_resident.append('\tiderefp3')       # page3[249] = 0xFF
-                        cache_init_emitted = True
+                    # (cache init removed — the loader is always generated
+                    # with use_cache=False so page3[249] is never read. The
+                    # 5-byte init was dead code on every overlay-using program.)
                     new_resident.append(f'\tldi $a,{idx}')
                     new_resident.append('\tjal _overlay_load')  # load only, returns
                     # Restore args and call overlay directly
@@ -3651,8 +3769,8 @@ class MK1CodeGen:
                     ee_capacity -= fsize
                     placed = True
                 if not placed:
-                    # Placement failed. Find the largest bundled helper in this
-                    # overlay and force it resident to shrink the overlay.
+                    # Placement failed. First, try to find the largest bundled
+                    # helper IN THIS overlay and force it resident to shrink it.
                     biggest_helper = None
                     biggest_size = 0
                     for oline in asm_lines:
@@ -3669,7 +3787,16 @@ class MK1CodeGen:
                                 if hsize_check > biggest_size:
                                     biggest_size = hsize_check
                                     biggest_helper = hname_check
-                    if biggest_helper and _placement_retries < 3:
+                    # If the failing overlay has no bundled helpers of its own,
+                    # promote the largest globally-bundled helper: this shrinks
+                    # OTHER overlays and frees up SRAM/EEPROM space.
+                    if biggest_helper is None and bundleable_helpers:
+                        for hname_g in bundleable_helpers:
+                            hsize_g = measure_lines(helper_bodies.get(hname_g, (0, 0, []))[2])
+                            if hsize_g > biggest_size:
+                                biggest_size = hsize_g
+                                biggest_helper = hname_g
+                    if biggest_helper and _placement_retries < 5:
                         import sys
                         print(f"  Placement retry: making {biggest_helper} ({biggest_size}B) resident to fit {name} ({fsize}B)",
                               file=sys.stderr)
@@ -3834,8 +3961,6 @@ class MK1CodeGen:
         # Kernel = j _main + overlay_load + runtime helpers + main
         # The jump at code[0] ensures physical reset (PC=0) lands in _main,
         # not in overlay_load (which would crash without call context).
-        # After first run, page3 has calibrated ipm and precomputed note table,
-        # so _main can replay without re-calibrating.
         assembled.append('\tj _main')
         assembled.extend(loader)
         assembled.extend(runtime_resident_helpers)
@@ -4254,6 +4379,50 @@ class MK1CodeGen:
                   f"{sum(f for _,_,_,f,_ in ee_overlays)}B [ESP32 p3patch]",
                   file=sys.stderr)
 
+
+    def _emit_user_call(self, name, args):
+        """Emit code to call a user-defined function by name. Factored out of
+        gen_expr so that user functions with names matching a builtin (e.g. a
+        user's own lcd_cmd) can be dispatched without going through the
+        builtin code path."""
+        nparams = self.func_params.get(name, len(args))
+        use_regcall = self._use_regcall(nparams) and len(args) == nparams
+        if use_regcall:
+            stack_args = args[2:]
+            for arg in reversed(stack_args):
+                if arg[0] == 'num':
+                    self.emit(f'\tpush_imm {arg[1] & 0xFF}')
+                else:
+                    self.gen_expr(arg)
+                    self.emit('\tpush $a')
+                self.local_count += 1
+            if len(args) >= 2:
+                if args[1][0] == 'num':
+                    self.emit(f'\tldi $b,{args[1][1] & 0xFF}')
+                else:
+                    self.gen_expr(args[1])
+                    self.emit('\tmov $a,$b')
+            if len(args) >= 1:
+                if args[0][0] == 'num':
+                    self.emit(f'\tldi $a,{args[0][1] & 0xFF}')
+                else:
+                    self.gen_expr(args[0])
+            self.emit(f'\tjal _{name}')
+            for _ in stack_args:
+                self.emit('\tpop $d')
+                self.local_count -= 1
+        else:
+            for arg in reversed(args):
+                if arg[0] == 'num':
+                    self.emit(f'\tpush_imm {arg[1] & 0xFF}')
+                else:
+                    self.gen_expr(arg)
+                    self.emit('\tpush $a')
+                self.local_count += 1
+            self.emit(f'\tjal _{name}')
+            for _ in args:
+                self.emit('\tpop $d')
+                self.local_count -= 1
 
     def _use_regcall(self, nparams):
         """Always pass first 2 args in A/B (hybrid register calling).
@@ -5330,6 +5499,12 @@ class MK1CodeGen:
 
         elif kind == 'call':
             name, args = expr[1], expr[2]
+            # User-defined function with a name matching a builtin takes
+            # precedence over the builtin. Dispatch directly to the user's
+            # code without consulting the builtin table.
+            if name in self.func_params:
+                self._emit_user_call(name, args)
+                return
             if name == 'out':
                 if args:
                     arg = args[0]
@@ -5505,6 +5680,24 @@ class MK1CodeGen:
                 self._lcd_helpers.add('__i2c_sb')
                 # __i2c_rb NOT needed: LCD init data pre-populated in data page
                 self.emit('\tjal __lcd_init')
+                return
+
+            if name == 'lcd_clear':
+                # HD44780 Clear Display (0x01) via __lcd_cmd (shares __lcd_send
+                # with __lcd_chr so almost free). Inline ~3ms delay avoids
+                # pulling in __delay_Nms/__delay_cal infrastructure.
+                if not hasattr(self, '_lcd_helpers'):
+                    self._lcd_helpers = set()
+                self._lcd_helpers.add('__lcd_cmd')
+                self._lcd_helpers.add('__i2c_sb')
+                self.emit('\tldi $d,1')        # D = cmd byte (Clear)
+                self.emit('\tjal __lcd_cmd')
+                # ~3ms raw delay for HD44780 Clear (needs 1.52ms min).
+                lbl_c = self.label('lcclr_d')
+                self.emit('\tldi $a,0')
+                self.emit(f'{lbl_c}:')
+                self.emit('\tdec')
+                self.emit(f'\tjnz {lbl_c}')
                 return
 
             if name == 'i2c_stream':
@@ -7092,7 +7285,24 @@ def main():
     # Warnings — init stage can use up to 254B (runs once, self-copies kernel)
     init_limit = 254 if (init_extraction or overlay_mode) else MAX_CODE
     if code_bytes > init_limit:
-        print(f"  !! CODE OVERFLOW: {code_bytes}B > {init_limit}B limit", file=sys.stderr)
+        print(f"  !! CODE OVERFLOW: {code_bytes}B > {init_limit}B limit "
+              f"(over by {code_bytes - init_limit}B)", file=sys.stderr)
+        # Suggest concrete remediation
+        if overlay_mode:
+            ov_region_needed = getattr(gen, '_overlay_region', 0) + 14
+            if ov_region_needed > 250:
+                print(f"     → kernel+copy needs {ov_region_needed}B but page is 250B."
+                      f" Move more user functions into overlays or split large helpers.",
+                      file=sys.stderr)
+        elif init_extraction:
+            print(f"     → stage 1 exceeds page limit. Causes: "
+                  f"large init helpers (e.g. __lcd_init), many resident runtime helpers, "
+                  f"or an oversized main.",
+                  file=sys.stderr)
+        else:
+            print(f"     → program doesn't fit in flat mode. Add user functions to "
+                  f"enable overlay partitioning, or reduce code size.",
+                  file=sys.stderr)
     elif code_bytes > init_limit - 3:
         print(f"  !! Code page tight: only {init_limit - code_bytes}B free", file=sys.stderr)
     if gen.data_alloc > 256:
