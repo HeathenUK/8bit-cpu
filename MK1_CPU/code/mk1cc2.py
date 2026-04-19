@@ -580,14 +580,44 @@ class MK1CodeGen:
                     self._find_vars_in_expr(sub, used)
 
     def _auto_split_functions(self, functions):
-        """Split functions spanning I2C + LCD domains into separate phases."""
+        """Split functions spanning I2C + LCD domains into separate phases.
+        Also splits main when it has the same transition — the tail becomes
+        a new overlay-eligible function that main jal's into."""
         new_functions = []
         main_rewrites = {}  # original_name → [(phase1_name, phase2_name)]
 
+        def _is_redundant_lcd_cmd_after_lcd_init(prev_stmt, stmt):
+            """True if stmt is lcd_cmd(0x01) or lcd_cmd(0x02) and prev is lcd_init()
+            — the init sequence already clears the display so the cmd is a no-op."""
+            if prev_stmt is None or stmt is None:
+                return False
+            if (prev_stmt[0] == 'expr_stmt' and prev_stmt[1][0] == 'call'
+                    and prev_stmt[1][1] == 'lcd_init'):
+                if (stmt[0] == 'expr_stmt' and stmt[1][0] == 'call'
+                        and stmt[1][1] == 'lcd_cmd' and stmt[1][2]):
+                    arg = stmt[1][2][0]
+                    if arg[0] == 'num' and arg[1] in (0x01, 0x02):
+                        return True
+            return False
+
         for name, params, body, ret_type in functions:
-            if name == 'main' or body[0] != 'block':
+            if body[0] != 'block':
                 new_functions.append((name, params, body, ret_type))
                 continue
+
+            # AST-level peephole: drop redundant lcd_cmd(0x01)/(0x02) right after
+            # lcd_init(). Must match the gen_expr-level peephole so auto-split's
+            # domain analysis sees the same sequence the codegen will emit.
+            stmts_orig = body[1]
+            filtered = []
+            prev = None
+            for s in stmts_orig:
+                if _is_redundant_lcd_cmd_after_lcd_init(prev, s):
+                    continue  # drop the redundant clear
+                filtered.append(s)
+                prev = s
+            if filtered != stmts_orig:
+                body = ('block', filtered)
 
             stmts = body[1]
             # Classify each statement
@@ -639,6 +669,73 @@ class MK1CodeGen:
             import sys
             print(f"  Phase 7: splitting {name} at stmt {split} "
                   f"(live: {live_vars})", file=sys.stderr)
+
+            # Main splits as dispatcher: main becomes a small function that
+            # runs init, calls an I2C-heavy phase (as its own overlay), then
+            # resumes with the original display-heavy calls.
+            # Keeping the user-function calls in main directly (not inside a
+            # phase2) avoids the SCC-merge problem where phase2 would end up
+            # in the same overlay slot as every user function it calls,
+            # ballooning the slot size.
+            if name == 'main':
+                INIT_CALLS = {'i2c_init', 'lcd_init', 'delay_calibrate',
+                              'ddra_imm', 'ddrb_imm'}
+                def _is_init_stmt(s):
+                    if s[0] == 'expr_stmt' and s[1][0] == 'call':
+                        return s[1][1] in INIT_CALLS
+                    return False
+                prelude_end = 0
+                for si, s in enumerate(stmts):
+                    if _is_init_stmt(s):
+                        prelude_end = si + 1
+                    else:
+                        break
+                prelude_stmts = list(stmts[:prelude_end])
+                body_stmts = list(stmts[prelude_end:])
+                split_in_body = split - prelude_end
+                if split_in_body < 1 or split_in_body >= len(body_stmts):
+                    new_functions.append((name, params, body, ret_type))
+                    continue
+                # Name without leading underscore so the emitted label is
+                # `_main_p1` (one '_'), keeping it classified as a user
+                # function rather than a library helper.
+                p1_name = 'main_p1'
+                p1_inner = list(body_stmts[:split_in_body])
+                # Allocate transfer globals for live vars so the post-split
+                # code in main can still read them after p1 returns.
+                xfer_globals = {}  # lv → xfer_name
+                for lv in live_vars:
+                    xfer_name = f'__xfer_main_{lv}'
+                    if xfer_name not in self.globals and xfer_name not in self.page3_globals:
+                        if self.data_alloc < 256:
+                            self.globals[xfer_name] = self.data_alloc
+                            self.data_alloc += 1
+                        else:
+                            self.page3_globals[xfer_name] = self.page3_alloc
+                            self.page3_alloc += 1
+                    xfer_globals[lv] = xfer_name
+                    # Phase 1 stores the local to the transfer global before returning.
+                    p1_inner.append(('expr_stmt',
+                        ('assign', '=',
+                         ('index', ('var', xfer_name), ('num', 0)),
+                         ('var', lv))))
+                # Main body after phase 1: redeclare the live vars from globals,
+                # then continue with the original post-split statements.
+                reload_stmts = []
+                for lv in live_vars:
+                    reload_stmts.append(('local', lv,
+                        ('index', ('var', xfer_globals[lv]), ('num', 0)), 'u8'))
+                new_main_stmts = (list(prelude_stmts)
+                                  + [('expr_stmt', ('call', p1_name, []))]
+                                  + reload_stmts
+                                  + list(body_stmts[split_in_body:]))
+                new_main_body = ('block', new_main_stmts)
+                p1_body = ('block', p1_inner)
+                new_functions.append(('main', list(params), new_main_body, ret_type))
+                new_functions.append((p1_name, [], p1_body, 'void'))
+                self.func_params[p1_name] = 0
+                self.func_bodies[p1_name] = ([], p1_body)
+                continue
 
             if len(live_vars) <= 2:
                 p1_name = f'{name}_p1'
@@ -2927,894 +3024,993 @@ class MK1CodeGen:
                             cond_res.discard(next_name)
                             changed = True
 
-        # ── Step 9: Bundle/inline helpers only used by overlay code ──
-        # If a helper is not in _NO_OVERLAY and never called from resident code,
-        # BUNDLE it into each overlay that needs it (append body, keep jal intact).
-        # For helpers called multiple times within an overlay (e.g., __i2c_sb × 4
-        # from __lcd_chr), bundling is far better than inlining (39B vs 156B).
-        overlay_names = {name for name, _, _, _ in overlay_funcs_flat}
-        helper_bodies = {}
-        hi = 0
-        while hi < len(new_resident):
-            hs = new_resident[hi].strip()
-            if hs.endswith(':') and hs.startswith('__') and not hs.startswith('.'):
-                hname = hs[:-1]
-                hstart = hi
-                hi += 1
-                hlines = []
-                while hi < len(new_resident):
-                    ns = new_resident[hi].strip()
-                    if ns.endswith(':') and not ns.startswith('.') and ns.startswith('_'):
-                        break
-                    hlines.append(new_resident[hi])
+        # Snapshot pre-bundling state so placement retry can rebuild
+        # overlays with an updated resident set. Placement retry adds a
+        # bundled helper to _NO_OVERLAY, then this loop re-runs step 9
+        # so that helper is emitted in the kernel instead of bundled.
+        _snap_new_resident = list(new_resident)
+        _snap_overlay_asm_blocks = [(n, list(l), s) for n, l, s in overlay_asm_blocks]
+        _bundle_placement_pass = 0
+        _retry_bundling = True
+        while _retry_bundling:
+            _retry_bundling = False
+            _bundle_placement_pass += 1
+            if _bundle_placement_pass > 10:
+                raise Exception("bundle/placement retry did not converge after 10 passes")
+            if _bundle_placement_pass > 1:
+                new_resident = list(_snap_new_resident)
+                overlay_asm_blocks = [(n, list(l), s) for n, l, s in _snap_overlay_asm_blocks]
+
+            # ── Step 9: Bundle/inline helpers only used by overlay code ──
+            # If a helper is not in _NO_OVERLAY and never called from resident code,
+            # BUNDLE it into each overlay that needs it (append body, keep jal intact).
+            # For helpers called multiple times within an overlay (e.g., __i2c_sb × 4
+            # from __lcd_chr), bundling is far better than inlining (39B vs 156B).
+            overlay_names = {name for name, _, _, _ in overlay_funcs_flat}
+            helper_bodies = {}
+            hi = 0
+            while hi < len(new_resident):
+                hs = new_resident[hi].strip()
+                if hs.endswith(':') and hs.startswith('__') and not hs.startswith('.'):
+                    hname = hs[:-1]
+                    hstart = hi
                     hi += 1
-                helper_bodies[hname] = (hstart, hi, hlines)
-            else:
-                hi += 1
-
-        # Save original ranges before merging (for correct removal later)
-        helper_original_ranges = {h: (s, e) for h, (s, e, _) in helper_bodies.items()}
-
-        # Detect fall-through: if a helper body doesn't end with a terminator,
-        # it falls through to the next label. Merge it with that label's body
-        # so bundling preserves the fall-through semantics.
-        terminators = {'ret', 'hlt'}
-        helper_order = sorted(helper_bodies.keys(),
-                              key=lambda h: helper_bodies[h][0])
-        for idx_h, hname in enumerate(helper_order):
-            hstart, hend, hlines = helper_bodies[hname]
-            # Find last real instruction
-            last_instr = ''
-            for hl in reversed(hlines):
-                stripped = hl.strip()
-                if stripped and not stripped.endswith(':') and not stripped.startswith(';'):
-                    last_instr = stripped.split()[0]
-                    break
-            is_terminator = (last_instr in terminators or
-                             last_instr == 'j' or
-                             (last_instr.startswith('j') and not last_instr.startswith('jal')))
-            if not is_terminator and idx_h + 1 < len(helper_order):
-                # Falls through to next helper — merge bodies
-                next_name = helper_order[idx_h + 1]
-                ns, ne, nlines = helper_bodies[next_name]
-                # Extend current helper to include next helper's label + body
-                merged_lines = hlines + [new_resident[ns]] + nlines
-                helper_bodies[hname] = (hstart, ne, merged_lines)
-                # Don't remove the next helper from helper_bodies — it can
-                # still be bundled independently by overlays that call it directly
-
-        # Identify which helpers can be bundled (not in _NO_OVERLAY, not called
-        # from non-helper resident code).
-        bundleable_helpers = []
-        for hname, (hstart, hend, hlines) in list(helper_bodies.items()):
-            if f'{hname}:' in _NO_OVERLAY:
-                continue
-            called_from_resident = False
-            for ci, cline in enumerate(new_resident):
-                if ci >= hstart and ci < hend:
-                    continue
-                # Skip helper bodies that are already confirmed bundleable
-                # (removed from _NO_OVERLAY). But scan bodies of helpers still
-                # in _NO_OVERLAY — if they call us, we must stay resident.
-                in_removed_helper = False
-                for oh, (ohs, ohe, _) in helper_bodies.items():
-                    if oh != hname and ohs <= ci < ohe:
-                        if f'{oh}:' not in _NO_OVERLAY:
-                            in_removed_helper = True
+                    hlines = []
+                    while hi < len(new_resident):
+                        ns = new_resident[hi].strip()
+                        if ns.endswith(':') and not ns.startswith('.') and ns.startswith('_'):
                             break
-                if in_removed_helper:
+                        hlines.append(new_resident[hi])
+                        hi += 1
+                    helper_bodies[hname] = (hstart, hi, hlines)
+                else:
+                    hi += 1
+
+            # Save original ranges before merging (for correct removal later)
+            helper_original_ranges = {h: (s, e) for h, (s, e, _) in helper_bodies.items()}
+
+            # Detect fall-through: if a helper body doesn't end with a terminator,
+            # it falls through to the next label. Merge it with that label's body
+            # so bundling preserves the fall-through semantics.
+            terminators = {'ret', 'hlt'}
+            helper_order = sorted(helper_bodies.keys(),
+                                  key=lambda h: helper_bodies[h][0])
+            for idx_h, hname in enumerate(helper_order):
+                hstart, hend, hlines = helper_bodies[hname]
+                # Find last real instruction
+                last_instr = ''
+                for hl in reversed(hlines):
+                    stripped = hl.strip()
+                    if stripped and not stripped.endswith(':') and not stripped.startswith(';'):
+                        last_instr = stripped.split()[0]
+                        break
+                is_terminator = (last_instr in terminators or
+                                 last_instr == 'j' or
+                                 (last_instr.startswith('j') and not last_instr.startswith('jal')))
+                if not is_terminator and idx_h + 1 < len(helper_order):
+                    # Falls through to next helper — merge bodies
+                    next_name = helper_order[idx_h + 1]
+                    ns, ne, nlines = helper_bodies[next_name]
+                    # Extend current helper to include next helper's label + body
+                    merged_lines = hlines + [new_resident[ns]] + nlines
+                    helper_bodies[hname] = (hstart, ne, merged_lines)
+                    # Don't remove the next helper from helper_bodies — it can
+                    # still be bundled independently by overlays that call it directly
+
+            # Identify which helpers can be bundled (not in _NO_OVERLAY, not called
+            # from non-helper resident code).
+            bundleable_helpers = []
+            for hname, (hstart, hend, hlines) in list(helper_bodies.items()):
+                if f'{hname}:' in _NO_OVERLAY:
                     continue
-                cs = cline.strip()
-                if f'jal {hname}' in cs or f'j {hname}' in cs:
-                    called_from_resident = True
+                called_from_resident = False
+                for ci, cline in enumerate(new_resident):
+                    if ci >= hstart and ci < hend:
+                        continue
+                    # Skip helper bodies that are already confirmed bundleable
+                    # (removed from _NO_OVERLAY). But scan bodies of helpers still
+                    # in _NO_OVERLAY — if they call us, we must stay resident.
+                    in_removed_helper = False
+                    for oh, (ohs, ohe, _) in helper_bodies.items():
+                        if oh != hname and ohs <= ci < ohe:
+                            if f'{oh}:' not in _NO_OVERLAY:
+                                in_removed_helper = True
+                                break
+                    if in_removed_helper:
+                        continue
+                    cs = cline.strip()
+                    if f'jal {hname}' in cs or f'j {hname}' in cs:
+                        called_from_resident = True
+                        break
+                if not called_from_resident:
+                    bundleable_helpers.append(hname)
+
+            # Build dependency graph for transitive closure.
+            deps = {h: set() for h in bundleable_helpers}
+            for hname in bundleable_helpers:
+                _, _, hlines = helper_bodies[hname]
+                for hl in hlines:
+                    hs2 = hl.strip()
+                    if hs2.startswith('jal '):
+                        target = hs2.split()[1]
+                        if target in deps:
+                            deps[hname].add(target)
+
+            # Compute transitive closure: all helpers reachable from h
+            def transitive_deps(h, seen=None):
+                if seen is None:
+                    seen = set()
+                for d in deps.get(h, set()):
+                    if d not in seen:
+                        seen.add(d)
+                        transitive_deps(d, seen)
+                return seen
+
+            # ── Knapsack: decide which bundleable helpers should stay resident ──
+            # Count how many overlay slots need each helper (transitively).
+            # For helpers needed by N≥2 overlays, keeping resident saves (N-1)×size
+            # in overlay storage at a cost of +size in the kernel.
+            helper_usage_count = {h: 0 for h in bundleable_helpers}
+            for oi, (oname, olines, ofsize) in enumerate(overlay_asm_blocks):
+                needed = set()
+                for ol in olines:
+                    os2 = ol.strip()
+                    if os2.startswith('jal '):
+                        target = os2.split()[1]
+                        if target in helper_usage_count:
+                            needed.add(target)
+                all_needed_k = set(needed)
+                for h in needed:
+                    all_needed_k |= transitive_deps(h)
+                for h in all_needed_k:
+                    helper_usage_count[h] = helper_usage_count.get(h, 0) + 1
+
+            # Knapsack: for each helper, value = (N-1) × size (bytes saved from
+            # not duplicating). Keep resident if value > weight (size).
+            # Estimate kernel: resident code MINUS bundleable helpers + ~40B loader overhead
+            bundleable_ranges = set()
+            for hname_k in bundleable_helpers:
+                hs_k, he_k, _ = helper_bodies[hname_k]
+                bundleable_ranges.update(range(hs_k, he_k))
+            non_bundleable_lines = [l for i, l in enumerate(new_resident) if i not in bundleable_ranges]
+            est_kernel_base = measure_lines(non_bundleable_lines) + 40
+
+            import sys
+            print(f"  Knapsack: {len(bundleable_helpers)} bundleable, usage={dict(helper_usage_count)}, est_kernel={est_kernel_base}B", file=sys.stderr)
+            knapsack_candidates = []
+            for hname in bundleable_helpers:
+                hsize = measure_lines(helper_bodies[hname][2]) + 1  # +1 for label
+                n_users = helper_usage_count.get(hname, 0)
+                if n_users >= 2:
+                    value = (n_users - 1) * hsize
+                    knapsack_candidates.append((value, hsize, hname))
+
+            # Sort by value descending (most savings first)
+            knapsack_candidates.sort(reverse=True)
+            keep_resident = set()
+            est_kernel_growth = 0
+            for value, hsize, hname in knapsack_candidates:
+                # Only keep resident if the savings outweigh the kernel growth
+                # and the kernel doesn't grow too much (leave at least 80B overlay region)
+                est_kernel = est_kernel_base + est_kernel_growth + hsize
+                est_overlay_region = 250 - est_kernel
+                if est_overlay_region >= 40 and value >= hsize:
+                    keep_resident.add(hname)
+                    est_kernel_growth += hsize
+                    # Re-add to _NO_OVERLAY
+                    _NO_OVERLAY.add(f'{hname}:')
+                    import sys
+                    print(f"  Knapsack: keeping {hname} resident ({hsize}B, used by {helper_usage_count[hname]} overlays, saves {value}B)",
+                          file=sys.stderr)
+
+            # ── Phase 6: Wrapping-aware helper promotion ──
+            # Estimate post-bundling overlay sizes. If any would wrap (exceed the
+            # estimated overlay region), force the most-shared bundled helper resident.
+            # This reduces overlay sizes at the cost of kernel growth.
+            est_overlay_avail = 250 - (est_kernel_base + est_kernel_growth)
+            for _wrap_retry in range(3):
+                # Estimate post-bundling size for each overlay
+                wrapping_overlays = []
+                for oi, (oname, olines, ofsize) in enumerate(overlay_asm_blocks):
+                    # Estimate bundled size: function size + sum of all bundleable helpers it needs
+                    needed_helpers = set()
+                    for ol in olines:
+                        os2 = ol.strip()
+                        if os2.startswith('jal '):
+                            target = os2.split()[1]
+                            if target in bundleable_helpers:
+                                needed_helpers.add(target)
+                                needed_helpers |= transitive_deps(target)
+                    bundled_size = ofsize + sum(
+                        measure_lines(helper_bodies[h][2]) + 1 for h in needed_helpers
+                        if h in helper_bodies and h not in keep_resident)
+                    if bundled_size > est_overlay_avail:
+                        wrapping_overlays.append((oi, oname, bundled_size, needed_helpers - keep_resident))
+                if not wrapping_overlays:
                     break
-            if not called_from_resident:
-                bundleable_helpers.append(hname)
-
-        # Build dependency graph for transitive closure.
-        deps = {h: set() for h in bundleable_helpers}
-        for hname in bundleable_helpers:
-            _, _, hlines = helper_bodies[hname]
-            for hl in hlines:
-                hs2 = hl.strip()
-                if hs2.startswith('jal '):
-                    target = hs2.split()[1]
-                    if target in deps:
-                        deps[hname].add(target)
-
-        # Compute transitive closure: all helpers reachable from h
-        def transitive_deps(h, seen=None):
-            if seen is None:
-                seen = set()
-            for d in deps.get(h, set()):
-                if d not in seen:
-                    seen.add(d)
-                    transitive_deps(d, seen)
-            return seen
-
-        # ── Knapsack: decide which bundleable helpers should stay resident ──
-        # Count how many overlay slots need each helper (transitively).
-        # For helpers needed by N≥2 overlays, keeping resident saves (N-1)×size
-        # in overlay storage at a cost of +size in the kernel.
-        helper_usage_count = {h: 0 for h in bundleable_helpers}
-        for oi, (oname, olines, ofsize) in enumerate(overlay_asm_blocks):
-            needed = set()
-            for ol in olines:
-                os2 = ol.strip()
-                if os2.startswith('jal '):
-                    target = os2.split()[1]
-                    if target in helper_usage_count:
-                        needed.add(target)
-            all_needed_k = set(needed)
-            for h in needed:
-                all_needed_k |= transitive_deps(h)
-            for h in all_needed_k:
-                helper_usage_count[h] = helper_usage_count.get(h, 0) + 1
-
-        # Knapsack: for each helper, value = (N-1) × size (bytes saved from
-        # not duplicating). Keep resident if value > weight (size).
-        # Estimate kernel: resident code MINUS bundleable helpers + ~40B loader overhead
-        bundleable_ranges = set()
-        for hname_k in bundleable_helpers:
-            hs_k, he_k, _ = helper_bodies[hname_k]
-            bundleable_ranges.update(range(hs_k, he_k))
-        non_bundleable_lines = [l for i, l in enumerate(new_resident) if i not in bundleable_ranges]
-        est_kernel_base = measure_lines(non_bundleable_lines) + 40
-
-        import sys
-        print(f"  Knapsack: {len(bundleable_helpers)} bundleable, usage={dict(helper_usage_count)}, est_kernel={est_kernel_base}B", file=sys.stderr)
-        knapsack_candidates = []
-        for hname in bundleable_helpers:
-            hsize = measure_lines(helper_bodies[hname][2]) + 1  # +1 for label
-            n_users = helper_usage_count.get(hname, 0)
-            if n_users >= 2:
-                value = (n_users - 1) * hsize
-                knapsack_candidates.append((value, hsize, hname))
-
-        # Sort by value descending (most savings first)
-        knapsack_candidates.sort(reverse=True)
-        keep_resident = set()
-        est_kernel_growth = 0
-        for value, hsize, hname in knapsack_candidates:
-            # Only keep resident if the savings outweigh the kernel growth
-            # and the kernel doesn't grow too much (leave at least 80B overlay region)
-            est_kernel = est_kernel_base + est_kernel_growth + hsize
-            est_overlay_region = 250 - est_kernel
-            if est_overlay_region >= 40 and value >= hsize:
-                keep_resident.add(hname)
-                est_kernel_growth += hsize
-                # Re-add to _NO_OVERLAY
-                _NO_OVERLAY.add(f'{hname}:')
+                # Find the bundled helper that, if promoted, would reduce the most wrapping
+                helper_impact = {}
+                for _, _, bsize, helpers in wrapping_overlays:
+                    for h in helpers:
+                        if h in helper_bodies:
+                            hsize = measure_lines(helper_bodies[h][2]) + 1
+                            helper_impact[h] = helper_impact.get(h, 0) + hsize
+                if not helper_impact:
+                    break
+                best = max(helper_impact, key=helper_impact.get)
+                best_size = measure_lines(helper_bodies[best][2]) + 1
+                # Check that promoting this helper doesn't make kernel too large
+                new_kernel = est_kernel_base + est_kernel_growth + best_size
+                if new_kernel > 230:  # leave at least 20B overlay region
+                    break
+                keep_resident.add(best)
+                est_kernel_growth += best_size
+                est_overlay_avail = 250 - (est_kernel_base + est_kernel_growth)
+                _NO_OVERLAY.add(f'{best}:')
                 import sys
-                print(f"  Knapsack: keeping {hname} resident ({hsize}B, used by {helper_usage_count[hname]} overlays, saves {value}B)",
+                print(f"  Phase 6: promoting {best} ({best_size}B) to resident (reduces wrapping by {helper_impact[best]}B)",
                       file=sys.stderr)
 
-        # ── Phase 6: Wrapping-aware helper promotion ──
-        # Estimate post-bundling overlay sizes. If any would wrap (exceed the
-        # estimated overlay region), force the most-shared bundled helper resident.
-        # This reduces overlay sizes at the cost of kernel growth.
-        est_overlay_avail = 250 - (est_kernel_base + est_kernel_growth)
-        for _wrap_retry in range(3):
-            # Estimate post-bundling size for each overlay
-            wrapping_overlays = []
+            # Remove kept-resident helpers from bundleable list.
+            # Identify helpers merged into other helpers via fall-through.
+            # When __lcd_cmd is kept resident, __lcd_send must follow in the kernel
+            # (fall-through linkage via `j __lcd_send` at end of __lcd_cmd body).
+            merged_into_resident = set()
+            for hname in keep_resident:
+                if hname in helper_bodies:
+                    _, _, hlines = helper_bodies[hname]
+                    for hl in hlines:
+                        hs = hl.strip()
+                        if hs.endswith(':') and hs.startswith('__') and not hs.startswith('.'):
+                            sub_name = hs[:-1]
+                            if sub_name != hname and sub_name in bundleable_helpers:
+                                merged_into_resident.add(sub_name)
+            # Remove both kept-resident AND merged-sub helpers from bundleable.
+            # Merged sub-helpers are part of the resident helper's body.
+            remove_from_bundleable = keep_resident | merged_into_resident
+            if remove_from_bundleable:
+                bundleable_helpers = [h for h in bundleable_helpers if h not in remove_from_bundleable]
+                for h in remove_from_bundleable:
+                    deps.pop(h, None)
+                for h in deps:
+                    deps[h] -= remove_from_bundleable
+
+            # For each overlay, find all bundleable helpers it needs (transitively).
+            # Then append them all. Order: leaves first (deps before dependents).
             for oi, (oname, olines, ofsize) in enumerate(overlay_asm_blocks):
-                # Estimate bundled size: function size + sum of all bundleable helpers it needs
-                needed_helpers = set()
+                # Find directly-called bundleable helpers
+                needed = set()
                 for ol in olines:
                     os2 = ol.strip()
                     if os2.startswith('jal '):
                         target = os2.split()[1]
                         if target in bundleable_helpers:
-                            needed_helpers.add(target)
-                            needed_helpers |= transitive_deps(target)
-                bundled_size = ofsize + sum(
-                    measure_lines(helper_bodies[h][2]) + 1 for h in needed_helpers
-                    if h in helper_bodies and h not in keep_resident)
-                if bundled_size > est_overlay_avail:
-                    wrapping_overlays.append((oi, oname, bundled_size, needed_helpers - keep_resident))
-            if not wrapping_overlays:
-                break
-            # Find the bundled helper that, if promoted, would reduce the most wrapping
-            helper_impact = {}
-            for _, _, bsize, helpers in wrapping_overlays:
-                for h in helpers:
-                    if h in helper_bodies:
-                        hsize = measure_lines(helper_bodies[h][2]) + 1
-                        helper_impact[h] = helper_impact.get(h, 0) + hsize
-            if not helper_impact:
-                break
-            best = max(helper_impact, key=helper_impact.get)
-            best_size = measure_lines(helper_bodies[best][2]) + 1
-            # Check that promoting this helper doesn't make kernel too large
-            new_kernel = est_kernel_base + est_kernel_growth + best_size
-            if new_kernel > 230:  # leave at least 20B overlay region
-                break
-            keep_resident.add(best)
-            est_kernel_growth += best_size
-            est_overlay_avail = 250 - (est_kernel_base + est_kernel_growth)
-            _NO_OVERLAY.add(f'{best}:')
-            import sys
-            print(f"  Phase 6: promoting {best} ({best_size}B) to resident (reduces wrapping by {helper_impact[best]}B)",
-                  file=sys.stderr)
+                            needed.add(target)
+                # Add transitive deps
+                all_needed = set(needed)
+                for h in needed:
+                    all_needed |= transitive_deps(h)
 
-        # Remove kept-resident helpers from bundleable list.
-        # Identify helpers merged into other helpers via fall-through.
-        # When __lcd_cmd is kept resident, __lcd_send must follow in the kernel
-        # (fall-through linkage via `j __lcd_send` at end of __lcd_cmd body).
-        merged_into_resident = set()
-        for hname in keep_resident:
-            if hname in helper_bodies:
-                _, _, hlines = helper_bodies[hname]
-                for hl in hlines:
-                    hs = hl.strip()
-                    if hs.endswith(':') and hs.startswith('__') and not hs.startswith('.'):
-                        sub_name = hs[:-1]
-                        if sub_name != hname and sub_name in bundleable_helpers:
-                            merged_into_resident.add(sub_name)
-        # Remove both kept-resident AND merged-sub helpers from bundleable.
-        # Merged sub-helpers are part of the resident helper's body.
-        remove_from_bundleable = keep_resident | merged_into_resident
-        if remove_from_bundleable:
-            bundleable_helpers = [h for h in bundleable_helpers if h not in remove_from_bundleable]
-            for h in remove_from_bundleable:
-                deps.pop(h, None)
-            for h in deps:
-                deps[h] -= remove_from_bundleable
+                if not all_needed:
+                    continue
 
-        # For each overlay, find all bundleable helpers it needs (transitively).
-        # Then append them all. Order: leaves first (deps before dependents).
-        for oi, (oname, olines, ofsize) in enumerate(overlay_asm_blocks):
-            # Find directly-called bundleable helpers
-            needed = set()
-            for ol in olines:
-                os2 = ol.strip()
-                if os2.startswith('jal '):
-                    target = os2.split()[1]
-                    if target in bundleable_helpers:
-                        needed.add(target)
-            # Add transitive deps
-            all_needed = set(needed)
-            for h in needed:
-                all_needed |= transitive_deps(h)
+                # Topological sort for this overlay's needed helpers (leaves first)
+                sorted_for_ov = []
+                vis = set()
+                def topo(h):
+                    if h in vis or h not in all_needed:
+                        return
+                    vis.add(h)
+                    for d in deps.get(h, set()):
+                        topo(d)
+                    sorted_for_ov.append(h)
+                for h in all_needed:
+                    topo(h)
 
-            if not all_needed:
-                continue
+                # Append helper bodies in dependency order.
+                # Rename all labels with _ovN suffix to avoid duplicate symbols
+                # across overlays (each overlay gets its own copy at org OVERLAY_REGION).
+                suffix = f'_ov{oi}'
 
-            # Topological sort for this overlay's needed helpers (leaves first)
-            sorted_for_ov = []
-            vis = set()
-            def topo(h):
-                if h in vis or h not in all_needed:
-                    return
-                vis.add(h)
-                for d in deps.get(h, set()):
-                    topo(d)
-                sorted_for_ov.append(h)
-            for h in all_needed:
-                topo(h)
+                # Collect ALL __ labels defined in bundled helper bodies (including
+                # internal labels from fall-through merging, e.g., __lcd_send inside __lcd_cmd)
+                all_bundled_labels = set(all_needed)
+                for hname in sorted_for_ov:
+                    hstart_b, _, hlines_b = helper_bodies[hname]
+                    for hl_b in [new_resident[hstart_b]] + hlines_b:
+                        s_b = hl_b.strip()
+                        if s_b.endswith(':') and s_b.startswith('__'):
+                            all_bundled_labels.add(s_b[:-1])
 
-            # Append helper bodies in dependency order.
-            # Rename all labels with _ovN suffix to avoid duplicate symbols
-            # across overlays (each overlay gets its own copy at org OVERLAY_REGION).
-            suffix = f'_ov{oi}'
+                new_olines = list(olines)
 
-            # Collect ALL __ labels defined in bundled helper bodies (including
-            # internal labels from fall-through merging, e.g., __lcd_send inside __lcd_cmd)
-            all_bundled_labels = set(all_needed)
-            for hname in sorted_for_ov:
-                hstart_b, _, hlines_b = helper_bodies[hname]
-                for hl_b in [new_resident[hstart_b]] + hlines_b:
-                    s_b = hl_b.strip()
-                    if s_b.endswith(':') and s_b.startswith('__'):
-                        all_bundled_labels.add(s_b[:-1])
-
-            new_olines = list(olines)
-
-            # First rename all bundled label references in the overlay's OWN code
-            for li in range(len(new_olines)):
-                for lbl in all_bundled_labels:
-                    s_check = new_olines[li]
-                    # Rename jal references
-                    s_check = s_check.replace(f'jal {lbl}', f'jal {lbl}{suffix}')
-                    # Rename j references (but not jal, jnz, jz, jc, jnc)
-                    if f'j {lbl}' in s_check and f'jal {lbl}' not in s_check:
-                        for jtype in ('jnz', 'jz', 'jc', 'jnc'):
-                            if f'{jtype} {lbl}' in s_check:
-                                break
-                        else:
-                            s_check = s_check.replace(f'j {lbl}', f'j {lbl}{suffix}')
-                    new_olines[li] = s_check
-
-            # Append renamed helper bodies
-            for hname in sorted_for_ov:
-                hstart, _, hlines = helper_bodies[hname]
-                helper_full = [new_resident[hstart]] + hlines
-                for hl in helper_full:
-                    l = hl
-                    # Rename all bundled labels (definitions and references)
+                # First rename all bundled label references in the overlay's OWN code
+                for li in range(len(new_olines)):
                     for lbl in all_bundled_labels:
-                        l = l.replace(f'{lbl}:', f'{lbl}{suffix}:')
-                        l = l.replace(f'jal {lbl}', f'jal {lbl}{suffix}')
-                        if f'j {lbl}' in l and f'jal {lbl}' not in l:
+                        s_check = new_olines[li]
+                        # Rename jal references
+                        s_check = s_check.replace(f'jal {lbl}', f'jal {lbl}{suffix}')
+                        # Rename j references (but not jal, jnz, jz, jc, jnc)
+                        if f'j {lbl}' in s_check and f'jal {lbl}' not in s_check:
                             for jtype in ('jnz', 'jz', 'jc', 'jnc'):
-                                if f'{jtype} {lbl}' in l:
+                                if f'{jtype} {lbl}' in s_check:
                                     break
                             else:
-                                l = l.replace(f'j {lbl}', f'j {lbl}{suffix}')
-                    # Rename local labels to avoid conflicts between overlays
-                    import re as _re
-                    for m in _re.finditer(r'\.([\w]+)', l):
-                        ref = '.' + m.group(1)
-                        if any(ref + ':' in h2.strip() for h2 in [new_resident[hstart]] + hlines):
-                            l = l.replace(ref, ref + suffix)
-                    new_olines.append(l)
-            new_fsize = measure_lines(new_olines)
-            overlay_asm_blocks[oi] = (oname, new_olines, new_fsize)
+                                s_check = s_check.replace(f'j {lbl}', f'j {lbl}{suffix}')
+                        new_olines[li] = s_check
 
-        # Remove all bundled helpers from resident.
-        # Use ORIGINAL ranges (pre-merge) to avoid accidentally removing
-        # resident helpers that were merged into a bundled helper's body.
-        for hname in bundleable_helpers:
-            orig_start, orig_end = helper_original_ranges.get(hname, (0, 0))
-            for ri in range(orig_start, orig_end):
-                new_resident[ri] = ''
+                # Append renamed helper bodies
+                for hname in sorted_for_ov:
+                    hstart, _, hlines = helper_bodies[hname]
+                    helper_full = [new_resident[hstart]] + hlines
+                    for hl in helper_full:
+                        l = hl
+                        # Rename all bundled labels (definitions and references)
+                        for lbl in all_bundled_labels:
+                            l = l.replace(f'{lbl}:', f'{lbl}{suffix}:')
+                            l = l.replace(f'jal {lbl}', f'jal {lbl}{suffix}')
+                            if f'j {lbl}' in l and f'jal {lbl}' not in l:
+                                for jtype in ('jnz', 'jz', 'jc', 'jnc'):
+                                    if f'{jtype} {lbl}' in l:
+                                        break
+                                else:
+                                    l = l.replace(f'j {lbl}', f'j {lbl}{suffix}')
+                        # Rename local labels to avoid conflicts between overlays
+                        import re as _re
+                        for m in _re.finditer(r'\.([\w]+)', l):
+                            ref = '.' + m.group(1)
+                            if any(ref + ':' in h2.strip() for h2 in [new_resident[hstart]] + hlines):
+                                l = l.replace(ref, ref + suffix)
+                        new_olines.append(l)
+                new_fsize = measure_lines(new_olines)
+                overlay_asm_blocks[oi] = (oname, new_olines, new_fsize)
 
-        new_resident = [l for l in new_resident if l != '']
+            # Remove all bundled helpers from resident.
+            # Use ORIGINAL ranges (pre-merge) to avoid accidentally removing
+            # resident helpers that were merged into a bundled helper's body.
+            for hname in bundleable_helpers:
+                orig_start, orig_end = helper_original_ranges.get(hname, (0, 0))
+                for ri in range(orig_start, orig_end):
+                    new_resident[ri] = ''
 
-        # Rebuild overlay_meta with updated sizes
-        overlay_meta = [(idx, name, fsize) for idx, (name, _, fsize) in enumerate(overlay_asm_blocks)]
-        # Track post-bundling max for diagnostics (may exceed overlay region due to wrapping)
-        max_bundled_size = max((fsize for _, _, fsize in overlay_asm_blocks), default=0)
+            new_resident = [l for l in new_resident if l != '']
 
-        # ── Step 9b: Validate overlay self-containment (post-inlining) ──
-        # Every jal in an overlay must target a function in the SAME overlay
-        # or a resident function. Must run AFTER helper inlining (step 9)
-        # so we validate the actual post-inlining code, not pre-inlining.
-        resident_labels = set()
-        for line in new_resident:
-            s = line.strip()
-            if s.endswith(':') and not s.startswith('.'):
-                resident_labels.add(s[:-1])
-        for idx, (oname, olines, ofsize) in enumerate(overlay_asm_blocks):
-            for oline in olines:
-                s = oline.strip()
-                if s.startswith('jal '):
-                    target = s.split()[1]
-                    if target.startswith('.'):
-                        continue  # local label
-                    if target in resident_labels:
-                        continue  # resident — OK
-                    # Check if target is defined within this overlay's own lines
-                    overlay_labels = {ol.strip()[:-1] for ol in olines
-                                     if ol.strip().endswith(':') and not ol.strip().startswith('.')}
-                    if target in overlay_labels:
-                        continue  # same overlay — OK
-                    # Target is not reachable — broken!
-                    raise Exception(
-                        f"overlay '{oname}' calls '{target}' which is not resident "
-                        f"or in this overlay. This would execute garbage after inlining. "
-                        f"Overlay contains: {list(overlay_labels)}"
-                    )
+            # Rebuild overlay_meta with updated sizes
+            overlay_meta = [(idx, name, fsize) for idx, (name, _, fsize) in enumerate(overlay_asm_blocks)]
+            # Track post-bundling max for diagnostics (may exceed overlay region due to wrapping)
+            max_bundled_size = max((fsize for _, _, fsize in overlay_asm_blocks), default=0)
 
-        # ── Step 10: Separate main from other resident code ──
-        # In the new architecture, _main body goes into page3_code (kernel image).
-        # Init-only helpers + init calls stay in section code (stage 1).
-        # We need to extract _main from new_resident.
-        main_lines = []
-        other_resident = []
-        in_main = False
-        for line in new_resident:
-            s = line.strip()
-            if s == '_main:':
-                in_main = True
-                main_lines.append(line)
-                continue
-            if in_main:
-                if s.endswith(':') and not s.startswith('.') and s.startswith('_'):
-                    in_main = False
-                    other_resident.append(line)
-                else:
+            # ── Step 9b: Validate overlay self-containment (post-inlining) ──
+            # Every jal in an overlay must target a function in the SAME overlay
+            # or a resident function. Must run AFTER helper inlining (step 9)
+            # so we validate the actual post-inlining code, not pre-inlining.
+            resident_labels = set()
+            for line in new_resident:
+                s = line.strip()
+                if s.endswith(':') and not s.startswith('.'):
+                    resident_labels.add(s[:-1])
+            for idx, (oname, olines, ofsize) in enumerate(overlay_asm_blocks):
+                for oline in olines:
+                    s = oline.strip()
+                    if s.startswith('jal '):
+                        target = s.split()[1]
+                        if target.startswith('.'):
+                            continue  # local label
+                        if target in resident_labels:
+                            continue  # resident — OK
+                        # Check if target is defined within this overlay's own lines
+                        overlay_labels = {ol.strip()[:-1] for ol in olines
+                                         if ol.strip().endswith(':') and not ol.strip().startswith('.')}
+                        if target in overlay_labels:
+                            continue  # same overlay — OK
+                        # Target is not reachable — broken!
+                        raise Exception(
+                            f"overlay '{oname}' calls '{target}' which is not resident "
+                            f"or in this overlay. This would execute garbage after inlining. "
+                            f"Overlay contains: {list(overlay_labels)}"
+                        )
+
+            # ── Step 10: Separate main from other resident code ──
+            # In the new architecture, _main body goes into page3_code (kernel image).
+            # Init-only helpers + init calls stay in section code (stage 1).
+            # We need to extract _main from new_resident.
+            main_lines = []
+            other_resident = []
+            in_main = False
+            for line in new_resident:
+                s = line.strip()
+                if s == '_main:':
+                    in_main = True
                     main_lines.append(line)
-            else:
-                other_resident.append(line)
-
-        # ── Step 10b: Extract init-only code from main ──
-        # Init-only code (VIA init, bus recovery, overlay calls for init functions)
-        # moves to stage 1. Runtime code stays in main (kernel).
-        INIT_MARKERS = {
-            'exw 0 0', 'exw 0 1', 'exw 0 3',
-            'push $a ;!keep', 'pop $a ;!keep',
-            'jal __lcd_init',
-            'push_b', 'pop_b', 'iderefp3',
-        }
-        INIT_PREFIXES = ('ddrb_imm', 'exrw 2', 'ldi $d,', 'ddra_imm', 'push_imm')
-        # Helpers that are safe to call during init (don't end init phase)
-        INIT_COMPAT_HELPERS = {'__i2c_stream', '__i2c_st', '__i2c_sp',
-                               '__lcd_init', '__tone_setup'}
-
-        # Pre-scan: find overlay_load call sequences
-        overlay_call_lines = set()
-        for mi, ml in enumerate(main_lines):
-            if ml.strip() == 'jal _overlay_load':
-                overlay_call_lines.add(mi)
-                for bi in range(max(0, mi - 8), mi):
-                    bs = main_lines[bi].strip()
-                    if (bs.startswith('ldi ') or bs.startswith('push_b') or
-                        bs == 'pop_b' or bs == 'iderefp3' or
-                        bs.startswith('mov ')):
-                        overlay_call_lines.add(bi)
-
-        init_extracted = []
-        runtime_main = []
-        in_init_phase = True
-        for mi, line in enumerate(main_lines):
-            s = line.strip()
-            if s == '_main:':
-                continue  # handled separately
-            if in_init_phase:
-                # Pure init: VIA init builtins, bus recovery — NO function calls
-                # Overlay calls (jal _overlay_load) must stay in runtime because
-                # overlays need resident kernel functions not yet loaded in stage 1.
-                is_init = (s in INIT_MARKERS or
-                           any(s.startswith(p) for p in INIT_PREFIXES) or
-                           s.startswith('clr $a') or s.startswith('dec') or
-                           s.startswith('.via_') or s.startswith('.br_') or
-                           s.startswith('.rcv') or s.startswith('mov $c,$a') or
-                           s == 'nop')
-                if s.startswith('jnz .') or s.startswith('j .via') or s.startswith('j .br') or s.startswith('j .rcv'):
-                    is_init = True
-                # ldi before init-compatible jal is also init
-                if s.startswith('ldi $a,') or s.startswith('ldi $b,'):
-                    for nli in range(mi + 1, min(mi + 4, len(main_lines))):
-                        ns = main_lines[nli].strip()
-                        if ns.startswith('jal '):
-                            t = ns.split()[1]
-                            if t in INIT_COMPAT_HELPERS or is_init_only(t):
-                                is_init = True
-                            break
-                if s.startswith('jal '):
-                    target = s.split()[1]
-                    if is_init_only(target) or target in INIT_COMPAT_HELPERS:
-                        is_init = True
+                    continue
+                if in_main:
+                    if s.endswith(':') and not s.startswith('.') and s.startswith('_'):
+                        in_main = False
+                        other_resident.append(line)
                     else:
-                        # Any non-init jal ends the init phase
-                        in_init_phase = False
-                if is_init:
-                    init_extracted.append(line)
+                        main_lines.append(line)
                 else:
-                    in_init_phase = False
+                    other_resident.append(line)
+
+            # ── Step 10b: Extract init-only code from main ──
+            # Init-only code (VIA init, bus recovery, overlay calls for init functions)
+            # moves to stage 1. Runtime code stays in main (kernel).
+            INIT_MARKERS = {
+                'exw 0 0', 'exw 0 1', 'exw 0 3',
+                'push $a ;!keep', 'pop $a ;!keep',
+                'jal __lcd_init',
+                'push_b', 'pop_b', 'iderefp3',
+            }
+            INIT_PREFIXES = ('ddrb_imm', 'exrw 2', 'ldi $d,', 'ddra_imm', 'push_imm')
+            # Helpers that are safe to call during init (don't end init phase)
+            INIT_COMPAT_HELPERS = {'__i2c_stream', '__i2c_st', '__i2c_sp',
+                                   '__lcd_init', '__tone_setup'}
+
+            # Pre-scan: find overlay_load call sequences
+            overlay_call_lines = set()
+            for mi, ml in enumerate(main_lines):
+                if ml.strip() == 'jal _overlay_load':
+                    overlay_call_lines.add(mi)
+                    for bi in range(max(0, mi - 8), mi):
+                        bs = main_lines[bi].strip()
+                        if (bs.startswith('ldi ') or bs.startswith('push_b') or
+                            bs == 'pop_b' or bs == 'iderefp3' or
+                            bs.startswith('mov ')):
+                            overlay_call_lines.add(bi)
+
+            init_extracted = []
+            runtime_main = []
+            in_init_phase = True
+            for mi, line in enumerate(main_lines):
+                s = line.strip()
+                if s == '_main:':
+                    continue  # handled separately
+                if in_init_phase:
+                    # Pure init: VIA init builtins, bus recovery — NO function calls
+                    # Overlay calls (jal _overlay_load) must stay in runtime because
+                    # overlays need resident kernel functions not yet loaded in stage 1.
+                    is_init = (s in INIT_MARKERS or
+                               any(s.startswith(p) for p in INIT_PREFIXES) or
+                               s.startswith('clr $a') or s.startswith('dec') or
+                               s.startswith('.via_') or s.startswith('.br_') or
+                               s.startswith('.rcv') or s.startswith('mov $c,$a') or
+                               s == 'nop')
+                    if s.startswith('jnz .') or s.startswith('j .via') or s.startswith('j .br') or s.startswith('j .rcv'):
+                        is_init = True
+                    # ldi before init-compatible jal is also init
+                    if s.startswith('ldi $a,') or s.startswith('ldi $b,'):
+                        for nli in range(mi + 1, min(mi + 4, len(main_lines))):
+                            ns = main_lines[nli].strip()
+                            if ns.startswith('jal '):
+                                t = ns.split()[1]
+                                if t in INIT_COMPAT_HELPERS or is_init_only(t):
+                                    is_init = True
+                                break
+                    if s.startswith('jal '):
+                        target = s.split()[1]
+                        if is_init_only(target) or target in INIT_COMPAT_HELPERS:
+                            is_init = True
+                        else:
+                            # Any non-init jal ends the init phase
+                            in_init_phase = False
+                    if is_init:
+                        init_extracted.append(line)
+                    else:
+                        in_init_phase = False
+                        runtime_main.append(line)
+                else:
                     runtime_main.append(line)
-            else:
-                runtime_main.append(line)
 
-        # Strip trailing unreachable ret
-        while runtime_main and runtime_main[-1].strip() == 'ret':
-            runtime_main.pop()
-        # Bus recovery at _main start: self-copy and overlay loading use
-        # derefp3/deref which toggle control signals (E0=SCL), corrupting
-        # the I2C bus. A STOP condition resets the bus to idle before any
-        # runtime I2C transactions.
-        bus_recovery = [
-            '\tddrb_imm 0x03',   # SCL low, SDA low
-            '\tddrb_imm 0x01',   # SCL high, SDA low
-            '\tddrb_imm 0x00',   # SCL high, SDA high (STOP/idle)
-        ]
-        main_lines = ['_main:'] + bus_recovery + runtime_main
-
-        # ── Step 11: Generate kernel assembly (overlay_load function) ──
-        # This is the runtime overlay loader that lives in the code page.
-        # It checks cache, reads manifest from page3, dispatches to the
-        # appropriate page's copy loop, restores args, and calls the overlay.
-
-        p3_used = self.page3_alloc
-        META_SIZE = 3   # [offset, size] + [page] = 2+1 bytes per overlay
-        meta_table_size = len(overlay_meta) * META_SIZE
-        note_table_size = 0  # notes now in page 1, not page 3
-
-        # Determine which SRAM pages are actually used by overlays
-        # (we'll compute this after placement, but need to generate copy loops
-        # only for pages that have data — done below after placement)
-
-        # Placeholder: generate full loader with all 3 page dispatch paths
-        # Will trim unused paths after placement
-
-        # The meta_base in page3 is after the kernel image. We'll compute
-        # actual positions after determining KERNEL_SIZE.
-
-        # For now, build the kernel + main as assembly lines, measure, then finalize.
-
-        # ── Step 12: Compute KERNEL_SIZE ──
-        # kernel = overlay_load function + main body
-        # We need to know KERNEL_SIZE to:
-        #   a) set OVERLAY_REGION = KERNEL_SIZE
-        #   b) know how much to copy in the self-copy routine
-        #   c) place manifest and overlay data in page 3
-
-        # First pass: generate kernel loader with placeholder OVERLAY_REGION,
-        # measure everything, then do a second pass with correct values.
-
-        # We'll iterate: generate with estimate, measure, regenerate if needed.
-        OVERLAY_REGION = 128  # initial estimate, will be refined
-
-        def generate_kernel_loader(overlay_region, meta_base, has_p1, has_p2, has_p3,
-                                     p3_count=0, p1_count=0, use_cache=False,
-                                     has_eeprom_tier=False, eeprom_addr_hi=0):
-            """Generate the overlay loader assembly.
-            Layout in page3 after kernel:
-              __manifest: [offset0, size0, offset1, size1, ...]  (2B each)
-              __pages:    [page0, page1, ...]                     (1B each)
-            Page values: 3=derefp3, 1=deref, 2=deref2
-            EEPROM-backed overlays are preloaded into freed page3 space during init,
-            so the runtime loader only needs SRAM copy paths.
-            """
-            num_pages = sum([has_p3, has_p1, has_p2])
-            loader = [
-                '; ── overlay loader (kernel) ──',
-                '_overlay_load:',
-                '\tmov $a,$c',                  # C = index
-                '\tsll',                        # A = index * 2
-                '\taddi __manifest,$a',          # A = __manifest + index*2
-                # Read manifest entry [offset, size]
-                '\tmov $a,$d',                  # D = manifest addr
-                '\tderefp3',                    # A = src_offset
-                '\tmov $a,$c',                  # C = src offset
-                '\tmov $d,$a',                  # A = manifest addr
-                '\tinc',                        # A = manifest addr + 1
-                '\tderefp3',                    # A = size
-                f'\taddi {overlay_region},$a',  # A = overlay_region + size = end
-                '\tmov $a,$d',                  # D = end addr
-                f'\tldi $b,{overlay_region}',   # B = dest start
+            # Strip trailing unreachable ret
+            while runtime_main and runtime_main[-1].strip() == 'ret':
+                runtime_main.pop()
+            # Bus recovery at _main start: self-copy and overlay loading use
+            # derefp3/deref which toggle control signals (E0=SCL), corrupting
+            # the I2C bus. A STOP condition resets the bus to idle before any
+            # runtime I2C transactions.
+            bus_recovery = [
+                '\tddrb_imm 0x03',   # SCL low, SDA low
+                '\tddrb_imm 0x01',   # SCL high, SDA low
+                '\tddrb_imm 0x00',   # SCL high, SDA high (STOP/idle)
             ]
+            main_lines = ['_main:'] + bus_recovery + runtime_main
 
-            # Page dispatch: read __pages[index] to determine which deref to use
-            if num_pages > 1:
-                # Restart with index preservation (need index for __pages lookup)
+            # ── Step 11: Generate kernel assembly (overlay_load function) ──
+            # This is the runtime overlay loader that lives in the code page.
+            # It checks cache, reads manifest from page3, dispatches to the
+            # appropriate page's copy loop, restores args, and calls the overlay.
+
+            p3_used = self.page3_alloc
+            META_SIZE = 3   # [offset, size] + [page] = 2+1 bytes per overlay
+            meta_table_size = len(overlay_meta) * META_SIZE
+            note_table_size = 0  # notes now in page 1, not page 3
+
+            # Determine which SRAM pages are actually used by overlays
+            # (we'll compute this after placement, but need to generate copy loops
+            # only for pages that have data — done below after placement)
+
+            # Placeholder: generate full loader with all 3 page dispatch paths
+            # Will trim unused paths after placement
+
+            # The meta_base in page3 is after the kernel image. We'll compute
+            # actual positions after determining KERNEL_SIZE.
+
+            # For now, build the kernel + main as assembly lines, measure, then finalize.
+
+            # ── Step 12: Compute KERNEL_SIZE ──
+            # kernel = overlay_load function + main body
+            # We need to know KERNEL_SIZE to:
+            #   a) set OVERLAY_REGION = KERNEL_SIZE
+            #   b) know how much to copy in the self-copy routine
+            #   c) place manifest and overlay data in page 3
+
+            # First pass: generate kernel loader with placeholder OVERLAY_REGION,
+            # measure everything, then do a second pass with correct values.
+
+            # We'll iterate: generate with estimate, measure, regenerate if needed.
+            OVERLAY_REGION = 128  # initial estimate, will be refined
+
+            def generate_kernel_loader(overlay_region, meta_base, has_p1, has_p2, has_p3,
+                                         p3_count=0, p1_count=0, use_cache=False,
+                                         has_eeprom_tier=False, eeprom_addr_hi=0):
+                """Generate the overlay loader assembly.
+                Layout in page3 after kernel:
+                  __manifest: [offset0, size0, offset1, size1, ...]  (2B each)
+                  __pages:    [page0, page1, ...]                     (1B each)
+                Page values: 3=derefp3, 1=deref, 2=deref2
+                EEPROM-backed overlays are preloaded into freed page3 space during init,
+                so the runtime loader only needs SRAM copy paths.
+                """
+                num_pages = sum([has_p3, has_p1, has_p2])
                 loader = [
                     '; ── overlay loader (kernel) ──',
                     '_overlay_load:',
-                    '\tpush $a',                    # save index for page lookup
                     '\tmov $a,$c',                  # C = index
                     '\tsll',                        # A = index * 2
                     '\taddi __manifest,$a',          # A = __manifest + index*2
+                    # Read manifest entry [offset, size]
                     '\tmov $a,$d',                  # D = manifest addr
                     '\tderefp3',                    # A = src_offset
                     '\tmov $a,$c',                  # C = src offset
                     '\tmov $d,$a',                  # A = manifest addr
-                    '\tinc',
+                    '\tinc',                        # A = manifest addr + 1
                     '\tderefp3',                    # A = size
-                    f'\taddi {overlay_region},$a',
+                    f'\taddi {overlay_region},$a',  # A = overlay_region + size = end
                     '\tmov $a,$d',                  # D = end addr
                     f'\tldi $b,{overlay_region}',   # B = dest start
-                    # Now read page: __pages[index]
-                    '\tpop $a',                     # A = index (saved at entry)
-                    '\taddi __pages,$a',             # A = __pages + index
-                    '\tderefp3',                    # A = page number (1,2,3)
-                    # Dispatch on page number
-                    '\tcmpi 2',                     # page >= 2?
                 ]
-                if has_p2 and has_p3:
-                    loader.append('\tjz .copy_p2')  # page == 2
-                    loader.append('\tjc .copy_p3')  # page == 3 (>2)
-                elif has_p2:
-                    loader.append('\tjz .copy_p2')  # page == 2
-                    # no page 3: fall through to page 1
-                elif has_p3:
-                    loader.append('\tjc .copy_p3')  # page >= 2 means page 3
-                # Fall through to page 1 (default)
-            else:
-                # Single page — no dispatch needed, no push/pop
-                pass
 
-            # Emit copy loops
-            copy_pages = []
-            if has_p1: copy_pages.append(('.copy_p1', 'deref'))
-            if has_p3: copy_pages.append(('.copy_p3', 'derefp3'))
-            if has_p2: copy_pages.append(('.copy_p2', 'deref2'))
+                # Page dispatch: read __pages[index] to determine which deref to use
+                if num_pages > 1:
+                    # Restart with index preservation (need index for __pages lookup)
+                    loader = [
+                        '; ── overlay loader (kernel) ──',
+                        '_overlay_load:',
+                        '\tpush $a',                    # save index for page lookup
+                        '\tmov $a,$c',                  # C = index
+                        '\tsll',                        # A = index * 2
+                        '\taddi __manifest,$a',          # A = __manifest + index*2
+                        '\tmov $a,$d',                  # D = manifest addr
+                        '\tderefp3',                    # A = src_offset
+                        '\tmov $a,$c',                  # C = src offset
+                        '\tmov $d,$a',                  # A = manifest addr
+                        '\tinc',
+                        '\tderefp3',                    # A = size
+                        f'\taddi {overlay_region},$a',
+                        '\tmov $a,$d',                  # D = end addr
+                        f'\tldi $b,{overlay_region}',   # B = dest start
+                        # Now read page: __pages[index]
+                        '\tpop $a',                     # A = index (saved at entry)
+                        '\taddi __pages,$a',             # A = __pages + index
+                        '\tderefp3',                    # A = page number (1,2,3)
+                        # Dispatch on page number
+                        '\tcmpi 2',                     # page >= 2?
+                    ]
+                    if has_p2 and has_p3:
+                        loader.append('\tjz .copy_p2')  # page == 2
+                        loader.append('\tjc .copy_p3')  # page == 3 (>2)
+                    elif has_p2:
+                        loader.append('\tjz .copy_p2')  # page == 2
+                        # no page 3: fall through to page 1
+                    elif has_p3:
+                        loader.append('\tjc .copy_p3')  # page >= 2 means page 3
+                    # Fall through to page 1 (default)
+                else:
+                    # Single page — no dispatch needed, no push/pop
+                    pass
 
-            for ci, (label, deref_op) in enumerate(copy_pages):
-                is_last = (ci == len(copy_pages) - 1)
-                loader.append(f'{label}:')
-                loader += [
-                    '\tmov $c,$a',          # A = src addr
-                    f'\t{deref_op}',        # A = page[src]
-                    '\tistc_inc',           # code[B] = A; B++
-                    '\tmov $c,$a',          # A = src (from C)
-                    '\tinc',
-                    '\tmov $a,$c',          # C = src + 1
-                    '\tmov $b,$a',          # A = B (dest)
-                    '\tcmp $d',             # dest == end?
-                    f'\tjnz {label}',
-                ]
-                if not is_last:
-                    loader.append('\tj .ov_done')
+                # Emit copy loops
+                copy_pages = []
+                if has_p1: copy_pages.append(('.copy_p1', 'deref'))
+                if has_p3: copy_pages.append(('.copy_p3', 'derefp3'))
+                if has_p2: copy_pages.append(('.copy_p2', 'deref2'))
 
-            # Bus recovery + return
-            loader.append('.ov_done:')
-            loader.append('\tddrb_imm 0x03')
-            loader.append('\tddrb_imm 0x01')
-            loader.append('\tddrb_imm 0x00')
-            loader.append('\tret')
-            return loader
+                for ci, (label, deref_op) in enumerate(copy_pages):
+                    is_last = (ci == len(copy_pages) - 1)
+                    loader.append(f'{label}:')
+                    loader += [
+                        '\tmov $c,$a',          # A = src addr
+                        f'\t{deref_op}',        # A = page[src]
+                        '\tistc_inc',           # code[B] = A; B++
+                        '\tmov $c,$a',          # A = src (from C)
+                        '\tinc',
+                        '\tmov $a,$c',          # C = src + 1
+                        '\tmov $b,$a',          # A = B (dest)
+                        '\tcmp $d',             # dest == end?
+                        f'\tjnz {label}',
+                    ]
+                    if not is_last:
+                        loader.append('\tj .ov_done')
 
-        # ── Step 13: Two-pass sizing ──
-        # Pass 1: optimistic estimate (page3 only → smallest loader)
-        # If overlays don't fit in page3, we'll re-estimate with more pages
-        loader_pass1 = generate_kernel_loader(OVERLAY_REGION, 0, False, False, True, 2, 0, use_cache=False,
-                                                has_eeprom_tier=False, eeprom_addr_hi=0)
-        loader_size = measure_lines(loader_pass1)
-        main_size = measure_lines(main_lines)
+                # Bus recovery + return
+                loader.append('.ov_done:')
+                loader.append('\tddrb_imm 0x03')
+                loader.append('\tddrb_imm 0x01')
+                loader.append('\tddrb_imm 0x00')
+                loader.append('\tret')
+                return loader
 
-        # Extract _NO_OVERLAY helpers AND resident user functions from other_resident.
-        # These live permanently in the code page kernel.
-        runtime_resident_helpers = []
-        runtime_helper_names = set()
-        for label_s in _NO_OVERLAY:
-            name = label_s.rstrip(':')
-            if name.startswith('__'):
-                runtime_helper_names.add(name)
-        # Also include non-overlayed functions (both user and helper) that were
-        # overlay-eligible but not selected for overlay — they stay resident.
-        overlay_func_names = {name for name, _, _, _ in overlay_funcs_flat}
-        init_only_func_names = {name for name, _, _, _ in init_only_funcs}
-        resident_funcs = set()
-        for name, _, _, _ in overlay_eligible:
-            if name not in overlay_func_names:
-                resident_funcs.add(name)
+            # ── Step 13: Two-pass sizing ──
+            # Pass 1: optimistic estimate (page3 only → smallest loader)
+            # If overlays don't fit in page3, we'll re-estimate with more pages
+            loader_pass1 = generate_kernel_loader(OVERLAY_REGION, 0, False, False, True, 2, 0, use_cache=False,
+                                                    has_eeprom_tier=False, eeprom_addr_hi=0)
+            loader_size = measure_lines(loader_pass1)
+            main_size = measure_lines(main_lines)
 
-        all_kernel_names = runtime_helper_names | resident_funcs | merged_into_resident
-        if all_kernel_names:
-            rh_lines = []
-            non_rh_lines = []
-            in_helper = False
-            for line in other_resident:
-                s = line.strip()
-                if s.endswith(':') and not s.startswith('.') and s.startswith('_'):
-                    hname = s[:-1]
-                    if hname in all_kernel_names:
-                        in_helper = True
+            # Extract _NO_OVERLAY helpers AND resident user functions from other_resident.
+            # These live permanently in the code page kernel.
+            runtime_resident_helpers = []
+            runtime_helper_names = set()
+            for label_s in _NO_OVERLAY:
+                name = label_s.rstrip(':')
+                if name.startswith('__'):
+                    runtime_helper_names.add(name)
+            # Also include non-overlayed functions (both user and helper) that were
+            # overlay-eligible but not selected for overlay — they stay resident.
+            overlay_func_names = {name for name, _, _, _ in overlay_funcs_flat}
+            init_only_func_names = {name for name, _, _, _ in init_only_funcs}
+            resident_funcs = set()
+            for name, _, _, _ in overlay_eligible:
+                if name not in overlay_func_names:
+                    resident_funcs.add(name)
+
+            all_kernel_names = runtime_helper_names | resident_funcs | merged_into_resident
+            if all_kernel_names:
+                rh_lines = []
+                non_rh_lines = []
+                in_helper = False
+                for line in other_resident:
+                    s = line.strip()
+                    if s.endswith(':') and not s.startswith('.') and s.startswith('_'):
+                        hname = s[:-1]
+                        if hname in all_kernel_names:
+                            in_helper = True
+                            rh_lines.append(line)
+                            continue
+                        else:
+                            in_helper = False
+                    if in_helper:
                         rh_lines.append(line)
-                        continue
                     else:
-                        in_helper = False
-                if in_helper:
-                    rh_lines.append(line)
-                else:
-                    non_rh_lines.append(line)
-            runtime_resident_helpers = rh_lines
-            other_resident = non_rh_lines
+                        non_rh_lines.append(line)
+                runtime_resident_helpers = rh_lines
+                other_resident = non_rh_lines
 
-        # Split shared helpers (needed by both init and overlays) from
-        # kernel-only helpers. Shared helpers go in the code page tail
-        # (above KERNEL_SIZE) to survive self-copy without duplication.
-        shared_helper_names = set()
-        # Helpers called from init-only code AND from overlays/kernel
-        init_only_callers = {'__lcd_init', '__eeprom_rd', '__tone_setup'}
-        all_init_jals = set()
-        for line in self.code:
-            s = line.strip()
-            # Collect jal targets from init-compatible code
-            if s.startswith('jal __') and any(s.endswith(n) or n in s for n in []):
-                pass  # complex detection not needed — use a simpler heuristic
-        # With the bundling system, helpers stay in the kernel (resident)
-        # and init code uses renamed _init copies. No separate shared zone needed.
-        # (shared_helper_names remains empty)
+            # Split shared helpers (needed by both init and overlays) from
+            # kernel-only helpers. Shared helpers go in the code page tail
+            # (above KERNEL_SIZE) to survive self-copy without duplication.
+            shared_helper_names = set()
+            # Helpers called from init-only code AND from overlays/kernel
+            init_only_callers = {'__lcd_init', '__eeprom_rd', '__tone_setup'}
+            all_init_jals = set()
+            for line in self.code:
+                s = line.strip()
+                # Collect jal targets from init-compatible code
+                if s.startswith('jal __') and any(s.endswith(n) or n in s for n in []):
+                    pass  # complex detection not needed — use a simpler heuristic
+            # With the bundling system, helpers stay in the kernel (resident)
+            # and init code uses renamed _init copies. No separate shared zone needed.
+            # (shared_helper_names remains empty)
 
-        shared_helpers_ov = []
-        kernel_only_helpers = []
-        hi = 0
-        while hi < len(runtime_resident_helpers):
-            s = runtime_resident_helpers[hi].strip()
-            if s.endswith(':') and s.startswith('__') and not s.startswith('.'):
-                fname = s[:-1]
-                start = hi
-                hi += 1
-                while hi < len(runtime_resident_helpers):
-                    ns = runtime_resident_helpers[hi].strip()
-                    if ns.endswith(':') and not ns.startswith('.') and ns.startswith('_'):
-                        break
+            shared_helpers_ov = []
+            kernel_only_helpers = []
+            hi = 0
+            while hi < len(runtime_resident_helpers):
+                s = runtime_resident_helpers[hi].strip()
+                if s.endswith(':') and s.startswith('__') and not s.startswith('.'):
+                    fname = s[:-1]
+                    start = hi
                     hi += 1
-                if fname in shared_helper_names:
-                    shared_helpers_ov.extend(runtime_resident_helpers[start:hi])
+                    while hi < len(runtime_resident_helpers):
+                        ns = runtime_resident_helpers[hi].strip()
+                        if ns.endswith(':') and not ns.startswith('.') and ns.startswith('_'):
+                            break
+                        hi += 1
+                    if fname in shared_helper_names:
+                        shared_helpers_ov.extend(runtime_resident_helpers[start:hi])
+                    else:
+                        kernel_only_helpers.extend(runtime_resident_helpers[start:hi])
                 else:
-                    kernel_only_helpers.extend(runtime_resident_helpers[start:hi])
-            else:
-                kernel_only_helpers.append(runtime_resident_helpers[hi])
-                hi += 1
-        runtime_resident_helpers = kernel_only_helpers
-        # Pre-peephole: apply peephole to code components before measuring.
-        # This ensures measure_lines matches the assembler's actual byte count
-        # (the peephole optimizes patterns like ldi+push → push_imm, saving bytes).
-        runtime_resident_helpers = peephole(runtime_resident_helpers)
-        shared_helpers_ov = peephole(shared_helpers_ov)
-        main_lines = peephole(main_lines)
-        shared_helper_size = measure_lines(shared_helpers_ov)
+                    kernel_only_helpers.append(runtime_resident_helpers[hi])
+                    hi += 1
+            runtime_resident_helpers = kernel_only_helpers
+            # Pre-peephole: apply peephole to code components before measuring.
+            # This ensures measure_lines matches the assembler's actual byte count
+            # (the peephole optimizes patterns like ldi+push → push_imm, saving bytes).
+            runtime_resident_helpers = peephole(runtime_resident_helpers)
+            shared_helpers_ov = peephole(shared_helpers_ov)
+            main_lines = peephole(main_lines)
+            shared_helper_size = measure_lines(shared_helpers_ov)
 
-        runtime_helper_size = measure_lines(runtime_resident_helpers)
-        main_size = measure_lines(main_lines)
-        KERNEL_SIZE_est = loader_size + main_size + runtime_helper_size
-        OVERLAY_REGION_est = KERNEL_SIZE_est
+            runtime_helper_size = measure_lines(runtime_resident_helpers)
+            main_size = measure_lines(main_lines)
+            KERNEL_SIZE_est = loader_size + main_size + runtime_helper_size
+            OVERLAY_REGION_est = KERNEL_SIZE_est
 
-        # ── Step 14: Place overlay data in SRAM pages ──
-        # Page 3: after kernel image + manifest
-        # Page 1: from data_alloc to 255
-        # Page 2: from 0 to 195 (stack uses 196-255)
+            # ── Step 14: Place overlay data in SRAM pages ──
+            # Page 3: after kernel image + manifest
+            # Page 1: from data_alloc to 255
+            # Page 2: from 0 to 195 (stack uses 196-255)
 
-        # Kernel image occupies page3[0..KERNEL_SIZE-1] via page3_code
-        # Manifest follows at page3[KERNEL_SIZE..KERNEL_SIZE+meta_table_size-1]
-        # Overlay data follows manifest
+            # Kernel image occupies page3[0..KERNEL_SIZE-1] via page3_code
+            # Manifest follows at page3[KERNEL_SIZE..KERNEL_SIZE+meta_table_size-1]
+            # Overlay data follows manifest
 
-        # But wait — the kernel image is stored in page3 temporarily (for self-copy).
-        # After self-copy, that page3 space is freed. However, the manifest and overlay
-        # data need to persist at runtime. So:
-        #   page3[0..KERNEL_SIZE-1] = kernel image (freed after init)
-        #   page3[p3_used..p3_used+meta_table_size-1] = manifest (persists)
-        #   page3 overlay data starts at p3_used + meta_table_size
-        #
-        # Actually, the kernel image goes via section page3_code with org 0,
-        # which uses page3 addresses 0..KERNEL_SIZE-1 in the page3 buffer.
-        # The manifest and overlay data must not collide with the kernel image.
-        #
-        # Key insight: page3_alloc (p3_used) already accounts for app globals etc.
-        # The kernel image also uses page3 space (addresses 0..KERNEL_SIZE-1 in
-        # the page3_code section). But page3_code addresses are CODE page addresses,
-        # not page3 addresses! The assembler maps page3_code PC to code page addresses
-        # but stores bytes in the page3 buffer at the same offset.
-        #
-        # So the kernel image occupies page3 buffer [0..KERNEL_SIZE-1].
-        # App globals start at page3[0] too — collision!
-        #
-        # Resolution: the kernel image uses page3_code which writes to page3 buffer
-        # at addresses matching code PC. Since kernel starts at org 0, it uses
-        # page3 buffer [0..KERNEL_SIZE-1]. App globals also start at page3[0].
-        # This IS a collision.
-        #
-        # Fix: bump page3_alloc to max(page3_alloc, KERNEL_SIZE) so manifest
-        # and overlay data start after the kernel image.
-        # Then the manifest meta_base = max(p3_used, KERNEL_SIZE).
+            # But wait — the kernel image is stored in page3 temporarily (for self-copy).
+            # After self-copy, that page3 space is freed. However, the manifest and overlay
+            # data need to persist at runtime. So:
+            #   page3[0..KERNEL_SIZE-1] = kernel image (freed after init)
+            #   page3[p3_used..p3_used+meta_table_size-1] = manifest (persists)
+            #   page3 overlay data starts at p3_used + meta_table_size
+            #
+            # Actually, the kernel image goes via section page3_code with org 0,
+            # which uses page3 addresses 0..KERNEL_SIZE-1 in the page3 buffer.
+            # The manifest and overlay data must not collide with the kernel image.
+            #
+            # Key insight: page3_alloc (p3_used) already accounts for app globals etc.
+            # The kernel image also uses page3 space (addresses 0..KERNEL_SIZE-1 in
+            # the page3_code section). But page3_code addresses are CODE page addresses,
+            # not page3 addresses! The assembler maps page3_code PC to code page addresses
+            # but stores bytes in the page3 buffer at the same offset.
+            #
+            # So the kernel image occupies page3 buffer [0..KERNEL_SIZE-1].
+            # App globals start at page3[0] too — collision!
+            #
+            # Resolution: the kernel image uses page3_code which writes to page3 buffer
+            # at addresses matching code PC. Since kernel starts at org 0, it uses
+            # page3 buffer [0..KERNEL_SIZE-1]. App globals also start at page3[0].
+            # This IS a collision.
+            #
+            # Fix: bump page3_alloc to max(page3_alloc, KERNEL_SIZE) so manifest
+            # and overlay data start after the kernel image.
+            # Then the manifest meta_base = max(p3_used, KERNEL_SIZE).
 
-        # Shared helpers go into page3 at [KERNEL_SIZE..OVERLAY_REGION-1].
-        # This reserves page3 space for them — overlay data must start after.
-        # Conservative kernel estimate: the knapsack may keep helpers resident
-        # (adding up to ~100B), and multi-page dispatch adds ~20B to the loader.
-        # Use a generous estimate to avoid page3 overflow after sizing converges.
-        kernel_max_est = KERNEL_SIZE_est + shared_helper_size + 35  # headroom for multi-page dispatch
-        meta_base = max(p3_used, kernel_max_est)
-        p3_code_offset = meta_base + meta_table_size
-        p3_capacity = 256 - p3_code_offset - note_table_size
-        # When shared helpers occupy page3, force ALL overlays to page1.
-        # Mixing page3+page1 overlays requires multi-page dispatch in the loader
-        # (adds ~19B), which shrinks the overlay region and often doesn't fit.
-        if shared_helper_size > 0:
-            p3_capacity = 0
+            # Shared helpers go into page3 at [KERNEL_SIZE..OVERLAY_REGION-1].
+            # This reserves page3 space for them — overlay data must start after.
+            # Conservative kernel estimate: the knapsack may keep helpers resident
+            # (adding up to ~100B), and multi-page dispatch adds ~20B to the loader.
+            # Use a generous estimate to avoid page3 overflow after sizing converges.
+            kernel_max_est = KERNEL_SIZE_est + shared_helper_size + 35  # headroom for multi-page dispatch
+            meta_base = max(p3_used, kernel_max_est)
+            p3_code_offset = meta_base + meta_table_size
+            p3_capacity = 256 - p3_code_offset - note_table_size
+            # When shared helpers occupy page3, force ALL overlays to page1.
+            # Mixing page3+page1 overlays requires multi-page dispatch in the loader
+            # (adds ~19B), which shrinks the overlay region and often doesn't fit.
+            if shared_helper_size > 0:
+                p3_capacity = 0
 
 
-        p1_code_offset = self.data_alloc
-        p1_capacity = 256 - self.data_alloc
-        p2_code_offset = 0
-        # Page 2 needs SP init (3B) which increases init code. Estimate if
-        # init code can afford it (must stay ≤ 250B including selfcopy).
-        # If the program has LCD init (heavy init helpers), init is ~240B
-        # without SP init. Adding 3B pushes to 243B + selfcopy 14B = 257B > 250.
-        # In that case, disable page 2 to avoid the SP init overhead.
-        has_heavy_init = hasattr(self, '_lcd_helpers') and '__lcd_init' in getattr(self, '_lcd_helpers', set())
-        p2_capacity = 196 if not has_heavy_init else 0
+            p1_code_offset = self.data_alloc
+            p1_capacity = 256 - self.data_alloc
+            p2_code_offset = 0
+            # Page 2 needs SP init (3B) which increases init code. Estimate if
+            # init code can afford it (must stay ≤ 250B including selfcopy).
+            # If the program has LCD init (heavy init helpers), init is ~240B
+            # without SP init. Adding 3B pushes to 243B + selfcopy 14B = 257B > 250.
+            # In that case, disable page 2 to avoid the SP init overhead.
+            has_heavy_init = hasattr(self, '_lcd_helpers') and '__lcd_init' in getattr(self, '_lcd_helpers', set())
+            p2_capacity = 196 if not has_heavy_init else 0
 
-        p3_overlays = []
-        p1_overlays = []
-        p2_overlays = []
-        ee_overlays = []  # EEPROM overflow tier
+            p3_overlays = []
+            p1_overlays = []
+            p2_overlays = []
+            ee_overlays = []  # EEPROM overflow tier
 
-        # EEPROM overlay tier: align base to 256B boundary so addr_hi is constant
-        # and manifest offset = addr_lo directly.
-        ee_overlay_base = (self.eeprom_alloc + 0xFF) & ~0xFF  # align up to 256B
-        if ee_overlay_base == 0:
-            ee_overlay_base = 0x0100  # minimum: page 1
-        ee_overlay_hi = (ee_overlay_base >> 8) & 0xFF
-        ee_code_offset = 0  # offset from ee_overlay_base (= addr_lo)
-        ee_capacity = 256   # 8-bit offset range
+            # EEPROM overlay tier: align base to 256B boundary so addr_hi is constant
+            # and manifest offset = addr_lo directly.
+            ee_overlay_base = (self.eeprom_alloc + 0xFF) & ~0xFF  # align up to 256B
+            if ee_overlay_base == 0:
+                ee_overlay_base = 0x0100  # minimum: page 1
+            ee_overlay_hi = (ee_overlay_base >> 8) & 0xFF
+            ee_code_offset = 0  # offset from ee_overlay_base (= addr_lo)
+            ee_capacity = 256   # 8-bit offset range
 
-        # Page-concentrating placement: fill one SRAM page before opening the
-        # next. Each additional page adds a dispatch arm (~17B) to the overlay
-        # loader and shrinks the overlay region, so concentrating on as few
-        # pages as possible is a direct win for nearly every program.
-        # Priority order: p1 (data, largest & no SP init cost) → p2 (needs SP
-        # init, only 196B) → p3 (shared with kernel image, smallest).
-        def place_overlay(idx, name, asm_lines, fsize):
-            nonlocal p3_code_offset, p3_capacity, p1_code_offset, p1_capacity, p2_code_offset, p2_capacity
-            nonlocal ee_code_offset, ee_capacity
-            if fsize <= p1_capacity:
-                p1_overlays.append((idx, name, asm_lines, fsize, p1_code_offset))
-                p1_code_offset += fsize; p1_capacity -= fsize
-                return True
-            if fsize <= p2_capacity:
-                p2_overlays.append((idx, name, asm_lines, fsize, p2_code_offset))
-                p2_code_offset += fsize; p2_capacity -= fsize
-                return True
-            if fsize <= p3_capacity:
-                p3_overlays.append((idx, name, asm_lines, fsize, p3_code_offset))
-                p3_code_offset += fsize; p3_capacity -= fsize
-                return True
-            # SRAM full — try EEPROM overflow tier
-            if fsize <= ee_capacity:
-                ee_overlays.append((idx, name, asm_lines, fsize, ee_code_offset))
-                ee_code_offset += fsize; ee_capacity -= fsize
-                return True
-            return False
-
-        _placement_retries = 0
-        _retry_bundling = False
-        # Sort by size descending — largest overlays first for better bin-packing
-        sorted_overlays = sorted(enumerate(overlay_asm_blocks),
-                                  key=lambda x: x[1][2], reverse=True)
-        for idx, (name, asm_lines, fsize) in sorted_overlays:
-            placed = place_overlay(idx, name, asm_lines, fsize)
-            if not placed:
-                caps = [(p3_capacity, 3), (p1_capacity, 1), (p2_capacity, 2)]
-                placed = False
-                for cap, page in caps:
-                    if fsize <= cap:
-                        if page == 3:
-                            p3_overlays.append((idx, name, asm_lines, fsize, p3_code_offset))
-                            p3_code_offset += fsize
-                            p3_capacity -= fsize
-                        elif page == 1:
-                            p1_overlays.append((idx, name, asm_lines, fsize, p1_code_offset))
-                            p1_code_offset += fsize
-                            p1_capacity -= fsize
-                        elif page == 2:
-                            p2_overlays.append((idx, name, asm_lines, fsize, p2_code_offset))
-                            p2_code_offset += fsize
-                            p2_capacity -= fsize
-                        placed = True
-                        break
-                # Try EEPROM overflow tier
-                if not placed and fsize <= ee_capacity:
+            # Page-concentrating placement: fill one SRAM page before opening the
+            # next. Each additional page adds a dispatch arm (~17B) to the overlay
+            # loader and shrinks the overlay region, so concentrating on as few
+            # pages as possible is a direct win for nearly every program.
+            # Priority order: p1 (data, largest & no SP init cost) → p2 (needs SP
+            # init, only 196B) → p3 (shared with kernel image, smallest).
+            def place_overlay(idx, name, asm_lines, fsize):
+                nonlocal p3_code_offset, p3_capacity, p1_code_offset, p1_capacity, p2_code_offset, p2_capacity
+                nonlocal ee_code_offset, ee_capacity
+                if fsize <= p1_capacity:
+                    p1_overlays.append((idx, name, asm_lines, fsize, p1_code_offset))
+                    p1_code_offset += fsize; p1_capacity -= fsize
+                    return True
+                if fsize <= p2_capacity:
+                    p2_overlays.append((idx, name, asm_lines, fsize, p2_code_offset))
+                    p2_code_offset += fsize; p2_capacity -= fsize
+                    return True
+                if fsize <= p3_capacity:
+                    p3_overlays.append((idx, name, asm_lines, fsize, p3_code_offset))
+                    p3_code_offset += fsize; p3_capacity -= fsize
+                    return True
+                # SRAM full — try EEPROM overflow tier
+                if fsize <= ee_capacity:
                     ee_overlays.append((idx, name, asm_lines, fsize, ee_code_offset))
-                    ee_code_offset += fsize
-                    ee_capacity -= fsize
-                    placed = True
+                    ee_code_offset += fsize; ee_capacity -= fsize
+                    return True
+                return False
+
+            _placement_retries = 0
+            # Sort by size descending — largest overlays first for better bin-packing
+            sorted_overlays = sorted(enumerate(overlay_asm_blocks),
+                                      key=lambda x: x[1][2], reverse=True)
+            for idx, (name, asm_lines, fsize) in sorted_overlays:
+                placed = place_overlay(idx, name, asm_lines, fsize)
                 if not placed:
-                    # Placement failed. First, try to find the largest bundled
-                    # helper IN THIS overlay and force it resident to shrink it.
-                    biggest_helper = None
-                    biggest_size = 0
-                    for oline in asm_lines:
-                        os = oline.strip()
-                        if os.endswith(':') and os.startswith('__') and not os.startswith('.'):
-                            hname_check = os[:-1]
-                            # Strip overlay suffix to get base name
-                            for suffix in [f'_ov{i}' for i in range(len(overlay_asm_blocks))]:
-                                if hname_check.endswith(suffix):
-                                    hname_check = hname_check[:-len(suffix)]
-                                    break
-                            if hname_check in bundleable_helpers:
-                                hsize_check = measure_lines(helper_bodies.get(hname_check, (0, 0, []))[2])
-                                if hsize_check > biggest_size:
-                                    biggest_size = hsize_check
-                                    biggest_helper = hname_check
-                    # If the failing overlay has no bundled helpers of its own,
-                    # promote the largest globally-bundled helper: this shrinks
-                    # OTHER overlays and frees up SRAM/EEPROM space.
-                    if biggest_helper is None and bundleable_helpers:
-                        for hname_g in bundleable_helpers:
-                            hsize_g = measure_lines(helper_bodies.get(hname_g, (0, 0, []))[2])
-                            if hsize_g > biggest_size:
-                                biggest_size = hsize_g
-                                biggest_helper = hname_g
-                    if biggest_helper and _placement_retries < 5:
-                        import sys
-                        print(f"  Placement retry: making {biggest_helper} ({biggest_size}B) resident to fit {name} ({fsize}B)",
-                              file=sys.stderr)
-                        _NO_OVERLAY.add(f'{biggest_helper}:')
-                        bundleable_helpers = [h for h in bundleable_helpers if h != biggest_helper]
-                        _placement_retries += 1
-                        _retry_bundling = True
-                        break  # break out of placement loop to retry
-                    raise Exception(
-                        f"overlay '{name}' ({fsize}B) exceeds ALL storage. "
-                        f"p3={p3_capacity}B, p1={p1_capacity}B, p2={p2_capacity}B, "
-                        f"eeprom={ee_capacity}B free"
-                    )
+                    caps = [(p3_capacity, 3), (p1_capacity, 1), (p2_capacity, 2)]
+                    placed = False
+                    for cap, page in caps:
+                        if fsize <= cap:
+                            if page == 3:
+                                p3_overlays.append((idx, name, asm_lines, fsize, p3_code_offset))
+                                p3_code_offset += fsize
+                                p3_capacity -= fsize
+                            elif page == 1:
+                                p1_overlays.append((idx, name, asm_lines, fsize, p1_code_offset))
+                                p1_code_offset += fsize
+                                p1_capacity -= fsize
+                            elif page == 2:
+                                p2_overlays.append((idx, name, asm_lines, fsize, p2_code_offset))
+                                p2_code_offset += fsize
+                                p2_capacity -= fsize
+                            placed = True
+                            break
+                    # Try EEPROM overflow tier
+                    if not placed and fsize <= ee_capacity:
+                        ee_overlays.append((idx, name, asm_lines, fsize, ee_code_offset))
+                        ee_code_offset += fsize
+                        ee_capacity -= fsize
+                        placed = True
+                    if not placed:
+                        # Placement failed. First, try to find the largest bundled
+                        # helper IN THIS overlay and force it resident to shrink it.
+                        biggest_helper = None
+                        biggest_size = 0
+                        for oline in asm_lines:
+                            os = oline.strip()
+                            if os.endswith(':') and os.startswith('__') and not os.startswith('.'):
+                                hname_check = os[:-1]
+                                # Strip overlay suffix to get base name
+                                for suffix in [f'_ov{i}' for i in range(len(overlay_asm_blocks))]:
+                                    if hname_check.endswith(suffix):
+                                        hname_check = hname_check[:-len(suffix)]
+                                        break
+                                if hname_check in bundleable_helpers:
+                                    hsize_check = measure_lines(helper_bodies.get(hname_check, (0, 0, []))[2])
+                                    if hsize_check > biggest_size:
+                                        biggest_size = hsize_check
+                                        biggest_helper = hname_check
+                        # If the failing overlay has no bundled helpers of its own,
+                        # promote the largest globally-bundled helper: this shrinks
+                        # OTHER overlays and frees up SRAM/EEPROM space.
+                        if biggest_helper is None and bundleable_helpers:
+                            for hname_g in bundleable_helpers:
+                                hsize_g = measure_lines(helper_bodies.get(hname_g, (0, 0, []))[2])
+                                if hsize_g > biggest_size:
+                                    biggest_size = hsize_g
+                                    biggest_helper = hname_g
+                        if biggest_helper and _placement_retries < 5:
+                            import sys
+                            print(f"  Placement retry: making {biggest_helper} ({biggest_size}B) resident to fit {name} ({fsize}B)",
+                                  file=sys.stderr)
+                            _NO_OVERLAY.add(f'{biggest_helper}:')
+                            bundleable_helpers = [h for h in bundleable_helpers if h != biggest_helper]
+                            _placement_retries += 1
+                            _retry_bundling = True
+                            break  # break out of placement loop to retry
+                        raise Exception(
+                            f"overlay '{name}' ({fsize}B) exceeds ALL storage. "
+                            f"p3={p3_capacity}B, p1={p1_capacity}B, p2={p2_capacity}B, "
+                            f"eeprom={ee_capacity}B free"
+                        )
+
+            # Post-placement wrap safety: an overlay that exceeds the overlay
+            # region WRAPS into kernel space when copied — safe only if it is
+            # the LAST overlay loaded (no subsequent overlay load to corrupt).
+            # Any wrapping overlay that is not called last is unsafe.
+            # Recompute kernel size with ACTUAL page dispatch flags so the
+            # available overlay region matches what step 15 will finalize.
+            _has_p1_chk = len(p1_overlays) > 0
+            _has_p2_chk = len(p2_overlays) > 0
+            _has_p3_chk = (len(p3_overlays) > 0) or (len(ee_overlays) > 0)
+            _loader_chk = generate_kernel_loader(
+                OVERLAY_REGION_est, 0,
+                _has_p1_chk, _has_p2_chk, _has_p3_chk,
+                len(p3_overlays) + len(ee_overlays), len(p1_overlays),
+                use_cache=False,
+                has_eeprom_tier=(len(ee_overlays) > 0),
+                eeprom_addr_hi=ee_overlay_hi)
+            _kernel_chk = measure_lines(_loader_chk) + main_size + runtime_helper_size
+            _ov_avail = 250 - _kernel_chk
+            _wrapping_indices = {i for i, (_, _, sz) in enumerate(overlay_asm_blocks)
+                                 if sz > _ov_avail}
+            # Determine call order from main_lines: ldi $a,N → jal _overlay_load
+            _call_order = []
+            for _mli in range(len(main_lines) - 1):
+                _s = main_lines[_mli].strip()
+                _ns = main_lines[_mli + 1].strip()
+                if _s.startswith('ldi $a,') and _ns == 'jal _overlay_load':
+                    try:
+                        _call_order.append(int(_s.split(',')[1]))
+                    except ValueError:
+                        pass
+            _unsafe_wrap = False
+            if _wrapping_indices and _call_order:
+                _last_call = _call_order[-1]
+                for _wi in _wrapping_indices:
+                    # A wrap is safe only if this overlay is called exactly
+                    # once (the last call). Multiple calls = later load
+                    # re-copies and the wrap may clobber in between.
+                    if _wi != _last_call or _call_order.count(_wi) > 1:
+                        _unsafe_wrap = True
+                        break
+            elif len(_wrapping_indices) > 1:
+                _unsafe_wrap = True
+            if _unsafe_wrap and _placement_retries < 5 and bundleable_helpers:
+                # Find the helper that, if promoted, best reduces the number
+                # of UNSAFELY wrapping overlays. Reject promotions that would
+                # make the overlay region too small to hold any current overlay
+                # (net loss — promoting eats region faster than it shrinks ovs).
+                best_helper = None
+                best_unsafe_count = len(_wrapping_indices)
+                # Reject promotions that would grow the kernel past a safe
+                # cap — once kernel ≥210B we've lost too much overlay region
+                # for the remaining user functions to fit.
+                _kernel_cap = 210
+                for h in bundleable_helpers:
+                    hsize_h = measure_lines(helper_bodies.get(h, (0, 0, []))[2]) + 1
+                    proj_region = _ov_avail - hsize_h
+                    if proj_region < 16:
+                        continue
+                    if _kernel_chk + hsize_h > _kernel_cap:
+                        continue
+                    proj_wraps = 0
+                    for oi, (_, olines, _s) in enumerate(overlay_asm_blocks):
+                        has_h = any(ol.strip().startswith(f'{h}_ov') and
+                                    ol.strip().endswith(':') for ol in olines)
+                        new_sz = _s - (hsize_h if has_h else 0)
+                        if new_sz > proj_region:
+                            proj_wraps += 1
+                    if proj_wraps < best_unsafe_count:
+                        best_unsafe_count = proj_wraps
+                        best_helper = h
+                if best_helper:
+                    hsize_h = measure_lines(helper_bodies.get(best_helper, (0, 0, []))[2])
+                    import sys
+                    print(f"  Wrap-safety retry: {len(_wrapping_indices)} overlays wrap unsafely; "
+                          f"promoting {best_helper} ({hsize_h}B) resident "
+                          f"→ projected {best_unsafe_count} wraps",
+                          file=sys.stderr)
+                    _NO_OVERLAY.add(f'{best_helper}:')
+                    bundleable_helpers = [h for h in bundleable_helpers if h != best_helper]
+                    _placement_retries += 1
+                    _retry_bundling = True
+                    continue  # continue outer while — rebundle & re-place
 
         has_p1 = len(p1_overlays) > 0
         has_p2 = len(p2_overlays) > 0
