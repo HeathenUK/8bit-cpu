@@ -1302,13 +1302,13 @@ class MK1CodeGen:
         if not helpers:
             return
 
-        # Always emit __i2c_sb (send byte, B=byte, C=counter) — shared by all helpers
+        # Always emit __i2c_sb (send byte, B=byte, D=counter) — shared by all helpers
         # Optimized: uses ddrb_imm (bus-safe, preserves A), merged tst+shift,
-        # zero NOPs, no push/pop in ACK clock.
+        # zero NOPs, no push/pop in ACK clock. Uses D as counter (was C) to
+        # save 1B on entry (no need to route 8 via A).
         self.emit('__i2c_sb:')
         self.emit('\tmov $a,$b')
-        self.emit('\tldi $a,8')
-        self.emit('\tmov $a,$c')
+        self.emit('\tldi $d,8')          # D = counter (direct — saves 1B)
         lbl_s = self.label('isb')
         lbl_h = self.label('isbh')
         lbl_n = self.label('isbn')
@@ -1328,9 +1328,9 @@ class MK1CodeGen:
         self.emit('\tmov $b,$a')
         self.emit('\tsll')
         self.emit('\tmov $a,$b')
-        self.emit('\tmov $c,$a')
+        self.emit('\tmov $d,$a')
         self.emit('\tdec')
-        self.emit('\tmov $a,$c')
+        self.emit('\tmov $a,$d')
         self.emit(f'\tjnz {lbl_s}')
         # ACK clock: no NOPs needed (ddrb_imm has built-in settling),
         # no push/pop needed (ddrb_imm preserves A)
