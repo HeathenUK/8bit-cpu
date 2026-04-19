@@ -5528,6 +5528,12 @@ class MK1CodeGen:
 
         elif kind == 'call':
             name, args = expr[1], expr[2]
+            # Invalidate the lcd_init-just-emitted peephole marker whenever
+            # a call other than lcd_init / lcd_cmd / lcd_char runs. The marker
+            # only covers the literal "lcd_init(); lcd_cmd(0x01);" sequence
+            # with no intervening calls.
+            if name not in ('lcd_init', 'lcd_cmd', 'lcd_char'):
+                self._lcd_init_just_emitted = False
             # User-defined function with a name matching a builtin takes
             # precedence over the builtin. Dispatch directly to the user's
             # code without consulting the builtin table.
@@ -5709,6 +5715,12 @@ class MK1CodeGen:
                 self._lcd_helpers.add('__i2c_sb')
                 # __i2c_rb NOT needed: LCD init data pre-populated in data page
                 self.emit('\tjal __lcd_init')
+                # The HD44780 init data sequence we emit includes Clear Display
+                # (0x01) as its penultimate command, so a program's
+                # `lcd_cmd(0x01)` / `lcd_clear()` immediately after `lcd_init()`
+                # is semantically redundant. Mark the flag so the lcd_cmd
+                # builtin can elide such a call when it sees this flag set.
+                self._lcd_init_just_emitted = True
                 return
 
             if name == 'lcd_clear':
@@ -6207,6 +6219,17 @@ class MK1CodeGen:
                 is_char = (name == 'lcd_char')
                 flags = 0x09 if is_char else 0x00  # RS+BL or nothing
                 flags_en = (flags | 0x04) if is_char else 0x04  # +EN
+                # Peephole: lcd_cmd(0x01)/(0x02) immediately after lcd_init() is
+                # redundant — the init data sequence already issues Clear Display.
+                # Skip the call entirely; the required delay already happened
+                # during lcd_init's DELAY sentinel processing.
+                if args and not is_char and getattr(self, '_lcd_init_just_emitted', False):
+                    c_peep = self._const_eval(args[0])
+                    if c_peep is not None and c_peep in (0x01, 0x02):
+                        self._lcd_init_just_emitted = False
+                        return
+                # Any other lcd_cmd / lcd_char invalidates the flag.
+                self._lcd_init_just_emitted = False
                 if args:
                     c = self._const_eval(args[0])
                     if c is not None:
