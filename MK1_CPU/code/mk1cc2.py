@@ -1063,18 +1063,13 @@ class MK1CodeGen:
         for fn in other_fns:
             self.compile_function(*fn)
 
-        # In --eeprom mode, EEPROM-backed overlays may trigger an init-time
-        # preload that calls __eeprom_rd (which in turn calls __i2c_sb and
-        # __i2c_rb). Force these helpers emitted so the preload can link.
-        # The preload is only actually emitted if the partitioner places
-        # overlays in the EEPROM tier; if it doesn't, these helpers are
-        # unused init-only code — some waste, but they live in stage 1 only.
+        # In --eeprom mode, the preload uses only __i2c_sb (inline sequential
+        # read — no __eeprom_rd / __i2c_rb function dependencies). Ensure
+        # __i2c_sb is emitted even if user code doesn't otherwise reference it.
         if getattr(self, 'eeprom_mode', False):
             if not hasattr(self, '_lcd_helpers'):
                 self._lcd_helpers = set()
-            self._lcd_helpers.add('__eeprom_rd')
             self._lcd_helpers.add('__i2c_sb')
-            self._lcd_helpers.add('__i2c_rb')
 
         # Auto-insert delay_calibrate when lcd_cmd uses calibrated delays.
         # The call is inserted into _main (after VIA/LCD init, before user code).
@@ -1258,14 +1253,10 @@ class MK1CodeGen:
         if getattr(self, '_i2c_init_called', False):
             refs.add('__i2c_sb')
             refs.add('__i2c_rb')
-        # In --eeprom mode, the overlay partitioner may generate an init-time
-        # EEPROM preload loop that calls __eeprom_rd (which in turn calls
-        # __i2c_sb and __i2c_rb). These references don't exist in self.code
-        # yet at dead-elim time, so keep them alive unconditionally.
+        # In --eeprom mode, the inline preload calls __i2c_sb (the reference
+        # is generated later in _overlay_partition and isn't visible here).
         if getattr(self, 'eeprom_mode', False):
-            refs.add('__eeprom_rd')
             refs.add('__i2c_sb')
-            refs.add('__i2c_rb')
         # __lcd_send is reached via fall-through from __lcd_cmd — keep alive
         # when __lcd_cmd is referenced (merge may make it a sub-label)
         if '__lcd_cmd' in refs:
@@ -4482,30 +4473,89 @@ class MK1CodeGen:
             '\tjnz .selfcopy_loop',
         ]
 
-        # EEPROM-backed overlays: MK1 reads them from EEPROM at init time
-        # (standalone — no ESP32 runtime role). After self-copy frees page3,
-        # this loop copies bytes from EEPROM 0x{ee_overlay_base:04X} into
-        # page3[0..N-1] via __eeprom_rd + iderefp3.
+        # EEPROM-backed overlays: MK1 reads them from EEPROM at init time.
+        # Uses sequential read + inline byte-accumulation to avoid __eeprom_rd
+        # and __i2c_rb helpers (which would need 74B of tail region to survive
+        # self-copy). Only __i2c_sb (resident, mini-copied) is called.
+        #
+        # Register plan (during the byte loop):
+        #   A = scratch
+        #   B = byte accumulator during read, then reused for iderefp3 offset
+        #   C = page3 destination offset (preserved across iterations)
+        #   D = bytes remaining counter (from N down to 1)
+        #   Stack[top] = bit counter (8 → 0)
         ee_preload_bytes = sum(fsize for _, _, _, fsize, _ in ee_overlays)
         if ee_preload_bytes > 0:
             ee_hi_byte = (ee_overlay_base >> 8) & 0xFF
             self_copy.extend([
-                '; ── EEPROM preload: EEPROM 0x{:04X}+ → page3[0..{}] ──'.format(
-                    ee_overlay_base, ee_preload_bytes - 1),
-                '\tclr $a',                     # A = 0 (offset)
-                '.ee_pre_lp:',
-                '\tpush $a',                    # save offset on stack
-                f'\tldi $b,{ee_hi_byte}',       # B = addr_hi
-                '\tjal __eeprom_rd',            # A = EEPROM[B:A=offset]; B/C/D clobbered
-                '\tmov $a,$d',                  # D = byte (save)
-                '\tpop $a',                     # A = offset
-                '\tmov $a,$b',                  # B = offset (dest in page3)
-                '\tmov $d,$a',                  # A = byte
-                '\tiderefp3',                   # page3[B] = A
-                '\tmov $b,$a',                  # A = offset
-                '\tinc',                        # offset++
-                f'\tcmpi {ee_preload_bytes},$a',
-                '\tjnz .ee_pre_lp',
+                '; ── EEPROM preload (inline sequential read) ──',
+                # --- Setup: START + write-addr + hi + lo, STOP+START + read-addr ---
+                '\texrw 2',
+                '\tddrb_imm 0x01',
+                '\tddrb_imm 0x03',
+                '\tldi $a,0xAE',
+                '\tjal __i2c_sb',
+                f'\tldi $a,{ee_hi_byte}',
+                '\tjal __i2c_sb',
+                '\tclr $a',
+                '\tjal __i2c_sb',
+                '\tddrb_imm 0x03',      # STOP
+                '\tddrb_imm 0x01',
+                '\tddrb_imm 0x00',
+                '\texrw 2',             # RESTART (re-set OUT direction)
+                '\tddrb_imm 0x01',
+                '\tddrb_imm 0x03',
+                '\tldi $a,0xAF',
+                '\tjal __i2c_sb',
+                # --- Outer: init byte counter and page3 offset ---
+                f'\tldi $d,{ee_preload_bytes}',
+                '\tldi $c,0',
+                '.ee_byte:',
+                # --- Inner: inline 8-bit read into B ---
+                '\tldi $b,0',           # accumulator
+                '\tpush_imm 8',         # bit counter on stack
+                '.ee_bit:',
+                '\tmov $b,$a',          # A = accum
+                '\tsll',                # A <<= 1
+                '\tmov $a,$b',          # B = shifted
+                '\tddrb_imm 0x00',      # SCL HIGH (release, slave drives SDA)
+                '\texrw 0',             # A = port (bit 0 = SDA)
+                '\ttst 0x01',
+                '\tjz .ee_bz',
+                '\tmov $b,$a',
+                '\tori 0x01,$a',
+                '\tmov $a,$b',
+                '.ee_bz:',
+                '\tddrb_imm 0x02',      # SCL LOW
+                '\tpop $a',             # bit counter
+                '\tdec',
+                '\tpush $a',
+                '\tjnz .ee_bit',
+                '\tpop $a',             # discard 0 counter
+                # --- Store byte (B) to page3[C]. Need A=byte, B=offset. ---
+                '\tmov $b,$a',          # A = byte
+                '\tpush $a',            # save byte on stack
+                '\tmov $c,$a',          # A = offset (from C)
+                '\tmov $a,$b',          # B = offset
+                '\tpop $a',             # A = byte
+                '\tiderefp3',           # page3[B] = A
+                # --- ACK (SDA low, clock one bit, SDA low again) ---
+                '\tddrb_imm 0x03',
+                '\tddrb_imm 0x01',
+                '\tddrb_imm 0x03',
+                # --- Increment offset (C) ---
+                '\tmov $c,$a',
+                '\tinc',
+                '\tmov $a,$c',
+                # --- Decrement byte counter (D) ---
+                '\tmov $d,$a',
+                '\tdec',
+                '\tmov $a,$d',
+                '\tjnz .ee_byte',
+                # --- Final STOP (I2C bus idle) ---
+                '\tddrb_imm 0x03',
+                '\tddrb_imm 0x01',
+                '\tddrb_imm 0x00',
             ])
         self_copy.append('\tj 0')                        # jump to kernel at code[0]
 
@@ -4742,18 +4792,12 @@ class MK1CodeGen:
                 result.append(l)
             return result
 
-        # When EEPROM preload is active, defer __eeprom_rd's init-only body
-        # so it lands at code[>= KERNEL_SIZE] and survives self-copy.
-        _preload_init_only = set()
-        if ee_preload_bytes > 0:
-            _preload_init_only = {'__eeprom_rd'}
+        # All init-only funcs emitted normally — the inline preload doesn't
+        # need any of them at code[>= KERNEL_SIZE].
         _deferred_init_only_bodies = []
         for name, start, end, fsize in init_only_funcs:
             body = _rename_shared_refs(self.code[start:end])
-            if name in _preload_init_only:
-                _deferred_init_only_bodies.extend(body)
-            else:
-                assembled.extend(body)
+            assembled.extend(body)
 
         # Emit init-specific copies of shared helpers (with _init suffix).
         if shared_helpers_ov:
@@ -4829,18 +4873,11 @@ class MK1CodeGen:
             # Exclude helpers that are still resident (don't need init copies)
             needed_but_not_init -= {n for n in needed_but_not_init
                                     if f'{n}:' in _NO_OVERLAY and n not in init_rename_set}
-            # Preload-survivor helpers: __eeprom_rd and __i2c_rb are called by
-            # the self-copy routine's preload loop, which runs AFTER self-copy
-            # overwrites code[0..KERNEL_SIZE-1]. These helpers MUST live at
-            # code[KERNEL_SIZE..] to survive. Defer their emission to the post-
-            # pad region (emitted after pad_needed is computed below).
+            # The EEPROM preload is inline (uses only __i2c_sb which is
+            # resident). No preload-survivor helpers need deferring to
+            # code[KERNEL_SIZE..] — __i2c_sb is in the kernel already.
             _preload_survivors = set()
-            if ee_preload_bytes > 0:
-                for _n in ('__eeprom_rd', '__i2c_rb'):
-                    if _n in needed_but_not_init:
-                        _preload_survivors.add(_n)
-                needed_but_not_init = needed_but_not_init - _preload_survivors
-            _deferred_preload_helpers = []  # emitted after KERNEL_SIZE pad
+            _deferred_preload_helpers = []
             import sys as _emdbg
             if needed_but_not_init or _preload_survivors:
                 i = 0
@@ -8003,6 +8040,11 @@ def main():
             print(f"     → program doesn't fit in flat mode. Add user functions to "
                   f"enable overlay partitioning, or reduce code size.",
                   file=sys.stderr)
+        # Hard fail: uploading oversized code silently truncates at the ESP32
+        # assembler's 256B code buffer, leaving the MK1 running garbage and
+        # corrupting state for subsequent programs. Refuse to emit.
+        print("───────────────────────", file=sys.stderr)
+        sys.exit(1)
     elif code_bytes > init_limit - 3:
         print(f"  !! Code page tight: only {init_limit - code_bytes}B free", file=sys.stderr)
     if gen.data_alloc > 256:
