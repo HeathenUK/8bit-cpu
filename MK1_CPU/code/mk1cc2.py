@@ -5149,6 +5149,12 @@ class MK1CodeGen:
                 init_shared.append(l)
             assembled.extend(init_shared)
 
+        # Defaults — must always be defined, even when the init-scan block
+        # below is skipped (programs with no init code and no EEPROM preload
+        # fall through and line ~5338 reads these).
+        _deferred_preload_helpers = []
+        _preload_survivors = set()
+
         # Also include any non-shared, non-init-only helpers needed by init
         # OR by the self_copy routine (which runs as stage-1 init code and
         # may call __eeprom_rd for EEPROM preload).
@@ -5206,8 +5212,9 @@ class MK1CodeGen:
             # The EEPROM preload is inline (uses only __i2c_sb which is
             # resident). No preload-survivor helpers need deferring to
             # code[KERNEL_SIZE..] — __i2c_sb is in the kernel already.
-            _preload_survivors = set()
-            _deferred_preload_helpers = []
+            # (_preload_survivors and _deferred_preload_helpers are initialised
+            # unconditionally above so the tail-emission block works even
+            # when this init-scan branch is skipped.)
             import sys as _emdbg
             if needed_but_not_init or _preload_survivors:
                 i = 0
@@ -8333,6 +8340,7 @@ def main():
     ap.add_argument('--eeprom', action='store_true', help='EEPROM overlay mode: partition code for EEPROM-backed execution')
     ap.add_argument('--eeprom-base', type=lambda x: int(x, 0), default=0x0200,
                     help='EEPROM base address for overlay storage (default: 0x0200)')
+    ap.add_argument('--metrics-out', help='Write size metrics as JSON to this path (for size-regression harness)')
     args = ap.parse_args()
 
     with open(args.input) as f: source = f.read()
@@ -8439,12 +8447,52 @@ def main():
     eeprom_header = 16
     eeprom_payload = max(0, eeprom_bytes - eeprom_header)
 
+    # Collect structured metrics for the size-regression harness.
+    # Populated alongside the human-readable report; written to --metrics-out
+    # at the end. Fields are null when not applicable to the current mode.
+    metrics = {
+        'mode': None,
+        'compile_ok': True,
+        'code_overflow': False,
+        'stage1_init': None,
+        'stage1_copy': None,
+        'stage1_total': None,
+        'kernel': None,
+        'page0_used': None,
+        'page0_free': None,
+        'page1_allocated': gen.data_alloc,
+        'page1_free': 256 - gen.data_alloc,
+        'page3_used': None,
+        'page3_free': None,
+        'eeprom_used': 0,
+        'eeprom_free': 4096,
+        'overlay_slots': None,
+        'overlay_largest': None,
+        'overlay_shared': None,
+        'overlay_region': None,
+    }
+
     print("\n── MK1 Memory Report ──", file=sys.stderr)
     if overlay_mode:
         ov_kernel = gen._overlay_kernel_size
         ov_region = gen._overlay_region
         ov_shared = gen._overlay_shared_size
         init_only = code_bytes - copy_loop
+        metrics.update({
+            'mode': 'overlay',
+            'stage1_init': init_only,
+            'stage1_copy': copy_loop,
+            'stage1_total': code_bytes,
+            'kernel': ov_kernel,
+            'page0_used': ov_region,
+            'page0_free': MAX_CODE - ov_region,
+            'overlay_shared': ov_shared,
+            'overlay_region': ov_region,
+            'overlay_slots': getattr(gen, '_overlay_count', None),
+            'overlay_largest': getattr(gen, '_overlay_largest', None),
+            'page3_used': p3_bytes,
+            'page3_free': 256 - p3_bytes,
+        })
         print(f"  Mode:       two-stage boot (overlay system)", file=sys.stderr)
         print(f"  Stage 1:    {init_only}B init + {copy_loop}B copy = {code_bytes}B", file=sys.stderr)
         print(f"  Stage 2:    {ov_kernel}B kernel + {ov_shared}B shared = {ov_region}B", file=sys.stderr)
@@ -8453,12 +8501,31 @@ def main():
     elif init_extraction:
         init_only = code_bytes - copy_loop
         total = max(init_only, kernel_bytes) + copy_loop
+        metrics.update({
+            'mode': 'init_extraction',
+            'stage1_init': init_only,
+            'stage1_copy': copy_loop,
+            'stage1_total': code_bytes,
+            'kernel': kernel_bytes,
+            'page0_used': kernel_bytes,
+            'page0_free': MAX_CODE - kernel_bytes,
+            'page3_used': kernel_bytes,
+            'page3_free': 256 - kernel_bytes,
+        })
         print(f"  Mode:       two-stage boot (init extraction)", file=sys.stderr)
         print(f"  Stage 1:    {init_only}B init + {copy_loop}B copy = {code_bytes}B / {MAX_CODE}B", file=sys.stderr)
         print(f"  Stage 2:    {kernel_bytes}B kernel  (runtime code page)", file=sys.stderr)
         runtime_free = MAX_CODE - kernel_bytes
         print(f"  Page 0:     {kernel_bytes}B used, {runtime_free}B free at runtime", file=sys.stderr)
     else:
+        metrics.update({
+            'mode': 'flat',
+            'kernel': code_bytes,
+            'page0_used': code_bytes,
+            'page0_free': MAX_CODE - code_bytes,
+            'page3_used': p3_bytes,
+            'page3_free': 256 - p3_bytes,
+        })
         print(f"  Mode:       single-stage (flat)", file=sys.stderr)
         print(f"  Page 0:     {code_bytes}B / {MAX_CODE}B code", file=sys.stderr)
 
@@ -8482,6 +8549,8 @@ def main():
         print(f"  Page 3:     unused (256B available)", file=sys.stderr)
 
     if eeprom_bytes > 0:
+        metrics['eeprom_used'] = eeprom_payload
+        metrics['eeprom_free'] = 4096 - eeprom_payload
         print(f"  EEPROM:     {eeprom_payload}B used, {4096 - eeprom_payload}B free  (AT24C32)", file=sys.stderr)
     else:
         print(f"  EEPROM:     unused  (4096B available)", file=sys.stderr)
@@ -8493,6 +8562,8 @@ def main():
     # Warnings — init stage can use up to 254B (runs once, self-copies kernel)
     init_limit = 254 if (init_extraction or overlay_mode) else MAX_CODE
     if code_bytes > init_limit:
+        metrics['code_overflow'] = True
+        metrics['compile_ok'] = False
         print(f"  !! CODE OVERFLOW: {code_bytes}B > {init_limit}B limit "
               f"(over by {code_bytes - init_limit}B)", file=sys.stderr)
         # Suggest concrete remediation
@@ -8515,6 +8586,10 @@ def main():
         # assembler's 256B code buffer, leaving the MK1 running garbage and
         # corrupting state for subsequent programs. Refuse to emit.
         print("───────────────────────", file=sys.stderr)
+        if args.metrics_out:
+            import json as _json
+            with open(args.metrics_out, 'w') as _mf:
+                _json.dump(metrics, _mf, indent=2)
         sys.exit(1)
     elif code_bytes > init_limit - 3:
         print(f"  !! Code page tight: only {init_limit - code_bytes}B free", file=sys.stderr)
@@ -8522,6 +8597,11 @@ def main():
         print(f"  !! DATA OVERFLOW: {gen.data_alloc}B > 256B", file=sys.stderr)
 
     print("───────────────────────", file=sys.stderr)
+
+    if args.metrics_out:
+        import json as _json
+        with open(args.metrics_out, 'w') as _mf:
+            _json.dump(metrics, _mf, indent=2)
 
 if __name__ == '__main__':
     main()

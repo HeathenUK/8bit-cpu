@@ -59,6 +59,8 @@ void main() {
 
     lcd_char(tens + 48);    /* 48 = ASCII '0' */
     lcd_char(t + 48);
+    lcd_char(0xDF);         /* HD44780 ROM A00 degree symbol */
+    lcd_char('C');
 
     halt();
 }
