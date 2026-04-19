@@ -4423,9 +4423,12 @@ class MK1CodeGen:
                                         (uid, i, stream[i][0], imm_val))
 
                 # Optional debug for parametric scan — set MK1_DEBUG_T2=1 to
-                # see candidate histograms and the top-3 param opportunities.
+                # see candidate histograms, top parametric opportunities, and
+                # near-miss candidates (positive raw savings but rejected by
+                # budget check).
                 import os as _t2os
-                if _t2os.environ.get('MK1_DEBUG_T2'):
+                _debug_t2 = _t2os.environ.get('MK1_DEBUG_T2')
+                if _debug_t2:
                     mode_counts = {}
                     for (m, k), occ in seqs.items():
                         mode_counts[m] = mode_counts.get(m, 0) + 1
@@ -4438,6 +4441,10 @@ class MK1CodeGen:
                         pvals = sorted(set(o[3] for o in occ if o[3] is not None))
                         print(f"    param K={K} L={L} vals={pvals} head: {k[:3]}",
                               file=sys.stderr)
+                    # Also collect near-miss candidates (positive raw savings but
+                    # rejected because budget_improvement < 0) — print after the
+                    # best-finder runs below.
+                    _t2_near_miss = []
                 best = None   # (budget_improvement, raw_savings, mode, key, accepted, L, S)
                 for (mode, key), raw_occ in seqs.items():
                     if len(raw_occ) < 2:
@@ -4537,10 +4544,18 @@ class MK1CodeGen:
                     post_budget = post_kernel + post_max_ov
                     budget_improvement = cur_budget - post_budget
                     if budget_improvement < 0:
+                        if _debug_t2 and raw_savings >= 4:
+                            _t2_near_miss.append((raw_savings, budget_improvement, K, S, mode, key[:3]))
                         continue
                     score = (budget_improvement, raw_savings)
                     if best is None or score > best[:2]:
                         best = (budget_improvement, raw_savings, mode, key, accepted, L, S)
+                if _debug_t2 and _t2_near_miss:
+                    _t2_near_miss.sort(reverse=True)
+                    print(f"  [T2 debug] near-miss (rejected, raw_savings > 4):", file=sys.stderr)
+                    for rs, bi, K, S, mode, head in _t2_near_miss[:3]:
+                        print(f"    raw={rs}B budget={bi}B K={K} S={S} mode={mode} head={head}",
+                              file=sys.stderr)
                 if best is None:
                     return None
                 _bi, raw_savings, mode, key, accepted, L, S = best
