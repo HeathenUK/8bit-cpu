@@ -941,12 +941,21 @@ class MK1CodeGen:
         # Classify helpers (detect runtime I2C, build dynamic _NO_OVERLAY)
         self._classify_helpers()
 
+        # Cache page 1 globals for _overlay_partition: it emits overlay data
+        # in the same data buffer and needs to interleave globals up front so
+        # they land at the offsets the allocator assigned.
+        self._page1_globals_cache = [(n, i) for n, i, s in globals_ if n in self.globals]
+
         # Two-stage boot overlay partitioning
         self._overlay_partition()
 
-        # Emit page 1 globals (skip if init extraction handled everything)
-        page1_vars = [(n, i) for n, i, s in globals_ if n in self.globals]
-        if page1_vars and not getattr(self, '_init_extraction_done', False):
+        # Emit page 1 globals ONLY if overlay partitioning didn't inline them.
+        # Overlay mode emits them inside the data section before overlay bodies;
+        # skip the separate emission here to avoid double-defining the labels.
+        page1_vars = self._page1_globals_cache
+        overlays_handled_globals = getattr(self, '_overlay_kernel_size', None) is not None
+        if (page1_vars and not getattr(self, '_init_extraction_done', False)
+                and not overlays_handled_globals):
             self.emit('\tsection data')
             for name, init in page1_vars:
                 self.emit(f'_{name}:')
@@ -4040,14 +4049,32 @@ class MK1CodeGen:
             assembled.append('\tsection page3_code')
             assembled.extend(asm_lines)
 
-        # Pad data section to data_alloc so overlay data starts at the correct offset.
-        # The manifest stores offsets based on data_alloc, but the assembler's
-        # data_size starts at 0. Without padding, overlay data at data[0] wouldn't
-        # match the manifest offset (data_alloc).
+        # Emit globals FIRST in the data section so they occupy the offsets the
+        # allocator assigned them (p1[0..data_alloc-1]). Without this, overlay
+        # bodies emitted by data_code sections would consume those low bytes
+        # and push globals out to the tail of the buffer, breaking every
+        # `ld $a,_global` read in the program.
         if p1_overlays and self.data_alloc > 0:
             assembled.append('\tsection data')
-            for _ in range(self.data_alloc):
-                assembled.append('\tbyte 0')
+            page1_vars = getattr(self, '_page1_globals_cache', None)
+            if page1_vars is None:
+                # Fall back to zero-pad if the globals cache wasn't built.
+                for _ in range(self.data_alloc):
+                    assembled.append('\tbyte 0')
+            else:
+                emitted = 0
+                for name, init in page1_vars:
+                    assembled.append(f'_{name}:')
+                    if isinstance(init, list):
+                        for v in init:
+                            assembled.append(f'\tbyte {v}')
+                            emitted += 1
+                    else:
+                        assembled.append(f'\tbyte {init}')
+                        emitted += 1
+                # Any remainder (unused allocation slots) → zero-fill.
+                for _ in range(max(0, self.data_alloc - emitted)):
+                    assembled.append('\tbyte 0')
 
         for idx, name, asm_lines, fsize, _ in p1_overlays:
             assembled.append('\tsection code')
