@@ -714,10 +714,110 @@ class MK1CodeGen:
                             self.page3_globals[xfer_name] = self.page3_alloc
                             self.page3_alloc += 1
                     xfer_globals[lv] = xfer_name
-                    # Phase 1 stores the local to the transfer global before returning.
+
+                # Optimization: for each live_var that is only WRITTEN (never
+                # read) inside p1, skip allocating a local and redirect the
+                # assignment directly to the xfer global. Saves ~40B in
+                # dashboard-class main_p1 by eliminating the local-stack
+                # shuffle (push_imm 0 / stsp / mov $d,$a / final copy-out).
+                def _used_in_stmts(stmts, name):
+                    """Return True if `name` is read as a variable in any of stmts.
+                    AST shape: expressions are tuples with [0] = kind.
+                    assign tuple: ('assign', op, lhs, rhs) — lhs is a write, rhs is a read."""
+                    def rd(e):
+                        if e is None: return False
+                        if not isinstance(e, tuple): return False
+                        t = e[0]
+                        if t == 'var':
+                            return e[1] == name
+                        if t == 'num' or t == 'str':
+                            return False
+                        if t == 'assign':
+                            # rhs (e[3]) is a read. lhs (e[2]) is a write, but
+                            # if lhs is `var[expr]` the expr is a read.
+                            lhs = e[2]
+                            lhs_read = False
+                            if isinstance(lhs, tuple) and lhs[0] == 'index':
+                                # index(target, idx) — both can contain reads
+                                lhs_read = rd(lhs[1]) or rd(lhs[2])
+                            return lhs_read or rd(e[3])
+                        if t == 'call':
+                            return any(rd(a) for a in e[2] or [])
+                        if t in ('bin', 'binop'):
+                            return rd(e[2]) or rd(e[3])
+                        if t in ('un', 'unop'):
+                            return rd(e[2])
+                        if t == 'index':
+                            return rd(e[1]) or rd(e[2])
+                        if t == 'addr_of':
+                            return rd(e[1])
+                        return False
+                    def st(s):
+                        if not isinstance(s, tuple): return False
+                        t = s[0]
+                        if t == 'local':
+                            return rd(s[2])
+                        if t == 'expr_stmt':
+                            return rd(s[1])
+                        if t == 'return':
+                            return rd(s[1]) if len(s) > 1 and s[1] else False
+                        if t == 'if':
+                            then_block = s[2] if len(s) > 2 else []
+                            else_block = s[3] if len(s) > 3 and s[3] else []
+                            return rd(s[1]) or any(st(x) for x in then_block) \
+                                   or any(st(x) for x in else_block)
+                        if t == 'while':
+                            return rd(s[1]) or any(st(x) for x in s[2])
+                        if t == 'block':
+                            return any(st(x) for x in s[1])
+                        return False
+                    return any(st(s) for s in stmts)
+
+                write_only_lvs = set()
+                for lv in live_vars:
+                    # Count writes (local decls with init, or assign to var lv)
+                    # and check no reads of lv within p1_inner.
+                    if not _used_in_stmts(p1_inner, lv):
+                        write_only_lvs.add(lv)
+
+                if write_only_lvs:
+                    # Rewrite p1_inner: drop local decls for write_only_lvs,
+                    # rewrite `lv = expr` → `__xfer_main_lv[0] = expr`.
+                    new_p1 = []
+                    for s in p1_inner:
+                        if s[0] == 'local' and s[1] in write_only_lvs:
+                            # Drop the declaration. If there's an initializer,
+                            # replace with a direct write to the xfer global.
+                            if s[2] is not None:
+                                new_p1.append(('expr_stmt',
+                                    ('assign', '=',
+                                     ('index', ('var', xfer_globals[s[1]]), ('num', 0)),
+                                     s[2])))
+                            continue
+                        if (s[0] == 'expr_stmt' and s[1][0] == 'assign'
+                                and s[1][1] == '=' and s[1][2][0] == 'var'
+                                and s[1][2][1] in write_only_lvs):
+                            lvn = s[1][2][1]
+                            new_p1.append(('expr_stmt',
+                                ('assign', '=',
+                                 ('index', ('var', xfer_globals[lvn]), ('num', 0)),
+                                 s[1][3])))
+                            continue
+                        new_p1.append(s)
+                    p1_inner = new_p1
+                    import sys as _p7dbg
+                    print(f"  Phase 7 direct-xfer: {sorted(write_only_lvs)} "
+                          f"write directly to globals (no local alloc)",
+                          file=_p7dbg.stderr)
+
+                # For vars that DO get read inside p1, fall back to the
+                # original "local + copy-out at end" pattern.
+                for lv in live_vars:
+                    if lv in write_only_lvs:
+                        continue
                     p1_inner.append(('expr_stmt',
                         ('assign', '=',
-                         ('index', ('var', xfer_name), ('num', 0)),
+                         ('index', ('var', xfer_globals[lv]), ('num', 0)),
                          ('var', lv))))
                 # Main body after phase 1: redeclare the live vars from globals,
                 # then continue with the original post-split statements.
