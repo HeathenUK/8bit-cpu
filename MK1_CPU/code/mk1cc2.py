@@ -3704,37 +3704,33 @@ class MK1CodeGen:
         ee_code_offset = 0  # offset from ee_overlay_base (= addr_lo)
         ee_capacity = 256   # 8-bit offset range
 
-        # Best-fit placement: for each overlay, pick the page with least remaining waste
+        # Page-concentrating placement: fill one SRAM page before opening the
+        # next. Each additional page adds a dispatch arm (~17B) to the overlay
+        # loader and shrinks the overlay region, so concentrating on as few
+        # pages as possible is a direct win for nearly every program.
+        # Priority order: p1 (data, largest & no SP init cost) → p2 (needs SP
+        # init, only 196B) → p3 (shared with kernel image, smallest).
         def place_overlay(idx, name, asm_lines, fsize):
             nonlocal p3_code_offset, p3_capacity, p1_code_offset, p1_capacity, p2_code_offset, p2_capacity
             nonlocal ee_code_offset, ee_capacity
-            candidates = []
-            if fsize <= p3_capacity:
-                candidates.append((p3_capacity - fsize, 3))
             if fsize <= p1_capacity:
-                candidates.append((p1_capacity - fsize, 1))
-            if fsize <= p2_capacity:
-                candidates.append((p2_capacity - fsize, 2))
-            if not candidates:
-                # SRAM full — try EEPROM overflow tier
-                if fsize <= ee_capacity:
-                    ee_overlays.append((idx, name, asm_lines, fsize, ee_code_offset))
-                    ee_code_offset += fsize; ee_capacity -= fsize
-                    return True
-                return False
-            # Best fit: smallest remaining space after placement
-            candidates.sort()
-            _, page = candidates[0]
-            if page == 3:
-                p3_overlays.append((idx, name, asm_lines, fsize, p3_code_offset))
-                p3_code_offset += fsize; p3_capacity -= fsize
-            elif page == 1:
                 p1_overlays.append((idx, name, asm_lines, fsize, p1_code_offset))
                 p1_code_offset += fsize; p1_capacity -= fsize
-            elif page == 2:
+                return True
+            if fsize <= p2_capacity:
                 p2_overlays.append((idx, name, asm_lines, fsize, p2_code_offset))
                 p2_code_offset += fsize; p2_capacity -= fsize
-            return True
+                return True
+            if fsize <= p3_capacity:
+                p3_overlays.append((idx, name, asm_lines, fsize, p3_code_offset))
+                p3_code_offset += fsize; p3_capacity -= fsize
+                return True
+            # SRAM full — try EEPROM overflow tier
+            if fsize <= ee_capacity:
+                ee_overlays.append((idx, name, asm_lines, fsize, ee_code_offset))
+                ee_code_offset += fsize; ee_capacity -= fsize
+                return True
+            return False
 
         _placement_retries = 0
         _retry_bundling = False
