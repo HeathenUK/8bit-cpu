@@ -4248,6 +4248,292 @@ class MK1CodeGen:
             main_lines = peephole(main_lines)
             shared_helper_size = measure_lines(shared_helpers_ov)
 
+            # ── T2.1: Cross-section procedure abstraction ──
+            # Scan runtime_resident_helpers + every overlay body for instruction
+            # sequences that repeat ≥2 times across different sections. Extract
+            # profitable ones as kernel-resident thunks (placed at the tail of
+            # runtime_resident_helpers) and rewrite all call sites to `jal`.
+            #
+            # Savings model: sequence of S bytes occurring K times across sections
+            # Cost:    thunk body S + ret(1) = S+1 bytes added to kernel
+            # Savings: K occurrences × S bytes inlined, replaced with K × 2-byte jal
+            # Net:     (K × S) − (K × 2) − (S + 1) = (K−1)·S − 2K − 1
+            #          > 0 when S ≥ 4 AND K ≥ 3, or S ≥ 6 AND K ≥ 2.
+            #
+            # Constraints (inherit from Phase 6 + cross-section specifics):
+            #   - sequence stays within one "unit" (helper or overlay body)
+            #   - no local `j .lbl` / `jnz .lbl` / etc. (labels are unit-local)
+            #   - no `ret` / `hlt` inside body (thunk's own ret ends execution)
+            #   - no `ldsp`/`stsp` (jal shifts SP by 2, breaks offsets)
+            #   - push/pop balanced within the sequence
+            #   - no `jal __ovthunk_N` (those are overlay-local labels)
+            #   - no `jal __xsthunk_N` (don't nest our own thunks on first pass)
+            def _t2_byte_size(line):
+                s = line.strip()
+                if not s or s.endswith(':') or s.startswith(';'):
+                    return 0
+                mn = s.split()[0]
+                if mn == 'cmp':
+                    parts = s.split()
+                    return 1 if (len(parts) > 1 and parts[1].startswith('$')) else 2
+                elif mn in two_byte:
+                    return 2
+                else:
+                    return 1
+
+            def _t2_extractable(text):
+                """Cross-section extraction-safety: must not reference local or
+                overlay-local labels, must not end execution, must not do
+                SP-relative addressing."""
+                for jtype in ['j ', 'jnz ', 'jz ', 'jc ', 'jnc ']:
+                    if text.startswith(jtype):
+                        tgt = text[len(jtype):].strip()
+                        if tgt.startswith('.'):
+                            return False
+                if text in ('ret', 'hlt'):
+                    return False
+                if text.startswith('j ') and not text.startswith('jal'):
+                    return False
+                mn = text.split()[0] if text.split() else ''
+                if mn in ('ldsp', 'stsp'):
+                    return False
+                # jal to unit-local or cross-section-unsafe names: reject
+                if text.startswith('jal '):
+                    tgt = text.split(None, 1)[1].strip()
+                    if tgt.startswith('__ovthunk_') or tgt.startswith('__xsthunk_'):
+                        return False
+                return True
+
+            def _t2_balanced(texts):
+                bal = 0
+                for t in texts:
+                    mn = t.split()[0] if t.split() else ''
+                    if mn in ('push', 'push_b', 'push_imm'):
+                        bal += 1
+                    elif mn in ('pop', 'pop_b'):
+                        bal -= 1
+                        if bal < 0: return False
+                    elif mn == 'exw':
+                        return False
+                return bal == 0
+
+            def _t2_strip_section_tokens(lines):
+                """Yield (global_idx, text) for instruction lines only —
+                skipping labels, comments, directives, and blanks."""
+                for i, line in enumerate(lines):
+                    s = line.strip()
+                    if not s or s.endswith(':') or s.startswith(';'):
+                        continue
+                    if s.startswith('section') or s.startswith('org'):
+                        continue
+                    yield i, s
+
+            def _t2_find_best_cross_section():
+                """Build a unified view of (runtime_resident_helpers + each
+                overlay body), find the most-profitable cross-section sequence.
+                Returns (budget_improvement, key_tuple, occurrences, L, S) or None.
+
+                Ranking metric is `pre_budget - post_budget` (where budget =
+                kernel_size + max_overlay_size), NOT raw byte savings. In
+                overlay mode the code-page fit is what matters: a thunk that
+                grows the kernel by 10B while shrinking the largest overlay by
+                7B is a net loss even if total-bytes-used decreases."""
+                # Build per-unit instruction streams with global indices
+                units = {}   # unit_id → list of (global_idx, text)
+                units['kernel'] = list(_t2_strip_section_tokens(runtime_resident_helpers))
+                for oi, (oname, olines, _ofsize) in enumerate(overlay_asm_blocks):
+                    units[f'ov{oi}'] = list(_t2_strip_section_tokens(olines))
+
+                # Current sizes (unchanging across candidates this pass)
+                cur_kernel_size = measure_lines(runtime_resident_helpers)
+                cur_ov_sizes = [sz for _, _, sz in overlay_asm_blocks]
+                cur_max_ov = max(cur_ov_sizes, default=0)
+                cur_budget = cur_kernel_size + cur_max_ov
+
+                MIN_LEN, MAX_LEN = 4, 12
+                seqs = {}   # key_tuple → [(unit_id, stream_start_idx, global_start_idx), …]
+                for uid, stream in units.items():
+                    texts = [t for (_g, t) in stream]
+                    for i in range(len(texts)):
+                        for L in range(MIN_LEN, min(MAX_LEN, len(texts) - i) + 1):
+                            ok = True
+                            for k in range(L):
+                                if not _t2_extractable(texts[i + k]):
+                                    ok = False; break
+                            if not ok:
+                                continue
+                            key = tuple(texts[i:i + L])
+                            if not _t2_balanced(key):
+                                continue
+                            seqs.setdefault(key, []).append((uid, i, stream[i][0]))
+
+                best = None   # (budget_improvement, raw_savings, key, accepted, L, S)
+                for key, raw_occ in seqs.items():
+                    if len(raw_occ) < 2:
+                        continue
+                    # Accept sequences whether they repeat within one unit
+                    # (kernel has duplicates) or across multiple units (shared
+                    # idiom between kernel and overlays, or between overlays).
+                    # The budget check below handles the cost tradeoff.
+                    # Non-overlap within each unit: greedy
+                    by_unit = {}
+                    for o in raw_occ:
+                        by_unit.setdefault(o[0], []).append(o)
+                    accepted = []
+                    L = len(key)
+                    for uid, occs in by_unit.items():
+                        occs.sort(key=lambda o: o[1])
+                        last_end = -1
+                        for o in occs:
+                            if o[1] >= last_end:
+                                accepted.append(o); last_end = o[1] + L
+                    if len(accepted) < 2:
+                        continue
+                    # Byte size of the sequence
+                    S = 0
+                    for text in key:
+                        s = text.strip()
+                        mn = s.split()[0]
+                        if mn == 'cmp':
+                            parts = s.split()
+                            S += 1 if (len(parts) > 1 and parts[1].startswith('$')) else 2
+                        elif mn in two_byte:
+                            S += 2
+                        else:
+                            S += 1
+                    if S < 4:
+                        continue
+                    K = len(accepted)
+                    raw_savings = (K - 1) * S - 2 * K - 1
+                    if raw_savings <= 0:
+                        continue
+                    # Simulate post-extraction budget
+                    unit_occ = {}
+                    for (uid, _, _) in accepted:
+                        unit_occ[uid] = unit_occ.get(uid, 0) + 1
+                    kernel_occ = unit_occ.get('kernel', 0)
+                    post_kernel = cur_kernel_size + (S + 1) - kernel_occ * (S - 2)
+                    new_ov_sizes = []
+                    for oi, sz in enumerate(cur_ov_sizes):
+                        n = unit_occ.get(f'ov{oi}', 0)
+                        new_ov_sizes.append(sz - n * (S - 2))
+                    post_max_ov = max(new_ov_sizes, default=0)
+                    post_budget = post_kernel + post_max_ov
+                    budget_improvement = cur_budget - post_budget
+                    # Prefer extractions that improve the page-0 budget; tie-break
+                    # on raw byte savings (for EEPROM overlay storage, total-bytes
+                    # does still matter even when budget is neutral).
+                    if budget_improvement < 0:
+                        continue
+                    score = (budget_improvement, raw_savings)
+                    if best is None or score > best[:2]:
+                        best = (budget_improvement, raw_savings, key, accepted, L, S)
+                if best is None:
+                    return None
+                # Legacy return shape: (raw_savings, key, accepted, L, S)
+                _bi, raw_savings, key, accepted, L, S = best
+                return (raw_savings, key, accepted, L, S)
+
+            def _t2_rewrite_unit(lines, call_at_global, replace_at_global, thunk_name):
+                """Replace the text at replace_at_global indices by deletion, and
+                emit `jal thunk_name` at each call_at_global index. Returns new
+                list of lines."""
+                call_at = set(call_at_global)
+                replace_at = set(replace_at_global)
+                out = []
+                for i, line in enumerate(lines):
+                    if i in call_at:
+                        out.append(f'\tjal {thunk_name}')
+                    elif i in replace_at:
+                        continue
+                    else:
+                        out.append(line)
+                return out
+
+            _t2_thunk_counter = 0
+            _t2_total_saved = 0
+            # _t2_find_best_cross_section() already enforces the budget
+            # constraint: candidates that would grow (kernel + max_overlay)
+            # are filtered out. Iterate until no budget-improving candidate
+            # remains. Raw byte savings are reported for diagnostics.
+            for _t2_pass in range(8):   # up to 8 cross-section thunks per program
+                best = _t2_find_best_cross_section()
+                if best is None:
+                    break
+                savings, key, accepted, L, S = best
+                thunk_name = f'__xsthunk_{_t2_thunk_counter}'
+                _t2_thunk_counter += 1
+                _t2_total_saved += savings
+
+                # Build the thunk body
+                thunk_lines = [f'{thunk_name}:']
+                thunk_lines.extend(f'\t{t}' for t in key)
+                thunk_lines.append('\tret')
+
+                # For each unit with occurrences, rewrite: replace L instructions
+                # starting at each accepted position with a single `jal thunk_name`.
+                # `accepted` is a list of (unit_id, stream_start_idx, global_start_idx).
+                # We need to map stream positions back to `lines` indices.
+                by_unit = {}
+                for o in accepted:
+                    by_unit.setdefault(o[0], []).append(o)
+
+                for uid, occs in by_unit.items():
+                    # Pick target list by unit
+                    if uid == 'kernel':
+                        target_lines = runtime_resident_helpers
+                    else:
+                        oi = int(uid[2:])
+                        target_lines = overlay_asm_blocks[oi][1]
+
+                    # Re-derive stream (same as collection step) for global indexing
+                    stream = list(_t2_strip_section_tokens(target_lines))
+                    # For each occurrence, collect the global line indices of the
+                    # L instructions in the sequence
+                    call_at_global = []
+                    replace_at_global = []
+                    for (_uid, stream_start, _g0) in occs:
+                        for k in range(L):
+                            gidx = stream[stream_start + k][0]
+                            if k == 0:
+                                call_at_global.append(gidx)
+                            else:
+                                replace_at_global.append(gidx)
+                        # Also replace position 0's line (so only one `jal` emitted)
+                        replace_at_global.append(stream[stream_start][0])
+                        # BUT we don't want to lose position 0 entirely — use
+                        # call_at set in rewrite to emit jal at position 0.
+                    # De-dup replace set; call_at positions will emit jal but
+                    # their replace flag causes their original line to be dropped.
+                    new_target = _t2_rewrite_unit(target_lines,
+                                                   call_at_global,
+                                                   replace_at_global,
+                                                   thunk_name)
+
+                    if uid == 'kernel':
+                        runtime_resident_helpers = new_target
+                    else:
+                        overlay_asm_blocks[oi] = (overlay_asm_blocks[oi][0],
+                                                   new_target,
+                                                   measure_lines(new_target))
+
+                # Append thunk to runtime_resident_helpers (kernel-resident so
+                # callable from everywhere)
+                runtime_resident_helpers.extend(thunk_lines)
+
+                print(f"  T2.1 xs-abstract: extracted {L}-instr {S}B sequence × "
+                      f"{len(accepted)} across "
+                      f"{len(set(a[0] for a in accepted))} sections "
+                      f"(saves {savings}B) as {thunk_name}",
+                      file=sys.stderr)
+
+            if _t2_total_saved:
+                # Re-peephole after edits (thunk body + call sites may enable new
+                # peephole patterns); re-measure shared/main just in case.
+                runtime_resident_helpers = peephole(runtime_resident_helpers)
+                print(f"  T2.1 total cross-section savings: {_t2_total_saved}B",
+                      file=sys.stderr)
+
             runtime_helper_size = measure_lines(runtime_resident_helpers)
             main_size = measure_lines(main_lines)
             KERNEL_SIZE_est = loader_size + main_size + runtime_helper_size
