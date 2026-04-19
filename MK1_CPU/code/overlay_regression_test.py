@@ -34,9 +34,28 @@ def compile_c(source, eeprom=True):
     with open('/tmp/_regtest.asm') as f:
         return f.read()
 
+def hw_reset(ser):
+    """Force a clean MK1 CPU reset between tests. Clears PC, drops HLT.
+    Peripherals (VIA ports, I2C SDA/SCL positions, RTC state) persist —
+    programs that use I2C must do their own bus recovery at startup."""
+    old_timeout = ser.timeout
+    ser.timeout = 5
+    ser.reset_input_buffer()
+    ser.write(b'RESET\n')
+    try:
+        ser.readline()
+    except:
+        pass
+    time.sleep(0.2)
+    ser.timeout = old_timeout
+
+
 def assemble_and_upload(ser, asm, timeout=30):
     """Assemble and upload via serial. Sends large payloads in chunks
-    to avoid overflowing the ESP32 UART RX buffer."""
+    to avoid overflowing the ESP32 UART RX buffer.
+    Issues a hardware reset first so every test starts with PC=0 and HLT
+    de-asserted regardless of the previous test's state."""
+    hw_reset(ser)
     escaped = asm.replace('\n', '\\n')
     payload = f'ASM:{escaped}\n'.encode()
     ser.reset_input_buffer()
