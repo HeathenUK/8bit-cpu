@@ -4281,16 +4281,25 @@ class MK1CodeGen:
                 else:
                     return 1
 
-            def _t2_extractable(text):
+            def _t2_extractable(text, allow_ret_terminal=False):
                 """Cross-section extraction-safety: must not reference local or
                 overlay-local labels, must not end execution, must not do
-                SP-relative addressing."""
+                SP-relative addressing.
+
+                `allow_ret_terminal`: when True, `ret` is permitted AS A SEQUENCE
+                TERMINATOR (tail-merge variant: the extracted thunk's own ret
+                returns to the calling helper's caller, and call sites jump to
+                the thunk with `j` instead of `jal`). The caller must still
+                ensure ret only appears at the last position of the sequence.
+                """
+                if text == 'ret':
+                    return allow_ret_terminal
                 for jtype in ['j ', 'jnz ', 'jz ', 'jc ', 'jnc ']:
                     if text.startswith(jtype):
                         tgt = text[len(jtype):].strip()
                         if tgt.startswith('.'):
                             return False
-                if text in ('ret', 'hlt'):
+                if text == 'hlt':
                     return False
                 if text.startswith('j ') and not text.startswith('jal'):
                     return False
@@ -4351,31 +4360,42 @@ class MK1CodeGen:
                 cur_budget = cur_kernel_size + cur_max_ov
 
                 MIN_LEN, MAX_LEN = 4, 12
-                seqs = {}   # key_tuple → [(unit_id, stream_start_idx, global_start_idx), …]
+                # Two sequence flavours are scanned in a single unified hash:
+                #   - "call" sequences: flow into ret or back to caller normally
+                #     (extraction adds entry jal/ret; cost = S+1, call = 2B jal)
+                #   - "tail" sequences: last instruction is `ret` (extraction
+                #     emits shared tail; cost = S+0, call = 2B j)
+                # We distinguish by hashing a separate "mode" tag per candidate.
+                seqs = {}   # (mode, key_tuple) → [(unit_id, stream_start, global_start), …]
                 for uid, stream in units.items():
                     texts = [t for (_g, t) in stream]
                     for i in range(len(texts)):
                         for L in range(MIN_LEN, min(MAX_LEN, len(texts) - i) + 1):
+                            # Tail-merge candidate: the sequence's last instruction
+                            # may be `ret`. Intermediate instructions follow normal
+                            # extractability rules.
+                            last = texts[i + L - 1]
+                            ret_terminal = (last == 'ret')
                             ok = True
-                            for k in range(L):
+                            for k in range(L - 1):   # all but last
                                 if not _t2_extractable(texts[i + k]):
                                     ok = False; break
+                            if ok and not _t2_extractable(last, allow_ret_terminal=True):
+                                ok = False
                             if not ok:
                                 continue
                             key = tuple(texts[i:i + L])
                             if not _t2_balanced(key):
                                 continue
-                            seqs.setdefault(key, []).append((uid, i, stream[i][0]))
+                            mode = 'tail' if ret_terminal else 'call'
+                            seqs.setdefault((mode, key), []).append((uid, i, stream[i][0]))
 
-                best = None   # (budget_improvement, raw_savings, key, accepted, L, S)
-                for key, raw_occ in seqs.items():
+                best = None   # (budget_improvement, raw_savings, mode, key, accepted, L, S)
+                for (mode, key), raw_occ in seqs.items():
                     if len(raw_occ) < 2:
                         continue
-                    # Accept sequences whether they repeat within one unit
-                    # (kernel has duplicates) or across multiple units (shared
-                    # idiom between kernel and overlays, or between overlays).
-                    # The budget check below handles the cost tradeoff.
-                    # Non-overlap within each unit: greedy
+                    # Accept same-unit and cross-unit equally; budget check below
+                    # handles the cost/benefit. Non-overlap within each unit: greedy
                     by_unit = {}
                     for o in raw_occ:
                         by_unit.setdefault(o[0], []).append(o)
@@ -4404,7 +4424,18 @@ class MK1CodeGen:
                     if S < 4:
                         continue
                     K = len(accepted)
-                    raw_savings = (K - 1) * S - 2 * K - 1
+                    # Cost models differ by mode:
+                    #   call: thunk = sequence + ret (S+1), each call = jal (2B)
+                    #     savings = K*S - K*2 - (S+1) = (K-1)*S - 2K - 1
+                    #   tail: thunk = sequence (S, ends with the sequence's own ret),
+                    #     each call = j (2B) — caller's flow bypasses the inline body
+                    #     savings = K*S - K*2 - S = (K-1)*S - 2K
+                    if mode == 'call':
+                        raw_savings = (K - 1) * S - 2 * K - 1
+                        thunk_cost = S + 1
+                    else:   # tail
+                        raw_savings = (K - 1) * S - 2 * K
+                        thunk_cost = S
                     if raw_savings <= 0:
                         continue
                     # Simulate post-extraction budget
@@ -4412,7 +4443,7 @@ class MK1CodeGen:
                     for (uid, _, _) in accepted:
                         unit_occ[uid] = unit_occ.get(uid, 0) + 1
                     kernel_occ = unit_occ.get('kernel', 0)
-                    post_kernel = cur_kernel_size + (S + 1) - kernel_occ * (S - 2)
+                    post_kernel = cur_kernel_size + thunk_cost - kernel_occ * (S - 2)
                     new_ov_sizes = []
                     for oi, sz in enumerate(cur_ov_sizes):
                         n = unit_occ.get(f'ov{oi}', 0)
@@ -4420,30 +4451,27 @@ class MK1CodeGen:
                     post_max_ov = max(new_ov_sizes, default=0)
                     post_budget = post_kernel + post_max_ov
                     budget_improvement = cur_budget - post_budget
-                    # Prefer extractions that improve the page-0 budget; tie-break
-                    # on raw byte savings (for EEPROM overlay storage, total-bytes
-                    # does still matter even when budget is neutral).
                     if budget_improvement < 0:
                         continue
                     score = (budget_improvement, raw_savings)
                     if best is None or score > best[:2]:
-                        best = (budget_improvement, raw_savings, key, accepted, L, S)
+                        best = (budget_improvement, raw_savings, mode, key, accepted, L, S)
                 if best is None:
                     return None
-                # Legacy return shape: (raw_savings, key, accepted, L, S)
-                _bi, raw_savings, key, accepted, L, S = best
-                return (raw_savings, key, accepted, L, S)
+                _bi, raw_savings, mode, key, accepted, L, S = best
+                return (raw_savings, key, accepted, L, S, mode)
 
-            def _t2_rewrite_unit(lines, call_at_global, replace_at_global, thunk_name):
+            def _t2_rewrite_unit(lines, call_at_global, replace_at_global, thunk_name,
+                                  call_insn='jal'):
                 """Replace the text at replace_at_global indices by deletion, and
-                emit `jal thunk_name` at each call_at_global index. Returns new
-                list of lines."""
+                emit `<call_insn> thunk_name` at each call_at_global index.
+                call_insn is 'jal' for call-mode thunks, 'j' for tail-merge."""
                 call_at = set(call_at_global)
                 replace_at = set(replace_at_global)
                 out = []
                 for i, line in enumerate(lines):
                     if i in call_at:
-                        out.append(f'\tjal {thunk_name}')
+                        out.append(f'\t{call_insn} {thunk_name}')
                     elif i in replace_at:
                         continue
                     else:
@@ -4460,15 +4488,20 @@ class MK1CodeGen:
                 best = _t2_find_best_cross_section()
                 if best is None:
                     break
-                savings, key, accepted, L, S = best
-                thunk_name = f'__xsthunk_{_t2_thunk_counter}'
+                savings, key, accepted, L, S, mode = best
+                thunk_name = (f'__tailmerge_{_t2_thunk_counter}' if mode == 'tail'
+                              else f'__xsthunk_{_t2_thunk_counter}')
                 _t2_thunk_counter += 1
                 _t2_total_saved += savings
 
-                # Build the thunk body
+                # Build the thunk body.
+                # call mode: append explicit `ret`; call sites use `jal`.
+                # tail mode: sequence already ends with `ret`; call sites use `j`.
                 thunk_lines = [f'{thunk_name}:']
                 thunk_lines.extend(f'\t{t}' for t in key)
-                thunk_lines.append('\tret')
+                if mode == 'call':
+                    thunk_lines.append('\tret')
+                call_insn = 'j' if mode == 'tail' else 'jal'
 
                 # For each unit with occurrences, rewrite: replace L instructions
                 # starting at each accepted position with a single `jal thunk_name`.
@@ -4508,7 +4541,8 @@ class MK1CodeGen:
                     new_target = _t2_rewrite_unit(target_lines,
                                                    call_at_global,
                                                    replace_at_global,
-                                                   thunk_name)
+                                                   thunk_name,
+                                                   call_insn=call_insn)
 
                     if uid == 'kernel':
                         runtime_resident_helpers = new_target
@@ -4521,7 +4555,8 @@ class MK1CodeGen:
                 # callable from everywhere)
                 runtime_resident_helpers.extend(thunk_lines)
 
-                print(f"  T2.1 xs-abstract: extracted {L}-instr {S}B sequence × "
+                _tag = 'T2.3 tail-merge' if mode == 'tail' else 'T2.1 xs-abstract'
+                print(f"  {_tag}: extracted {L}-instr {S}B sequence × "
                       f"{len(accepted)} across "
                       f"{len(set(a[0] for a in accepted))} sections "
                       f"(saves {savings}B) as {thunk_name}",
