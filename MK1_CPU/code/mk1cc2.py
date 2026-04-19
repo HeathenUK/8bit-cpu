@@ -4306,10 +4306,14 @@ class MK1CodeGen:
                 mn = text.split()[0] if text.split() else ''
                 if mn in ('ldsp', 'stsp'):
                     return False
-                # jal to unit-local or cross-section-unsafe names: reject
+                # jal to overlay-local thunks: reject (they're only defined
+                # inside the overlay that created them, so a sequence spanning
+                # units would reference a symbol that isn't in every unit's
+                # address space). jal to __xsthunk_N / __tailmerge_N is FINE
+                # — they're kernel-resident and callable from anywhere.
                 if text.startswith('jal '):
                     tgt = text.split(None, 1)[1].strip()
-                    if tgt.startswith('__ovthunk_') or tgt.startswith('__xsthunk_'):
+                    if tgt.startswith('__ovthunk_'):
                         return False
                 return True
 
@@ -4360,13 +4364,14 @@ class MK1CodeGen:
                 cur_budget = cur_kernel_size + cur_max_ov
 
                 MIN_LEN, MAX_LEN = 4, 12
-                # Two sequence flavours are scanned in a single unified hash:
-                #   - "call" sequences: flow into ret or back to caller normally
-                #     (extraction adds entry jal/ret; cost = S+1, call = 2B jal)
-                #   - "tail" sequences: last instruction is `ret` (extraction
-                #     emits shared tail; cost = S+0, call = 2B j)
-                # We distinguish by hashing a separate "mode" tag per candidate.
-                seqs = {}   # (mode, key_tuple) → [(unit_id, stream_start, global_start), …]
+                # Three sequence flavours scanned in a unified hash:
+                #   - "call": flow ends normally; extraction adds ret; call = 2B jal
+                #   - "tail": last instruction is `ret`; call = 2B j (no extra ret)
+                #   - "param": first instruction is `ldi $a, N`; the N varies
+                #     across occurrences. Thunk replaces the ldi with `mov $b,$a`
+                #     at entry. Caller emits `ldi $b, N; jal thunk`. Sub-modes:
+                #     param_call (+ret), param_tail (sequence ends in ret).
+                seqs = {}   # (mode, key_tuple) → [(uid, stream_start, gidx, param_val), …]
                 for uid, stream in units.items():
                     texts = [t for (_g, t) in stream]
                     for i in range(len(texts)):
@@ -4388,12 +4393,53 @@ class MK1CodeGen:
                             if not _t2_balanced(key):
                                 continue
                             mode = 'tail' if ret_terminal else 'call'
-                            seqs.setdefault((mode, key), []).append((uid, i, stream[i][0]))
+                            seqs.setdefault((mode, key), []).append((uid, i, stream[i][0], None))
+                            # Parametric variant: position-0 `ldi $a, N`, rest
+                            # identical. Canonicalize by stripping the imm from
+                            # position 0. The parameter value is recorded in the
+                            # occurrence tuple for use at extraction time.
+                            p0 = texts[i]
+                            if p0.startswith('ldi $a,') or p0.startswith('ldi $a ,'):
+                                try:
+                                    imm_s = p0.split(',', 1)[1].strip()
+                                    imm_val = int(imm_s, 0)
+                                except Exception:
+                                    imm_val = None
+                                if imm_val is not None:
+                                    # Canonical: replace position 0 with a placeholder
+                                    param_key = ('<ldi $a, *>',) + tuple(texts[i+1:i+L])
+                                    pmode = 'param_tail' if ret_terminal else 'param_call'
+                                    seqs.setdefault((pmode, param_key), []).append(
+                                        (uid, i, stream[i][0], imm_val))
 
+                # Optional debug for parametric scan — set MK1_DEBUG_T2=1 to
+                # see candidate histograms and the top-3 param opportunities.
+                import os as _t2os
+                if _t2os.environ.get('MK1_DEBUG_T2'):
+                    mode_counts = {}
+                    for (m, k), occ in seqs.items():
+                        mode_counts[m] = mode_counts.get(m, 0) + 1
+                    param_candidates = [(len(occ), len(k), k, occ)
+                                         for (m, k), occ in seqs.items()
+                                         if m == 'param_call' and len(occ) >= 2]
+                    param_candidates.sort(key=lambda x: (-x[0], -x[1]))
+                    print(f"  [T2 debug] seq counts: {mode_counts}", file=sys.stderr)
+                    for K, L, k, occ in param_candidates[:3]:
+                        pvals = sorted(set(o[3] for o in occ if o[3] is not None))
+                        print(f"    param K={K} L={L} vals={pvals} head: {k[:3]}",
+                              file=sys.stderr)
                 best = None   # (budget_improvement, raw_savings, mode, key, accepted, L, S)
                 for (mode, key), raw_occ in seqs.items():
                     if len(raw_occ) < 2:
                         continue
+                    # For parametric modes: only consider if the imm varies
+                    # across occurrences. If all occurrences have the same imm,
+                    # this is a byte-identical match already covered by call/tail
+                    # mode at strictly lower cost (2B call vs 4B param call).
+                    if mode.startswith('param_'):
+                        param_vals = set(o[3] for o in raw_occ)
+                        if len(param_vals) < 2:
+                            continue
                     # Accept same-unit and cross-unit equally; budget check below
                     # handles the cost/benefit. Non-overlap within each unit: greedy
                     by_unit = {}
@@ -4409,9 +4455,14 @@ class MK1CodeGen:
                                 accepted.append(o); last_end = o[1] + L
                     if len(accepted) < 2:
                         continue
-                    # Byte size of the sequence
+                    # Byte size of the sequence — for parametric modes, the
+                    # placeholder is a 2B ldi $a, N (same as an actual one);
+                    # don't count the placeholder string as free.
                     S = 0
                     for text in key:
+                        if text == '<ldi $a, *>':
+                            S += 2   # the original was `ldi $a, N` = 2B
+                            continue
                         s = text.strip()
                         mn = s.split()[0]
                         if mn == 'cmp':
@@ -4430,24 +4481,43 @@ class MK1CodeGen:
                     #   tail: thunk = sequence (S, ends with the sequence's own ret),
                     #     each call = j (2B) — caller's flow bypasses the inline body
                     #     savings = K*S - K*2 - S = (K-1)*S - 2K
+                    #   param_call: thunk = (mov $b,$a = 1B) + (rest S-2B) + ret (1B) = S
+                    #     each call = ldi $b,N (2B) + jal (2B) = 4B
+                    #     savings = K*S - 4K - S = (K-1)*S - 4K
+                    #   param_tail: thunk = mov $b,$a (1B) + rest S-2 (ending in ret) = S-1
+                    #     each call = ldi $b,N + j = 4B
+                    #     savings = K*S - 4K - (S-1) = (K-1)*S - 4K + 1
                     if mode == 'call':
                         raw_savings = (K - 1) * S - 2 * K - 1
                         thunk_cost = S + 1
-                    else:   # tail
+                    elif mode == 'tail':
                         raw_savings = (K - 1) * S - 2 * K
                         thunk_cost = S
+                    elif mode == 'param_call':
+                        raw_savings = (K - 1) * S - 4 * K
+                        thunk_cost = S
+                    else:   # param_tail
+                        raw_savings = (K - 1) * S - 4 * K + 1
+                        thunk_cost = S - 1
                     if raw_savings <= 0:
                         continue
-                    # Simulate post-extraction budget
+                    # Parametric modes need a size delta per occurrence too:
+                    # each inline occurrence was S bytes, each call site is 4B
+                    # (vs 2B for non-param). Adjust per-unit size delta.
+                    param = mode.startswith('param_')
+                    per_call_bytes = 4 if param else 2
+                    # Simulate post-extraction budget. Per-occurrence size delta
+                    # = S (inline removed) - per_call_bytes (call site emitted).
+                    occ_delta = S - per_call_bytes
                     unit_occ = {}
-                    for (uid, _, _) in accepted:
-                        unit_occ[uid] = unit_occ.get(uid, 0) + 1
+                    for o in accepted:
+                        unit_occ[o[0]] = unit_occ.get(o[0], 0) + 1
                     kernel_occ = unit_occ.get('kernel', 0)
-                    post_kernel = cur_kernel_size + thunk_cost - kernel_occ * (S - 2)
+                    post_kernel = cur_kernel_size + thunk_cost - kernel_occ * occ_delta
                     new_ov_sizes = []
                     for oi, sz in enumerate(cur_ov_sizes):
                         n = unit_occ.get(f'ov{oi}', 0)
-                        new_ov_sizes.append(sz - n * (S - 2))
+                        new_ov_sizes.append(sz - n * occ_delta)
                     post_max_ov = max(new_ov_sizes, default=0)
                     post_budget = post_kernel + post_max_ov
                     budget_improvement = cur_budget - post_budget
@@ -4462,15 +4532,20 @@ class MK1CodeGen:
                 return (raw_savings, key, accepted, L, S, mode)
 
             def _t2_rewrite_unit(lines, call_at_global, replace_at_global, thunk_name,
-                                  call_insn='jal'):
-                """Replace the text at replace_at_global indices by deletion, and
-                emit `<call_insn> thunk_name` at each call_at_global index.
-                call_insn is 'jal' for call-mode thunks, 'j' for tail-merge."""
+                                  call_insn='jal', param_at_global=None):
+                """Replace lines at replace_at_global by deletion, emit
+                `<call_insn> thunk_name` at each call_at_global.
+                param_at_global: dict {global_idx → imm_val}; when provided,
+                emits `ldi $b, N` BEFORE the call at that global idx (parametric
+                modes), making the full call site `ldi $b, N` + jal/j."""
                 call_at = set(call_at_global)
                 replace_at = set(replace_at_global)
+                params = param_at_global or {}
                 out = []
                 for i, line in enumerate(lines):
                     if i in call_at:
+                        if i in params:
+                            out.append(f'\tldi $b,{params[i]}')
                         out.append(f'\t{call_insn} {thunk_name}')
                     elif i in replace_at:
                         continue
@@ -4489,19 +4564,31 @@ class MK1CodeGen:
                 if best is None:
                     break
                 savings, key, accepted, L, S, mode = best
-                thunk_name = (f'__tailmerge_{_t2_thunk_counter}' if mode == 'tail'
-                              else f'__xsthunk_{_t2_thunk_counter}')
+                if mode == 'tail':
+                    thunk_name = f'__tailmerge_{_t2_thunk_counter}'
+                elif mode in ('param_call', 'param_tail'):
+                    thunk_name = f'__param_{_t2_thunk_counter}'
+                else:
+                    thunk_name = f'__xsthunk_{_t2_thunk_counter}'
                 _t2_thunk_counter += 1
                 _t2_total_saved += savings
 
                 # Build the thunk body.
-                # call mode: append explicit `ret`; call sites use `jal`.
-                # tail mode: sequence already ends with `ret`; call sites use `j`.
+                # call mode:       thunk = key lines + ret (caller uses jal)
+                # tail mode:       thunk = key lines (last is ret) (caller uses j)
+                # param_call mode: thunk = `mov $b,$a` + key[1:] + ret (caller uses jal, with `ldi $b,N`)
+                # param_tail mode: thunk = `mov $b,$a` + key[1:] (caller uses j, with `ldi $b,N`)
                 thunk_lines = [f'{thunk_name}:']
-                thunk_lines.extend(f'\t{t}' for t in key)
-                if mode == 'call':
+                if mode.startswith('param_'):
+                    # Replace the placeholder with `mov $b,$a` at entry
+                    thunk_lines.append('\tmov $b,$a')
+                    for t in key[1:]:
+                        thunk_lines.append(f'\t{t}')
+                else:
+                    thunk_lines.extend(f'\t{t}' for t in key)
+                if mode in ('call', 'param_call'):
                     thunk_lines.append('\tret')
-                call_insn = 'j' if mode == 'tail' else 'jal'
+                call_insn = 'j' if mode in ('tail', 'param_tail') else 'jal'
 
                 # For each unit with occurrences, rewrite: replace L instructions
                 # starting at each accepted position with a single `jal thunk_name`.
@@ -4525,24 +4612,26 @@ class MK1CodeGen:
                     # L instructions in the sequence
                     call_at_global = []
                     replace_at_global = []
-                    for (_uid, stream_start, _g0) in occs:
+                    param_at_global = {}
+                    for occ in occs:
+                        _uid, stream_start, _g0 = occ[0], occ[1], occ[2]
+                        param_val = occ[3] if len(occ) > 3 else None
                         for k in range(L):
                             gidx = stream[stream_start + k][0]
                             if k == 0:
                                 call_at_global.append(gidx)
+                                if param_val is not None:
+                                    param_at_global[gidx] = f'0x{param_val:02X}'
                             else:
                                 replace_at_global.append(gidx)
-                        # Also replace position 0's line (so only one `jal` emitted)
+                        # Position 0's line gets replaced by the jal/j emission
                         replace_at_global.append(stream[stream_start][0])
-                        # BUT we don't want to lose position 0 entirely — use
-                        # call_at set in rewrite to emit jal at position 0.
-                    # De-dup replace set; call_at positions will emit jal but
-                    # their replace flag causes their original line to be dropped.
                     new_target = _t2_rewrite_unit(target_lines,
                                                    call_at_global,
                                                    replace_at_global,
                                                    thunk_name,
-                                                   call_insn=call_insn)
+                                                   call_insn=call_insn,
+                                                   param_at_global=param_at_global)
 
                     if uid == 'kernel':
                         runtime_resident_helpers = new_target
@@ -4555,7 +4644,13 @@ class MK1CodeGen:
                 # callable from everywhere)
                 runtime_resident_helpers.extend(thunk_lines)
 
-                _tag = 'T2.3 tail-merge' if mode == 'tail' else 'T2.1 xs-abstract'
+                _tag_map = {
+                    'call': 'T2.1 xs-abstract',
+                    'tail': 'T2.3 tail-merge',
+                    'param_call': 'T2.2 param-abstract',
+                    'param_tail': 'T2.2 param-tail',
+                }
+                _tag = _tag_map.get(mode, 'T2')
                 print(f"  {_tag}: extracted {L}-instr {S}B sequence × "
                       f"{len(accepted)} across "
                       f"{len(set(a[0] for a in accepted))} sections "
