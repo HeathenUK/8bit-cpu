@@ -5568,7 +5568,42 @@ class MK1CodeGen:
                 return sz
             _cur_addr = _measure_code_section(assembled)
             import sys
-            if _cur_addr < _mc_end:
+
+            # Optimisation: the region [cur_addr..helper_start-1] is BEFORE
+            # the mini-copy target range [helper_start..mc_end-1], so init
+            # helpers placed there won't be overwritten by mini-copy. Fit as
+            # many init helpers as possible into that slack before padding
+            # up to mc_end for the rest.
+            _pre_mc_budget = helper_start - _cur_addr
+            _pre_mc_helpers = []        # (name, start, end, fsize) placed pre-mini-copy
+            _post_mc_helpers = []
+            if _pre_mc_budget > 0:
+                # Greedy by size: smallest first. No reordering constraint —
+                # the init code calls them via `jal NAME`, so placement is
+                # address-independent.
+                _sorted_iof = sorted(init_only_funcs, key=lambda h: h[3])
+                _remaining = _pre_mc_budget
+                for h in _sorted_iof:
+                    if h[3] <= _remaining:
+                        _pre_mc_helpers.append(h)
+                        _remaining -= h[3]
+                    else:
+                        _post_mc_helpers.append(h)
+            else:
+                _post_mc_helpers = list(init_only_funcs)
+
+            if _pre_mc_helpers:
+                print(f"  Init-helper pre-mini-copy placement: {len(_pre_mc_helpers)} "
+                      f"helper(s) ({sum(h[3] for h in _pre_mc_helpers)}B) fit in "
+                      f"{_pre_mc_budget}B slack before mini-copy target — saves "
+                      f"equivalent bytes of padding", file=sys.stderr)
+                for name, start, end, fsize in _pre_mc_helpers:
+                    body = _rename_shared_refs(self.code[start:end])
+                    assembled.extend(body)
+                # Recompute cur_addr after pre-mc helpers emitted
+                _cur_addr = _measure_code_section(assembled)
+
+            if _post_mc_helpers and _cur_addr < _mc_end:
                 _pad_needed = _mc_end - _cur_addr
                 print(f"  Init-helper placement: padding {_pad_needed}B so init helpers"
                       f" land past mini-copy target ({_mc_end}B, currently at {_cur_addr})", file=sys.stderr)
@@ -5576,7 +5611,9 @@ class MK1CodeGen:
                     assembled.append('\tnop')
 
         _deferred_init_only_bodies = []
-        for name, start, end, fsize in init_only_funcs:
+        # Emit the init helpers that didn't fit pre-mini-copy
+        _iof_to_emit = _post_mc_helpers if init_only_funcs else []
+        for name, start, end, fsize in _iof_to_emit:
             body = _rename_shared_refs(self.code[start:end])
             assembled.extend(body)
 

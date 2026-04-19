@@ -233,7 +233,7 @@
     "page3_used": 206,
     "stage1_copy": 14,
     "stage1_init": 226,
-    "stage1_total": 232
+    "stage1_total": 225
   },
   "lcd_temp_overlay": {
     "code_overflow": true,
@@ -254,11 +254,11 @@
     "page3_used": 211,
     "stage1_copy": 14,
     "stage1_init": 262,
-    "stage1_total": 268
+    "stage1_total": 261
   },
   "lcd_temp_overlay_cmd": {
     "code_overflow": true,
-    "compile_ok": false,
+    "compile_ok": true,
     "eeprom_free": 4096,
     "eeprom_used": 0,
     "kernel": 202,
@@ -275,7 +275,7 @@
     "page3_used": 211,
     "stage1_copy": 14,
     "stage1_init": 250,
-    "stage1_total": 256
+    "stage1_total": 239
   },
   "lcd_test": {
     "code_overflow": false,
@@ -363,7 +363,7 @@
   },
   "overlay_clock": {
     "code_overflow": true,
-    "compile_ok": false,
+    "compile_ok": true,
     "eeprom_free": 4096,
     "eeprom_used": 0,
     "kernel": 212,
@@ -380,7 +380,7 @@
     "page3_used": 221,
     "stage1_copy": 14,
     "stage1_init": 250,
-    "stage1_total": 256
+    "stage1_total": 239
   },
   "overlay_dashboard": {
     "code_overflow": true,
@@ -426,7 +426,7 @@
   },
   "overlay_info": {
     "code_overflow": true,
-    "compile_ok": false,
+    "compile_ok": true,
     "eeprom_free": 4096,
     "eeprom_used": 0,
     "kernel": 202,
@@ -443,11 +443,11 @@
     "page3_used": 237,
     "stage1_copy": 14,
     "stage1_init": 250,
-    "stage1_total": 256
+    "stage1_total": 239
   },
   "overlay_seconds": {
     "code_overflow": true,
-    "compile_ok": false,
+    "compile_ok": true,
     "eeprom_free": 4096,
     "eeprom_used": 0,
     "kernel": 202,
@@ -464,7 +464,7 @@
     "page3_used": 217,
     "stage1_copy": 14,
     "stage1_init": 250,
-    "stage1_total": 256
+    "stage1_total": 239
   },
   "overlay_stopwatch": {
     "code_overflow": false,
@@ -489,7 +489,7 @@
   },
   "overlay_temp_label": {
     "code_overflow": true,
-    "compile_ok": false,
+    "compile_ok": true,
     "eeprom_free": 4096,
     "eeprom_used": 0,
     "kernel": 202,
@@ -506,11 +506,11 @@
     "page3_used": 218,
     "stage1_copy": 14,
     "stage1_init": 250,
-    "stage1_total": 256
+    "stage1_total": 239
   },
   "test1_clock": {
     "code_overflow": true,
-    "compile_ok": false,
+    "compile_ok": true,
     "eeprom_free": 4096,
     "eeprom_used": 0,
     "kernel": 212,
@@ -527,11 +527,11 @@
     "page3_used": 221,
     "stage1_copy": 14,
     "stage1_init": 250,
-    "stage1_total": 256
+    "stage1_total": 239
   },
   "test2_temp": {
     "code_overflow": true,
-    "compile_ok": false,
+    "compile_ok": true,
     "eeprom_free": 4096,
     "eeprom_used": 0,
     "kernel": 202,
@@ -548,11 +548,11 @@
     "page3_used": 218,
     "stage1_copy": 14,
     "stage1_init": 250,
-    "stage1_total": 256
+    "stage1_total": 239
   },
   "test3_seconds": {
     "code_overflow": true,
-    "compile_ok": false,
+    "compile_ok": true,
     "eeprom_free": 4096,
     "eeprom_used": 0,
     "kernel": 202,
@@ -569,11 +569,11 @@
     "page3_used": 217,
     "stage1_copy": 14,
     "stage1_init": 250,
-    "stage1_total": 256
+    "stage1_total": 239
   },
   "test4_info": {
     "code_overflow": true,
-    "compile_ok": false,
+    "compile_ok": true,
     "eeprom_free": 4096,
     "eeprom_used": 0,
     "kernel": 202,
@@ -590,7 +590,7 @@
     "page3_used": 237,
     "stage1_copy": 14,
     "stage1_init": 250,
-    "stage1_total": 256
+    "stage1_total": 239
   },
   "test_autosplit": {
     "code_overflow": false,
@@ -674,7 +674,7 @@
     "page3_used": 194,
     "stage1_copy": 14,
     "stage1_init": 227,
-    "stage1_total": 233
+    "stage1_total": 226
   },
   "test_lcd_eeprom": {
     "code_overflow": true,
@@ -695,7 +695,7 @@
     "page3_used": 279,
     "stage1_copy": 14,
     "stage1_init": 385,
-    "stage1_total": 299
+    "stage1_total": 286
   },
   "test_music3": {
     "code_overflow": false,
@@ -821,7 +821,7 @@
     "page3_used": 213,
     "stage1_copy": 14,
     "stage1_init": 235,
-    "stage1_total": 238
+    "stage1_total": 218
   },
   "twinkle_markers": {
     "code_overflow": true,
@@ -863,6 +863,6 @@
     "page3_used": 217,
     "stage1_copy": 14,
     "stage1_init": 224,
-    "stage1_total": 236
+    "stage1_total": 224
   }
 }
