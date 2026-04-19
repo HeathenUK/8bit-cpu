@@ -106,6 +106,15 @@ static const FixedInstr FIXED_INSTRUCTIONS[] = {
     { "swap",    0xEE,  ARGS_NONE },  // swap A and B
     { "inc",     0xFB,  ARGS_NONE },  // A = A + 1
     { "dec",     0xFE,  ARGS_NONE },  // A = A - 1
+    // ── Register inc/dec (clobber A, set flags) ──
+    // Named with underscore to avoid colliding with the existing "dec"/"inc"
+    // A-register ops during shortest-match mnemonic lookup.
+    { "decd",    0xCC,  ARGS_NONE },  // D = D - 1 (A := old D - 1)
+    { "decc",    0xD8,  ARGS_NONE },  // C = C - 1 (A := old C - 1)
+    { "decb",    0xDC,  ARGS_NONE },  // B = B - 1 (A := old B - 1)
+    { "incc",    0xE8,  ARGS_NONE },  // C = C + 1 (A := old C + 1)
+    { "incd",    0xEC,  ARGS_NONE },  // D = D + 1 (A := old D + 1)
+    { "incb",    0xF5,  ARGS_NONE },  // B = B + 1 (A := old B + 1)
     { "jnc",     0xCA,  ARGS_IMM  },  // jump if not carry
     { "jnz",     0xCE,  ARGS_IMM  },  // jump if not zero
     { "setjmp",  0xCB,  ARGS_IMM  },  // cross-page jump (future)

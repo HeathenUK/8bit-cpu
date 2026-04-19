@@ -669,6 +669,137 @@ def run_tests():
     ])
     results.append(run_test("DEC ZF: 1-1 sets zero", code, [0]))
 
+    # ═══ New register inc/dec opcodes (0xCC/0xD8/0xDC/0xE8/0xEC/0xF5) ═══
+    # These extend the existing A-register inc/dec to B, C, D. Replace the
+    # 3-byte `mov $X,$a; inc|dec; mov $a,$X` pattern with 1 byte. Clobbers A
+    # with the new register value.
+
+    # ── Test: DEC $d ──
+    code = assemble_simple([
+        (decode['move imm, $d'], 5),
+        decode['decd'],              # D = 4, A = 4
+        decode['move $d, $out'],       # should be 4
+        decode['decd'],              # D = 3
+        decode['move $d, $out'],       # should be 3
+        decode['hlt'],
+    ])
+    results.append(run_test("DEC $d: 5→4→3", code, [4, 3]))
+
+    # ── Test: DEC $c ──
+    code = assemble_simple([
+        (decode['move imm, $c'], 10),
+        decode['decc'],              # C = 9
+        decode['move $c, $out'],
+        decode['hlt'],
+    ])
+    results.append(run_test("DEC $c: 10→9", code, [9]))
+
+    # ── Test: DEC $b ──
+    code = assemble_simple([
+        (decode['move imm, $b'], 100),
+        decode['decb'],              # B = 99
+        decode['move $b, $out'],
+        decode['hlt'],
+    ])
+    results.append(run_test("DEC $b: 100→99", code, [99]))
+
+    # ── Test: INC $d ──
+    code = assemble_simple([
+        (decode['move imm, $d'], 0),
+        decode['incd'],              # D = 1
+        decode['move $d, $out'],
+        decode['incd'],              # D = 2
+        decode['move $d, $out'],
+        decode['hlt'],
+    ])
+    results.append(run_test("INC $d: 0→1→2", code, [1, 2]))
+
+    # ── Test: INC $c ──
+    code = assemble_simple([
+        (decode['move imm, $c'], 42),
+        decode['incc'],              # C = 43
+        decode['move $c, $out'],
+        decode['hlt'],
+    ])
+    results.append(run_test("INC $c: 42→43", code, [43]))
+
+    # ── Test: INC $b ──
+    code = assemble_simple([
+        (decode['move imm, $b'], 7),
+        decode['incb'],              # B = 8
+        decode['move $b, $out'],
+        decode['hlt'],
+    ])
+    results.append(run_test("INC $b: 7→8", code, [8]))
+
+    # ── Test: DEC $d wrap ──
+    code = assemble_simple([
+        (decode['move imm, $d'], 0),
+        decode['decd'],              # D = 255 (wrap)
+        decode['move $d, $out'],
+        decode['hlt'],
+    ])
+    results.append(run_test("DEC $d wrap: 0→255", code, [255]))
+
+    # ── Test: INC $d wrap ──
+    code = assemble_simple([
+        (decode['move imm, $d'], 255),
+        decode['incd'],              # D = 0 (wrap)
+        decode['move $d, $out'],
+        decode['hlt'],
+    ])
+    results.append(run_test("INC $d wrap: 255→0", code, [0]))
+
+    # ── Test: DEC $d sets ZF (loop termination) ──
+    # addr 0: ldi $d,1; 2: dec $d; 3: jzf 9; 5: ldi $a,99; 7: out; 9: ldi $a,77; 11: out; 13: hlt
+    code = assemble_simple([
+        (decode['move imm, $d'], 1),   # addr 0
+        decode['decd'],              # addr 2: D=0, ZF=1
+        (decode['jzf'], 9),            # addr 3: jump to 9 if zero
+        (decode['move imm, $a'], 99),  # addr 5: skipped
+        decode['move $a, $out'],       # addr 7: skipped
+        (decode['move imm, $a'], 77),  # addr 9
+        decode['move $a, $out'],       # addr 11: out 77
+        decode['hlt'],                 # addr 13
+    ])
+    results.append(run_test("DEC $d ZF: 1-1 sets zero", code, [77]))
+
+    # ── Test: Loop with dec $d (real-world pattern) ──
+    # Count 3,2,1 using dec $d; jnz.
+    # addr 0: ldi $d,3; 2: move $d,$a (copy counter to A for display)
+    # 3: out; 4: dec $d; 5: jnz 2; 7: hlt
+    code = assemble_simple([
+        (decode['move imm, $d'], 3),   # addr 0-1
+        decode['move $d, $a'],         # addr 2
+        decode['move $a, $out'],       # addr 3
+        decode['decd'],              # addr 4
+        (decode['jnz'], 2),            # addr 5-6 — loop back
+        decode['hlt'],                 # addr 7
+    ])
+    results.append(run_test("DEC $d loop: 3→2→1", code, [3, 2, 1]))
+
+    # ── Test: DEC $d doesn't clobber B ──
+    code = assemble_simple([
+        (decode['move imm, $d'], 5),
+        (decode['move imm, $b'], 42),
+        decode['decd'],              # D=4, A=4, B preserved
+        decode['move $d, $out'],       # 4
+        decode['move $b, $out'],       # 42
+        decode['hlt'],
+    ])
+    results.append(run_test("DEC $d preserves B", code, [4, 42]))
+
+    # ── Test: INC $c doesn't clobber D ──
+    code = assemble_simple([
+        (decode['move imm, $c'], 10),
+        (decode['move imm, $d'], 99),
+        decode['incc'],              # C=11, A=11, D preserved
+        decode['move $c, $out'],       # 11
+        decode['move $d, $out'],       # 99
+        decode['hlt'],
+    ])
+    results.append(run_test("INC $c preserves D", code, [11, 99]))
+
     # ── Test: JNC (jump if not carry) ──
     # 5 - 3 = 2, no borrow, CF=1 → jnc should NOT jump
     code = assemble_simple([

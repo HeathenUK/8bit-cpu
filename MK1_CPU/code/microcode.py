@@ -207,6 +207,29 @@ ucode_template[0xFB] = ('inc', [MI|PO, RO|II|PE, AO|EI, SUB|EO|EI, CINV|EO|AI|FI
 # E must be 0 (same trick), then SUB inverts it to 0xFF with carry=0.
 ucode_template[0xFE] = ('dec', [MI|PO, RO|II|PE, AO|EI, SUB|EO|EI, CINV|SUB|EO|AI|FI, RST, RST, RST], False)
 
+# ── INC/DEC on non-A registers (generic, used for any loop counter) ──
+# Pattern: route REG → A, run A's dec/inc microcode, route A → REG.
+# Clobbers A with the new register value. Sets flags.
+# Replaces 3-byte pattern `mov $X,$a; dec|inc; mov $a,$X` with 1 byte.
+# Reclaims opcodes NOT emitted by the compiler (verified against mk1cc2.py).
+# Uses only existing micro-signals (DO/DI/BO/BI/CO/CI/AI/AO/EI/EO/SUB/CINV/FI) —
+# no new hardware wiring. CINV was added for A's inc/dec bodge; these reuse it.
+
+# DEC $b (replaces sub $d,$a — auto-gen ALU, not emitted)
+ucode_template[0xDC] = ('decb', [MI|PO, RO|II|PE, BO|AI, AO|EI, SUB|EO|EI, CINV|SUB|EO|AI|FI, AO|BI, RST], False)
+# DEC $c (replaces sub $c,$a — auto-gen ALU, not emitted)
+ucode_template[0xD8] = ('decc', [MI|PO, RO|II|PE, CO|AI, AO|EI, SUB|EO|EI, CINV|SUB|EO|AI|FI, AO|CI, RST], False)
+# DEC $d (replaces add $d,$a — auto-gen ALU, not emitted)
+ucode_template[0xCC] = ('decd', [MI|PO, RO|II|PE, DO|AI, AO|EI, SUB|EO|EI, CINV|SUB|EO|AI|FI, AO|DI, RST], False)
+# INC $b (replaces and $b,$b — auto-gen ALU, not emitted).
+# Keeping jal_r at 0xE1 intact — it's the only primitive for indirect calls
+# (function pointers, jump tables) and we may want it for future C features.
+ucode_template[0xF5] = ('incb', [MI|PO, RO|II|PE, BO|AI, AO|EI, SUB|EO|EI, CINV|EO|AI|FI, AO|BI, RST], False)
+# INC $c (replaces or $c,$a — auto-gen ALU, not emitted)
+ucode_template[0xE8] = ('incc', [MI|PO, RO|II|PE, CO|AI, AO|EI, SUB|EO|EI, CINV|EO|AI|FI, AO|CI, RST], False)
+# INC $d (replaces or $d,$a — auto-gen ALU, not emitted)
+ucode_template[0xEC] = ('incd', [MI|PO, RO|II|PE, DO|AI, AO|EI, SUB|EO|EI, CINV|EO|AI|FI, AO|DI, RST], False)
+
 # JNC: jump if NOT carry (base template = take jump, patched to skip when CF=1)
 ucode_template[0xCA] = ('jnc', [MI|PO, RO|II|PE, PO|MI, RO|PI, RST, RST, RST, RST], True)
 
