@@ -1063,6 +1063,19 @@ class MK1CodeGen:
         for fn in other_fns:
             self.compile_function(*fn)
 
+        # In --eeprom mode, EEPROM-backed overlays may trigger an init-time
+        # preload that calls __eeprom_rd (which in turn calls __i2c_sb and
+        # __i2c_rb). Force these helpers emitted so the preload can link.
+        # The preload is only actually emitted if the partitioner places
+        # overlays in the EEPROM tier; if it doesn't, these helpers are
+        # unused init-only code — some waste, but they live in stage 1 only.
+        if getattr(self, 'eeprom_mode', False):
+            if not hasattr(self, '_lcd_helpers'):
+                self._lcd_helpers = set()
+            self._lcd_helpers.add('__eeprom_rd')
+            self._lcd_helpers.add('__i2c_sb')
+            self._lcd_helpers.add('__i2c_rb')
+
         # Auto-insert delay_calibrate when lcd_cmd uses calibrated delays.
         # The call is inserted into _main (after VIA/LCD init, before user code).
         # In overlay mode, __delay_cal becomes an overlay-eligible function.
@@ -1243,6 +1256,14 @@ class MK1CodeGen:
         # Keep I2C helpers alive when i2c_init() was called — they may be
         # needed for EEPROM preload (generated later in _overlay_partition)
         if getattr(self, '_i2c_init_called', False):
+            refs.add('__i2c_sb')
+            refs.add('__i2c_rb')
+        # In --eeprom mode, the overlay partitioner may generate an init-time
+        # EEPROM preload loop that calls __eeprom_rd (which in turn calls
+        # __i2c_sb and __i2c_rb). These references don't exist in self.code
+        # yet at dead-elim time, so keep them alive unconditionally.
+        if getattr(self, 'eeprom_mode', False):
+            refs.add('__eeprom_rd')
             refs.add('__i2c_sb')
             refs.add('__i2c_rb')
         # __lcd_send is reached via fall-through from __lcd_cmd — keep alive
@@ -1463,11 +1484,13 @@ class MK1CodeGen:
             no_ov.add('__i2c_sb:')
         if '__i2c_rb' in helpers:
             no_ov.add('__i2c_rb:')
-        # __eeprom_rd: resident only if user code accesses eeprom arrays at runtime
+        # __eeprom_rd: resident only if user code accesses eeprom arrays at
+        # runtime. In --eeprom overlay mode it's called only by the init-time
+        # preload (before self-copy), so it stays init-only.
         if '__eeprom_rd' in helpers:
             if getattr(self, '_needs_runtime_eeprom_rd', False):
                 no_ov.add('__eeprom_rd:')
-            # else: init-only (LCD init), will be handled by init extraction
+            # else: init-only, handled by init extraction (stage 1 code)
         if '__i2c_stream' in helpers:
             no_ov.add('__i2c_stream:')
 
@@ -1494,6 +1517,12 @@ class MK1CodeGen:
         unconditional = set()
         if getattr(self, '_i2c_init_called', False) and not self._needs_runtime_i2c:
             # i2c_init() called without LCD → __i2c_sb needed for EEPROM preload.
+            unconditional.add('__i2c_sb')
+        # In --eeprom mode, the init-time preload runs BEFORE self-copy (so
+        # __eeprom_rd can live in stage 1 init code without surviving the
+        # self-copy). We still need __i2c_sb kept alive for the preload chain;
+        # __i2c_rb and __eeprom_rd are init-only (emitted in stage 1).
+        if getattr(self, 'eeprom_mode', False):
             unconditional.add('__i2c_sb')
         # __lcd_send's residency is handled by step 8b propagation (scans
         # resident __lcd_cmd body for 'j __lcd_send' reference)
@@ -4365,14 +4394,21 @@ class MK1CodeGen:
         KERNEL_SIZE = loader_size + main_size + runtime_helper_size
         OVERLAY_REGION = KERNEL_SIZE + shared_helper_size
 
-        # Fix p3 overlay offsets if meta_base changed from estimate
+        # Fix p3 overlay offsets if meta_base changed from estimate.
+        # IMPORTANT: only shift REGULAR p3 overlays, not EEPROM-backed ones.
+        # EEPROM overlays are placed at page3[0..] and don't move with meta_base
+        # (they sit in the space freed by self-copy of the kernel image).
         final_meta_base = max(p3_used, OVERLAY_REGION)
         final_p3_start = final_meta_base + meta_table_size
+        ee_names_for_shift = {name for _, name, _, _, _ in ee_overlays}
         if p3_overlays:
-            old_first_offset = p3_overlays[0][4]
-            if old_first_offset != final_p3_start:
-                delta = final_p3_start - old_first_offset
-                p3_overlays = [(idx, n, a, f, off + delta)
+            # First non-EEPROM entry establishes the regular-p3 base offset.
+            reg_first = next(((n, off) for _, n, _, _, off in p3_overlays
+                              if n not in ee_names_for_shift), None)
+            if reg_first is not None and reg_first[1] != final_p3_start:
+                delta = final_p3_start - reg_first[1]
+                p3_overlays = [(idx, n, a, f,
+                                 off if n in ee_names_for_shift else off + delta)
                                for idx, n, a, f, off in p3_overlays]
         meta_base = final_meta_base
 
@@ -4401,11 +4437,15 @@ class MK1CodeGen:
         OVERLAY_REGION = KERNEL_SIZE + shared_helper_size
         meta_base = max(p3_used, OVERLAY_REGION)
         final_p3_start = meta_base + meta_table_size
+        ee_names_for_shift2 = {name for _, name, _, _, _ in ee_overlays}
         if p3_overlays:
-            old_first = p3_overlays[0][4]
-            if old_first != final_p3_start:
-                delta = final_p3_start - old_first
-                p3_overlays = [(i, n, a, f, off + delta) for i, n, a, f, off in p3_overlays]
+            reg_first2 = next(((n, off) for _, n, _, _, off in p3_overlays
+                               if n not in ee_names_for_shift2), None)
+            if reg_first2 is not None and reg_first2[1] != final_p3_start:
+                delta = final_p3_start - reg_first2[1]
+                p3_overlays = [(i, n, a, f,
+                                 off if n in ee_names_for_shift2 else off + delta)
+                               for i, n, a, f, off in p3_overlays]
         # Regenerate loader with correct OVERLAY_REGION
         loader = generate_kernel_loader(OVERLAY_REGION, meta_base,
                                         has_p1, has_p2, has_p3,
@@ -4438,10 +4478,31 @@ class MK1CodeGen:
             '\tjnz .selfcopy_loop',
         ]
 
-        # EEPROM-backed overlays: page3 patching handled by ESP32 during upload.
-        # No init-time I2C preload needed. The ESP32 runs init (self-copy) via
-        # clock cycles, then writes overlay data to page3 via bus before RUN.
-        # No init preload — ESP32 handles page3 patching via bus after self-copy
+        # EEPROM-backed overlays: MK1 reads them from EEPROM at init time
+        # (standalone — no ESP32 runtime role). After self-copy frees page3,
+        # this loop copies bytes from EEPROM 0x{ee_overlay_base:04X} into
+        # page3[0..N-1] via __eeprom_rd + iderefp3.
+        ee_preload_bytes = sum(fsize for _, _, _, fsize, _ in ee_overlays)
+        if ee_preload_bytes > 0:
+            ee_hi_byte = (ee_overlay_base >> 8) & 0xFF
+            self_copy.extend([
+                '; ── EEPROM preload: EEPROM 0x{:04X}+ → page3[0..{}] ──'.format(
+                    ee_overlay_base, ee_preload_bytes - 1),
+                '\tclr $a',                     # A = 0 (offset)
+                '.ee_pre_lp:',
+                '\tpush $a',                    # save offset on stack
+                f'\tldi $b,{ee_hi_byte}',       # B = addr_hi
+                '\tjal __eeprom_rd',            # A = EEPROM[B:A=offset]; B/C/D clobbered
+                '\tmov $a,$d',                  # D = byte (save)
+                '\tpop $a',                     # A = offset
+                '\tmov $a,$b',                  # B = offset (dest in page3)
+                '\tmov $d,$a',                  # A = byte
+                '\tiderefp3',                   # page3[B] = A
+                '\tmov $b,$a',                  # A = offset
+                '\tinc',                        # offset++
+                f'\tcmpi {ee_preload_bytes},$a',
+                '\tjnz .ee_pre_lp',
+            ])
         self_copy.append('\tj 0')                        # jump to kernel at code[0]
 
         # ── Step 18: Assemble everything ──
@@ -4577,16 +4638,33 @@ class MK1CodeGen:
             assembled.append('\tsection stack_code')
             assembled.extend(asm_lines)
 
-        # EEPROM-backed overlay code: emitted to p3patch section.
-        # The ESP32 runs init (self-copy) then writes patch data to page3
-        # via bus, before the user's RUN command. No init-time I2C needed.
+        # EEPROM-backed overlay code: stored in EEPROM at ee_overlay_base.
+        # At init time, the self_copy preload loop reads these bytes back
+        # into page3. MK1 is standalone — no ESP32 runtime role.
+        # The ESP32 writes er.eeprom (which this section appends to) to the
+        # AT24C32 EEPROM during upload; after that the ESP32 has no role.
         if ee_overlays:
+            # Pad from self.eeprom_alloc to ee_overlay_base with zeros so
+            # overlays land at the known base address the preload uses.
+            pad_count = ee_overlay_base - self.eeprom_alloc
+            if pad_count > 0:
+                assembled.append('\tsection eeprom')
+                assembled.append(f'; pad {pad_count}B from 0x{self.eeprom_alloc:04X} → 0x{ee_overlay_base:04X}')
+                for _ in range(pad_count):
+                    assembled.append('\tbyte 0')
+                # Advance the compiler's eeprom_alloc so downstream eeprom
+                # emission (line ~1208) doesn't overlap the overlay region.
+                self.eeprom_alloc = ee_overlay_base
             for idx, name, asm_lines, fsize, p3_offset in ee_overlays:
-                assembled.append(f'; p3patch overlay: {name} → page3[{p3_offset}] ({fsize}B)')
+                # Set code PC to OVERLAY_REGION so labels resolve to the
+                # runtime address the overlay will execute from after the
+                # loader copies it into the overlay slot.
+                assembled.append(f'; eeprom overlay: {name} → page3[{p3_offset}] ({fsize}B)')
                 assembled.append('\tsection code')
                 assembled.append(f'\torg {OVERLAY_REGION}')
-                assembled.append('\tsection p3patch')
+                assembled.append('\tsection eeprom')
                 assembled.extend(asm_lines)
+                self.eeprom_alloc += fsize
 
         # Phase 4: Emit init code in section code (the actual code page at upload)
         # Order: init calls FIRST (VIA init, jal __delay_cal, etc.), then
@@ -4660,8 +4738,18 @@ class MK1CodeGen:
                 result.append(l)
             return result
 
+        # When EEPROM preload is active, defer __eeprom_rd's init-only body
+        # so it lands at code[>= KERNEL_SIZE] and survives self-copy.
+        _preload_init_only = set()
+        if ee_preload_bytes > 0:
+            _preload_init_only = {'__eeprom_rd'}
+        _deferred_init_only_bodies = []
         for name, start, end, fsize in init_only_funcs:
-            assembled.extend(_rename_shared_refs(self.code[start:end]))
+            body = _rename_shared_refs(self.code[start:end])
+            if name in _preload_init_only:
+                _deferred_init_only_bodies.extend(body)
+            else:
+                assembled.extend(body)
 
         # Emit init-specific copies of shared helpers (with _init suffix).
         if shared_helpers_ov:
@@ -4684,17 +4772,52 @@ class MK1CodeGen:
             assembled.extend(init_shared)
 
         # Also include any non-shared, non-init-only helpers needed by init
-        if init_code_lines:
+        # OR by the self_copy routine (which runs as stage-1 init code and
+        # may call __eeprom_rd for EEPROM preload).
+        if init_code_lines or ee_preload_bytes > 0:
+            # Precompute helper bodies in self.code once for transitive scan.
+            _helper_bodies_in_code = {}  # name → list of lines
+            _hci = 0
+            while _hci < len(self.code):
+                _hs = self.code[_hci].strip()
+                if _hs.endswith(':') and not _hs.startswith('.') and _hs.startswith('_'):
+                    _hn = _hs[:-1]
+                    _hstart = _hci
+                    _hci += 1
+                    while _hci < len(self.code):
+                        _ns = self.code[_hci].strip()
+                        if _ns.endswith(':') and not _ns.startswith('.') and _ns.startswith('_'):
+                            break
+                        _hci += 1
+                    _helper_bodies_in_code[_hn] = self.code[_hstart:_hci]
+                else:
+                    _hci += 1
+
             init_needs = set()
-            all_init_lines = list(init_code_lines)
+            all_init_lines = list(init_code_lines) + list(self_copy)
             for name, start, end, fsize in init_only_funcs:
                 all_init_lines.extend(self.code[start:end])
-            for line in all_init_lines:
-                s = line.strip()
-                if s.startswith('jal '):
-                    target = s.split()[1]
-                    if target.startswith('__'):
-                        init_needs.add(target)
+            def _scan_jals(lines, out):
+                for line in lines:
+                    s = line.strip()
+                    if s.startswith('jal '):
+                        target = s.split()[1]
+                        if target.startswith('__'):
+                            out.add(target)
+            _scan_jals(all_init_lines, init_needs)
+            # Transitive: follow jal edges through helper bodies until fixed-point.
+            _frontier = set(init_needs)
+            while _frontier:
+                _next = set()
+                for _hn in _frontier:
+                    _body = _helper_bodies_in_code.get(_hn, [])
+                    _tmp = set()
+                    _scan_jals(_body, _tmp)
+                    for _t in _tmp:
+                        if _t not in init_needs:
+                            init_needs.add(_t)
+                            _next.add(_t)
+                _frontier = _next
 
             needed_but_not_init = init_needs - {n for n, _, _, _ in init_only_funcs}
             # Exclude mini-copied helpers (available at kernel addresses)
@@ -4702,7 +4825,20 @@ class MK1CodeGen:
             # Exclude helpers that are still resident (don't need init copies)
             needed_but_not_init -= {n for n in needed_but_not_init
                                     if f'{n}:' in _NO_OVERLAY and n not in init_rename_set}
-            if needed_but_not_init:
+            # Preload-survivor helpers: __eeprom_rd and __i2c_rb are called by
+            # the self-copy routine's preload loop, which runs AFTER self-copy
+            # overwrites code[0..KERNEL_SIZE-1]. These helpers MUST live at
+            # code[KERNEL_SIZE..] to survive. Defer their emission to the post-
+            # pad region (emitted after pad_needed is computed below).
+            _preload_survivors = set()
+            if ee_preload_bytes > 0:
+                for _n in ('__eeprom_rd', '__i2c_rb'):
+                    if _n in needed_but_not_init:
+                        _preload_survivors.add(_n)
+                needed_but_not_init = needed_but_not_init - _preload_survivors
+            _deferred_preload_helpers = []  # emitted after KERNEL_SIZE pad
+            import sys as _emdbg
+            if needed_but_not_init or _preload_survivors:
                 i = 0
                 while i < len(self.code):
                     s = self.code[i].strip()
@@ -4715,12 +4851,11 @@ class MK1CodeGen:
                             if ns.endswith(':') and not ns.startswith('.') and ns.startswith('_'):
                                 break
                             i += 1
-                        if hname in needed_but_not_init:
+                        if hname in needed_but_not_init or hname in _preload_survivors:
                             # Rename if this helper has labels in overlay sections
                             helper_lines = self.code[hstart:i]
                             if hname in init_rename_set:
                                 helper_lines = _rename_shared_refs(helper_lines)
-                                # Also rename local labels to avoid conflicts
                                 renamed = []
                                 for hl in helper_lines:
                                     l = hl
@@ -4731,12 +4866,14 @@ class MK1CodeGen:
                                         import re as _re
                                         for m in _re.finditer(r'\.([\w]+)', l):
                                             ref = '.' + m.group(1)
-                                            # Rename if this local label exists in the helper
                                             if any(ref + ':' in h2.strip() for h2 in self.code[hstart:i]):
                                                 l = l.replace(ref, ref + '_i')
                                     renamed.append(l)
                                 helper_lines = renamed
-                            assembled.extend(helper_lines)
+                            if hname in _preload_survivors:
+                                _deferred_preload_helpers.extend(helper_lines)
+                            else:
+                                assembled.extend(helper_lines)
                     else:
                         i += 1
 
@@ -4796,10 +4933,23 @@ class MK1CodeGen:
         # Self-copy must start at or after KERNEL_SIZE to avoid overwriting itself.
         # The copy writes to code[0..KERNEL_SIZE-1], so the loop code must be
         # at addresses >= KERNEL_SIZE. Pad with a jump + NOPs if init is short.
+        # EEPROM-preload helpers (__eeprom_rd, __i2c_rb) go HERE (at or after
+        # KERNEL_SIZE) so they survive self-copy — the preload loop calls them
+        # after self-copy has overwritten code[0..KERNEL_SIZE-1].
         init_lines_filtered = [l for l in assembled[phase4_start:]
                                if l.strip() and not l.strip().startswith(';')
                                and 'section' not in l and 'org' not in l]
         init_size = measure_lines(init_lines_filtered)
+        if ee_preload_bytes > 0:
+            import sys as _l1dbg
+            tail_bytes = measure_lines(_deferred_preload_helpers) \
+                       + measure_lines(_deferred_init_only_bodies) \
+                       + measure_lines(self_copy)
+            print(f"  [stage1] init_pre_pad={init_size}B, kernel={KERNEL_SIZE}B, "
+                  f"tail(helpers+selfcopy+preload)={tail_bytes}B, "
+                  f"budget={250-KERNEL_SIZE}B → "
+                  f"{'FITS' if KERNEL_SIZE + tail_bytes <= 250 else 'OVERFLOW'}",
+                  file=_l1dbg.stderr)
         if init_size < KERNEL_SIZE:
             pad_needed = KERNEL_SIZE - init_size
             if pad_needed > 2:
@@ -4812,7 +4962,12 @@ class MK1CodeGen:
                 for _ in range(pad_needed):
                     assembled.append('\tnop')
 
-        # EEPROM-backed overlays use ESP32 page3 patching (no init preload needed)
+        # Preload-survivor helpers: emitted at code[KERNEL_SIZE..] so they
+        # survive the self-copy that overwrites code[0..KERNEL_SIZE-1].
+        if _deferred_preload_helpers:
+            assembled.extend(_deferred_preload_helpers)
+        if _deferred_init_only_bodies:
+            assembled.extend(_deferred_init_only_bodies)
 
         assembled.append('__selfcopy:')
         assembled.extend(self_copy)
@@ -4888,7 +5043,7 @@ class MK1CodeGen:
                   f"{sum(f for _,_,_,f,_ in p2_overlays)}B", file=sys.stderr)
         if has_eeprom:
             print(f"  EEPROM: {len(ee_overlays)} overlays, "
-                  f"{sum(f for _,_,_,f,_ in ee_overlays)}B [ESP32 p3patch]",
+                  f"{sum(f for _,_,_,f,_ in ee_overlays)}B [MK1 init preload]",
                   file=sys.stderr)
 
 
