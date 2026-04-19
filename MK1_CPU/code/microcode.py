@@ -219,8 +219,10 @@ ucode_template[0xFE] = ('dec', [MI|PO, RO|II|PE, AO|EI, SUB|EO|EI, CINV|SUB|EO|A
 ucode_template[0xDC] = ('decb', [MI|PO, RO|II|PE, BO|AI, AO|EI, SUB|EO|EI, CINV|SUB|EO|AI|FI, AO|BI, RST], False)
 # DEC $c (replaces sub $c,$a — auto-gen ALU, not emitted)
 ucode_template[0xD8] = ('decc', [MI|PO, RO|II|PE, CO|AI, AO|EI, SUB|EO|EI, CINV|SUB|EO|AI|FI, AO|CI, RST], False)
-# DEC $d (replaces add $d,$a — auto-gen ALU, not emitted)
-ucode_template[0xCC] = ('decd', [MI|PO, RO|II|PE, DO|AI, AO|EI, SUB|EO|EI, CINV|SUB|EO|AI|FI, AO|DI, RST], False)
+# DEC $d (replaces and $d,$a — auto-gen ALU, not emitted).
+# Moved off 0xCC because the compiler's register allocator DOES emit
+# `add $d,$a` (0xCC) when a variable ends up in D.
+ucode_template[0xFC] = ('decd', [MI|PO, RO|II|PE, DO|AI, AO|EI, SUB|EO|EI, CINV|SUB|EO|AI|FI, AO|DI, RST], False)
 # INC $b (replaces and $b,$b — auto-gen ALU, not emitted).
 # Keeping jal_r at 0xE1 intact — it's the only primitive for indirect calls
 # (function pointers, jump tables) and we may want it for future C features.

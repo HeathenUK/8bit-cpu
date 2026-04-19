@@ -109,7 +109,7 @@ static const FixedInstr FIXED_INSTRUCTIONS[] = {
     // ── Register inc/dec (clobber A, set flags) ──
     // Named with underscore to avoid colliding with the existing "dec"/"inc"
     // A-register ops during shortest-match mnemonic lookup.
-    { "decd",    0xCC,  ARGS_NONE },  // D = D - 1 (A := old D - 1)
+    { "decd",    0xFC,  ARGS_NONE },  // D = D - 1 (A := old D - 1)
     { "decc",    0xD8,  ARGS_NONE },  // C = C - 1 (A := old C - 1)
     { "decb",    0xDC,  ARGS_NONE },  // B = B - 1 (A := old B - 1)
     { "incc",    0xE8,  ARGS_NONE },  // C = C + 1 (A := old C + 1)

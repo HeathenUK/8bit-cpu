@@ -881,6 +881,19 @@ static int runI2CScanAddr(uint8_t addr) {
         "    ddrb_imm 0x00\n"
         "    clr $a\n"
         "    exw 0 3\n"
+        // Bus recovery: 9 SCL clocks with SDA released. Required — if a prior
+        // transaction left a slave holding SDA low, every address we scan
+        // would appear to ACK. Inline (no loop) — per i2c_scan.c comment,
+        // loop overhead shifts timing and causes false ACKs.
+        "    ddrb_imm 0x02\n    ddrb_imm 0x00\n"  // clock 1
+        "    ddrb_imm 0x02\n    ddrb_imm 0x00\n"  // 2
+        "    ddrb_imm 0x02\n    ddrb_imm 0x00\n"  // 3
+        "    ddrb_imm 0x02\n    ddrb_imm 0x00\n"  // 4
+        "    ddrb_imm 0x02\n    ddrb_imm 0x00\n"  // 5
+        "    ddrb_imm 0x02\n    ddrb_imm 0x00\n"  // 6
+        "    ddrb_imm 0x02\n    ddrb_imm 0x00\n"  // 7
+        "    ddrb_imm 0x02\n    ddrb_imm 0x00\n"  // 8
+        "    ddrb_imm 0x02\n    ddrb_imm 0x00\n"  // 9
         // Clean STOP to end any prior transaction
         "    ddrb_imm 0x03\n"
         "    ddrb_imm 0x01\n"

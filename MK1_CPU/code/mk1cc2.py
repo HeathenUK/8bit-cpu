@@ -7859,6 +7859,44 @@ def peephole(lines):
             i += 1
         lines = out
 
+    # ── Pass: collapse `mov $X,$a ; inc|dec ; mov $a,$X` → incX/decX ──
+    # New microcode opcodes decb/decc/decd/incb/incc/incd do this in 1 byte.
+    # They clobber A with the new register value (same effect as the 3-byte
+    # sequence they replace — the compiler already assumes A is discardable
+    # at this point in the sequence, since the pattern intentionally routes
+    # through A to increment/decrement the register).
+    #
+    # Flags: the collapsed opcode sets Z/C identically to the expanded form
+    # (both use the CINV-based inc/dec microcode on A). Safe for `jnz`/`jz`/
+    # `jc`/`jnc` tests that follow.
+    COLLAPSE = {
+        ('mov $d,$a', 'dec', 'mov $a,$d'): 'decd',
+        ('mov $c,$a', 'dec', 'mov $a,$c'): 'decc',
+        ('mov $b,$a', 'dec', 'mov $a,$b'): 'decb',
+        ('mov $d,$a', 'inc', 'mov $a,$d'): 'incd',
+        ('mov $c,$a', 'inc', 'mov $a,$c'): 'incc',
+        ('mov $b,$a', 'inc', 'mov $a,$b'): 'incb',
+    }
+    out = []
+    i = 0
+    collapsed_count = 0
+    while i < len(lines):
+        if i + 2 < len(lines):
+            a, b, c = lines[i].strip(), lines[i+1].strip(), lines[i+2].strip()
+            replacement = COLLAPSE.get((a, b, c))
+            if replacement:
+                out.append(f'\t{replacement}')
+                i += 3
+                collapsed_count += 1
+                continue
+        out.append(lines[i])
+        i += 1
+    lines = out
+    if collapsed_count > 0:
+        import sys
+        print(f"  Peephole: collapsed {collapsed_count} reg-inc/dec patterns "
+              f"(saved {collapsed_count * 2}B)", file=sys.stderr)
+
     return lines
 
 

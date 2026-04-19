@@ -263,7 +263,7 @@ async function i2cScan() {
     const r = await fetch('/i2cscan');
     const j = await r.json();
     if (j.found && j.found.length > 0) {
-      let msg = 'I2C devices found:\\n' + j.found.map(d => '  ' + d.hex + ' (7-bit)  W:' + d.write + ' R:' + d.read).join('\\n');
+      let msg = 'I2C devices found: ' + j.found.map(d => d.hex + ' (W:' + d.write + ' R:' + d.read + ')').join(', ');
       o.innerHTML = '<span class="ok">' + esc(msg) + '</span>';
     } else {
       o.innerHTML = '<span class="err">No I2C devices found</span>';
