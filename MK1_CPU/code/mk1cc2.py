@@ -4351,14 +4351,24 @@ class MK1CodeGen:
                 overlay mode the code-page fit is what matters: a thunk that
                 grows the kernel by 10B while shrinking the largest overlay by
                 7B is a net loss even if total-bytes-used decreases."""
-                # Build per-unit instruction streams with global indices
+                # Build per-unit instruction streams with global indices.
+                # Include runtime_resident_helpers, every overlay body, AND
+                # main_lines (the runtime main code). main runs at kernel
+                # addresses post-self-copy, so it can call __xsthunk_N freely.
                 units = {}   # unit_id → list of (global_idx, text)
                 units['kernel'] = list(_t2_strip_section_tokens(runtime_resident_helpers))
+                units['main'] = list(_t2_strip_section_tokens(main_lines))
                 for oi, (oname, olines, _ofsize) in enumerate(overlay_asm_blocks):
                     units[f'ov{oi}'] = list(_t2_strip_section_tokens(olines))
 
-                # Current sizes (unchanging across candidates this pass)
-                cur_kernel_size = measure_lines(runtime_resident_helpers)
+                # Current sizes (unchanging across candidates this pass).
+                # Kernel = runtime_resident_helpers + main_lines (+ loader,
+                # constant across extractions). Track helpers and main
+                # separately so the budget simulation can add the thunk in
+                # the right place.
+                cur_helper_size = measure_lines(runtime_resident_helpers)
+                cur_main_size = measure_lines(main_lines)
+                cur_kernel_size = cur_helper_size + cur_main_size
                 cur_ov_sizes = [sz for _, _, sz in overlay_asm_blocks]
                 cur_max_ov = max(cur_ov_sizes, default=0)
                 cur_budget = cur_kernel_size + cur_max_ov
@@ -4508,12 +4518,17 @@ class MK1CodeGen:
                     per_call_bytes = 4 if param else 2
                     # Simulate post-extraction budget. Per-occurrence size delta
                     # = S (inline removed) - per_call_bytes (call site emitted).
+                    # Thunk is placed in kernel (runtime_resident_helpers); each
+                    # occurrence in kernel/main shrinks their respective unit.
+                    # Overlays shrink their own body sizes.
                     occ_delta = S - per_call_bytes
                     unit_occ = {}
                     for o in accepted:
                         unit_occ[o[0]] = unit_occ.get(o[0], 0) + 1
-                    kernel_occ = unit_occ.get('kernel', 0)
-                    post_kernel = cur_kernel_size + thunk_cost - kernel_occ * occ_delta
+                    # All in-kernel units (kernel helpers + main) contribute to
+                    # the single kernel_size figure that the budget cares about.
+                    kernel_side_occ = unit_occ.get('kernel', 0) + unit_occ.get('main', 0)
+                    post_kernel = cur_kernel_size + thunk_cost - kernel_side_occ * occ_delta
                     new_ov_sizes = []
                     for oi, sz in enumerate(cur_ov_sizes):
                         n = unit_occ.get(f'ov{oi}', 0)
@@ -4602,6 +4617,8 @@ class MK1CodeGen:
                     # Pick target list by unit
                     if uid == 'kernel':
                         target_lines = runtime_resident_helpers
+                    elif uid == 'main':
+                        target_lines = main_lines
                     else:
                         oi = int(uid[2:])
                         target_lines = overlay_asm_blocks[oi][1]
@@ -4635,6 +4652,8 @@ class MK1CodeGen:
 
                     if uid == 'kernel':
                         runtime_resident_helpers = new_target
+                    elif uid == 'main':
+                        main_lines = new_target
                     else:
                         overlay_asm_blocks[oi] = (overlay_asm_blocks[oi][0],
                                                    new_target,
