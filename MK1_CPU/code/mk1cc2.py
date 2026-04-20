@@ -4586,10 +4586,12 @@ class MK1CodeGen:
 
             _t2_thunk_counter = 0
             _t2_total_saved = 0
-            # _t2_find_best_cross_section() already enforces the budget
-            # constraint: candidates that would grow (kernel + max_overlay)
-            # are filtered out. Iterate until no budget-improving candidate
-            # remains. Raw byte savings are reported for diagnostics.
+            # Budget gate is strict: only accept extractions that don't grow
+            # the kernel+max_overlay sum. Attempted "best-effort" relaxation
+            # for already-overflow programs was a net loss — the relaxed
+            # extractions traded overlay bytes for kernel bytes at ~1:1,
+            # moving the fit constraint further from passing. See
+            # _t2_find_best_cross_section() for the scoring details.
             for _t2_pass in range(8):   # up to 8 cross-section thunks per program
                 best = _t2_find_best_cross_section()
                 if best is None:
