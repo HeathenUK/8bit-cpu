@@ -123,39 +123,105 @@ def dedup_consecutive(vals):
     return out
 
 
-def find_sequence(vals, expected):
-    """Verify the program's output matches `expected` by requiring the
-    expected sequence to appear as a contiguous subsequence at least
-    TWICE (not necessarily back-to-back).
+# Canonical "execution started at PC=0" sentinel. The test runner wraps
+# every program with `out(0xDE); out(0xAD); out(0xBE);` as the FIRST thing
+# after the _main preamble. If we see that 3-value sequence in the OI
+# capture, execution genuinely started clean (reset put PC at 0, self-copy
+# ran, _main body ran from the top). Any OI samples BEFORE the sentinel
+# are reset-transient artefacts (bus values latched during RUN startup
+# before the CPU settled) and are discarded.
+SENTINEL = [0xDE, 0xAD, 0xBE]
 
-    Why twice:
-      - HLT_GRACE_CYCLES (100k) makes _main re-run after hlt, so a
-        correctly-behaving program emits the expected sequence multiple
-        times in a sufficiently long RUNLOG window. Requiring ≥2
-        occurrences rules out single coincidental matches with bus noise.
-      - Between iterations, the main preamble's I2C bus-recovery
-        (`ddrb_imm`) can spuriously fire OI and insert noise bytes
-        between expected occurrences — these are hardware fetch-cycle
-        artefacts, not miscompiles. Allowing gaps between occurrences
-        handles that without creating false positives.
-      - A real miscompile either emits the wrong values (expected won't
-        appear 2+ times) or hangs (no captures at all).
+
+def find_sequence(vals, expected):
+    """Verify the program's output matches `expected`.
+
+    Strategy: each iteration of the halt-retry loop starts with the
+    SENTINEL [0xDE,0xAD,0xBE], so a correct program emits
+    [S0,S1,S2, expected..., S0,S1,S2, expected..., ...] in the capture.
+    Pass if ANY sentinel occurrence is followed by exactly `expected`.
+
+    Why any-occurrence (not first-occurrence):
+      - The first halt-retry iteration often has startup artefacts:
+        the ESP32 may miss OI edges during RUN loop warmup, or the
+        first out() fires during a transient bus state. Later
+        iterations, after the CPU has settled into the halt-retry
+        rhythm, are cleaner.
+      - A real miscompile produces wrong values at EVERY iteration,
+        so even the cleanest sentinel will fail to find `expected`.
+      - A hung program emits no sentinel at all, which still fails.
 
     Returns the expected sequence on success, [] on failure."""
     E = list(expected)
-    n = len(E)
-    if n == 0:
+    S = SENTINEL
+    if not E:
         return []
-    # Count non-overlapping contiguous occurrences of E in vals.
-    count = 0
+    # Try each sentinel occurrence; pass if any has matching tail.
     i = 0
-    while i <= len(vals) - n:
-        if vals[i:i + n] == E:
-            count += 1
-            i += n
+    while i <= len(vals) - len(S):
+        if vals[i:i + len(S)] == S:
+            tail = vals[i + len(S):i + len(S) + len(E)]
+            if tail == E:
+                return E
+            i += len(S)   # skip this sentinel, try the next
         else:
             i += 1
-    return E if count >= 2 else []
+    return []   # no sentinel followed by expected → miscompile or hang
+
+
+def wrap_with_sentinel(source):
+    """Inject the SENTINEL emit before the first non-init call in main.
+
+    Auto-injection has to come AFTER any init-only builtins (i2c_init,
+    lcd_init, tone_setup) — those calls only stay in stage-1 init code if
+    every preceding statement in main is also init-classified by step
+    10b, and out_imm breaks that classification. Inserting the sentinel
+    before i2c_init() would push the init body into runtime main,
+    bloating the kernel and defeating the very optimisation some tests
+    validate.
+
+    Strategy: find `void main(void) {`, then scan forward past lines that
+    match init-only builtin calls, and inject the sentinel after the last
+    such call. For tests with no init builtins, inject immediately after
+    the `{`. The test author can also pre-supply the sentinel in source
+    (signalled by presence of the three constants 0xDE/0xAD/0xBE) — in
+    that case we skip injection."""
+    # Skip if already has sentinel
+    if '0xDE' in source and '0xAD' in source and '0xBE' in source:
+        return source
+    marker = 'void main(void) {'
+    idx = source.find(marker)
+    if idx < 0:
+        return source
+    cursor = idx + len(marker)
+    # Scan forward line-by-line, skipping init-only builtin calls and
+    # trivial whitespace. Stop at the first real statement.
+    init_builtins = ('i2c_init(', 'lcd_init(', 'tone_setup(', 'delay_calibrate(')
+    remaining = source[cursor:]
+    insert_offset = 0
+    pos = 0
+    while pos < len(remaining):
+        # Skip whitespace
+        while pos < len(remaining) and remaining[pos] in ' \t\n\r':
+            pos += 1
+        if pos >= len(remaining):
+            break
+        # Check if the next statement is an init builtin
+        is_init = False
+        for b in init_builtins:
+            if remaining.startswith(b, pos):
+                # Advance past the whole statement (to next ';')
+                semi = remaining.find(';', pos)
+                if semi < 0:
+                    break
+                pos = semi + 1
+                insert_offset = pos
+                is_init = True
+                break
+        if not is_init:
+            break
+    injection = '\n    out(0xDE); out(0xAD); out(0xBE);'
+    return source[:cursor + insert_offset] + injection + source[cursor + insert_offset:]
 
 
 def trim_halt_retry(vals, expected_len):
@@ -168,13 +234,17 @@ def trim_halt_retry(vals, expected_len):
 
 # ── Compilation ──────────────────────────────────────────────────────
 
-def compile_c(source_path, eeprom=False, optimize=True):
+def compile_c(source_path, eeprom=False, optimize=True, extra_env=None):
     args = ['python3', COMPILER, source_path, '-o', '/tmp/_hwreg.asm']
     if optimize:
         args.append('-O')
     if eeprom:
         args.append('--eeprom')
-    r = subprocess.run(args, capture_output=True, text=True)
+    env = dict(os.environ)
+    env.setdefault('PYTHONHASHSEED', '0')
+    if extra_env:
+        env.update(extra_env)
+    r = subprocess.run(args, capture_output=True, text=True, env=env)
     if r.returncode != 0:
         return None, r.stderr
     with open('/tmp/_hwreg.asm') as f:
@@ -184,7 +254,8 @@ def compile_c(source_path, eeprom=False, optimize=True):
 # ── Test case runner ─────────────────────────────────────────────────
 
 class Test:
-    def __init__(self, name, source, expected, eeprom=False, cycles=500_000, us=2):
+    def __init__(self, name, source, expected, eeprom=False, cycles=2_000_000, us=2,
+                 env=None):
         self.name = name
         self.source = source
         self.expected = expected   # list of ints, prefix of expected OI history
@@ -195,13 +266,18 @@ class Test:
         # is at the marginal edge. Keep tests below 250 kHz so we never
         # blame a miscompile on a clock-induced glitch.
         self.us = us
+        # Optional extra env vars for the compiler (e.g. MK1_T2_MIN_LEN=3 to
+        # force init-touching T2.1 extraction for validation).
+        self.env = env
 
 
 def run_one(ser, test, verbose=False):
     """Compile + upload + runlog once. Return (passed, actual_trimmed, notes)."""
+    wrapped = wrap_with_sentinel(test.source)
     with open('/tmp/_hwreg_src.c', 'w') as f:
-        f.write(test.source)
-    asm, compile_err = compile_c('/tmp/_hwreg_src.c', eeprom=test.eeprom)
+        f.write(wrapped)
+    asm, compile_err = compile_c('/tmp/_hwreg_src.c', eeprom=test.eeprom,
+                                  extra_env=test.env)
     if asm is None:
         return False, [], f'compile error: {compile_err[:200]}'
     if not assemble_upload(ser, asm):
@@ -338,6 +414,42 @@ TESTS = [
         }''',
         [21], eeprom=True,   # 10+10+1 = 21
     ),
+    Test(
+        'T2.1 init-touch: thunk extracted from init code',
+        # With MIN_LEN=3, the 3-instr I2C STOP pattern (ddrb_imm 0x03/0x01/0x00)
+        # extracts as a kernel thunk. The thunk occurrences span BOTH the
+        # runtime main preamble's bus recovery AND the stage-1 init bus
+        # recovery. A regression that mis-places the thunk would make stage-1
+        # jal into a non-mini-copied address, so the expected output never
+        # appears after the sentinel.
+        # The sentinel anchor anchors capture at `_main` start post-self-copy;
+        # if stage-1 explodes, no sentinel appears and the test fails cleanly.
+        '''unsigned char g[200];
+        unsigned char m(unsigned char a, unsigned char b) {
+            unsigned char r = 0;
+            while (b > 0) { r = r + a; b = b - 1; }
+            return r;
+        }
+        unsigned char a10(unsigned char x) { return x + 10; }
+        unsigned char dbl(unsigned char x) { return x + x; }
+        unsigned char chain(unsigned char input) {
+            unsigned char s1 = m(input, 3);
+            unsigned char s2 = a10(s1);
+            return dbl(s2);
+        }
+        void main(void) {
+            i2c_init();
+            out(chain(7));
+            halt();
+        }''',
+        [62], eeprom=True,
+        # i2c_init adds stage-1 body + self-copy overhead per halt-retry
+        # iteration. Longer capture window lets more iterations accumulate
+        # in the 256-slot buffer so a clean sentinel+expected pair lands
+        # in the captured prefix.
+        cycles=2_000_000,
+        env={'MK1_T2_MIN_LEN': '3'},
+    ),
 ]
 
 
@@ -357,6 +469,8 @@ def main():
     failed = 0
     for t in TESTS:
         if args.filter and args.filter not in t.name:
+            continue
+        if t.name.startswith('__skip'):
             continue
         if args.cycles != 2_000_000:
             t.cycles = args.cycles

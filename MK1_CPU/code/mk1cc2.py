@@ -4518,6 +4518,19 @@ class MK1CodeGen:
                 cur_budget = cur_kernel_size + cur_max_ov
 
                 MIN_LEN, MAX_LEN = 4, 12
+                # Dev hook: MK1_T2_MIN_LEN lowers MIN_LEN so tests can force
+                # init-touching extractions to fire (the init scan is a
+                # structural no-op on the current corpus because typical init
+                # blocks have no 4+ instruction sequence matching another
+                # section). Set to 3 to let the three-instr I2C STOP pattern
+                # (`ddrb_imm 0x03/0x01/0x00`) match between init and __i2c_sp.
+                import os as _t2_env_os
+                _env_min_len = _t2_env_os.environ.get('MK1_T2_MIN_LEN')
+                if _env_min_len:
+                    try:
+                        MIN_LEN = max(2, int(_env_min_len))
+                    except ValueError:
+                        pass
                 # Three sequence flavours scanned in a unified hash:
                 #   - "call": flow ends normally; extraction adds ret; call = 2B jal
                 #   - "tail": last instruction is `ret`; call = 2B j (no extra ret)
@@ -4848,10 +4861,12 @@ class MK1CodeGen:
                     'param_tail': 'T2.2 param-tail',
                 }
                 _tag = _tag_map.get(mode, 'T2')
+                _sections = set(a[0] for a in accepted)
+                _init_flag = ' [INIT-TOUCHES]' if 'init' in _sections else ''
                 print(f"  {_tag}: extracted {L}-instr {S}B sequence × "
                       f"{len(accepted)} across "
-                      f"{len(set(a[0] for a in accepted))} sections "
-                      f"(saves {savings}B) as {thunk_name}",
+                      f"{len(_sections)} sections "
+                      f"(saves {savings}B) as {thunk_name}{_init_flag}",
                       file=sys.stderr)
 
             if _t2_total_saved:
