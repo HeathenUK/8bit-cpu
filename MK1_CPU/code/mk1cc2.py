@@ -3079,8 +3079,60 @@ class MK1CodeGen:
         # If a user+library combination exceeds the overlay region → fatal error.
         overlay_slots = []  # list of ([(name, start, end, fsize), ...], total_size)
 
+        # Pre-compute external callers so we can pick the slot's entry point.
+        # An "entry" function is one called from OUTSIDE the slot (main, other
+        # slots, resident helpers). The overlay loader tail-calls
+        # `j __ov_entry` which lands at offset 0 of the loaded bundle — so
+        # whichever function appears first in the slot IS the entry. If the
+        # compiler puts a helper first (e.g., double_it before compute_chain),
+        # external callers of compute_chain silently dispatch to double_it.
+        def _slot_entry_fn(comp_names):
+            """Pick the entry function for a slot. The overlay loader tail-
+            calls `j __ov_entry` which lands at offset 0 of the loaded bundle,
+            so slot[0] MUST be the function reachable from outside the slot.
+            Heuristic: a function called by NONE of the other functions in the
+            slot is likely the external entry point. User functions preferred
+            over library helpers. `comp_names` contains bare names (no leading
+            `_`); the asm `jal _foo` targets carry the underscore — normalize
+            on comparison.
+            """
+            comp_set = set(comp_names)
+            # Build intra-component call graph: who calls whom?
+            called_by_intra = {nm: False for nm in comp_names}
+            for nm in comp_names:
+                # Find this function's body in self.code and scan for jals
+                start, end, _ = ov_by_name.get(nm, (0, 0, 0))
+                for line in self.code[start:end]:
+                    s = line.strip()
+                    if s.startswith('jal '):
+                        tgt = s.split()[1]
+                        # Accept direct match or stripped-underscore match —
+                        # depending on how comp_names is built, entries may
+                        # or may not carry a leading '_'.
+                        matched = None
+                        if tgt in comp_set:
+                            matched = tgt
+                        elif tgt.startswith('_') and not tgt.startswith('__') and tgt[1:] in comp_set:
+                            matched = tgt[1:]
+                        if matched and matched != nm:
+                            called_by_intra[matched] = True
+            # Entry candidates: NOT called by any intra function.
+            externals = [nm for nm in comp_names if not called_by_intra[nm]]
+            candidates = externals if externals else list(comp_names)
+            # Prefer user functions over library helpers
+            user_first = [n for n in candidates if not n.startswith('__')]
+            return (user_first + candidates)[0]
+
         for comp in components:
-            slot = [(n, *ov_by_name[n]) for n in comp]
+            # Reorder so the entry function (user fn called externally) is
+            # first. Without this, the overlay loader's `j __ov_entry` may
+            # land on a helper instead of the requested user function.
+            entry_name = _slot_entry_fn(comp)
+            if entry_name and entry_name in comp:
+                comp_ordered = [entry_name] + [n for n in comp if n != entry_name]
+            else:
+                comp_ordered = list(comp)
+            slot = [(n, *ov_by_name[n]) for n in comp_ordered]
             slot_size = sum(f for _, _, _, f in slot)
 
             # Separate library helpers from user functions
@@ -3093,7 +3145,8 @@ class MK1CodeGen:
                 overlay_slots.append((slot, slot_size))
             elif not lib_funcs:
                 # All user — they're in the same component (call each other),
-                # so they must be in ONE overlay slot together.
+                # so they must be in ONE overlay slot together. `slot` was
+                # reordered above so the entry function is slot[0].
                 overlay_slots.append((slot, slot_size))
             else:
                 # Mixed: create one overlay per user func + ALL lib helpers
