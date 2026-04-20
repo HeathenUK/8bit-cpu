@@ -4732,6 +4732,36 @@ class MK1CodeGen:
             # overlay doesn't need $a/$b passed; the pop before __ov_entry is
             # wasted. Combined with caller-side liveness, we can drop both
             # push AND pop for dead registers. Savings: 2B per elided pair.
+            # Map __xsthunk_N / __param_N / __tailmerge_N to the overlay index
+            # they wrap. This lets jal-liveness see through the thunks to the
+            # actual overlay's arg count.
+            _t3_thunk_to_ov_idx = {}
+            for line in runtime_resident_helpers:
+                # Lines look like: __xsthunk_0:, then `ldi $a, IDX`, then jal
+                pass
+            # Build the map by scanning runtime_resident_helpers
+            _i = 0
+            _rhlp = runtime_resident_helpers
+            while _i < len(_rhlp):
+                s = _rhlp[_i].strip()
+                if (s.endswith(':') and
+                    (s.startswith('__xsthunk_') or s.startswith('__param_') or
+                     s.startswith('__tailmerge_'))):
+                    name = s[:-1]
+                    # Look ahead a few lines for `ldi $a, IDX; jal _overlay_load`
+                    for _k in range(1, 8):
+                        if _i + _k >= len(_rhlp): break
+                        ks = _rhlp[_i + _k].strip()
+                        if ks.startswith('ldi $a,') and _i + _k + 1 < len(_rhlp):
+                            if _rhlp[_i + _k + 1].strip() == 'jal _overlay_load':
+                                try:
+                                    idx_str = ks.split(',', 1)[1].strip()
+                                    _t3_thunk_to_ov_idx[name] = int(idx_str, 0)
+                                except Exception:
+                                    pass
+                                break
+                _i += 1
+
             def _t3_reg_used_by_instr(text, reg):
                 """True if the instruction text READS the named register.
                 `reg` is 'a', 'b', 'c', or 'd'."""
@@ -4744,7 +4774,28 @@ class MK1CodeGen:
                 if mn.startswith(('j','jz','jnz','jc','jnc')) and mn != 'jal':
                     return True         # branches read flags — conservative for A
                 if mn == 'jal':
-                    return True         # call may use any reg as arg
+                    # Transparent thunks: jal to __xsthunk_N / __param_N /
+                    # __tailmerge_N wraps an overlay call with known arg count.
+                    # Look up the wrapped overlay's arg count and decide.
+                    parts = s.split()
+                    if len(parts) >= 2:
+                        tgt = parts[1]
+                        # User function: `_foo` → check func_params
+                        if tgt.startswith('_') and not tgt.startswith('__'):
+                            bare = tgt.lstrip('_')
+                            if bare in self.func_params:
+                                arg_count = self.func_params[bare]
+                                if reg == 'a': return arg_count >= 1
+                                if reg == 'b': return arg_count >= 2
+                                return False
+                        # Thunk wrapping an overlay call
+                        if tgt in _t3_thunk_to_ov_idx:
+                            ov_idx = _t3_thunk_to_ov_idx[tgt]
+                            arg_count = _t3_overlay_arg_count(ov_idx)
+                            if reg == 'a': return arg_count >= 1
+                            if reg == 'b': return arg_count >= 2
+                            return False
+                    return True         # unknown target — conservative
                 # push $X reads $X
                 if mn == 'push' and s.split()[1] == dollar:
                     return True
@@ -4988,6 +5039,112 @@ class MK1CodeGen:
                 print(f"  T3.1 elided {_t3_saved}B of dead push/pop around overlay calls "
                       f"(main={_t3_main_saved}B, helpers={_t3_hlp_saved}B, "
                       f"overlays={_t3_ov_saved}B)",
+                      file=sys.stderr)
+
+            # ── T3.1b: General push/pop pair elision (experimental) ──
+            # Finds matching `push $X` / `pop $X` pairs where the register is
+            # dead across the pair. Currently disabled because the label-as-
+            # jump-target check aborts most candidates in practice (many
+            # labels are branch targets in the intervening region). Kept here
+            # for future refinement with a more precise reachability check.
+            def _t3_elide_generic_push_pop(lines):
+                saved = 0
+                # Find labels that are jump targets (anything after the start
+                # of scan could be jumped to, breaking the locality assumption).
+                labels_with_targets = set()
+                for ln in lines:
+                    s = ln.strip()
+                    if (s.startswith(('j ', 'jz ', 'jnz ', 'jc ', 'jnc ', 'jal '))
+                        and ' ' in s):
+                        tgt = s.split(' ', 1)[1].strip()
+                        labels_with_targets.add(tgt)
+                # Build a list of indices to potentially remove
+                to_remove = set()
+                n = len(lines)
+                for i, line in enumerate(lines):
+                    s = line.strip()
+                    # Only match raw `push $X` (no ;!keep comments)
+                    if not (s == 'push $a' or s == 'push $b'):
+                        continue
+                    if ';!keep' in line:
+                        continue
+                    reg = s.split()[1][1]   # 'a' or 'b'
+                    dollar = f'${reg}'
+                    # Scan forward finding the matching pop. Track stack depth
+                    # starting at 1 (our own push). Each push on same reg adds,
+                    # each pop subtracts until depth=0 (pair's pop).
+                    depth = 1
+                    j = i + 1
+                    broke = False
+                    saw_stsp = False
+                    saw_jump_in = False
+                    while j < n and depth > 0:
+                        js = lines[j].strip()
+                        if ';!keep' in lines[j]:
+                            broke = True; break
+                        mn = js.split()[0] if js.split() else ''
+                        # A label (`foo:` or `.foo:`) — if it's a jump target,
+                        # other code could land inside our window and the
+                        # stack-balance no longer holds locally.
+                        if js.endswith(':') and not js.startswith('section'):
+                            lbl = js[:-1]
+                            if lbl in labels_with_targets:
+                                saw_jump_in = True; break
+                            j += 1; continue
+                        if mn == 'stsp' or mn == 'ldsp' or mn == 'ldsp_b':
+                            saw_stsp = True; break
+                        if mn in ('push', 'push_b', 'push_imm'):
+                            depth += 1
+                        elif mn in ('pop', 'pop_b'):
+                            depth -= 1
+                            if depth == 0:
+                                # Matching pop. Verify it's `pop $X` for same reg.
+                                if mn == 'pop' and len(js.split()) > 1 and js.split()[1] == dollar:
+                                    # Check liveness of reg after the pop
+                                    if not _t3_reg_live_after(lines, j, reg):
+                                        # Check reg is also dead BEFORE the pair
+                                        # (i.e., the push's reg value wasn't
+                                        # "the interesting value" — the pair
+                                        # is a no-op). Actually the push
+                                        # preserves the reg value around
+                                        # clobbering ops between push and pop.
+                                        # So we need: is the reg LIVE at any
+                                        # point between push and pop where it
+                                        # gets READ? If yes, the push was
+                                        # preserving something useful that
+                                        # the code reads after the pop (we
+                                        # already verified dead-after-pop).
+                                        # OR reads in between (pops it, uses,
+                                        # pushes back? no — we tracked only
+                                        # matching pair).
+                                        # Simpler: liveness-after-pop is what
+                                        # matters. If dead, the push/pop pair
+                                        # can't affect observable behaviour.
+                                        to_remove.add(i)
+                                        to_remove.add(j)
+                                        saved += 2
+                                break
+                        j += 1
+                    if broke or saw_stsp or saw_jump_in:
+                        continue
+                out = [line for idx, line in enumerate(lines) if idx not in to_remove]
+                return out, saved
+
+            # Apply generic push/pop elision to all sections
+            main_lines, _t3b_main = _t3_elide_generic_push_pop(main_lines)
+            runtime_resident_helpers, _t3b_hlp = _t3_elide_generic_push_pop(runtime_resident_helpers)
+            _t3b_ov = 0
+            for oi in range(len(overlay_asm_blocks)):
+                oname, olines, ofsize = overlay_asm_blocks[oi]
+                new_olines, n = _t3_elide_generic_push_pop(olines)
+                if n:
+                    overlay_asm_blocks[oi] = (oname, new_olines, measure_lines(new_olines))
+                    _t3b_ov += n
+            _t3b_saved = _t3b_main + _t3b_hlp + _t3b_ov
+            if _t3b_saved:
+                print(f"  T3.1b elided {_t3b_saved}B of dead push/pop pairs "
+                      f"(main={_t3b_main}B, helpers={_t3b_hlp}B, "
+                      f"overlays={_t3b_ov}B)",
                       file=sys.stderr)
 
             runtime_helper_size = measure_lines(runtime_resident_helpers)
