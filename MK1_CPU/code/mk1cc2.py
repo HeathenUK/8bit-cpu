@@ -1980,25 +1980,24 @@ class MK1CodeGen:
             self.emit(f'{lbl_loop}:')
             self.emit('\tmov $d,$a')
             self.emit('\tderef')
-            self.emit(f'\tldi $b,{END}')
-            self.emit('\tcmp $b')
+            # `cmp imm` (cmpi, opcode 0xFD) is a single 2B instruction that
+            # doesn't clobber $b. Replaces the older 3B `ldi $b,N; cmp $b`
+            # pattern. Four sentinel checks → 4B saved off __lcd_init body.
+            self.emit(f'\tcmp {END}')
             self.emit(f'\tjz {lbl_done}')
             self.emit('\tpush $d')          # save index across helper calls
-            self.emit(f'\tldi $b,{START}')
-            self.emit('\tcmp $b')
+            self.emit(f'\tcmp {START}')
             self.emit(f'\tjnz {lbl_ns}')
             self.emit('\tjal __i2c_st')
             self.emit(f'\tj {lbl_adv}')
             self.emit(f'{lbl_ns}:')
-            self.emit(f'\tldi $b,{STOP}')
-            self.emit('\tcmp $b')
+            self.emit(f'\tcmp {STOP}')
             lbl_nd = self.label('li_nd')
             self.emit(f'\tjnz {lbl_nd}')
             self.emit('\tjal __i2c_sp')
             self.emit(f'\tj {lbl_adv}')
             self.emit(f'{lbl_nd}:')
-            self.emit(f'\tldi $b,{DELAY}')
-            self.emit('\tcmp $b')
+            self.emit(f'\tcmp {DELAY}')
             self.emit(f'\tjnz {lbl_send}')
             # Calibrated ~5ms delay — outer loop 5 × 256 inner iterations.
             lbl_outer = self.label('li_do')
