@@ -147,6 +147,13 @@ ucode_template[0b01111001] = ('exr 1 0', [MI|PO, RO|II|PE, XI, XI|E1|AI, RST, RS
 
 ucode_template[0b01111010] = ('not', [MI|PO, RO|II|PE,  AO|EI, AI, NOT|EO|AI, RST, RST, RST], False)
 ucode_template[0b01111011] = ('sll', [MI|PO, RO|II|PE,  SHF|AI|FI, RST,     RST, RST, RST, RST], False)
+
+# sllb: shift B left by 1, result stored in both A and B, flags from shift.
+# Equivalent to `mov $b,$a; sll; mov $a,$b` (3B) in a single byte.
+# Retires 0x22 (move $sp, $c) — 0 uses across the 42-program corpus.
+# Corpus scan identified 65 occurrences of the shift-B triple; sllb saves
+# 2B per use = ~130B corpus-wide.
+ucode_template[0b00100010] = ('sllb', [MI|PO, RO|II|PE, BO|AI, SHF|AI|FI, AO|BI, RST, RST, RST], False)
 ucode_template[0b01111100] = ('slr', [MI|PO, RO|II|PE,  SHF|RGT|AI|FI, RST, RST, RST, RST, RST], False)
 ucode_template[0b01111101] = ('rll', [MI|PO, RO|II|PE,  ROT|AI|FI, RST,     RST, RST, RST, RST], False)
 ucode_template[0b01111110] = ('rlr', [MI|PO, RO|II|PE,  ROT|RGT|AI|FI, RST, RST, RST, RST, RST], False)

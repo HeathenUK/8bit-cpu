@@ -9415,6 +9415,17 @@ def peephole(lines):
         ('mov $c,$a', 'inc', 'mov $a,$c'): 'incc',
         ('mov $b,$a', 'inc', 'mov $a,$b'): 'incb',
     }
+    # T4.1-discovered: `mov $b,$a; sll; mov $a,$b` (3B) → `sllb` (1B),
+    # saves 2B per occurrence. sllb is a new opcode (0x22) that retires
+    # the unused `move $sp, $c` — requires microcode EEPROM reflash.
+    # Gated behind MK1_NEW_OPCODES=1 so pre-flash compilation still
+    # emits the original 3-byte sequence and runs correctly on unflashed
+    # hardware. Once the user flashes the new microcode.bin to the four
+    # SST39SF040 EEPROMs (T48 + minipro, same binary all 4 chips per
+    # the project memory), they set the env var and rebuild.
+    import os as _sllb_os
+    if _sllb_os.environ.get('MK1_NEW_OPCODES') == '1':
+        COLLAPSE[('mov $b,$a', 'sll', 'mov $a,$b')] = 'sllb'
     out = []
     i = 0
     collapsed_count = 0
