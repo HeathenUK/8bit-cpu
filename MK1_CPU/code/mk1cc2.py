@@ -3188,26 +3188,14 @@ class MK1CodeGen:
                         ldi_b_line = new_resident[-2]
                         new_resident = new_resident[:-3]
                         new_resident.append(ldi_b_line)
-                    # UNIFORM OVERLAY CALL CONVENTION (task #38):
-                    # Always save $a and $b before loading the overlay, always
-                    # restore after. _overlay_load clobbers all four GPRs during
-                    # its copy loop, so any caller that wants arg values (or even
-                    # just a stable A) to survive the load MUST save/restore.
-                    # The old code branched on `func_params.get(target.lstrip('_'), 0)`
-                    # which returned 0 for bundled-helper overlays like
-                    # __lcd_chr_ov0 (because the key 'lcd_chr_ov0' is not a user
-                    # function), emitting the broken no-save pattern for helpers
-                    # that actually expect A=char at entry. Uniform save/restore
-                    # costs +4B per call site but fixes the class of bug for all
-                    # overlay targets regardless of origin (user fn, helper,
-                    # bundled wrapper, auto-split phase).
-                    new_resident.append('\tpush $b')            # save $b (arg2 or scratch)
-                    new_resident.append('\tpush $a')            # save $a (arg1 or scratch)
-                    new_resident.append(f'\tldi $a,{idx}')
-                    new_resident.append('\tjal _overlay_load')  # load only, returns
-                    new_resident.append('\tpop $a')             # restore $a
-                    new_resident.append('\tpop $b')             # restore $b
-                    new_resident.append(f'\tjal __ov_entry')    # call overlay
+                    # T3.3 THIN OVERLAY DISPATCH:
+                    # Caller sets $c = overlay index, leaves $a/$b as args.
+                    # `jal _overlay_load` loads the overlay body AND tail-calls
+                    # it (via loader's internal push/pop + `j __ov_entry`).
+                    # The overlay's `ret` returns to this caller directly.
+                    # Call site: 4B (ldi $c + jal) vs the old 11B pattern.
+                    new_resident.append(f'\tldi $c,{idx}')
+                    new_resident.append('\tjal _overlay_load')
                     rewritten = True
                 if not rewritten:
                     new_resident.append(line)
@@ -4073,11 +4061,28 @@ class MK1CodeGen:
                 EEPROM-backed overlays are preloaded into freed page3 space during init,
                 so the runtime loader only needs SRAM copy paths.
                 """
+                # ── T3.3 THIN OVERLAY DISPATCH ──
+                # Loader saves caller's $a/$b internally and tail-calls the
+                # loaded overlay via `j __ov_entry`. Call site shrinks from
+                #   push $b; push $a; ldi $a,IDX; jal _overlay_load;
+                #   pop $a; pop $b; jal __ov_entry           (11B)
+                # to
+                #   ldi $c,IDX; jal _overlay_load            (4B)
+                # with the loader gaining ~5B for its own push/pop/j.
+                # Net: 6B saved per call site above loader overhead.
+                #
+                # Calling convention change:
+                #   - Caller passes overlay index in $c (was $a)
+                #   - Caller's $a/$b are the overlay's args (unchanged)
+                #   - Loader preserves $a/$b across the copy + returns via
+                #     tail-call; overlay's `ret` returns to caller directly.
                 num_pages = sum([has_p3, has_p1, has_p2])
                 loader = [
-                    '; ── overlay loader (kernel) ──',
+                    '; ── overlay loader (kernel, thin dispatch) ──',
                     '_overlay_load:',
-                    '\tmov $a,$c',                  # C = index
+                    '\tpush $b',                    # save caller's arg2
+                    '\tpush $a',                    # save caller's arg1
+                    '\tmov $c,$a',                  # A = index (from $c)
                     '\tsll',                        # A = index * 2
                     '\taddi __manifest,$a',          # A = __manifest + index*2
                     # Read manifest entry [offset, size]
@@ -4094,14 +4099,25 @@ class MK1CodeGen:
 
                 # Page dispatch: read __pages[index] to determine which deref to use
                 if num_pages > 1:
-                    # Restart with index preservation (need index for __pages lookup)
+                    # Stash page number on the stack while we do the manifest
+                    # lookup (which clobbers $a, $b, $c, $d). Pop back just
+                    # before the dispatch. The caller's arg1/arg2 are below
+                    # the page-number on the stack — still restored correctly
+                    # at function exit.
                     loader = [
-                        '; ── overlay loader (kernel) ──',
+                        '; ── overlay loader (kernel, thin dispatch) ──',
                         '_overlay_load:',
-                        '\tpush $a',                    # save index for page lookup
-                        '\tmov $a,$c',                  # C = index
+                        '\tpush $b',                    # save caller's arg2
+                        '\tpush $a',                    # save caller's arg1
+                        # Compute __pages[index] once, stash on stack.
+                        '\tmov $c,$a',                  # A = index
+                        '\taddi __pages,$a',
+                        '\tderefp3',                    # A = page number (1,2,3)
+                        '\tpush $a',                    # stash page number
+                        # Manifest lookup
+                        '\tmov $c,$a',                  # A = index
                         '\tsll',                        # A = index * 2
-                        '\taddi __manifest,$a',          # A = __manifest + index*2
+                        '\taddi __manifest,$a',
                         '\tmov $a,$d',                  # D = manifest addr
                         '\tderefp3',                    # A = src_offset
                         '\tmov $a,$c',                  # C = src offset
@@ -4111,24 +4127,19 @@ class MK1CodeGen:
                         f'\taddi {overlay_region},$a',
                         '\tmov $a,$d',                  # D = end addr
                         f'\tldi $b,{overlay_region}',   # B = dest start
-                        # Now read page: __pages[index]
-                        '\tpop $a',                     # A = index (saved at entry)
-                        '\taddi __pages,$a',             # A = __pages + index
-                        '\tderefp3',                    # A = page number (1,2,3)
-                        # Dispatch on page number
-                        '\tcmpi 2',                     # page >= 2?
+                        '\tpop $a',                     # A = page number
+                        '\tcmpi 2',
                     ]
                     if has_p2 and has_p3:
                         loader.append('\tjz .copy_p2')  # page == 2
                         loader.append('\tjc .copy_p3')  # page == 3 (>2)
                     elif has_p2:
                         loader.append('\tjz .copy_p2')  # page == 2
-                        # no page 3: fall through to page 1
                     elif has_p3:
                         loader.append('\tjc .copy_p3')  # page >= 2 means page 3
                     # Fall through to page 1 (default)
                 else:
-                    # Single page — no dispatch needed, no push/pop
+                    # Single page — no dispatch needed.
                     pass
 
                 # Emit copy loops
@@ -4171,7 +4182,13 @@ class MK1CodeGen:
                 loader.append('\tjnz .ov_br')
                 loader.append('\tddrb_imm 0x01')   # SDA LOW, SCL HIGH (STOP prep)
                 loader.append('\tddrb_imm 0x00')   # SDA HIGH = STOP
-                loader.append('\tret')
+                # T3.3 tail-call: restore caller's arg1/arg2 and fall into
+                # the overlay body. The overlay's `ret` returns to the caller
+                # of _overlay_load (which used `jal`), skipping the loader's
+                # own return frame — so we don't emit a ret here.
+                loader.append('\tpop $a')          # restore caller's arg1
+                loader.append('\tpop $b')          # restore caller's arg2
+                loader.append('\tj __ov_entry')    # tail-call loaded overlay
                 return loader
 
             # ── Step 13: Two-pass sizing ──
