@@ -3766,59 +3766,15 @@ class MK1CodeGen:
             # S bytes becomes 1 thunk (S+1 bytes) + N jal calls (2 bytes each).
             # Profitable when (N-1) * S > 2*N + 1, i.e., S ≥ 4 AND N ≥ 2.
             # Thunks live at the tail of the overlay so they're loaded together.
+            import mk1ir as _ir_p6
             def _phase6_byte_size(line):
-                sline = line.strip()
-                if not sline or sline.endswith(':') or sline.startswith(';'):
-                    return 0
-                mn = sline.split()[0]
-                if mn == 'cmp':
-                    parts = sline.split()
-                    return 1 if (len(parts) > 1 and parts[1].startswith('$')) else 2
-                elif mn in two_byte:
-                    return 2
-                else:
-                    return 1
+                return _ir_p6.instr_byte_size(line, two_byte)
 
             def _phase6_is_extractable(instr):
-                """Instructions that are safe inside a thunk body — no local
-                label branches, no absolute stack-relative ops (ldsp/stsp),
-                no unconditional jumps that would skip the thunk's ret."""
-                for jtype in ['j ', 'jnz ', 'jz ', 'jc ', 'jnc ']:
-                    if instr.startswith(jtype):
-                        tgt = instr[len(jtype):].strip()
-                        if tgt.startswith('.'):
-                            return False  # local branch — target might be outside
-                if instr in ('ret', 'hlt'):
-                    return False
-                if instr.startswith('j ') and not instr.startswith('jal'):
-                    return False
-                mn = instr.split()[0] if instr.split() else ''
-                # Stack-relative: jal-pushed return address shifts SP by 2,
-                # so ldsp/stsp offsets would read/write the wrong slot.
-                if mn in ('ldsp', 'stsp'):
-                    return False
-                return True
+                return _ir_p6.is_locally_extractable(instr)
 
             def _phase6_seq_stack_balanced(seq_texts):
-                """A sequence is extractable only if its push/pop operations
-                are balanced — unbalanced pushes (or pops) inside a thunk
-                break the caller's stack discipline because the thunk's ret
-                pops whatever is at SP's top (which must be the jal-pushed
-                return address)."""
-                balance = 0
-                for t in seq_texts:
-                    mn = t.split()[0] if t.split() else ''
-                    if mn in ('push', 'push_b', 'push_imm', 'exw'):
-                        # push/push_b/push_imm add 1. `exw` reads IO into stack.
-                        if mn == 'exw':
-                            # exw depends on args — conservatively reject
-                            return False
-                        balance += 1
-                    elif mn in ('pop', 'pop_b'):
-                        balance -= 1
-                        if balance < 0:
-                            return False  # pop without matching push
-                return balance == 0
+                return _ir_p6.seq_stack_balanced(seq_texts)
 
             def _phase6_extract(olines, oi_tag):
                 """Find + extract the best repeated sequence. Returns (new_olines,
@@ -4393,67 +4349,19 @@ class MK1CodeGen:
             #   - push/pop balanced within the sequence
             #   - no `jal __ovthunk_N` (those are overlay-local labels)
             #   - no `jal __xsthunk_N` (don't nest our own thunks on first pass)
+            import mk1ir as _ir_t2
             def _t2_byte_size(line):
-                s = line.strip()
-                if not s or s.endswith(':') or s.startswith(';'):
-                    return 0
-                mn = s.split()[0]
-                if mn == 'cmp':
-                    parts = s.split()
-                    return 1 if (len(parts) > 1 and parts[1].startswith('$')) else 2
-                elif mn in two_byte:
-                    return 2
-                else:
-                    return 1
+                return _ir_t2.instr_byte_size(line, two_byte)
 
             def _t2_extractable(text, allow_ret_terminal=False):
-                """Cross-section extraction-safety: must not reference local or
-                overlay-local labels, must not end execution, must not do
-                SP-relative addressing.
-
-                `allow_ret_terminal`: when True, `ret` is permitted AS A SEQUENCE
-                TERMINATOR (tail-merge variant: the extracted thunk's own ret
-                returns to the calling helper's caller, and call sites jump to
-                the thunk with `j` instead of `jal`). The caller must still
-                ensure ret only appears at the last position of the sequence.
-                """
-                if text == 'ret':
-                    return allow_ret_terminal
-                for jtype in ['j ', 'jnz ', 'jz ', 'jc ', 'jnc ']:
-                    if text.startswith(jtype):
-                        tgt = text[len(jtype):].strip()
-                        if tgt.startswith('.'):
-                            return False
-                if text == 'hlt':
-                    return False
-                if text.startswith('j ') and not text.startswith('jal'):
-                    return False
-                mn = text.split()[0] if text.split() else ''
-                if mn in ('ldsp', 'stsp'):
-                    return False
-                # jal to overlay-local thunks: reject (they're only defined
-                # inside the overlay that created them, so a sequence spanning
-                # units would reference a symbol that isn't in every unit's
-                # address space). jal to __xsthunk_N / __tailmerge_N is FINE
-                # — they're kernel-resident and callable from anywhere.
-                if text.startswith('jal '):
-                    tgt = text.split(None, 1)[1].strip()
-                    if tgt.startswith('__ovthunk_'):
-                        return False
-                return True
+                return _ir_t2.is_locally_extractable(
+                    text,
+                    allow_ret_terminal=allow_ret_terminal,
+                    reject_ovthunk_jal=True,
+                )
 
             def _t2_balanced(texts):
-                bal = 0
-                for t in texts:
-                    mn = t.split()[0] if t.split() else ''
-                    if mn in ('push', 'push_b', 'push_imm'):
-                        bal += 1
-                    elif mn in ('pop', 'pop_b'):
-                        bal -= 1
-                        if bal < 0: return False
-                    elif mn == 'exw':
-                        return False
-                return bal == 0
+                return _ir_t2.seq_stack_balanced(texts)
 
             def _t2_strip_section_tokens(lines):
                 """Yield (global_idx, text) for instruction lines only —

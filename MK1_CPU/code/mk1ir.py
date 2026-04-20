@@ -748,6 +748,92 @@ def reg_live_after(lines, idx: int, reg: str, **kwargs) -> bool:
     return False
 
 
+# ── Shared extractability / sizing primitives ────────────────────────
+# These are used by multiple passes (T2.1 cross-section abstraction,
+# Phase 6 within-overlay dedup, future tail-merge / CSE). Extracted
+# here so behavior stays consistent across passes.
+
+TWO_BYTE: frozenset = frozenset({
+    'ldsp', 'stsp', 'push_imm', 'jal', 'jc', 'jz', 'jnc', 'jnz', 'j',
+    'ldi', 'cmp', 'addi', 'subi', 'andi', 'ori', 'ld', 'st', 'ldsp_b',
+    'ldp3', 'stp3', 'setjmp', 'ocall', 'tst', 'out_imm', 'cmpi',
+    'ddrb_imm', 'ddra_imm', 'ora_imm', 'orb_imm',
+})
+
+
+def instr_byte_size(line: str, two_byte_set: frozenset = TWO_BYTE) -> int:
+    """Byte size of an asm line. 0 for labels / comments / blanks /
+    directives. `cmp $X` is 1 byte (reg-reg); `cmp N` is 2 (reg-imm)."""
+    s = line.strip()
+    if not s or s.endswith(':') or s.startswith(';'):
+        return 0
+    if s.startswith('section') or s.startswith('org '):
+        return 0
+    parts = s.split()
+    mn = parts[0]
+    if mn == 'cmp':
+        return 1 if (len(parts) > 1 and parts[1].startswith('$')) else 2
+    if mn in two_byte_set:
+        return 2
+    return 1
+
+
+def seq_stack_balanced(texts: list[str]) -> bool:
+    """True iff the sequence has balanced push/pop — no trailing imbalance
+    and no intermediate pop-without-push. `exw` (stack from IO) is rejected
+    because its effective stack-delta depends on state, so it's unsafe to
+    extract into a thunk body. A thunk's `ret` requires the stack top to
+    be the jal-pushed return address; any imbalance breaks that."""
+    balance = 0
+    for t in texts:
+        mn = t.split()[0] if t.split() else ''
+        if mn in ('push', 'push_b', 'push_imm'):
+            balance += 1
+        elif mn in ('pop', 'pop_b'):
+            balance -= 1
+            if balance < 0:
+                return False
+        elif mn == 'exw':
+            return False
+    return balance == 0
+
+
+def is_locally_extractable(text: str,
+                            allow_ret_terminal: bool = False,
+                            reject_ovthunk_jal: bool = False) -> bool:
+    """Predicate: can this single instruction legally appear inside a
+    thunk body?
+
+    - Local-label branches (`.foo`) are rejected — their targets may not
+      exist in every rewrite site.
+    - `hlt` is always rejected; `ret` only allowed when
+      `allow_ret_terminal=True` (tail-merge variant).
+    - Stack-relative addressing (`ldsp`/`stsp`) is rejected because a
+      `jal` to the thunk pushes a return address, shifting SP.
+    - When `reject_ovthunk_jal=True`, `jal __ovthunk_N` is rejected
+      (overlay-local symbols don't resolve cross-overlay)."""
+    s = text.strip()
+    if s == 'ret':
+        return allow_ret_terminal
+    if s == 'hlt':
+        return False
+    for jtype in ('j ', 'jnz ', 'jz ', 'jc ', 'jnc '):
+        if s.startswith(jtype):
+            tgt = s[len(jtype):].strip()
+            if tgt.startswith('.'):
+                return False
+    if s.startswith('j ') and not s.startswith('jal'):
+        return False
+    mn = s.split()[0] if s.split() else ''
+    if mn in ('ldsp', 'stsp'):
+        return False
+    if reject_ovthunk_jal and s.startswith('jal '):
+        tgt = s.split(None, 1)[1].strip()
+        if tgt.startswith('__ovthunk_'):
+            return False
+    return True
+
+
 def validate_section_jumps(prog: Program, runtime_sections: set,
                             stage1_section: str) -> list[str]:
     """Cross-section jump validator. For each `jal X` or `j X` in a
