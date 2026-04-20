@@ -7209,7 +7209,11 @@ class MK1CodeGen:
                 self.emit(f'{lbl}:')
                 self.emit('\tdec')
                 self.emit(f'\tjnz {lbl}')
-                # After delay loop: A=0
+                # After delay loop: A=0 (redundant — the loop's exit condition
+                # IS "A=0"). Kept as an INIT_MARKER so the init-extraction
+                # scanner in steps 7/11 correctly continues past this point.
+                # Removing this causes overlay_dashboard to stop extracting
+                # init code at the wrong boundary (+63B kernel regression).
                 self.emit("\tclr $a")
                 self.emit('\texw 0 0')         # ORB = 0 (A=0)
                 self.emit_ddrb(0x00)   # DDRB = 0 (both lines idle/HIGH)
