@@ -2634,7 +2634,7 @@ class MK1CodeGen:
                 'exw 0 0', 'exw 0 1', 'exw 0 3',
                 'push $a ;!keep', 'pop $a ;!keep',
             }
-            INIT_PREFIXES_SET = ('ddrb_imm', 'exrw 2', 'ldi $d,', 'ddra_imm', 'push_imm')
+            INIT_PREFIXES_SET = ('ddrb_imm', 'exrw 2', 'exw ', 'ldi $d,', 'ddra_imm', 'push_imm')
             INIT_JAL_TARGETS = {'__lcd_init', '__tone_setup'}
             # __delay_cal excluded: runs as overlay at _main start (not init)
             # Note: __i2c_stream, __i2c_st, __i2c_sp are NOT init-only targets —
@@ -2660,13 +2660,17 @@ class MK1CodeGen:
                            s == 'nop')
                 if s.startswith('jnz .') or s.startswith('j .'):
                     is_init = True
-                # ldi before init-compatible jal
+                # ldi before init-compatible jal or exw is init.
+                # Common pattern: `ldi $a, val; exw E M` for user VIA init.
                 if s.startswith('ldi $a,') or s.startswith('ldi $b,'):
                     for nli in range(mi + 1, min(mi + 4, len(user_code))):
                         ns = user_code[nli].strip()
                         if ns.startswith('jal '):
                             if ns.split()[1] in INIT_JAL_TARGETS:
                                 is_init = True
+                            break
+                        if ns.startswith('exw ') or ns.startswith('ddrb_imm') or ns.startswith('ddra_imm'):
+                            is_init = True
                             break
                 if s.startswith('jal '):
                     target = s.split()[1]
@@ -3912,7 +3916,11 @@ class MK1CodeGen:
                 'jal __lcd_init',
                 'push_b', 'pop_b', 'iderefp3',
             }
-            INIT_PREFIXES = ('ddrb_imm', 'exrw 2', 'ldi $d,', 'ddra_imm', 'push_imm')
+            # 'exw ' prefix covers user-written VIA init like `exw(val, 2, 0)`
+            # (DDR setup) — previously these ended the init phase and caused
+            # subsequent lcd_init() calls to stay in runtime_main while their
+            # body was placed stage-1-only (section-mismatch error).
+            INIT_PREFIXES = ('ddrb_imm', 'exrw 2', 'exw ', 'ldi $d,', 'ddra_imm', 'push_imm')
             # Helpers that are safe to call during init (don't end init phase)
             INIT_COMPAT_HELPERS = {'__i2c_stream', '__i2c_st', '__i2c_sp',
                                    '__i2c_rs',
@@ -3933,6 +3941,8 @@ class MK1CodeGen:
             init_extracted = []
             runtime_main = []
             in_init_phase = True
+            import os as _iidbg_os
+            _iidbg = _iidbg_os.environ.get('MK1_DEBUG_INIT')
             for mi, line in enumerate(main_lines):
                 s = line.strip()
                 if s == '_main:':
@@ -3949,7 +3959,8 @@ class MK1CodeGen:
                                s == 'nop')
                     if s.startswith('jnz .') or s.startswith('j .via') or s.startswith('j .br') or s.startswith('j .rcv'):
                         is_init = True
-                    # ldi before init-compatible jal is also init
+                    # ldi before init-compatible jal or exw is also init.
+                    # Common pattern: `ldi $a, val; exw E M` for user VIA init.
                     if s.startswith('ldi $a,') or s.startswith('ldi $b,'):
                         for nli in range(mi + 1, min(mi + 4, len(main_lines))):
                             ns = main_lines[nli].strip()
@@ -3957,6 +3968,9 @@ class MK1CodeGen:
                                 t = ns.split()[1]
                                 if t in INIT_COMPAT_HELPERS or is_init_only(t):
                                     is_init = True
+                                break
+                            if ns.startswith('exw ') or ns.startswith('ddrb_imm') or ns.startswith('ddra_imm'):
+                                is_init = True
                                 break
                     if s.startswith('jal '):
                         target = s.split()[1]
@@ -3967,9 +3981,13 @@ class MK1CodeGen:
                             in_init_phase = False
                     if is_init:
                         init_extracted.append(line)
+                        if _iidbg:
+                            print(f"  [init-dbg] INIT: {s!r}", file=sys.stderr)
                     else:
                         in_init_phase = False
                         runtime_main.append(line)
+                        if _iidbg:
+                            print(f"  [init-dbg] END-INIT: {s!r}", file=sys.stderr)
                 else:
                     runtime_main.append(line)
 
