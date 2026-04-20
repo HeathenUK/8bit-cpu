@@ -4126,9 +4126,10 @@ class MK1CodeGen:
                         '\tmov $c,$a',          # A = src addr
                         f'\t{deref_op}',        # A = page[src]
                         '\tistc_inc',           # code[B] = A; B++
-                        '\tmov $c,$a',          # A = src (from C)
-                        '\tinc',
-                        '\tmov $a,$c',          # C = src + 1
+                        # Pre-collapsed incc (was `mov $c,$a; inc; mov $a,$c` = 3B).
+                        # The final peephole is skipped in overlay mode (it'd
+                        # shift manifest offsets), so we fold it at emission.
+                        '\tincc',               # C = C + 1 (src pointer advance)
                         '\tmov $b,$a',          # A = B (dest)
                         '\tcmp $d',             # dest == end?
                         f'\tjnz {label}',
@@ -4544,7 +4545,7 @@ class MK1CodeGen:
                     post_budget = post_kernel + post_max_ov
                     budget_improvement = cur_budget - post_budget
                     if budget_improvement < 0:
-                        if _debug_t2 and raw_savings >= 4:
+                        if _debug_t2 and raw_savings >= 1:
                             _t2_near_miss.append((raw_savings, budget_improvement, K, S, mode, key[:3]))
                         continue
                     score = (budget_improvement, raw_savings)
@@ -5109,9 +5110,9 @@ class MK1CodeGen:
             '\tmov $b,$a',                      # A = B (offset for derefp3)
             '\tderefp3',                        # A = page3[B]
             '\tistc_inc',                       # code[B] = A; B++
-            '\tmov $d,$a',                      # A = D (count)
-            '\tdec',
-            '\tmov $a,$d',                      # D--
+            # Pre-collapsed: was `mov $d,$a; dec; mov $a,$d` (3B) → `decd` (1B).
+            # Stage-1 code isn't reached by the final peephole in overlay mode.
+            '\tdecd',                           # D--, sets flags
             '\tjnz .selfcopy_loop',
         ]
 
@@ -5607,6 +5608,11 @@ class MK1CodeGen:
                 _pad_needed = _mc_end - _cur_addr
                 print(f"  Init-helper placement: padding {_pad_needed}B so init helpers"
                       f" land past mini-copy target ({_mc_end}B, currently at {_cur_addr})", file=sys.stderr)
+                # Label prevents peephole dead-code elimination of the padding —
+                # the nops are semantically load-bearing (they push init
+                # helpers past the mini-copy target range so mini-copy doesn't
+                # overwrite them mid-execution).
+                assembled.append('__mc_pad:')
                 for _ in range(_pad_needed):
                     assembled.append('\tnop')
 
@@ -8851,12 +8857,45 @@ def main():
     # and are nearly impossible to debug from hardware symptoms alone.
     _validate_section_jumps(asm.split('\n'))
 
-    # Run peephole optimizer — but NOT for overlay programs where
-    # manifest offsets are already computed from pre-peepholed component sizes.
-    # A final peephole would shrink the kernel, making offsets wrong.
+    # Run peephole optimizer — but NOT on kernel sections for overlay
+    # programs where manifest offsets were computed from pre-peepholed
+    # component sizes. A final peephole of the KERNEL would shrink it and
+    # make offsets wrong; peepholing STAGE-1 is fine because it's a
+    # separate section and doesn't affect kernel addresses.
     lines = asm.split('\n')
     if not getattr(gen, '_overlay_kernel_size', None):
+        # Flat or init-extraction mode: peephole everything
         lines = peephole(lines)
+        asm = '\n'.join(lines)
+    else:
+        # Overlay mode: peephole stage-1 (`code` section) only, leave
+        # `page3_code`, `page3_kernel`, `data_code`, `stack_code`,
+        # `page3`, `data`, `eeprom` unchanged.
+        SAFE_SECTIONS = {'code'}  # stage-1 code; no manifest-offset concern
+        groups = []   # list of (section_name, [lines])
+        cur_sec = 'code'
+        cur_lines = []
+        for line in lines:
+            s = line.strip()
+            if s.startswith('section '):
+                if cur_lines:
+                    groups.append((cur_sec, cur_lines))
+                cur_sec = s.split()[1]
+                cur_lines = [line]
+            else:
+                cur_lines.append(line)
+        if cur_lines:
+            groups.append((cur_sec, cur_lines))
+        out_lines = []
+        for sec, grp in groups:
+            if sec in SAFE_SECTIONS:
+                # Split `section` directive from body so peephole doesn't
+                # interpret it oddly — peephole already handles these lines
+                # but keep the directive in place.
+                out_lines.extend(peephole(grp))
+            else:
+                out_lines.extend(grp)
+        lines = out_lines
         asm = '\n'.join(lines)
 
     if args.output:
