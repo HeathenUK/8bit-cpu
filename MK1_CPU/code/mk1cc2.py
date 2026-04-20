@@ -5295,12 +5295,16 @@ class MK1CodeGen:
             _ov_avail = 250 - _kernel_chk
             _wrapping_indices = {i for i, (_, _, sz) in enumerate(overlay_asm_blocks)
                                  if sz > _ov_avail}
-            # Determine call order from main_lines: ldi $a,N → jal _overlay_load
+            # Determine call order from main_lines. T3.3 thin-dispatch puts
+            # the overlay index in $c (ldi $c,N) right before jal _overlay_load.
+            # (Pre-T3.3 used $a; tolerated as fallback.)
             _call_order = []
             for _mli in range(len(main_lines) - 1):
                 _s = main_lines[_mli].strip()
                 _ns = main_lines[_mli + 1].strip()
-                if _s.startswith('ldi $a,') and _ns == 'jal _overlay_load':
+                if _ns != 'jal _overlay_load':
+                    continue
+                if _s.startswith('ldi $c,') or _s.startswith('ldi $a,'):
                     try:
                         _call_order.append(int(_s.split(',')[1]))
                     except ValueError:
@@ -5705,17 +5709,25 @@ class MK1CodeGen:
         for new_idx, (old_idx, name, asm_lines, fsize, offset) in enumerate(all_placed_ordered):
             old_to_new[old_idx] = new_idx
 
-        # Fix up overlay indices in assembled code (ldi $a,N before jal _overlay_load)
+        # Fix up overlay indices in assembled code. T3.3 thin-dispatch
+        # puts the index in $c (ldi $c,N) immediately before the load.
+        # (Pre-T3.3 convention used $a; kept as fallback for any stale
+        # emission path.)
         for ci in range(len(assembled) - 1):
             s = assembled[ci].strip()
             nxt = assembled[ci + 1].strip()
-            if nxt == 'jal _overlay_load' and s.startswith('ldi $a,'):
-                try:
-                    old_idx = int(s.split(',')[1])
-                    if old_idx in old_to_new:
-                        assembled[ci] = f'\tldi $a,{old_to_new[old_idx]}'
-                except ValueError:
-                    pass
+            if nxt != 'jal _overlay_load':
+                continue
+            for reg in ('$c', '$a'):
+                prefix = f'ldi {reg},'
+                if s.startswith(prefix):
+                    try:
+                        old_idx = int(s.split(',')[1])
+                        if old_idx in old_to_new:
+                            assembled[ci] = f'\tldi {reg},{old_to_new[old_idx]}'
+                    except ValueError:
+                        pass
+                    break
 
         # Manifest: [offset, size] per overlay (2 bytes each)
         for _, name, asm_lines, fsize, offset in all_placed_ordered:
@@ -6292,13 +6304,14 @@ class MK1CodeGen:
             # Find which overlay(s) wrap and check if they're loaded last
             wrapping_overlays = [(n, fs) for _, n, fs in overlay_meta
                                  if fs > avail]  # pre-bundling check
-            # Check assembled code for overlay call order
+            # Check assembled code for overlay call order. T3.3 uses $c;
+            # pre-T3.3 $a tolerated as fallback.
             call_order = []
             for ci, line in enumerate(assembled):
                 s = line.strip()
                 if s == 'jal _overlay_load' and ci > 0:
                     prev = assembled[ci - 1].strip()
-                    if prev.startswith('ldi $a,'):
+                    if prev.startswith('ldi $c,') or prev.startswith('ldi $a,'):
                         try:
                             idx = int(prev.split(',')[1])
                             call_order.append(idx)
