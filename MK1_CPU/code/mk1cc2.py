@@ -4969,9 +4969,25 @@ class MK1CodeGen:
                         i += 1
                 return out, saved
 
-            main_lines, _t3_saved = _t3_elide_overlay_saves(main_lines)
+            # Apply T3.1 to main_lines, runtime_resident_helpers (which
+            # contains __xsthunk_N wrappers that make overlay calls), and
+            # every overlay body. The same overlay-call pattern + liveness
+            # logic applies — anywhere the uniform pattern appears, we can
+            # elide when the caller's flow doesn't need the saved registers.
+            main_lines, _t3_main_saved = _t3_elide_overlay_saves(main_lines)
+            runtime_resident_helpers, _t3_hlp_saved = _t3_elide_overlay_saves(runtime_resident_helpers)
+            _t3_ov_saved = 0
+            for oi in range(len(overlay_asm_blocks)):
+                oname, olines, ofsize = overlay_asm_blocks[oi]
+                new_olines, n = _t3_elide_overlay_saves(olines)
+                if n:
+                    overlay_asm_blocks[oi] = (oname, new_olines, measure_lines(new_olines))
+                    _t3_ov_saved += n
+            _t3_saved = _t3_main_saved + _t3_hlp_saved + _t3_ov_saved
             if _t3_saved:
-                print(f"  T3.1 elided {_t3_saved}B of dead push/pop around overlay calls",
+                print(f"  T3.1 elided {_t3_saved}B of dead push/pop around overlay calls "
+                      f"(main={_t3_main_saved}B, helpers={_t3_hlp_saved}B, "
+                      f"overlays={_t3_ov_saved}B)",
                       file=sys.stderr)
 
             runtime_helper_size = measure_lines(runtime_resident_helpers)
