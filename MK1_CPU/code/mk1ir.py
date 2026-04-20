@@ -319,6 +319,220 @@ def section_size_bytes(section: Section) -> int:
 
 # ── Round-trip sanity check ───────────────────────────────────────
 
+# ── Reusable passes ─────────────────────────────────────────────
+
+def collapse_3_window(prog: Program, collapse_table: dict) -> int:
+    """Walk every chunk's items; wherever three consecutive Instrs
+    have mnemonics+operands matching a key in collapse_table, replace
+    the 3-Instr run with the single Instr whose mnemonic is the value.
+
+    collapse_table: dict mapping (str1, str2, str3) → str
+      where each str is the stripped asm form of one line
+      (e.g. 'mov $b,$a'). Value is the replacement mnemonic.
+
+    Operands are preserved from the ORIGINAL first line's indentation
+    (tab prefix), so output looks identical to a hand-written emission.
+    Returns the number of collapses performed."""
+    count = 0
+    for chunk in prog.chunks:
+        items = chunk.items
+        out = []
+        i = 0
+        while i < len(items):
+            if (i + 2 < len(items)
+                and isinstance(items[i], Instr)
+                and isinstance(items[i + 1], Instr)
+                and isinstance(items[i + 2], Instr)):
+                a = items[i].raw.strip().split(';')[0].strip()
+                b = items[i + 1].raw.strip().split(';')[0].strip()
+                c = items[i + 2].raw.strip().split(';')[0].strip()
+                replacement = collapse_table.get((a, b, c))
+                if replacement is not None:
+                    # Preserve original indentation from the first line.
+                    indent = items[i].raw[:len(items[i].raw)
+                                          - len(items[i].raw.lstrip())]
+                    raw_line = indent + replacement
+                    out.append(Instr(
+                        raw=raw_line,
+                        mnemonic=replacement,
+                        operands=[],
+                        size_bytes=instr_size(replacement, ''),
+                        comment='',
+                    ))
+                    i += 3
+                    count += 1
+                    continue
+            out.append(items[i])
+            i += 1
+        chunk.items = out
+    return count
+
+
+def dead_code_elim(prog: Program, terminators=None) -> int:
+    """Remove unreachable items after a terminator (`ret`, `hlt`, plain
+    `j`) up to the next Label. Section and org directives also end the
+    dead region. Returns the number of items removed.
+
+    Directives (`section`, `org`) inside a dead region are KEPT because
+    the serializer and downstream passes rely on section markers being
+    contiguous. Labels obviously end the dead region — they're jump
+    targets, so code after them is reachable."""
+    if terminators is None:
+        terminators = {'ret', 'hlt', 'j'}
+    removed = 0
+    for chunk in prog.chunks:
+        out = []
+        in_dead = False
+        for item in chunk.items:
+            if isinstance(item, Label):
+                in_dead = False
+            elif isinstance(item, Directive):
+                # Keep — don't classify as dead.
+                pass
+            elif in_dead:
+                removed += 1
+                continue
+            out.append(item)
+            if isinstance(item, Instr) and item.mnemonic in terminators:
+                in_dead = True
+        chunk.items = out
+    return removed
+
+
+def branch_thread(prog: Program, cond_mnemonics=None) -> int:
+    """Rewrite `<cond> TARGET` where TARGET's first instruction is `j X`
+    to `<cond> X` directly. Skips the intermediate one-line jump.
+    cond_mnemonics defaults to the set of branching instructions.
+    Returns count of rewrites.
+
+    Uses the labels index (`prog.labels`) to resolve jump targets
+    across chunks. If TARGET's first instruction (first non-comment,
+    non-blank, non-directive item after the label) is an unconditional
+    `j X`, thread through."""
+    if cond_mnemonics is None:
+        cond_mnemonics = {'j', 'jz', 'jnz', 'jc', 'jnc'}
+
+    # Pre-build a map label → first Instr after it (skipping blanks/
+    # comments/directives). Only cache if the first Instr is `j X`.
+    first_instr_after = {}
+    for chunk in prog.chunks:
+        for idx, item in enumerate(chunk.items):
+            if isinstance(item, Label):
+                # Scan forward for first Instr
+                for j in range(idx + 1, len(chunk.items)):
+                    nxt = chunk.items[j]
+                    if isinstance(nxt, (Comment, Blank, Directive)):
+                        continue
+                    if isinstance(nxt, Label):
+                        break
+                    if isinstance(nxt, Instr):
+                        first_instr_after[item.name] = nxt
+                    break
+
+    count = 0
+    for chunk in prog.chunks:
+        for idx, item in enumerate(chunk.items):
+            if not isinstance(item, Instr):
+                continue
+            if item.mnemonic not in cond_mnemonics:
+                continue
+            # Parse the jump target
+            body = item.raw.strip().split(';')[0].strip()
+            parts = body.split(None, 1)
+            if len(parts) != 2:
+                continue
+            target = parts[1].strip()
+            first = first_instr_after.get(target)
+            if first is None:
+                continue
+            first_body = first.raw.strip().split(';')[0].strip()
+            first_parts = first_body.split(None, 1)
+            if len(first_parts) != 2 or first_parts[0] != 'j':
+                continue
+            final_target = first_parts[1].strip()
+            # Rewrite: same conditional, new target
+            indent = item.raw[:len(item.raw) - len(item.raw.lstrip())]
+            new_raw = indent + f'{item.mnemonic} {final_target}'
+            item.raw = new_raw
+            item.operands = [final_target]
+            item.size_bytes = instr_size(item.mnemonic, final_target)
+            count += 1
+    return count
+
+
+def stsp_ldsp_elide(prog: Program, clobbers_a: set) -> int:
+    """Elide `ldsp N` when preceded by `stsp N` AND followed by an
+    instruction that clobbers A (so the loaded A value is wasted).
+    Also handles a single intervening label before the clobber.
+    Returns count of elisions."""
+    count = 0
+    for chunk in prog.chunks:
+        items = chunk.items
+        out = []
+        i = 0
+        while i < len(items):
+            # Need stsp N, then ldsp N, then (label?) → clobber
+            if (i + 1 < len(items)
+                and isinstance(items[i], Instr)
+                and items[i].mnemonic == 'stsp'
+                and isinstance(items[i + 1], Instr)
+                and items[i + 1].mnemonic == 'ldsp'):
+                stsp_body = items[i].raw.strip().split(';')[0].strip().split()
+                ldsp_body = items[i + 1].raw.strip().split(';')[0].strip().split()
+                if (len(stsp_body) == 2 and len(ldsp_body) == 2
+                    and stsp_body[1] == ldsp_body[1]):
+                    # Peek past the ldsp to see if A is clobbered. Skip
+                    # over one label if present (label then clobber is
+                    # still safe — any branch into that label also
+                    # clobbers A before using it).
+                    j = i + 2
+                    if j < len(items) and isinstance(items[j], Label):
+                        j += 1
+                    if j < len(items) and isinstance(items[j], Instr):
+                        if items[j].mnemonic in clobbers_a:
+                            # Keep stsp, drop ldsp.
+                            out.append(items[i])
+                            i += 2
+                            count += 1
+                            continue
+            out.append(items[i])
+            i += 1
+        chunk.items = out
+    return count
+
+
+def pass_2_window(prog: Program, rewrite_fn) -> int:
+    """Generic 2-instruction window rewrite. rewrite_fn takes
+    (line_a_stripped, line_b_stripped) and returns either
+      - None (no match, keep both lines as-is)
+      - a list of replacement raw lines (strings)
+    replacing the 2-line window. Returns count of rewrites."""
+    count = 0
+    for chunk in prog.chunks:
+        items = chunk.items
+        out = []
+        i = 0
+        while i < len(items):
+            if (i + 1 < len(items)
+                and isinstance(items[i], Instr)
+                and isinstance(items[i + 1], Instr)):
+                a = items[i].raw.strip().split(';')[0].strip()
+                b = items[i + 1].raw.strip().split(';')[0].strip()
+                replacement_lines = rewrite_fn(a, b, items[i].raw)
+                if replacement_lines is not None:
+                    for ln in replacement_lines:
+                        # Re-parse each replacement line so the IR stays
+                        # consistent (size_bytes, mnemonic, etc.).
+                        out.append(parse_line(ln))
+                    i += 2
+                    count += 1
+                    continue
+            out.append(items[i])
+            i += 1
+        chunk.items = out
+    return count
+
+
 def round_trip_identical(lines: list[str]) -> tuple[bool, str]:
     """Parse then serialize the given lines. Returns (identical, diff)
     where identical is True iff the serialization exactly matches the

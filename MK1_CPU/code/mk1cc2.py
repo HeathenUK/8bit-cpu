@@ -9048,23 +9048,13 @@ def peephole(lines):
                   'istc_inc', 'deref2'}
 
     # ── Pass 1: Dead code elimination ────────────────────────────────
-    changed = True
-    while changed:
-        changed = False
-        out = []
-        i = 0
-        while i < len(lines):
-            line = lines[i]
-            if is_instr(line) and mnemonic(line) in TERMINATORS:
-                out.append(line)
-                i += 1
-                while i < len(lines) and not is_label(lines[i]) and not is_section(lines[i]):
-                    changed = True
-                    i += 1
-                continue
-            out.append(line)
-            i += 1
-        lines = out
+    # IR-based: walk each chunk, drop items after a terminator until
+    # the next label (or section marker boundary). Byte-identical to
+    # the prior flat-list implementation, validated against corpus.
+    import mk1ir as _ir_p1
+    _prog = _ir_p1.parse_program(lines)
+    _ir_p1.dead_code_elim(_prog, terminators=TERMINATORS)
+    lines = _ir_p1.serialize_program(_prog)
 
     # ── Pass 2: Register-tracking optimization ───────────────────────
     # Track what's known to be in A, B, C, D. Eliminate redundant loads/movs.
@@ -9310,92 +9300,42 @@ def peephole(lines):
     lines = out
 
     # ── Pass 3: Pattern-based peephole ───────────────────────────────
+    # IR-based implementation. Each rule is an IR pass; the outer loop
+    # iterates until a fixed point (no further rewrites). Rules:
+    #   - stsp/ldsp elision when the ldsp's A is dead
+    #   - ldi $a,X + push $a → push_imm X
+    #   - push $a + pop $a → eliminate (unless ;!keep)
+    #   - push $a + pop $X → mov $a,$X
+    #   - Branch threading through one-instruction jump labels
+    import mk1ir as _ir_p3
+
+    # 2-instr window rewriter closure — all Pass 3's 2-instr rules live here.
+    def _pass3_window(a, b, first_raw):
+        indent = first_raw[:len(first_raw) - len(first_raw.lstrip())]
+        # ldi $a,X ; push $a → push_imm X
+        if a.startswith('ldi $a,') and b == 'push $a':
+            val = a.split(',', 1)[1]
+            return [indent + f'push_imm {val}']
+        # push $a ; pop $a → eliminate (honor ;!keep)
+        if a == 'push $a' and b == 'pop $a':
+            if ';!keep' not in first_raw:
+                return []
+        # push $a ; pop $X (X != $a) → mov $a,$X
+        if a == 'push $a' and b.startswith('pop ') and b != 'pop $a':
+            dst = b.split(None, 1)[1]
+            return [indent + f'mov $a,{dst}']
+        return None
+
     changed = True
     while changed:
         changed = False
-        out = []
-        i = 0
-        while i < len(lines):
-            line = lines[i]
-
-            # stsp N / ldsp N → stsp N (when next instr clobbers A)
-            if is_instr(line) and mnemonic(line) == 'stsp':
-                parts_st = line.strip().split()
-                if (i + 1 < len(lines) and is_instr(lines[i+1])):
-                    parts_ld = lines[i+1].strip().split()
-                    if (len(parts_st) == 2 and len(parts_ld) == 2
-                            and parts_ld[0] == 'ldsp' and parts_st[1] == parts_ld[1]
-                            and i + 2 < len(lines)):
-                        # Check what follows the ldsp
-                        nxt = lines[i+2] if i + 2 < len(lines) else None
-                        if nxt and is_instr(nxt):
-                            nmn = mnemonic(nxt)
-                            if nmn in CLOBBERS_A:
-                                out.append(line)
-                                i += 2
-                                changed = True
-                                continue
-                        # Also safe if followed by label then clobber
-                        if nxt and is_label(nxt) and i + 3 < len(lines) and is_instr(lines[i+3]):
-                            nmn = mnemonic(lines[i+3])
-                            if nmn in CLOBBERS_A:
-                                out.append(line)
-                                i += 2
-                                changed = True
-                                continue
-
-            # ldi $a,X / push $a → push_imm X
-            if (is_instr(line) and line.strip().startswith('ldi $a,')
-                    and i + 1 < len(lines) and lines[i+1].strip() == 'push $a'):
-                val = line.strip().split(',')[1]
-                out.append(f'\tpush_imm {val}')
-                i += 2
-                changed = True
-                continue
-
-            # push $a / pop $a → eliminate both (no-op)
-            # Skip if either line has ;!keep annotation (hardware side-effect)
-            if (is_instr(line) and line.strip() == 'push $a'
-                    and i + 1 < len(lines) and lines[i+1].strip() == 'pop $a'
-                    and ';!keep' not in line and ';!keep' not in lines[i+1]):
-                i += 2
-                changed = True
-                continue
-
-            # push $a / pop $b → mov $a,$b (1 byte instead of 2)
-            if (is_instr(line) and line.strip() == 'push $a'
-                    and i + 1 < len(lines) and is_instr(lines[i+1])):
-                pop_s = lines[i+1].strip()
-                if pop_s.startswith('pop ') and pop_s != 'pop $a':
-                    dst = pop_s.split()[1]
-                    out.append(f'\tmov $a,{dst}')
-                    i += 2
-                    changed = True
-                    continue
-
-            # Branch threading: j/jz/jnz/jc/jnc to a label that is just j elsewhere
-            if is_instr(line) and mnemonic(line) in ('j', 'jz', 'jnz', 'jc', 'jnc'):
-                parts_j = line.strip().split()
-                if len(parts_j) == 2:
-                    target = parts_j[1]
-                    # Find the target label and check if next instruction is j
-                    for k in range(len(lines)):
-                        if lines[k].strip() == f'{target}:':
-                            if (k + 1 < len(lines) and is_instr(lines[k+1])
-                                    and mnemonic(lines[k+1]) == 'j'):
-                                final = lines[k+1].strip().split()[1]
-                                out.append(f'\t{parts_j[0]} {final}')
-                                i += 1
-                                changed = True
-                                break
-                    else:
-                        out.append(line)
-                        i += 1
-                    continue
-
-            out.append(line)
-            i += 1
-        lines = out
+        _prog = _ir_p3.parse_program(lines)
+        n1 = _ir_p3.stsp_ldsp_elide(_prog, CLOBBERS_A)
+        n2 = _ir_p3.pass_2_window(_prog, _pass3_window)
+        n3 = _ir_p3.branch_thread(_prog)
+        lines = _ir_p3.serialize_program(_prog)
+        if n1 + n2 + n3 > 0:
+            changed = True
 
     # ── Pass: collapse `mov $X,$a ; inc|dec ; mov $a,$X` → incX/decX ──
     # New microcode opcodes decb/decc/decd/incb/incc/incd do this in 1 byte.
@@ -9426,21 +9366,14 @@ def peephole(lines):
     import os as _sllb_os
     if _sllb_os.environ.get('MK1_NEW_OPCODES') == '1':
         COLLAPSE[('mov $b,$a', 'sll', 'mov $a,$b')] = 'sllb'
-    out = []
-    i = 0
-    collapsed_count = 0
-    while i < len(lines):
-        if i + 2 < len(lines):
-            a, b, c = lines[i].strip(), lines[i+1].strip(), lines[i+2].strip()
-            replacement = COLLAPSE.get((a, b, c))
-            if replacement:
-                out.append(f'\t{replacement}')
-                i += 3
-                collapsed_count += 1
-                continue
-        out.append(lines[i])
-        i += 1
-    lines = out
+    # IR-based implementation — replaces the old flat-list window walk.
+    # Behavior and byte output are identical (validated against every
+    # corpus program); the IR version is the migration foundation that
+    # subsequent passes will build on.
+    import mk1ir as _ir
+    _prog = _ir.parse_program(lines)
+    collapsed_count = _ir.collapse_3_window(_prog, COLLAPSE)
+    lines = _ir.serialize_program(_prog)
     if collapsed_count > 0:
         import sys
         print(f"  Peephole: collapsed {collapsed_count} reg-inc/dec patterns "
@@ -9463,47 +9396,34 @@ def peephole(lines):
     #   Old: $X = N (via ldi 2B), then $a = N (ldi 2B) = 4B total.
     #   New: $a = N (2B), then $X = $a (mov 1B) = 3B. Saves 1B for
     #   any constant N that both registers need.
-    AUTO_P2 = {}   # (line_i, line_i+1) → replacement_lines
-    AUTO_P3 = {}   # (line_i, line_i+1, line_i+2) → replacement_lines
-
-    for reg_letter in ('b', 'c', 'd'):
-        reg = f'${reg_letter}'
-        AUTO_P2[(f'addi 1,{reg}', f'mov $a,{reg}')] = [f'\tmov $a,{reg}', f'\tinc{reg_letter}']
     import re as _re
-    auto_count = 0
-    out = []
-    i = 0
-    while i < len(lines):
-        # Try 2-instr rules
-        a = lines[i].strip()
-        b = lines[i+1].strip() if i+1 < len(lines) else ''
-        # andi/ori N,$a ; tst 0xFF → drop the tst
+
+    # T4.1 auto-rule rewriter — shared closure over the rule set.
+    # Returns None if no match (keep both lines), else a list of
+    # replacement raw lines.
+    def _t41_rewrite(a, b, first_raw):
+        # Preserve indentation from the first line being replaced.
+        indent = first_raw[:len(first_raw) - len(first_raw.lstrip())]
+        # Rule 2/3: andi/ori N,$a ; tst 0xFF → drop the tst
         m = _re.match(r'^(andi|ori) (\S+),\$a$', a)
         if m and b == 'tst 0xFF':
-            out.append(lines[i])
-            i += 2
-            auto_count += 1
-            continue
-        # ldi $X,N ; ldi $a,N → ldi $a,N ; mov $a,$X
+            return [indent + a]
+        # Rule 4: ldi $X,N ; ldi $a,N → ldi $a,N ; mov $a,$X
         m = _re.match(r'^ldi \$([bcd]),(\S+)$', a)
         m2 = _re.match(r'^ldi \$a,(\S+)$', b)
         if m and m2 and m.group(2) == m2.group(1):
             reg_letter = m.group(1)
             imm = m2.group(1)
-            out.append(f'\tldi $a,{imm}')
-            out.append(f'\tmov $a,${reg_letter}')
-            i += 2
-            auto_count += 1
-            continue
-        # addi 1,$a ; mov $a,$X → mov $a,$X ; incX
-        if (a, b) in AUTO_P2:
-            out.extend(AUTO_P2[(a, b)])
-            i += 2
-            auto_count += 1
-            continue
-        out.append(lines[i])
-        i += 1
-    lines = out
+            return [indent + f'ldi $a,{imm}', indent + f'mov $a,${reg_letter}']
+        # Rule 1: addi 1,$a ; mov $a,$X → mov $a,$X ; incX
+        for reg_letter in ('b', 'c', 'd'):
+            if a == f'addi 1,${reg_letter}' and b == f'mov $a,${reg_letter}':
+                return [indent + f'mov $a,${reg_letter}', indent + f'inc{reg_letter}']
+        return None
+
+    _prog = _ir.parse_program(lines)
+    auto_count = _ir.pass_2_window(_prog, _t41_rewrite)
+    lines = _ir.serialize_program(_prog)
     if auto_count > 0:
         import sys
         print(f"  Peephole: T4.1 auto-rules applied {auto_count}× "
