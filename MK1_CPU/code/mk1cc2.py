@@ -1999,20 +1999,29 @@ class MK1CodeGen:
             self.emit(f'{lbl_nd}:')
             self.emit(f'\tcmp {DELAY}')
             self.emit(f'\tjnz {lbl_send}')
-            # Calibrated ~5ms delay — outer loop 5 × 256 inner iterations.
-            lbl_outer = self.label('li_do')
-            lbl_inner = self.label('li_di')
-            self.emit(f'\tldi $c,5')       # 5ms outer count
-            self.emit(f'{lbl_outer}:')
-            self.emit('\tldi $a,0')        # 256 iterations ≈ 1ms at any clock
-            self.emit(f'{lbl_inner}:')
-            self.emit('\tdec')
-            self.emit(f'\tjnz {lbl_inner}')
-            self.emit('\tmov $c,$a')
-            self.emit('\tdec')
-            self.emit('\tmov $a,$c')
-            self.emit(f'\tjnz {lbl_outer}')
-            self.emit(f'\tj {lbl_adv}')
+            # ~5ms delay. Two paths:
+            #   - If __delay_Nms is resident (mini-copied), use it (4B).
+            #   - Otherwise inline a raw nested loop (~10B).
+            # The resident helper saves 6B on stage-1 for programs that
+            # already pull __delay_Nms in for runtime lcd_cmd calls.
+            if '__delay_Nms' in helpers:
+                self.emit('\tldi $b,5')
+                self.emit('\tjal __delay_Nms')
+                self.emit(f'\tj {lbl_adv}')
+            else:
+                lbl_outer = self.label('li_do')
+                lbl_inner = self.label('li_di')
+                self.emit(f'\tldi $c,5')       # 5ms outer count
+                self.emit(f'{lbl_outer}:')
+                self.emit('\tldi $a,0')        # 256 iterations ≈ 1ms at any clock
+                self.emit(f'{lbl_inner}:')
+                self.emit('\tdec')
+                self.emit(f'\tjnz {lbl_inner}')
+                self.emit('\tmov $c,$a')
+                self.emit('\tdec')
+                self.emit('\tmov $a,$c')
+                self.emit(f'\tjnz {lbl_outer}')
+                self.emit(f'\tj {lbl_adv}')
             self.emit(f'{lbl_send}:')
             self.emit('\tjal __i2c_sb')
             self.emit(f'{lbl_adv}:')
