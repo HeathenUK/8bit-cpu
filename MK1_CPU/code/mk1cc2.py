@@ -4482,11 +4482,7 @@ class MK1CodeGen:
                     # best-finder runs below.
                     _t2_near_miss = []
                 best = None   # (budget_improvement, raw_savings, mode, key, accepted, L, S)
-                # Sort candidate items for deterministic iteration order —
-                # otherwise dict/set iteration (in nested structures) can
-                # produce different results between runs, creating spurious
-                # size-regression noise in the baseline harness.
-                for (mode, key), raw_occ in sorted(seqs.items(), key=lambda kv: (kv[0][0], kv[0][1])):
+                for (mode, key), raw_occ in seqs.items():
                     if len(raw_occ) < 2:
                         continue
                     # For parametric modes: only consider if the imm varies
@@ -5670,18 +5666,12 @@ class MK1CodeGen:
         assembled.append('\tsection code')
         assembled.append('\torg 0')
         assembled.append('\tsection page3_code')
-        # Kernel = j _main + runtime helpers + overlay_load + main
-        # Helpers come right after `j _main` so helper_start = RESET_STUB = 2.
-        # This minimises the mini-copy target range (and therefore the
-        # stage-1 pad that pushes init-only helpers past the target).
-        # Previously helpers sat AFTER the loader, making helper_start ≈ 40-70
-        # and pad dominated stage-1 for overlay programs.
-        # The j _main jump at code[0] ensures physical reset (PC=0) lands in
-        # _main, not in helpers (which would execute as code without call
-        # context) or in the loader.
+        # Kernel = j _main + overlay_load + runtime helpers + main
+        # The jump at code[0] ensures physical reset (PC=0) lands in _main,
+        # not in overlay_load (which would crash without call context).
         assembled.append('\tj _main')
-        assembled.extend(runtime_resident_helpers)
         assembled.extend(loader)
+        assembled.extend(runtime_resident_helpers)
         # EEPROM preload helper: reads ee_preload_bytes from EEPROM
         # sequentially and stores them in page3[0..ee_preload_bytes-1] as
         # overlay slots. Called from main's preamble on every entry
@@ -5940,7 +5930,7 @@ class MK1CodeGen:
         # Mini-copy: copy resident kernel helpers from page3 to their code
         # addresses so init code can call them directly (no _init copies needed).
         # Saves ~30B by eliminating duplicated helper code in init.
-        helper_start = RESET_STUB   # helpers emitted right after j_main
+        helper_start = RESET_STUB + loader_size  # helpers come after j_main + loader
         mini_copied_helpers = set()
         if runtime_helper_size > 0:
             mc_lbl = self.label('mc')
