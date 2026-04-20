@@ -5201,12 +5201,10 @@ class MK1CodeGen:
                 '\tddrb_imm 0x03',
                 '\tddrb_imm 0x01',
                 '\tddrb_imm 0x03',
-                '\tmov $c,$a',
-                '\tinc',
-                '\tmov $a,$c',
-                '\tmov $d,$a',
-                '\tdec',
-                '\tmov $a,$d',
+                # Pre-collapsed to `incc` / `decd` (would also be caught by
+                # the section-aware final peephole on this `code` section).
+                '\tincc',
+                '\tdecd',
                 '\tjnz .ee_byte',
                 '\tddrb_imm 0x03',
                 '\tddrb_imm 0x01',
