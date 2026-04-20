@@ -514,13 +514,33 @@ static void handleBusSniff() {
 
 static volatile uint8_t lastOutputVal = 0;
 static volatile bool outputCaptured = false;
-static volatile uint32_t oiCount = 0;
-static volatile uint8_t oiHistory[256];
+static volatile uint32_t oiCount = 0;        // total OI events (may exceed 256)
+static volatile uint8_t oiHistory[256];      // ring buffer — keeps LAST 256
+
+// Ring-buffer accessors. Before this change, the code stored only the
+// first 256 events and dropped the rest. That's fatal for I2C-heavy
+// programs where the real `out()` emissions are at the END of the run
+// and get pushed past 256 by the intermediate bus traffic. Now we
+// store the most RECENT 256; real outputs stay visible.
+//
+// oiHistStored(): how many slots are in use (min(oiCount, 256))
+// oiHistAt(i):    i=0 is the OLDEST kept event, i=stored-1 is the NEWEST
+static inline uint32_t oiHistStored() {
+    return oiCount < 256 ? oiCount : 256;
+}
+static inline uint8_t oiHistAt(uint32_t i) {
+    if (oiCount <= 256) return oiHistory[i];
+    // Wrapped: physical index of oldest kept event = oiCount (mod 256).
+    return oiHistory[(oiCount + i) & 0xFF];
+}
 
 static uint32_t oiGpioMask = 0;  // precomputed at startOIMonitor
 
-static inline uint8_t IRAM_ATTR readBusFast() {
-    uint32_t gpio = GPIO.in;
+// Decode an 8-bit bus value from a GPIO register snapshot. Keep the
+// zero-arg variant for back-compat; callers with their own snapshot
+// (e.g. the RUNLOG/RUNNB loop that samples once and checks OI + reads
+// bus from the SAME snapshot) should use `decodeBus(gpio)` directly.
+static inline uint8_t IRAM_ATTR decodeBus(uint32_t gpio) {
     uint8_t val = 0;
     if (gpio & (1 << 5))  val |= 0x01;
     if (gpio & (1 << 6))  val |= 0x02;
@@ -532,6 +552,9 @@ static inline uint8_t IRAM_ATTR readBusFast() {
     if (gpio & (1 << 18)) val |= 0x80;
     return val;
 }
+static inline uint8_t IRAM_ATTR readBusFast() {
+    return decodeBus(GPIO.in);
+}
 
 static volatile uint32_t lastOiTime = 0;
 static void IRAM_ATTR onOIRising() {
@@ -541,8 +564,10 @@ static void IRAM_ATTR onOIRising() {
     uint32_t now = micros();
     if (now - lastOiTime < 1000) return;  // 1ms debounce
     lastOiTime = now;
-    uint8_t val = readBusFast();
-    if (oiCount < 256) oiHistory[oiCount] = val;
+    // ISR: snapshot GPIO now and decode, keeping OI+bus consistent.
+    uint32_t gpio = GPIO.in;
+    uint8_t val = decodeBus(gpio);
+    oiHistory[oiCount & 0xFF] = val;
     oiCount++;
     lastOutputVal = val;
     outputCaptured = true;
@@ -602,19 +627,20 @@ static void handleUploadAndWait() {
     // The ISR (from startOIMonitor) captures OI values in oiHistory.
     delay(timeoutSec * 1000);
 
-    // Find first non-spurious ISR value (filter 63=floating, 127=HLT)
-    uint32_t n = oiCount < 256 ? oiCount : 16;
+    // Find first non-spurious ISR value (filter 63=floating, 127=HLT).
+    // Iterate OLDEST→NEWEST through the ring buffer.
+    uint32_t n = oiHistStored();
     for (uint32_t i = 0; i < n; i++) {
-        if (oiHistory[i] != 0x3F && oiHistory[i] != 0x7F &&
-            oiHistory[i] != 0xBF && oiHistory[i] != 0xFF) {
-            val = oiHistory[i];
+        uint8_t v = oiHistAt(i);
+        if (v != 0x3F && v != 0x7F && v != 0xBF && v != 0xFF) {
+            val = v;
             found = true;
             break;
         }
     }
-    // If all spurious, report the first one anyway
+    // If all spurious, report the oldest one anyway
     if (!found && n > 0) {
-        val = oiHistory[0];
+        val = oiHistAt(0);
         found = true;
     }
 
@@ -624,7 +650,7 @@ static void handleUploadAndWait() {
                   ",\"history\":[";
     for (uint32_t i = 0; i < n; i++) {
         if (i > 0) json += ",";
-        json += String(oiHistory[i]);
+        json += String(oiHistAt(i));
     }
     json += "]}";
     server.send(200, "application/json", json);
@@ -678,17 +704,20 @@ static void handleReadOutput() {
     // Find first value that isn't a known spurious bus state:
     // 0x3F (63) = floating bus after halt
     // 0x7F (127) = HLT opcode during fetch
+    // Pick the NEWEST non-spurious value from the ring buffer — it's the
+    // program's final out() emission (or the one right before halt).
     uint8_t reportVal = 0;
     bool found = false;
-    uint32_t n = oiCount < 256 ? oiCount : 16;
-    for (uint32_t i = 0; i < n; i++) {
-        if (oiHistory[i] != 0x3F && oiHistory[i] != 0x7F) {
-            reportVal = oiHistory[i];
+    uint32_t n = oiHistStored();
+    for (uint32_t i = n; i > 0; i--) {
+        uint8_t v = oiHistAt(i - 1);
+        if (v != 0x3F && v != 0x7F) {
+            reportVal = v;
             found = true;
             break;
         }
     }
-    if (!found && n > 0) reportVal = oiHistory[0];  // fallback to first
+    if (!found && n > 0) reportVal = oiHistAt(n - 1);  // fallback to newest
     String json = "{\"value\":" + String(reportVal) +
                   ",\"captured\":" + (outputCaptured ? "true" : "false") +
                   ",\"oi_count\":" + String(oiCount) +
@@ -700,7 +729,7 @@ static void handleReadOutput() {
                   ",\"history\":[";
     for (uint32_t i = 0; i < n; i++) {
         if (i > 0) json += ",";
-        json += String(oiHistory[i]);
+        json += String(oiHistAt(i));
     }
     json += "]}";
     server.send(200, "application/json", json);
@@ -759,8 +788,8 @@ static void handleRunCycles() {
         // Check OI during HIGH phase
         uint32_t gpio1 = GPIO.in;
         if (gpio1 & oiMask) {
-            uint8_t val = readBusFast();
-            if (oiCount < 256) oiHistory[oiCount] = val;
+            uint8_t val = decodeBus(gpio1);
+            oiHistory[oiCount & 0xFF] = val;
             oiCount++;
             lastOutputVal = val;
             outputCaptured = true;
@@ -777,8 +806,8 @@ static void handleRunCycles() {
         // Check OI during LOW phase
         uint32_t gpio2 = GPIO.in;
         if (gpio2 & oiMask) {
-            uint8_t val = readBusFast();
-            if (oiCount < 256) oiHistory[oiCount] = val;
+            uint8_t val = decodeBus(gpio2);
+            oiHistory[oiCount & 0xFF] = val;
             oiCount++;
             lastOutputVal = val;
             outputCaptured = true;
@@ -986,15 +1015,17 @@ static int runI2CScanAddr(uint8_t addr) {
     for (int i = 0; i < 20000; i++) {
         GPIO.out_w1ts = clkMask;
         delayMicroseconds(1);
-        if (GPIO.in & oiMask) {
-            result = readBusFast();
+        uint32_t g1 = GPIO.in;
+        if (g1 & oiMask) {
+            result = decodeBus(g1);
             GPIO.out_w1tc = clkMask;
             break;
         }
         GPIO.out_w1tc = clkMask;
         delayMicroseconds(1);
-        if (GPIO.in & oiMask) {
-            result = readBusFast();
+        uint32_t g2 = GPIO.in;
+        if (g2 & oiMask) {
+            result = decodeBus(g2);
             break;
         }
     }
@@ -1713,8 +1744,8 @@ static void handleSerialCommand(const String& line) {
             else if (nops > 0) { for (volatile int j = 0; j < nops; j++) __asm__ __volatile__("nop"); }
             uint32_t gpio1 = GPIO.in;
             if (gpio1 & oiMask) {
-                uint8_t val = readBusFast();
-                if (oiCount < 256) oiHistory[oiCount] = val;
+                uint8_t val = decodeBus(gpio1);
+                oiHistory[oiCount & 0xFF] = val;
                 oiCount++;
                 lastOutputVal = val;
                 outputCaptured = true;
@@ -1727,8 +1758,8 @@ static void handleSerialCommand(const String& line) {
             else if (nops > 0) { for (volatile int j = 0; j < nops; j++) __asm__ __volatile__("nop"); }
             uint32_t gpio2 = GPIO.in;
             if (gpio2 & oiMask) {
-                uint8_t val = readBusFast();
-                if (oiCount < 256) oiHistory[oiCount] = val;
+                uint8_t val = decodeBus(gpio2);
+                oiHistory[oiCount & 0xFF] = val;
                 oiCount++;
                 lastOutputVal = val;
                 outputCaptured = true;
@@ -1748,7 +1779,7 @@ static void handleSerialCommand(const String& line) {
             ? (float)actualCycles / elapsed_us * 1000.0f : 0;
         Serial.printf("{\"cyc\":%d,\"val\":%d,\"cap\":%s,\"us\":%lu,\"khz\":%.1f%s%s}\n",
             actualCycles,
-            oiCount > 0 ? oiHistory[0] : 0,
+            oiCount > 0 ? oiHistAt(oiHistStored() - 1) : 0,
             outputCaptured ? "true" : "false",
             elapsed_us,
             actual_khz,
@@ -1806,8 +1837,8 @@ static void handleSerialCommand(const String& line) {
             if (us > 0) delayMicroseconds(us);
             uint32_t gpio1 = GPIO.in;
             if (gpio1 & oiMask) {
-                uint8_t val = readBusFast();
-                if (oiCount < 256) oiHistory[oiCount] = val;
+                uint8_t val = decodeBus(gpio1);
+                oiHistory[oiCount & 0xFF] = val;
                 oiCount++;
                 lastOutputVal = val;
                 outputCaptured = true;
@@ -1818,8 +1849,8 @@ static void handleSerialCommand(const String& line) {
             if (us > 0) delayMicroseconds(us);
             uint32_t gpio2 = GPIO.in;
             if (gpio2 & oiMask) {
-                uint8_t val = readBusFast();
-                if (oiCount < 256) oiHistory[oiCount] = val;
+                uint8_t val = decodeBus(gpio2);
+                oiHistory[oiCount & 0xFF] = val;
                 oiCount++;
                 lastOutputVal = val;
                 outputCaptured = true;
@@ -1834,23 +1865,29 @@ static void handleSerialCommand(const String& line) {
         (void)halted;  // halted flag reported below
         Serial.printf("{\"cyc\":%d,\"cnt\":%d,\"halted\":%s,\"hist\":[",
             actualCycles, oiCount, halted ? "true" : "false");
-        int hmax = oiCount < 256 ? oiCount : 256;
-        for (int i = 0; i < hmax && i < 32; i++) {
-            if (i) Serial.print(',');
-            Serial.print(oiHistory[i]);
+        // Send the NEWEST 32 events in chronological order. We keep the
+        // last 256 in the ring buffer; the tail (where the program's
+        // real output emissions live) is what we want to report.
+        uint32_t stored = oiHistStored();
+        uint32_t start = stored > 32 ? stored - 32 : 0;
+        for (uint32_t i = start; i < stored; i++) {
+            if (i > start) Serial.print(',');
+            Serial.print(oiHistAt(i));
         }
         Serial.printf("]%s}\n", aborted ? ",\"aborted\":true" : "");
     }
     else if (line == "OI") {
+        // Report the NEWEST non-spurious value. That's the program's last
+        // meaningful out() — typically the result you care about when
+        // structuring a test as `out(result); halt()`.
         uint8_t val = 0;
         bool found = false;
-        uint32_t n = oiCount < 256 ? oiCount : 16;
-        for (uint32_t i = 0; i < n; i++) {
-            if (oiHistory[i] != 0x3F && oiHistory[i] != 0x7F) {
-                val = oiHistory[i]; found = true; break;
-            }
+        uint32_t n = oiHistStored();
+        for (uint32_t i = n; i > 0; i--) {
+            uint8_t v = oiHistAt(i - 1);
+            if (v != 0x3F && v != 0x7F) { val = v; found = true; break; }
         }
-        if (!found && n > 0) val = oiHistory[0];
+        if (!found && n > 0) val = oiHistAt(n - 1);
         Serial.printf("{\"val\":%d,\"cap\":%s,\"cnt\":%d}\n",
             val, outputCaptured ? "true" : "false", oiCount);
     }
@@ -1995,9 +2032,11 @@ static void handleSerialCommand(const String& line) {
                     bool rtcOk = false;
                     for (int i = 0; i < 50000; i++) {
                         GPIO.out_w1ts = clkMask; delayMicroseconds(1);
-                        if (GPIO.in & oiMask) { rtcOk = (readBusFast() == 0xDD); GPIO.out_w1tc = clkMask; break; }
+                        uint32_t gA = GPIO.in;
+                        if (gA & oiMask) { rtcOk = (decodeBus(gA) == 0xDD); GPIO.out_w1tc = clkMask; break; }
                         GPIO.out_w1tc = clkMask; delayMicroseconds(1);
-                        if (GPIO.in & oiMask) { rtcOk = (readBusFast() == 0xDD); break; }
+                        uint32_t gB = GPIO.in;
+                        if (gB & oiMask) { rtcOk = (decodeBus(gB) == 0xDD); break; }
                     }
                     pinMode(PIN_CLK, INPUT);
                     disableOutput(); digitalWrite(PIN_DIR, HIGH);
@@ -2085,8 +2124,8 @@ static void handleSerialCommand(const String& line) {
             if (us > 0) delayMicroseconds(us);
             uint32_t gpio1 = GPIO.in;
             if (gpio1 & oiMask) {
-                uint8_t val = readBusFast();
-                if (oiCount < 256) oiHistory[oiCount] = val;
+                uint8_t val = decodeBus(gpio1);
+                oiHistory[oiCount & 0xFF] = val;
                 oiCount++;
                 lastOutputVal = val;
                 outputCaptured = true;
@@ -2096,8 +2135,8 @@ static void handleSerialCommand(const String& line) {
             if (us > 0) delayMicroseconds(us);
             uint32_t gpio2 = GPIO.in;
             if (gpio2 & oiMask) {
-                uint8_t val = readBusFast();
-                if (oiCount < 256) oiHistory[oiCount] = val;
+                uint8_t val = decodeBus(gpio2);
+                oiHistory[oiCount & 0xFF] = val;
                 oiCount++;
                 lastOutputVal = val;
                 outputCaptured = true;
@@ -2112,12 +2151,14 @@ static void handleSerialCommand(const String& line) {
 
         float actual_khz = (actualCycles > 100 && elapsed_us > 100)
             ? (float)actualCycles / elapsed_us * 1000.0f : 0;
-        // Output all captured values
+        // Output captured values in chronological order (oldest → newest).
+        // With the ring buffer, when oiCount > 256 we've kept the LATEST 256,
+        // i.e. the tail of the program. That's what callers want to see.
         Serial.printf("{\"cyc\":%d,\"cnt\":%d,\"khz\":%.1f,\"vals\":[", actualCycles, oiCount, actual_khz);
-        int show = oiCount < 256 ? oiCount : 256;
-        for (int i = 0; i < show; i++) {
+        uint32_t show = oiHistStored();
+        for (uint32_t i = 0; i < show; i++) {
             if (i) Serial.print(',');
-            Serial.print(oiHistory[i]);
+            Serial.print(oiHistAt(i));
         }
         Serial.println("]}");
     }
@@ -2687,16 +2728,18 @@ void setup() {
                 for (int i = 0; i < 50000; i++) {
                     GPIO.out_w1ts = clkMask;
                     delayMicroseconds(1);
-                    if (GPIO.in & oiMask) {
-                        uint8_t val = readBusFast();
+                    uint32_t g1 = GPIO.in;
+                    if (g1 & oiMask) {
+                        uint8_t val = decodeBus(g1);
                         rtcOk = (val == 0xDD);
                         GPIO.out_w1tc = clkMask;
                         break;
                     }
                     GPIO.out_w1tc = clkMask;
                     delayMicroseconds(1);
-                    if (GPIO.in & oiMask) {
-                        uint8_t val = readBusFast();
+                    uint32_t g2 = GPIO.in;
+                    if (g2 & oiMask) {
+                        uint8_t val = decodeBus(g2);
                         rtcOk = (val == 0xDD);
                         break;
                     }
