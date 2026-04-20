@@ -123,31 +123,39 @@ def dedup_consecutive(vals):
     return out
 
 
-def find_sequence(vals, expected, sync_marker=0x55):
-    """Find `expected` within `vals`, tolerating:
-      - spurious first capture (bus/opcode byte before program reaches
-        first real `out`)
-      - halt-retry loops (HLT_GRACE_CYCLES lets PC wrap past hlt;
-        program re-runs and emits expected again and again)
-      - sync marker at start: if the test emits out(sync_marker) first,
-        we look for sync followed by expected.
-    Returns actual sequence matched or [] if not found.
-    """
-    # Strategy: look for the expected sequence as a contiguous subsequence
-    # anywhere in vals. If sync_marker is provided, require it to precede.
+def find_sequence(vals, expected):
+    """Verify the program's output matches `expected` by requiring the
+    expected sequence to appear as a contiguous subsequence at least
+    TWICE (not necessarily back-to-back).
+
+    Why twice:
+      - HLT_GRACE_CYCLES (100k) makes _main re-run after hlt, so a
+        correctly-behaving program emits the expected sequence multiple
+        times in a sufficiently long RUNLOG window. Requiring ≥2
+        occurrences rules out single coincidental matches with bus noise.
+      - Between iterations, the main preamble's I2C bus-recovery
+        (`ddrb_imm`) can spuriously fire OI and insert noise bytes
+        between expected occurrences — these are hardware fetch-cycle
+        artefacts, not miscompiles. Allowing gaps between occurrences
+        handles that without creating false positives.
+      - A real miscompile either emits the wrong values (expected won't
+        appear 2+ times) or hangs (no captures at all).
+
+    Returns the expected sequence on success, [] on failure."""
     E = list(expected)
     n = len(E)
     if n == 0:
         return []
-    # First: search for sync_marker followed by expected
-    for i in range(len(vals) - n):
-        if vals[i] == sync_marker and vals[i+1:i+1+n] == E:
-            return E
-    # Fall back: just look for the expected prefix anywhere
-    for i in range(len(vals) - n + 1):
-        if vals[i:i+n] == E:
-            return E
-    return []
+    # Count non-overlapping contiguous occurrences of E in vals.
+    count = 0
+    i = 0
+    while i <= len(vals) - n:
+        if vals[i:i + n] == E:
+            count += 1
+            i += n
+        else:
+            i += 1
+    return E if count >= 2 else []
 
 
 def trim_halt_retry(vals, expected_len):
@@ -176,13 +184,17 @@ def compile_c(source_path, eeprom=False, optimize=True):
 # ── Test case runner ─────────────────────────────────────────────────
 
 class Test:
-    def __init__(self, name, source, expected, eeprom=False, cycles=200_000, us=1):
+    def __init__(self, name, source, expected, eeprom=False, cycles=500_000, us=2):
         self.name = name
         self.source = source
         self.expected = expected   # list of ints, prefix of expected OI history
         self.eeprom = eeprom
         self.cycles = cycles
-        self.us = us   # 1 = ~500 kHz clock; us=0 is too fast and glitches OI
+        # Clock speed: us=2 → ≈250 kHz. Per project_max_clock.md, the MK1
+        # is reliable to ~550 kHz and fails at ~600 kHz. us=1 (≈500 kHz)
+        # is at the marginal edge. Keep tests below 250 kHz so we never
+        # blame a miscompile on a clock-induced glitch.
+        self.us = us
 
 
 def run_one(ser, test, verbose=False):
@@ -203,7 +215,7 @@ def run_one(ser, test, verbose=False):
     # loops cause repetition; first sample can be spurious bus garbage).
     # Use subsequence search with an optional 0x55 sync marker the test
     # program can emit to anchor the start.
-    actual = find_sequence(deduped, test.expected, sync_marker=0x55)
+    actual = find_sequence(deduped, test.expected)
     passed = actual == test.expected
     notes = f'cyc={r.get("cyc")} cnt={r.get("cnt")} khz={r.get("khz")}'
     if verbose or not passed:
