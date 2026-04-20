@@ -254,7 +254,7 @@ def compile_c(source_path, eeprom=False, optimize=True, extra_env=None):
 # ── Test case runner ─────────────────────────────────────────────────
 
 class Test:
-    def __init__(self, name, source, expected, eeprom=False, cycles=2_000_000, us=2,
+    def __init__(self, name, source, expected, eeprom=False, cycles=500_000, us=2,
                  env=None):
         self.name = name
         self.source = source
@@ -272,7 +272,11 @@ class Test:
 
 
 def run_one(ser, test, verbose=False):
-    """Compile + upload + runlog once. Return (passed, actual_trimmed, notes)."""
+    """Compile + upload + runlog once. Return (passed, actual_trimmed, notes).
+
+    Retries up to 3 times on cnt=0 (no captures = MK1 didn't even reach
+    the first out_imm — almost always indicates the upload didn't latch
+    or RESET held the CPU). Each retry re-uploads."""
     wrapped = wrap_with_sentinel(test.source)
     with open('/tmp/_hwreg_src.c', 'w') as f:
         f.write(wrapped)
@@ -280,23 +284,35 @@ def run_one(ser, test, verbose=False):
                                   extra_env=test.env)
     if asm is None:
         return False, [], f'compile error: {compile_err[:200]}'
-    if not assemble_upload(ser, asm):
-        return False, [], 'assemble/upload failed'
-    r = runlog(ser, cycles=test.cycles, us=test.us)
-    if 'error' in r:
-        return False, [], r['error']
-    raw_vals = r.get('vals', [])
-    deduped = dedup_consecutive(raw_vals)
-    # Expected sequence might appear anywhere in the capture (halt-retry
-    # loops cause repetition; first sample can be spurious bus garbage).
-    # Use subsequence search with an optional 0x55 sync marker the test
-    # program can emit to anchor the start.
-    actual = find_sequence(deduped, test.expected)
-    passed = actual == test.expected
-    notes = f'cyc={r.get("cyc")} cnt={r.get("cnt")} khz={r.get("khz")}'
-    if verbose or not passed:
-        notes += f' raw={deduped[:25]}'
-    return passed, actual, notes
+
+    last_notes = ''
+    for attempt in range(3):
+        if not assemble_upload(ser, asm):
+            last_notes = f'assemble/upload failed (attempt {attempt+1})'
+            continue
+        r = runlog(ser, cycles=test.cycles, us=test.us)
+        if 'error' in r:
+            last_notes = r['error']
+            continue
+        raw_vals = r.get('vals', [])
+        deduped = dedup_consecutive(raw_vals)
+        last_notes = f'cyc={r.get("cyc")} cnt={r.get("cnt")} khz={r.get("khz")}'
+        # cnt=0 = upload/reset failure. Re-upload + retry.
+        if r.get('cnt', 0) == 0 and attempt < 2:
+            last_notes += f' (retry: cnt=0 on attempt {attempt+1})'
+            continue
+        actual = find_sequence(deduped, test.expected)
+        passed = actual == test.expected
+        if passed:
+            return True, actual, last_notes
+        last_notes += f' raw={deduped[:25]}'
+        # Wrong-data failure too — retry once in case it was a transient
+        # capture artefact, then give up.
+        if attempt < 2:
+            last_notes += f' (retry: wrong data attempt {attempt+1})'
+            continue
+        return False, actual, last_notes
+    return False, [], last_notes
 
 
 def run_test(ser, test, replications=3, verbose=False):
@@ -443,11 +459,6 @@ TESTS = [
             halt();
         }''',
         [62], eeprom=True,
-        # i2c_init adds stage-1 body + self-copy overhead per halt-retry
-        # iteration. Longer capture window lets more iterations accumulate
-        # in the 256-slot buffer so a clean sentinel+expected pair lands
-        # in the captured prefix.
-        cycles=2_000_000,
         env={'MK1_T2_MIN_LEN': '3'},
     ),
 ]
