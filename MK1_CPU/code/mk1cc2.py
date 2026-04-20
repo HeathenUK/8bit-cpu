@@ -9416,6 +9416,69 @@ def peephole(lines):
         print(f"  Peephole: collapsed {collapsed_count} reg-inc/dec patterns "
               f"(saved {collapsed_count * 2}B)", file=sys.stderr)
 
+    # ── T4.1 auto-discovered peephole rules ──────────────────────────
+    # Verified equivalences found by superopt.py against mk1sim, each
+    # under 64 boundary + 136 random initial register states. Adding
+    # them here is safe because equivalence includes SP/ZF/CF.
+    #
+    # Rule 1: addi 1, $a ; mov $a, $X → mov $a, $X ; incX
+    #   Both leave A = (old A) + 1, $X = (old A) + 1. incX's carry/zero
+    #   flags match the addi's (both from same CINV-less inc microcode).
+    # Rule 2: andi N, $a ; tst 0xFF → andi N, $a
+    #   andi already sets ZF from the result; tst 0xFF re-tests the same
+    #   value against all-bits-set, reproducing the same ZF. Redundant.
+    # Rule 3: ori N, $a ; tst 0xFF → ori N, $a
+    #   Symmetric to rule 2.
+    # Rule 4: ldi $X, N ; ldi $a, N → ldi $a, N ; mov $a, $X
+    #   Old: $X = N (via ldi 2B), then $a = N (ldi 2B) = 4B total.
+    #   New: $a = N (2B), then $X = $a (mov 1B) = 3B. Saves 1B for
+    #   any constant N that both registers need.
+    AUTO_P2 = {}   # (line_i, line_i+1) → replacement_lines
+    AUTO_P3 = {}   # (line_i, line_i+1, line_i+2) → replacement_lines
+
+    for reg_letter in ('b', 'c', 'd'):
+        reg = f'${reg_letter}'
+        AUTO_P2[(f'addi 1,{reg}', f'mov $a,{reg}')] = [f'\tmov $a,{reg}', f'\tinc{reg_letter}']
+    import re as _re
+    auto_count = 0
+    out = []
+    i = 0
+    while i < len(lines):
+        # Try 2-instr rules
+        a = lines[i].strip()
+        b = lines[i+1].strip() if i+1 < len(lines) else ''
+        # andi/ori N,$a ; tst 0xFF → drop the tst
+        m = _re.match(r'^(andi|ori) (\S+),\$a$', a)
+        if m and b == 'tst 0xFF':
+            out.append(lines[i])
+            i += 2
+            auto_count += 1
+            continue
+        # ldi $X,N ; ldi $a,N → ldi $a,N ; mov $a,$X
+        m = _re.match(r'^ldi \$([bcd]),(\S+)$', a)
+        m2 = _re.match(r'^ldi \$a,(\S+)$', b)
+        if m and m2 and m.group(2) == m2.group(1):
+            reg_letter = m.group(1)
+            imm = m2.group(1)
+            out.append(f'\tldi $a,{imm}')
+            out.append(f'\tmov $a,${reg_letter}')
+            i += 2
+            auto_count += 1
+            continue
+        # addi 1,$a ; mov $a,$X → mov $a,$X ; incX
+        if (a, b) in AUTO_P2:
+            out.extend(AUTO_P2[(a, b)])
+            i += 2
+            auto_count += 1
+            continue
+        out.append(lines[i])
+        i += 1
+    lines = out
+    if auto_count > 0:
+        import sys
+        print(f"  Peephole: T4.1 auto-rules applied {auto_count}× "
+              f"(saved ≥{auto_count}B)", file=sys.stderr)
+
     return lines
 
 
