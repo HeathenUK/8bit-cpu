@@ -68,7 +68,12 @@ def compile_one(source_path, eeprom=True, optimize=True):
             args.append('-O')
         if eeprom:
             args.append('--eeprom')
-        r = subprocess.run(args, capture_output=True, text=True, timeout=60)
+        # Fix PYTHONHASHSEED for deterministic codegen — the compiler has
+        # set-iteration sites whose order subtly affects T2.1/T3.1 extractions
+        # and kernel byte count (off-by-2B spurious regressions in the harness).
+        env = dict(os.environ)
+        env['PYTHONHASHSEED'] = '0'
+        r = subprocess.run(args, capture_output=True, text=True, timeout=60, env=env)
         stderr_tail = r.stderr.splitlines()[-5:] if r.stderr else []
 
         # Compiler writes metrics JSON even on overflow exit, so try to

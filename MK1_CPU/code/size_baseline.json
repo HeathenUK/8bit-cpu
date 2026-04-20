@@ -248,8 +248,8 @@
     "page3_free": 52,
     "page3_used": 204,
     "stage1_copy": 14,
-    "stage1_init": 204,
-    "stage1_total": 218
+    "stage1_init": 203,
+    "stage1_total": 217
   },
   "lcd_temp_overlay": {
     "code_overflow": false,
@@ -269,8 +269,8 @@
     "page3_free": 49,
     "page3_used": 207,
     "stage1_copy": 14,
-    "stage1_init": 240,
-    "stage1_total": 254
+    "stage1_init": 213,
+    "stage1_total": 227
   },
   "lcd_temp_overlay_cmd": {
     "code_overflow": false,
@@ -290,8 +290,8 @@
     "page3_free": 51,
     "page3_used": 205,
     "stage1_copy": 14,
-    "stage1_init": 219,
-    "stage1_total": 233
+    "stage1_init": 200,
+    "stage1_total": 214
   },
   "lcd_test": {
     "code_overflow": false,
@@ -395,8 +395,8 @@
     "page3_free": 41,
     "page3_used": 215,
     "stage1_copy": 14,
-    "stage1_init": 219,
-    "stage1_total": 233
+    "stage1_init": 210,
+    "stage1_total": 224
   },
   "overlay_dashboard": {
     "code_overflow": true,
@@ -424,21 +424,21 @@
     "compile_ok": true,
     "eeprom_free": 4096,
     "eeprom_used": 0,
-    "kernel": 105,
+    "kernel": 103,
     "mode": "overlay",
     "overlay_largest": null,
-    "overlay_region": 105,
+    "overlay_region": 103,
     "overlay_shared": 0,
     "overlay_slots": null,
-    "page0_free": 145,
-    "page0_used": 105,
+    "page0_free": 147,
+    "page0_used": 103,
     "page1_allocated": 0,
     "page1_free": 256,
-    "page3_free": 148,
-    "page3_used": 108,
+    "page3_free": 150,
+    "page3_used": 106,
     "stage1_copy": 14,
-    "stage1_init": 107,
-    "stage1_total": 121
+    "stage1_init": 105,
+    "stage1_total": 119
   },
   "overlay_info": {
     "code_overflow": false,
@@ -458,8 +458,8 @@
     "page3_free": 25,
     "page3_used": 231,
     "stage1_copy": 14,
-    "stage1_init": 219,
-    "stage1_total": 233
+    "stage1_init": 200,
+    "stage1_total": 214
   },
   "overlay_seconds": {
     "code_overflow": false,
@@ -479,8 +479,8 @@
     "page3_free": 45,
     "page3_used": 211,
     "stage1_copy": 14,
-    "stage1_init": 219,
-    "stage1_total": 233
+    "stage1_init": 200,
+    "stage1_total": 214
   },
   "overlay_stopwatch": {
     "code_overflow": false,
@@ -521,8 +521,8 @@
     "page3_free": 44,
     "page3_used": 212,
     "stage1_copy": 14,
-    "stage1_init": 219,
-    "stage1_total": 233
+    "stage1_init": 200,
+    "stage1_total": 214
   },
   "test1_clock": {
     "code_overflow": false,
@@ -542,8 +542,8 @@
     "page3_free": 41,
     "page3_used": 215,
     "stage1_copy": 14,
-    "stage1_init": 219,
-    "stage1_total": 233
+    "stage1_init": 210,
+    "stage1_total": 224
   },
   "test2_temp": {
     "code_overflow": false,
@@ -563,8 +563,8 @@
     "page3_free": 44,
     "page3_used": 212,
     "stage1_copy": 14,
-    "stage1_init": 219,
-    "stage1_total": 233
+    "stage1_init": 200,
+    "stage1_total": 214
   },
   "test3_seconds": {
     "code_overflow": false,
@@ -584,8 +584,8 @@
     "page3_free": 45,
     "page3_used": 211,
     "stage1_copy": 14,
-    "stage1_init": 219,
-    "stage1_total": 233
+    "stage1_init": 200,
+    "stage1_total": 214
   },
   "test4_info": {
     "code_overflow": false,
@@ -605,8 +605,8 @@
     "page3_free": 25,
     "page3_used": 231,
     "stage1_copy": 14,
-    "stage1_init": 219,
-    "stage1_total": 233
+    "stage1_init": 200,
+    "stage1_total": 214
   },
   "test_autosplit": {
     "code_overflow": false,
@@ -689,8 +689,8 @@
     "page3_free": 64,
     "page3_used": 192,
     "stage1_copy": 14,
-    "stage1_init": 215,
-    "stage1_total": 229
+    "stage1_init": 189,
+    "stage1_total": 203
   },
   "test_lcd_eeprom": {
     "code_overflow": true,
@@ -731,8 +731,8 @@
     "page3_free": 141,
     "page3_used": 115,
     "stage1_copy": 14,
-    "stage1_init": 134,
-    "stage1_total": 148
+    "stage1_init": 112,
+    "stage1_total": 126
   },
   "test_overlay_stress": {
     "code_overflow": false,
@@ -815,29 +815,29 @@
     "page3_free": 88,
     "page3_used": 168,
     "stage1_copy": 14,
-    "stage1_init": 179,
-    "stage1_total": 193
+    "stage1_init": 167,
+    "stage1_total": 181
   },
   "twinkle": {
     "code_overflow": false,
     "compile_ok": true,
     "eeprom_free": 4096,
     "eeprom_used": 0,
-    "kernel": 181,
+    "kernel": 183,
     "mode": "overlay",
     "overlay_largest": null,
-    "overlay_region": 185,
+    "overlay_region": 183,
     "overlay_shared": 0,
     "overlay_slots": null,
-    "page0_free": 65,
-    "page0_used": 181,
+    "page0_free": 67,
+    "page0_used": 183,
     "page1_allocated": 27,
     "page1_free": 229,
-    "page3_free": 53,
-    "page3_used": 199,
+    "page3_free": 55,
+    "page3_used": 201,
     "stage1_copy": 14,
-    "stage1_init": 212,
-    "stage1_total": 222
+    "stage1_init": 190,
+    "stage1_total": 204
   },
   "twinkle_markers": {
     "code_overflow": true,
@@ -847,17 +847,17 @@
     "kernel": 248,
     "mode": "overlay",
     "overlay_largest": null,
-    "overlay_region": 250,
+    "overlay_region": 248,
     "overlay_shared": 0,
     "overlay_slots": null,
-    "page0_free": 0,
+    "page0_free": 2,
     "page0_used": 248,
     "page1_allocated": 30,
     "page1_free": 226,
-    "page3_free": -9,
+    "page3_free": -7,
     "page3_used": 263,
     "stage1_copy": 14,
-    "stage1_init": 256,
+    "stage1_init": 254,
     "stage1_total": 268
   },
   "twinkle_v2": {
@@ -868,17 +868,17 @@
     "kernel": 190,
     "mode": "overlay",
     "overlay_largest": null,
-    "overlay_region": 194,
+    "overlay_region": 190,
     "overlay_shared": 0,
     "overlay_slots": null,
-    "page0_free": 56,
+    "page0_free": 60,
     "page0_used": 190,
     "page1_allocated": 30,
     "page1_free": 226,
-    "page3_free": 47,
+    "page3_free": 51,
     "page3_used": 205,
     "stage1_copy": 14,
-    "stage1_init": 212,
-    "stage1_total": 226
+    "stage1_init": 196,
+    "stage1_total": 210
   }
 }
