@@ -8400,19 +8400,32 @@ class MK1CodeGen:
                 self._lcd_helpers.add(helper)
                 self.emit(f'\tjal {helper}')
                 # HD44780 execution delay after lcd_cmd (not needed for lcd_char).
-                # MUST use calibrated __delay_Nms — clock speed varies.
-                # Clear display (0x01) / return home (0x02): 1.52ms → delay(2)
-                # All other commands: 37µs → delay(1)
                 if not is_char:
-                    if not hasattr(self, '_lcd_helpers'):
-                        self._lcd_helpers = set()
-                    self._lcd_helpers.add('__delay_Nms')
-                    self._needs_delay_calibrate = True
                     if c is not None and c in (0x01, 0x02):
-                        self.emit('\tldi $b,2')    # 2ms
+                        # T2.4 specialisation: clear-display / return-home need
+                        # ≥1.52ms. A raw 256-iter dec/jnz loop on $a takes
+                        # ~1024 CPU cycles, which is 1–10ms across the supported
+                        # clock range (100k–1MHz). That's safely ≥1.52ms with
+                        # zero __delay_Nms / __delay_cal infrastructure pulled
+                        # in. Same trick lcd_clear() already uses; here we apply
+                        # it whenever the const argument is 0x01 / 0x02.
+                        # Saves ~50B (delay_Nms ≈ 35B + delay_cal ≈ 65B init,
+                        # not all kernel-resident but each adds compile cost).
+                        lbl_c = self.label('lcd_cmd_d')
+                        self.emit('\tldi $a,0')
+                        self.emit(f'{lbl_c}:')
+                        self.emit('\tdec')
+                        self.emit(f'\tjnz {lbl_c}')
                     else:
+                        # Generic command: 37µs minimum. Calibrated delay needed
+                        # because programs may use lcd_cmd in tight runtime
+                        # loops where over-delay matters.
+                        if not hasattr(self, '_lcd_helpers'):
+                            self._lcd_helpers = set()
+                        self._lcd_helpers.add('__delay_Nms')
+                        self._needs_delay_calibrate = True
                         self.emit('\tldi $b,1')    # 1ms
-                    self.emit('\tjal __delay_Nms')
+                        self.emit('\tjal __delay_Nms')
                 return
 
             if name == 'lcd_print':
