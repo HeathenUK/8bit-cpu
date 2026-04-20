@@ -6091,15 +6091,13 @@ class MK1CodeGen:
                     mini_copied_helpers.add(s[:-1])
 
         # delay_calibrate auto-insertion now handled in lcd_init builtin
-        # Init sequence extracted from main (VIA init, calibration calls, etc.)
-        assembled.extend(init_code_lines)
-        # Jump past helper bodies to self-copy. Previously jumped to __init_done
-        # (which just did `j __selfcopy`), but the assembler was resolving
-        # __init_done to a broken address when multi-overlay + resident-helper
-        # config shifts label positions. Direct jump bypasses the issue entirely.
-        # __init_done label still emitted below for any stale references.
-        if init_only_funcs:
-            assembled.append('\tj __selfcopy')
+        # NOTE: init_code_lines emit was moved DOWN (after pre-mc helper
+        # placement) so the pre-mc slack budget = helper_start - cur_addr is
+        # measured BEFORE init code is emitted. With init code emitted first,
+        # cur_addr was inflated by init code size and slack shrank — typical
+        # programs got 15B slack and could only fit one tiny init helper,
+        # forcing the rest to post-mc with padding cost. Pre-emitting helpers
+        # gives ~25-30B slack on a typical LCD program.
 
         # Init-only helpers (their function bodies, called via jal from above)
         # Rename bundled/shared helper references to _init versions so init code
@@ -6222,8 +6220,18 @@ class MK1CodeGen:
                 for name, start, end, fsize in _pre_mc_helpers:
                     body = _rename_shared_refs(self.code[start:end])
                     assembled.extend(body)
-                # Recompute cur_addr after pre-mc helpers emitted
-                _cur_addr = _measure_code_section(assembled)
+
+            # Emit init code AFTER pre-mc helpers (was previously above
+            # mini-copy code, before pre-mc placement). The reorder gives
+            # the pre-mc slack budget the room init code used to occupy
+            # — typical LCD program slack went from ~15B to ~30B, fitting
+            # 2 init helpers instead of 1.
+            assembled.extend(init_code_lines)
+            if init_only_funcs:
+                assembled.append('\tj __selfcopy')
+
+            # Recompute cur_addr after init code + j __selfcopy emitted
+            _cur_addr = _measure_code_section(assembled)
 
             if _post_mc_helpers and _cur_addr < _mc_end:
                 _pad_needed = _mc_end - _cur_addr
@@ -6236,6 +6244,11 @@ class MK1CodeGen:
                 assembled.append('__mc_pad:')
                 for _ in range(_pad_needed):
                     assembled.append('\tnop')
+        else:
+            # No init-only helpers → no pre-mc / post-mc dance, just emit
+            # init code straight after mini-copy. Init code is unconditional;
+            # the reorder block above only runs when init helpers exist.
+            assembled.extend(init_code_lines)
 
         _deferred_init_only_bodies = []
         # Emit the init helpers that didn't fit pre-mini-copy
