@@ -82,12 +82,19 @@ def compare_snapshots(baseline, current):
         return ['new program (no baseline)']
     if current is None:
         return ['failed to compile']
-    if 'error' in current:
-        return [f'error: {current["error"]}']
-    if 'error' in baseline:
-        # Was broken in baseline, still broken → no change
-        if 'error' in current:
-            return []
+    b_err = baseline.get('error')
+    c_err = current.get('error')
+    if b_err and c_err:
+        # Both broken. Report only if the error text changed — otherwise
+        # it's the same pre-existing failure (most likely: the program
+        # references external symbols like `_eeprom_write` that aren't
+        # intended to link as a standalone).
+        if b_err != c_err:
+            return [f'error changed: was {b_err!r}, now {c_err!r}']
+        return []
+    if c_err and not b_err:
+        return [f'newly broken: {c_err}']
+    if b_err and not c_err:
         return ['was broken, now compiles']
     # Compare actual results
     if baseline.get('halted') != current.get('halted'):
