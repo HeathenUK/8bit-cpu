@@ -5744,16 +5744,21 @@ class MK1CodeGen:
                 '\tjal __i2c_sb',
                 '\tclr $a',
                 '\tjal __i2c_sb',
-                '\tddrb_imm 0x03',
-                '\tddrb_imm 0x01',
-                '\tddrb_imm 0x00',
-                '\texrw 2',
-                '\tddrb_imm 0x01',
-                '\tddrb_imm 0x03',
+                # Inline repeated-START (was STOP+START = 11B; this is 8B).
+                # Saves 3B in stage-1 — enough to fit test_eeprom_overlay
+                # cleanly. Same edge sequence as __i2c_rs helper without
+                # the jal/ret + needing the helper resident.
+                '\tddrb_imm 0x02',        # SCL LOW, SDA released
+                '\tddrb_imm 0x00',        # SCL rises → idle
+                '\tddrb_imm 0x01',        # SDA falls with SCL HIGH → REP START
+                '\tddrb_imm 0x03',        # SCL falls → ready for address byte
                 '\tldi $a,0xAF',
                 '\tjal __i2c_sb',
                 f'\tldi $d,{ee_preload_bytes}',
-                '\tldi $c,0',
+                # $c is the page3 write address counter, starts at 0. CPU
+                # reset zeroes all GPRs; the preceding self_copy loop and
+                # __i2c_sb calls clobber A/B/D but not C — so C is still 0
+                # here without an explicit ldi. Saves 2B in stage-1.
                 '.ee_byte:',
                 # Sentinel-bit inner loop: B starts at 0x01. Each iteration
                 # rotates B left through CF and ORs in the SDA bit. After
@@ -5777,12 +5782,13 @@ class MK1CodeGen:
                 '\tddrb_imm 0x02',        # SCL LOW
                 '\tj .ee_bit',
                 '.ee_byte_end:',
-                '\tmov $b,$a',
-                '\tpush $a',
-                '\tmov $c,$a',
-                '\tmov $a,$b',
-                '\tpop $a',
-                '\tiderefp3',
+                # B=read_byte (from sentinel loop), C=address counter.
+                # Need: A=byte, B=address for iderefp3.
+                # Old code used push/pop to save byte across C→B; the two-mov
+                # version saves 2B by routing byte through A directly.
+                '\tmov $b,$a',            # A = B (byte)
+                '\tmov $c,$b',            # B = C (address)
+                '\tiderefp3',             # page3[B=addr] = A=byte
                 '\tddrb_imm 0x03',
                 '\tddrb_imm 0x01',
                 '\tddrb_imm 0x03',
