@@ -12,7 +12,22 @@ Knows every MK1 constraint:
 Usage: python3 mk1cc2.py input.c [-o output.asm] [-O]
 """
 
-import sys, re, argparse
+import os, sys
+
+# ── Deterministic codegen ────────────────────────────────────────────
+# Several passes (T2.1 cross-section abstraction, overlay partitioning,
+# knapsack helper selection) iterate over sets/dicts whose key order
+# depends on Python's hash randomisation. Two compiles of the same
+# source file can produce slightly different byte output — different
+# extractions chosen, different placement decisions — which means
+# identical-looking tests flip between pass and fail runs. Re-exec with
+# a fixed PYTHONHASHSEED so every run is byte-identical.
+if os.environ.get('PYTHONHASHSEED') != '0':
+    env = dict(os.environ)
+    env['PYTHONHASHSEED'] = '0'
+    os.execvpe(sys.executable, [sys.executable, __file__] + sys.argv[1:], env)
+
+import re, argparse
 
 # ── Tokenizer (from mk1cc.py) ────────────────────────────────────────
 
