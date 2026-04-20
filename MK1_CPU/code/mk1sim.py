@@ -256,6 +256,19 @@ class MK1:
             # Instruction register lower bits to bus (for immediate operand addressing)
             bus = self.IR
 
+        # ALU-implicit bus drive: instructions like sll/slr/rll/rlr/not use the
+        # SHF or NOT mode bit without setting explicit EO in the output mux.
+        # On hardware the ALU continuously drives its output line and the mode
+        # bits determine what it computes; when AI is asserted the shifted A
+        # latches back. The simulator's _reg_out_value only kicks in for
+        # explicit EO (code=7), so without this fallback the bus sees 0 and
+        # A gets cleared. Check for ALU-mode bits with no explicit reg_out.
+        if bus is None and (ctrl & (SHF | OR | SUB | CINV)):
+            # Use A and E to compute ALU output for this cycle.
+            mode_bits = ctrl & (SUB | OR | SHF | RGT | CINV)
+            result, _ = self._alu_compute(self.A, self.E, mode_bits)
+            bus = result
+
         # If nothing drives the bus, it floats (we use 0 as default)
         if bus is None:
             bus = 0
