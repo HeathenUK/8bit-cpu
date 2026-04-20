@@ -4719,6 +4719,261 @@ class MK1CodeGen:
                 print(f"  T2.1 total cross-section savings: {_t2_total_saved}B",
                       file=sys.stderr)
 
+            # ── T3.1: Liveness-based overlay call-site push/pop elision ──
+            # Overlay call sites emit the uniform pattern:
+            #   push $b; push $a; ldi $a, IDX; jal _overlay_load
+            #   pop $a; pop $b; jal __ov_entry
+            # The push/pop pairs are belt-and-suspenders: they preserve caller's
+            # $a/$b across the overlay call. But if the caller's next use of $a
+            # (or $b) after __ov_entry is an OVERWRITE (ldi / clr / pop / mov),
+            # the save was wasted — the register was dead across the call.
+            #
+            # Also: the overlay function itself may not take all args. A 0-arg
+            # overlay doesn't need $a/$b passed; the pop before __ov_entry is
+            # wasted. Combined with caller-side liveness, we can drop both
+            # push AND pop for dead registers. Savings: 2B per elided pair.
+            def _t3_reg_used_by_instr(text, reg):
+                """True if the instruction text READS the named register.
+                `reg` is 'a', 'b', 'c', or 'd'."""
+                s = text.strip()
+                mn = s.split()[0] if s.split() else ''
+                dollar = f'${reg}'
+                # Instruction-specific reads
+                if mn == 'ret' or mn == 'hlt':
+                    return reg == 'a'   # conservative: ret may carry return in $a
+                if mn.startswith(('j','jz','jnz','jc','jnc')) and mn != 'jal':
+                    return True         # branches read flags — conservative for A
+                if mn == 'jal':
+                    return True         # call may use any reg as arg
+                # push $X reads $X
+                if mn == 'push' and s.split()[1] == dollar:
+                    return True
+                if mn == 'push_b' and reg == 'b':
+                    return True
+                if mn == 'push_imm':
+                    return False
+                # pop $X writes $X (not a read)
+                if mn == 'pop' and s.split()[1] == dollar:
+                    return False
+                if mn == 'pop_b' and reg == 'b':
+                    return False
+                # mov $src, $dst reads $src
+                if mn == 'mov':
+                    parts = s.replace(',', ' ').split()
+                    # parts = ['mov', '$src', '$dst'] per mk1cc2 convention
+                    if len(parts) >= 2 and parts[1] == dollar:
+                        return True
+                    return False
+                # cmp $X reads $X (and always reads $a)
+                if mn == 'cmp':
+                    parts = s.split()
+                    if reg == 'a': return True
+                    if len(parts) > 1 and parts[1] == dollar: return True
+                    return False
+                # add/sub/and/or $b, $a — reads both (but here $a is first arg
+                # by convention; we're checking the named reg)
+                if mn in ('add', 'sub', 'and', 'or', 'xor'):
+                    # all use $a and $b typically
+                    return reg in ('a', 'b')
+                # Unary ops on $a
+                if mn in ('inc', 'dec', 'sll', 'slr', 'rll', 'rlr', 'clr',
+                          'swap', 'tst', 'cmpi', 'addi', 'subi', 'andi', 'ori',
+                          'deref', 'derefp3', 'deref2', 'ideref', 'iderefp3',
+                          'ideref2', 'istc', 'istc_inc', 'out', 'out_imm',
+                          'exw', 'exr', 'exrw'):
+                    return reg == 'a'   # all operate on A
+                # Register inc/dec: decb reads $b, incb reads $b, etc.
+                if mn in ('decb', 'incb'):
+                    return reg == 'b'
+                if mn in ('decc', 'incc'):
+                    return reg == 'c'
+                if mn in ('decd', 'incd'):
+                    return reg == 'd'
+                # ldsp / stsp read $a (A gets stack value on ldsp; stsp writes A to stack)
+                if mn in ('ldsp', 'stsp', 'ldsp_b'):
+                    return mn == 'stsp' and reg == 'a'
+                # ddrb_imm / ddra_imm / ora_imm / orb_imm — take imm, no reg reads
+                if mn in ('ddrb_imm', 'ddra_imm', 'ora_imm', 'orb_imm', 'nop'):
+                    return False
+                # ldi $X, N — writes $X only
+                if mn == 'ldi':
+                    return False
+                return False   # unknown — conservative would be True, but we
+                               # need to be permissive to enable elision; the
+                               # above covers all emitted mnemonics
+
+            def _t3_reg_written_by_instr(text, reg):
+                s = text.strip()
+                mn = s.split()[0] if s.split() else ''
+                dollar = f'${reg}'
+                if mn == 'ldi':
+                    parts = s.replace(',', ' ').split()
+                    return len(parts) >= 2 and parts[1] == dollar
+                if mn == 'clr':
+                    parts = s.split()
+                    return len(parts) > 1 and parts[1] == dollar
+                if mn == 'pop' and s.split()[1] == dollar:
+                    return True
+                if mn == 'pop_b' and reg == 'b':
+                    return True
+                if mn == 'mov':
+                    parts = s.replace(',', ' ').split()
+                    # parts = ['mov', '$src', '$dst'] — dst is last
+                    if len(parts) >= 3 and parts[2] == dollar:
+                        return True
+                if mn in ('inc', 'dec', 'sll', 'slr', 'rll', 'rlr', 'swap',
+                          'addi', 'subi', 'andi', 'ori', 'derefp3', 'deref',
+                          'deref2', 'out', 'exrw', 'ldsp', 'ldsp_b', 'pop_b',
+                          'exw', 'exr'):
+                    if reg == 'a': return True
+                if mn in ('decb', 'incb'):
+                    return reg in ('a', 'b')
+                if mn in ('decc', 'incc'):
+                    return reg in ('a', 'c')
+                if mn in ('decd', 'incd'):
+                    return reg in ('a', 'd')
+                return False
+
+            def _t3_reg_live_after(lines, idx, reg):
+                """Forward-scan liveness: is `reg` live after lines[idx]?
+                Conservative on uncertainty (returns True). Looks within the
+                same straight-line sequence — any branch target label or
+                uncertainty returns True, EXCEPT for labels whose following
+                instruction is a terminator (hlt/ret) — those can't make the
+                reg live because no path out reads it."""
+                i = idx + 1
+                while i < len(lines):
+                    s = lines[i].strip()
+                    if not s or s.startswith(';'):
+                        i += 1; continue
+                    if s.startswith('section ') or s.startswith('org '):
+                        i += 1; continue
+                    if s.endswith(':'):
+                        # Label — peek at the next non-blank instruction to
+                        # see if this label is a dead-end trap.
+                        j = i + 1
+                        while j < len(lines):
+                            ns = lines[j].strip()
+                            if not ns or ns.startswith(';') or ns.startswith('section') or ns.startswith('org'):
+                                j += 1; continue
+                            break
+                        if j < len(lines):
+                            ns = lines[j].strip()
+                            if ns == 'hlt':
+                                # Halt trap — all regs dead from this path.
+                                return False
+                            if ns == 'ret':
+                                # Function return — $a may carry return value.
+                                return reg == 'a'
+                        # Other labels: conservative.
+                        return True
+                    # Check read first (reads mean live)
+                    if _t3_reg_used_by_instr(s, reg):
+                        return True
+                    # Then check write (writes mean dead if no prior read)
+                    if _t3_reg_written_by_instr(s, reg):
+                        return False
+                    mn = s.split()[0] if s.split() else ''
+                    # Unconditional branches and jal handled via _used_by_instr
+                    # (both return True for jal; plain `j` returns False from
+                    # _used but we catch here).
+                    if mn == 'j':
+                        return True
+                    if mn in ('jz', 'jnz', 'jc', 'jnc'):
+                        # Conditional branch — flow could diverge; conservative.
+                        return True
+                    if mn == 'ret' or mn == 'hlt':
+                        # End of flow — $a conservatively live (return val), others dead
+                        return reg == 'a'
+                    i += 1
+                # End of function — dead (nothing reads it)
+                return False
+
+            # Map overlay index → entry_name so we can look up arg count.
+            # overlay_meta was rebuilt at line ~3854 after size changes, so it
+            # currently reflects the final set of overlay slots.
+            _t3_idx_to_name = {idx: name for (idx, name, _sz) in overlay_meta}
+
+            def _t3_overlay_arg_count(idx):
+                """Best-effort arg count for overlay index. Returns 2 if
+                unknown (conservative — keeps push/pop)."""
+                name = _t3_idx_to_name.get(idx)
+                if name is None:
+                    return 2
+                # Strip leading _ (user functions are `_name` in asm)
+                bare = name.lstrip('_')
+                # Check func_params. For bundled helpers like `__lcd_chr_ov0`
+                # or phase-7 splits like `_show_temp_phase2`, func_params
+                # may not have the name; return 2 (conservative).
+                if bare in self.func_params:
+                    return self.func_params[bare]
+                # Phase-7 auto-split: name may be `<orig>_phase1/2`
+                if bare.endswith('_phase1') or bare.endswith('_phase2'):
+                    base = bare.rsplit('_phase', 1)[0]
+                    if base in self.func_params:
+                        return self.func_params[base]
+                return 2   # unknown → conservative
+
+            def _t3_elide_overlay_saves(lines):
+                """Find each overlay call pattern and elide push/pop pairs
+                whose register is dead across the call AND not needed as an
+                arg by the overlay. Returns (new_lines, bytes_saved)."""
+                saved = 0
+                out = []
+                i = 0
+                while i < len(lines):
+                    # Match: push $b / push $a / ldi $a, IDX / jal _overlay_load /
+                    #        pop $a / pop $b / jal __ov_entry
+                    if (i + 6 < len(lines) and
+                        lines[i].strip() == 'push $b' and
+                        lines[i+1].strip() == 'push $a' and
+                        lines[i+2].strip().startswith('ldi $a,') and
+                        lines[i+3].strip() == 'jal _overlay_load' and
+                        lines[i+4].strip() == 'pop $a' and
+                        lines[i+5].strip() == 'pop $b' and
+                        lines[i+6].strip() == 'jal __ov_entry'):
+                        # Extract overlay index from `ldi $a, IDX`
+                        idx_str = lines[i+2].strip().split(',', 1)[1].strip()
+                        try:
+                            ov_idx = int(idx_str, 0)
+                        except ValueError:
+                            ov_idx = None
+                        # Determine if each register is "needed" (arg to
+                        # overlay OR live after the whole call-site returns).
+                        arg_count = _t3_overlay_arg_count(ov_idx) if ov_idx is not None else 2
+                        a_needed_by_overlay = arg_count >= 1
+                        b_needed_by_overlay = arg_count >= 2
+                        # Caller-side liveness: check AFTER `jal __ov_entry`
+                        a_live_after = _t3_reg_live_after(lines, i+6, 'a')
+                        b_live_after = _t3_reg_live_after(lines, i+6, 'b')
+                        # Elide $a pair if: not an arg AND not live after
+                        elide_a = (not a_needed_by_overlay) and (not a_live_after)
+                        elide_b = (not b_needed_by_overlay) and (not b_live_after)
+                        # Emit pattern with elisions
+                        if not elide_b:
+                            out.append(lines[i])       # push $b
+                        if not elide_a:
+                            out.append(lines[i+1])     # push $a
+                        out.append(lines[i+2])         # ldi $a, IDX
+                        out.append(lines[i+3])         # jal _overlay_load
+                        if not elide_a:
+                            out.append(lines[i+4])     # pop $a
+                        if not elide_b:
+                            out.append(lines[i+5])     # pop $b
+                        out.append(lines[i+6])         # jal __ov_entry
+                        if elide_a: saved += 2         # push $a + pop $a = 2B total
+                        if elide_b: saved += 2         # push $b + pop $b = 2B total
+                        i += 7
+                    else:
+                        out.append(lines[i])
+                        i += 1
+                return out, saved
+
+            main_lines, _t3_saved = _t3_elide_overlay_saves(main_lines)
+            if _t3_saved:
+                print(f"  T3.1 elided {_t3_saved}B of dead push/pop around overlay calls",
+                      file=sys.stderr)
+
             runtime_helper_size = measure_lines(runtime_resident_helpers)
             main_size = measure_lines(main_lines)
             KERNEL_SIZE_est = loader_size + main_size + runtime_helper_size
