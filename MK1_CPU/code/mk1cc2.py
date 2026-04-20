@@ -4464,6 +4464,46 @@ class MK1CodeGen:
                 units['main'] = list(_t2_strip_section_tokens(main_lines))
                 for oi, (oname, olines, _ofsize) in enumerate(overlay_asm_blocks):
                     units[f'ov{oi}'] = list(_t2_strip_section_tokens(olines))
+                # Stage-1 init code runs AFTER mini-copy but BEFORE self-copy.
+                # Mini-copy places every runtime_resident_helper at its kernel
+                # address, so init code can call kernel-resident thunks freely.
+                # Shared/bundled/init-only helpers are NOT at their kernel
+                # addresses yet — they get renamed to `_init` variants at
+                # emission time. A sequence extracted from init that jal's to
+                # such a helper would point at the wrong address, so init
+                # occurrences are filtered out for sequences containing
+                # jal-to-non-mini-copied targets (see _seq_init_safe below).
+                if init_extracted:
+                    units['init'] = list(_t2_strip_section_tokens(init_extracted))
+
+                # Set of helpers that mini-copy places at their kernel address
+                # before init runs. These are the ONLY jal targets safe to
+                # appear in init-extracted sequences.
+                _mini_copied_names = set()
+                for line in runtime_resident_helpers:
+                    s = line.strip()
+                    if s.endswith(':') and s.startswith('__'):
+                        _mini_copied_names.add(s[:-1])
+
+                def _seq_init_safe(key):
+                    """A sequence is safe to extract from init iff every `jal`
+                    it contains targets a label that WILL be at its kernel
+                    address before the stage-1 init code executes. That means:
+                    already-existing T2.1 thunks (always in runtime helpers)
+                    OR any label defined in runtime_resident_helpers (the
+                    mini-copied set)."""
+                    for t in key:
+                        if not t.startswith('jal '):
+                            continue
+                        tgt = t.split(None, 1)[1].strip()
+                        if (tgt.startswith('__xsthunk_') or
+                            tgt.startswith('__tailmerge_') or
+                            tgt.startswith('__param_')):
+                            continue
+                        if tgt in _mini_copied_names:
+                            continue
+                        return False
+                    return True
 
                 # Current sizes (unchanging across candidates this pass).
                 # Kernel = runtime_resident_helpers + main_lines (+ loader,
@@ -4553,6 +4593,13 @@ class MK1CodeGen:
                 for (mode, key), raw_occ in seqs.items():
                     if len(raw_occ) < 2:
                         continue
+                    # Init-safety: sequences with jal to non-mini-copied labels
+                    # cannot run from stage-1 init. Prune init occurrences; if
+                    # that leaves <2 occurrences, drop the candidate.
+                    if not _seq_init_safe(key):
+                        raw_occ = [o for o in raw_occ if o[0] != 'init']
+                        if len(raw_occ) < 2:
+                            continue
                     # For parametric modes: only consider if the imm varies
                     # across occurrences. If all occurrences have the same imm,
                     # this is a byte-identical match already covered by call/tail
@@ -4646,7 +4693,13 @@ class MK1CodeGen:
                         new_ov_sizes.append(sz - n * occ_delta)
                     post_max_ov = max(new_ov_sizes, default=0)
                     post_budget = post_kernel + post_max_ov
-                    budget_improvement = cur_budget - post_budget
+                    # Init-code shrinkage is a separate stage-1 credit: the
+                    # thunk body was already billed to the kernel above, so
+                    # per-occurrence init savings directly offset that cost.
+                    # Stage-1 also fits on the 250B code page, so init bytes
+                    # saved ≈ budget bytes saved to a first approximation.
+                    init_delta = unit_occ.get('init', 0) * occ_delta
+                    budget_improvement = (cur_budget - post_budget) + init_delta
                     if budget_improvement < 0:
                         if _debug_t2 and raw_savings >= 1:
                             _t2_near_miss.append((raw_savings, budget_improvement, K, S, mode, key[:3]))
@@ -4740,6 +4793,8 @@ class MK1CodeGen:
                         target_lines = runtime_resident_helpers
                     elif uid == 'main':
                         target_lines = main_lines
+                    elif uid == 'init':
+                        target_lines = init_extracted
                     else:
                         oi = int(uid[2:])
                         target_lines = overlay_asm_blocks[oi][1]
@@ -4775,6 +4830,8 @@ class MK1CodeGen:
                         runtime_resident_helpers = new_target
                     elif uid == 'main':
                         main_lines = new_target
+                    elif uid == 'init':
+                        init_extracted = new_target
                     else:
                         overlay_asm_blocks[oi] = (overlay_asm_blocks[oi][0],
                                                    new_target,
