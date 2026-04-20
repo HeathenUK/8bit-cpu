@@ -2669,7 +2669,8 @@ class MK1CodeGen:
                            any(s.startswith(p) for p in INIT_PREFIXES_SET) or
                            s.startswith('clr $a') or s.startswith('dec') or
                            s.startswith('.via_') or s.startswith('.br_') or
-                           s.startswith('.rcv') or s.startswith('mov $c,$a') or
+                           s.startswith('.rcv') or s.startswith('.i2c_init_br') or
+                           s.startswith('mov $c,$a') or
                            s == 'nop')
                 if s.startswith('jnz .') or s.startswith('j .'):
                     is_init = True
