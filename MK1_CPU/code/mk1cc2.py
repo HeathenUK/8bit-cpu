@@ -4940,183 +4940,35 @@ class MK1CodeGen:
                                 break
                 _i += 1
 
+            # T1.2 liveness primitives live in mk1ir. These thin wrappers
+            # bind in compiler-specific context (func_params, thunk map).
+            import mk1ir as _ir_t3
+
+            def _t3_thunk_lookup(tgt):
+                return _t3_thunk_to_ov_idx.get(tgt)
+
+            def _t3_thunk_ov_arg_count(tgt):
+                idx = _t3_thunk_to_ov_idx.get(tgt)
+                if idx is None:
+                    return None
+                return _t3_overlay_arg_count(idx)
+
             def _t3_reg_used_by_instr(text, reg):
-                """True if the instruction text READS the named register.
-                `reg` is 'a', 'b', 'c', or 'd'."""
-                s = text.strip()
-                mn = s.split()[0] if s.split() else ''
-                dollar = f'${reg}'
-                # Instruction-specific reads
-                if mn == 'ret' or mn == 'hlt':
-                    return reg == 'a'   # conservative: ret may carry return in $a
-                if mn.startswith(('j','jz','jnz','jc','jnc')) and mn != 'jal':
-                    return True         # branches read flags — conservative for A
-                if mn == 'jal':
-                    # Transparent thunks: jal to __xsthunk_N / __param_N /
-                    # __tailmerge_N wraps an overlay call with known arg count.
-                    # Look up the wrapped overlay's arg count and decide.
-                    parts = s.split()
-                    if len(parts) >= 2:
-                        tgt = parts[1]
-                        # User function: `_foo` → check func_params
-                        if tgt.startswith('_') and not tgt.startswith('__'):
-                            bare = tgt.lstrip('_')
-                            if bare in self.func_params:
-                                arg_count = self.func_params[bare]
-                                if reg == 'a': return arg_count >= 1
-                                if reg == 'b': return arg_count >= 2
-                                return False
-                        # Thunk wrapping an overlay call
-                        if tgt in _t3_thunk_to_ov_idx:
-                            ov_idx = _t3_thunk_to_ov_idx[tgt]
-                            arg_count = _t3_overlay_arg_count(ov_idx)
-                            if reg == 'a': return arg_count >= 1
-                            if reg == 'b': return arg_count >= 2
-                            return False
-                    return True         # unknown target — conservative
-                # push $X reads $X
-                if mn == 'push' and s.split()[1] == dollar:
-                    return True
-                if mn == 'push_b' and reg == 'b':
-                    return True
-                if mn == 'push_imm':
-                    return False
-                # pop $X writes $X (not a read)
-                if mn == 'pop' and s.split()[1] == dollar:
-                    return False
-                if mn == 'pop_b' and reg == 'b':
-                    return False
-                # mov $src, $dst reads $src
-                if mn == 'mov':
-                    parts = s.replace(',', ' ').split()
-                    # parts = ['mov', '$src', '$dst'] per mk1cc2 convention
-                    if len(parts) >= 2 and parts[1] == dollar:
-                        return True
-                    return False
-                # cmp $X reads $X (and always reads $a)
-                if mn == 'cmp':
-                    parts = s.split()
-                    if reg == 'a': return True
-                    if len(parts) > 1 and parts[1] == dollar: return True
-                    return False
-                # add/sub/and/or $b, $a — reads both (but here $a is first arg
-                # by convention; we're checking the named reg)
-                if mn in ('add', 'sub', 'and', 'or', 'xor'):
-                    # all use $a and $b typically
-                    return reg in ('a', 'b')
-                # Unary ops on $a
-                if mn in ('inc', 'dec', 'sll', 'slr', 'rll', 'rlr', 'clr',
-                          'swap', 'tst', 'cmpi', 'addi', 'subi', 'andi', 'ori',
-                          'deref', 'derefp3', 'deref2', 'ideref', 'iderefp3',
-                          'ideref2', 'istc', 'istc_inc', 'out', 'out_imm',
-                          'exw', 'exr', 'exrw'):
-                    return reg == 'a'   # all operate on A
-                # Register inc/dec: decb reads $b, incb reads $b, etc.
-                if mn in ('decb', 'incb'):
-                    return reg == 'b'
-                if mn in ('decc', 'incc'):
-                    return reg == 'c'
-                if mn in ('decd', 'incd'):
-                    return reg == 'd'
-                # ldsp / stsp read $a (A gets stack value on ldsp; stsp writes A to stack)
-                if mn in ('ldsp', 'stsp', 'ldsp_b'):
-                    return mn == 'stsp' and reg == 'a'
-                # ddrb_imm / ddra_imm / ora_imm / orb_imm — take imm, no reg reads
-                if mn in ('ddrb_imm', 'ddra_imm', 'ora_imm', 'orb_imm', 'nop'):
-                    return False
-                # ldi $X, N — writes $X only
-                if mn == 'ldi':
-                    return False
-                return False   # unknown — conservative would be True, but we
-                               # need to be permissive to enable elision; the
-                               # above covers all emitted mnemonics
+                return _ir_t3.reg_used_by_instr(
+                    text, reg,
+                    func_params=self.func_params,
+                    thunk_ov_arg_count=_t3_thunk_ov_arg_count,
+                )
 
             def _t3_reg_written_by_instr(text, reg):
-                s = text.strip()
-                mn = s.split()[0] if s.split() else ''
-                dollar = f'${reg}'
-                if mn == 'ldi':
-                    parts = s.replace(',', ' ').split()
-                    return len(parts) >= 2 and parts[1] == dollar
-                if mn == 'clr':
-                    parts = s.split()
-                    return len(parts) > 1 and parts[1] == dollar
-                if mn == 'pop' and s.split()[1] == dollar:
-                    return True
-                if mn == 'pop_b' and reg == 'b':
-                    return True
-                if mn == 'mov':
-                    parts = s.replace(',', ' ').split()
-                    # parts = ['mov', '$src', '$dst'] — dst is last
-                    if len(parts) >= 3 and parts[2] == dollar:
-                        return True
-                if mn in ('inc', 'dec', 'sll', 'slr', 'rll', 'rlr', 'swap',
-                          'addi', 'subi', 'andi', 'ori', 'derefp3', 'deref',
-                          'deref2', 'out', 'exrw', 'ldsp', 'ldsp_b', 'pop_b',
-                          'exw', 'exr'):
-                    if reg == 'a': return True
-                if mn in ('decb', 'incb'):
-                    return reg in ('a', 'b')
-                if mn in ('decc', 'incc'):
-                    return reg in ('a', 'c')
-                if mn in ('decd', 'incd'):
-                    return reg in ('a', 'd')
-                return False
+                return _ir_t3.reg_written_by_instr(text, reg)
 
             def _t3_reg_live_after(lines, idx, reg):
-                """Forward-scan liveness: is `reg` live after lines[idx]?
-                Conservative on uncertainty (returns True). Looks within the
-                same straight-line sequence — any branch target label or
-                uncertainty returns True, EXCEPT for labels whose following
-                instruction is a terminator (hlt/ret) — those can't make the
-                reg live because no path out reads it."""
-                i = idx + 1
-                while i < len(lines):
-                    s = lines[i].strip()
-                    if not s or s.startswith(';'):
-                        i += 1; continue
-                    if s.startswith('section ') or s.startswith('org '):
-                        i += 1; continue
-                    if s.endswith(':'):
-                        # Label — peek at the next non-blank instruction to
-                        # see if this label is a dead-end trap.
-                        j = i + 1
-                        while j < len(lines):
-                            ns = lines[j].strip()
-                            if not ns or ns.startswith(';') or ns.startswith('section') or ns.startswith('org'):
-                                j += 1; continue
-                            break
-                        if j < len(lines):
-                            ns = lines[j].strip()
-                            if ns == 'hlt':
-                                # Halt trap — all regs dead from this path.
-                                return False
-                            if ns == 'ret':
-                                # Function return — $a may carry return value.
-                                return reg == 'a'
-                        # Other labels: conservative.
-                        return True
-                    # Check read first (reads mean live)
-                    if _t3_reg_used_by_instr(s, reg):
-                        return True
-                    # Then check write (writes mean dead if no prior read)
-                    if _t3_reg_written_by_instr(s, reg):
-                        return False
-                    mn = s.split()[0] if s.split() else ''
-                    # Unconditional branches and jal handled via _used_by_instr
-                    # (both return True for jal; plain `j` returns False from
-                    # _used but we catch here).
-                    if mn == 'j':
-                        return True
-                    if mn in ('jz', 'jnz', 'jc', 'jnc'):
-                        # Conditional branch — flow could diverge; conservative.
-                        return True
-                    if mn == 'ret' or mn == 'hlt':
-                        # End of flow — $a conservatively live (return val), others dead
-                        return reg == 'a'
-                    i += 1
-                # End of function — dead (nothing reads it)
-                return False
+                return _ir_t3.reg_live_after(
+                    lines, idx, reg,
+                    func_params=self.func_params,
+                    thunk_ov_arg_count=_t3_thunk_ov_arg_count,
+                )
 
             # Map overlay index → entry_name so we can look up arg count.
             # overlay_meta was rebuilt at line ~3854 after size changes, so it

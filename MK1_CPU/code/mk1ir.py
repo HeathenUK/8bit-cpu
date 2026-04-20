@@ -533,6 +533,221 @@ def pass_2_window(prog: Program, rewrite_fn) -> int:
     return count
 
 
+# ── T1.2: Liveness analysis ────────────────────────────────────────
+#
+# Forward-scan register liveness for straight-line sequences.
+# Conservative on uncertainty (assumes live) so caller-side decisions
+# that depend on "is this register dead?" err toward keeping code.
+#
+# These operate on text/mnemonic strings for reusability across the
+# line-based passes that still use flat lists AND the IR-based ones.
+# The text form is the stripped asm body (mnemonic + operands, no
+# leading tab, no trailing semicolon-comment).
+
+
+def reg_used_by_instr(text: str, reg: str,
+                       func_params: Optional[dict] = None,
+                       thunk_ov_arg_count: Optional[callable] = None,
+                       overlay_arg_count: Optional[callable] = None) -> bool:
+    """True if the instruction reads `reg`. `reg` is 'a','b','c','d'.
+
+    For `jal <label>`:
+      - If label is a user function `_foo`, look up arg count in
+        `func_params[foo]`. Args ≥1 means $a read; ≥2 means $b read.
+      - If label is a thunk wrapping an overlay and
+        `thunk_ov_arg_count(label)` returns a count, use it.
+      - Otherwise conservative: treat as True (caller passed args).
+    """
+    s = text.strip()
+    if not s:
+        return False
+    parts = s.split()
+    mn = parts[0]
+    dollar = f'${reg}'
+
+    if mn in ('ret', 'hlt'):
+        # ret may carry return value in $a. Conservative elsewhere: dead.
+        return reg == 'a'
+    if mn in ('j', 'jz', 'jnz', 'jc', 'jnc'):
+        # Conditional branches read flags; conservative for $a (flags set
+        # by prior A-op are the common case).
+        return True
+    if mn == 'jal':
+        # Resolve target; jal's read depends on callee's arg count.
+        if len(parts) >= 2:
+            tgt = parts[1]
+            # User function: _foo
+            if func_params is not None and tgt.startswith('_') and not tgt.startswith('__'):
+                bare = tgt.lstrip('_')
+                if bare in func_params:
+                    ac = func_params[bare]
+                    if reg == 'a': return ac >= 1
+                    if reg == 'b': return ac >= 2
+                    return False
+            # Thunk wrapping overlay
+            if thunk_ov_arg_count is not None:
+                ac = thunk_ov_arg_count(tgt)
+                if ac is not None:
+                    if reg == 'a': return ac >= 1
+                    if reg == 'b': return ac >= 2
+                    return False
+            # Direct _overlay_load: compiler passes index in $c; $a/$b
+            # unused by the loader itself. Overlay's arg count decides.
+            if tgt == '_overlay_load' and overlay_arg_count is not None:
+                # Caller-determined arg count isn't visible here; conservative.
+                return True
+        return True
+
+    # push/pop
+    if mn == 'push':
+        return len(parts) > 1 and parts[1] == dollar
+    if mn == 'push_b':
+        return reg == 'b'
+    if mn == 'push_imm':
+        return False
+    if mn == 'pop':
+        return False  # pop writes, doesn't read
+    if mn == 'pop_b':
+        return False
+
+    # mov src, dst → reads src
+    if mn == 'mov':
+        mv = s.replace(',', ' ').split()
+        return len(mv) >= 2 and mv[1] == dollar
+
+    # cmp $X reads $a and $X. cmp imm reads $a only (handled in mk1cc2 via cmpi).
+    if mn == 'cmp':
+        if reg == 'a': return True
+        return len(parts) > 1 and parts[1] == dollar
+
+    # ALU register-register forms: reads both $a and $b (by convention).
+    if mn in ('add', 'sub', 'and', 'or', 'xor'):
+        return reg in ('a', 'b')
+
+    # Unary A-ops
+    if mn in ('inc', 'dec', 'sll', 'slr', 'rll', 'rlr', 'clr',
+              'swap', 'tst', 'cmpi', 'addi', 'subi', 'andi', 'ori',
+              'deref', 'derefp3', 'deref2', 'ideref', 'iderefp3',
+              'ideref2', 'istc', 'istc_inc', 'out', 'out_imm',
+              'exw', 'exr', 'exrw', 'not', 'neg', 'adc', 'sbc'):
+        return reg == 'a'
+
+    # Register inc/dec — read the named register (decb reads $b, etc.)
+    if mn in ('decb', 'incb'): return reg == 'b'
+    if mn in ('decc', 'incc'): return reg == 'c'
+    if mn in ('decd', 'incd'): return reg == 'd'
+
+    # stsp writes A to stack; ldsp writes A from stack.
+    if mn == 'stsp': return reg == 'a'
+    if mn == 'ldsp': return False
+    if mn == 'ldsp_b': return False
+
+    # VIA immediate writes — take imm, no reg read.
+    if mn in ('ddrb_imm', 'ddra_imm', 'ora_imm', 'orb_imm', 'nop'):
+        return False
+
+    # ldi writes only
+    if mn == 'ldi': return False
+
+    return False
+
+
+def reg_written_by_instr(text: str, reg: str) -> bool:
+    """True if the instruction writes `reg`."""
+    s = text.strip()
+    if not s: return False
+    parts = s.split()
+    mn = parts[0]
+    dollar = f'${reg}'
+
+    if mn == 'ldi':
+        parts2 = s.replace(',', ' ').split()
+        return len(parts2) >= 2 and parts2[1] == dollar
+    if mn == 'clr':
+        return len(parts) > 1 and parts[1] == dollar
+    if mn == 'pop':
+        return len(parts) > 1 and parts[1] == dollar
+    if mn == 'pop_b':
+        return reg == 'b'
+    if mn == 'mov':
+        mv = s.replace(',', ' ').split()
+        return len(mv) >= 3 and mv[2] == dollar
+    if mn in ('inc', 'dec', 'sll', 'slr', 'rll', 'rlr', 'swap',
+              'addi', 'subi', 'andi', 'ori', 'derefp3', 'deref',
+              'deref2', 'out', 'exrw', 'ldsp', 'ldsp_b', 'exw', 'exr',
+              'not', 'neg', 'adc', 'sbc', 'setz', 'setnz', 'setc', 'setnc'):
+        if reg == 'a': return True
+    # Register inc/dec clobber A AND the named register
+    if mn in ('decb', 'incb'): return reg in ('a', 'b')
+    if mn in ('decc', 'incc'): return reg in ('a', 'c')
+    if mn in ('decd', 'incd'): return reg in ('a', 'd')
+    return False
+
+
+def reg_live_after(lines, idx: int, reg: str, **kwargs) -> bool:
+    """Forward-scan liveness. `lines` may be a list of strings (flat asm
+    line list as mk1cc2 uses internally) or a list of Items.
+
+    Returns True if `reg` might be read before being overwritten by
+    some path starting at lines[idx+1]. Conservative: unknown labels
+    and conditional flow return True unless a definite dead-end
+    (hlt/ret) is reached first. Passes **kwargs through to
+    `reg_used_by_instr` (for func_params / thunk lookups)."""
+    i = idx + 1
+    while i < len(lines):
+        # Normalize to a text string
+        entry = lines[i]
+        if isinstance(entry, Instr):
+            s = entry.raw.strip().split(';')[0].strip()
+        elif isinstance(entry, (Label, Directive, Comment, Blank)):
+            s = entry.raw.strip()
+        else:
+            s = entry.strip() if isinstance(entry, str) else ''
+
+        if not s or s.startswith(';'):
+            i += 1; continue
+        if s.startswith('section ') or s.startswith('org '):
+            i += 1; continue
+        if s.endswith(':'):
+            # Label — peek at next non-trivial for dead-end detection
+            j = i + 1
+            while j < len(lines):
+                entry2 = lines[j]
+                if isinstance(entry2, Instr):
+                    ns = entry2.raw.strip().split(';')[0].strip()
+                elif isinstance(entry2, (Label, Directive, Comment, Blank)):
+                    ns = entry2.raw.strip()
+                else:
+                    ns = entry2.strip() if isinstance(entry2, str) else ''
+                if not ns or ns.startswith(';') or ns.startswith('section') or ns.startswith('org'):
+                    j += 1; continue
+                break
+            if j < len(lines):
+                entry2 = lines[j]
+                if isinstance(entry2, Instr):
+                    ns = entry2.raw.strip().split(';')[0].strip()
+                else:
+                    ns = entry2.strip() if isinstance(entry2, str) else ''
+                if ns == 'hlt':
+                    return False
+                if ns == 'ret':
+                    return reg == 'a'
+            return True
+        if reg_used_by_instr(s, reg, **kwargs):
+            return True
+        if reg_written_by_instr(s, reg):
+            return False
+        mn = s.split()[0] if s.split() else ''
+        if mn == 'j':
+            return True
+        if mn in ('jz', 'jnz', 'jc', 'jnc'):
+            return True
+        if mn in ('ret', 'hlt'):
+            return reg == 'a'
+        i += 1
+    return False
+
+
 def validate_section_jumps(prog: Program, runtime_sections: set,
                             stage1_section: str) -> list[str]:
     """Cross-section jump validator. For each `jal X` or `j X` in a
