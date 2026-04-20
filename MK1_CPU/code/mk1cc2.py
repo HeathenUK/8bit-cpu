@@ -5868,17 +5868,35 @@ class MK1CodeGen:
             _pre_mc_helpers = []        # (name, start, end, fsize) placed pre-mini-copy
             _post_mc_helpers = []
             if _pre_mc_budget > 0:
-                # Greedy by size: smallest first. No reordering constraint —
-                # the init code calls them via `jal NAME`, so placement is
-                # address-independent.
-                _sorted_iof = sorted(init_only_funcs, key=lambda h: h[3])
-                _remaining = _pre_mc_budget
-                for h in _sorted_iof:
-                    if h[3] <= _remaining:
-                        _pre_mc_helpers.append(h)
-                        _remaining -= h[3]
-                    else:
-                        _post_mc_helpers.append(h)
+                # Pick the SUBSET of init helpers with maximum total bytes
+                # that fits in the pre-mini-copy slack. For small N (typical:
+                # ≤ 5 init helpers), exhaustive subset enumeration is fine.
+                # Falls back to greedy-largest-first for larger N to avoid
+                # 2^N blowup. Placement is address-independent (helpers are
+                # jal'd by label), so any subset is valid.
+                _n_iof = len(init_only_funcs)
+                if _n_iof <= 12:
+                    _best_subset = None
+                    _best_bytes = -1
+                    for _mask in range(1 << _n_iof):
+                        _sel = [init_only_funcs[i] for i in range(_n_iof) if (_mask >> i) & 1]
+                        _total = sum(h[3] for h in _sel)
+                        if _total <= _pre_mc_budget and _total > _best_bytes:
+                            _best_bytes = _total
+                            _best_subset = _sel
+                    _pre_mc_helpers = _best_subset or []
+                    _post_mc_helpers = [h for h in init_only_funcs if h not in _pre_mc_helpers]
+                else:
+                    # Fallback: greedy largest-first (better for byte-packing
+                    # than smallest-first). O(N log N).
+                    _sorted_iof = sorted(init_only_funcs, key=lambda h: -h[3])
+                    _remaining = _pre_mc_budget
+                    for h in _sorted_iof:
+                        if h[3] <= _remaining:
+                            _pre_mc_helpers.append(h)
+                            _remaining -= h[3]
+                        else:
+                            _post_mc_helpers.append(h)
             else:
                 _post_mc_helpers = list(init_only_funcs)
 

@@ -233,11 +233,11 @@
     "page3_used": 204,
     "stage1_copy": 14,
     "stage1_init": 209,
-    "stage1_total": 221
+    "stage1_total": 218
   },
   "lcd_temp_overlay": {
     "code_overflow": true,
-    "compile_ok": false,
+    "compile_ok": true,
     "eeprom_free": 4096,
     "eeprom_used": 0,
     "kernel": 201,
@@ -254,7 +254,7 @@
     "page3_used": 207,
     "stage1_copy": 14,
     "stage1_init": 245,
-    "stage1_total": 257
+    "stage1_total": 254
   },
   "lcd_temp_overlay_cmd": {
     "code_overflow": false,
