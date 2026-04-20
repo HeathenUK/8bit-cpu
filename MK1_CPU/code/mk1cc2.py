@@ -1567,7 +1567,7 @@ class MK1CodeGen:
         helpers = getattr(self, '_lcd_helpers', set())
 
         # Runtime I2C: needed if program uses LCD output or EEPROM reads at runtime
-        # (not just init-time operations like delay_cal or lcd_init)
+        # (not just init-time operations like delay_cal or lcd_init).
         runtime_i2c_markers = {'__lcd_chr', '__lcd_cmd', '__lcd_send', '__lcd_print',
                                '__eeprom_r2c_loop', '__eeprom_dispatch', '__eeprom_load'}
         self._needs_runtime_i2c = bool(helpers & runtime_i2c_markers)
@@ -2529,8 +2529,21 @@ class MK1CodeGen:
         # ── Step 3: Classify init-only vs runtime functions ──
         # Init-only functions run once during stage 1, then are discarded.
         # Runtime functions are loaded via overlay during stage 2.
+        # __tone_setup was previously in this set. But the compiler
+        # emits the note-precomputation loop (which calls __tone_setup)
+        # AFTER the runtime delay_cal overlay load — past the
+        # init/runtime boundary. Result: `jal __tone_setup` lived in
+        # runtime code while __tone_setup's body lived in stage-1 only,
+        # producing a post-self-copy garbage-execution bug that V3
+        # sim_corpus testing caught. Moving __tone_setup out lets the
+        # knapsack put it where the call actually happens.
+        #
+        # __lcd_init stays init-only: that call site IS in init
+        # (i2c_init precedes it and init extraction terminates cleanly
+        # on `jal __lcd_init` via INIT_MARKERS in step 10b). Moving it
+        # out causes kernel growth that overflows i2c_scan_lcd etc.
         INIT_ONLY_NAMES = {
-            '__lcd_init', '__tone_setup',
+            '__lcd_init',
             '__i2c_st', '__i2c_sp',  # START/STOP inlined in __lcd_chr at runtime
         }
         # __delay_cal is NOT init-only: it becomes an overlay in the overlay system,
@@ -2670,6 +2683,8 @@ class MK1CodeGen:
                            s.startswith('clr $a') or s.startswith('dec') or
                            s.startswith('.via_') or s.startswith('.br_') or
                            s.startswith('.rcv') or s.startswith('.i2c_init_br') or
+                           s.startswith('.__precomp') or
+                           s.startswith('.__preskip') or
                            s.startswith('mov $c,$a') or
                            s == 'nop')
                 if s.startswith('jnz .') or s.startswith('j .'):
@@ -4011,11 +4026,15 @@ class MK1CodeGen:
                                s.startswith('clr $a') or s.startswith('dec') or
                                s.startswith('.via_') or s.startswith('.br_') or
                                s.startswith('.rcv') or s.startswith('.i2c_init_br') or
+                               s.startswith('.__precomp') or
+                               s.startswith('.__preskip') or
                                s.startswith('mov $c,$a') or
                                s == 'nop')
                     if (s.startswith('jnz .') or s.startswith('j .via') or
                         s.startswith('j .br') or s.startswith('j .rcv') or
-                        s.startswith('j .i2c_init_br')):
+                        s.startswith('j .i2c_init_br') or
+                        s.startswith('j .__preskip') or
+                        s.startswith('j .__precomp')):
                         is_init = True
                     # ldi before init-compatible jal or exw is also init.
                     # Common pattern: `ldi $a, val; exw E M` for user VIA init.
