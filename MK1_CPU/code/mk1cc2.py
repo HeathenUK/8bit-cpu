@@ -9452,53 +9452,22 @@ def _validate_section_jumps(lines):
     and flags any runtime→stage-1 jal that would hit that trap.
     """
     import sys
-    # First pass: build label → section map.
-    label_section = {}
-    section = 'code'
-    for line in lines:
-        s = line.strip()
-        if s.startswith('section '):
-            section = s.split()[1]
-            continue
-        if s.endswith(':') and not s.startswith('.'):
-            label_section[s[:-1]] = section
-
     # Runtime sections (code that runs AFTER self-copy):
     #   page3_code  = overlay-mode kernel (separate from stage-1 `code`)
-    #   data_code   = overlay bodies stored in page 1, copied to overlay region at runtime
-    #   stack_code  = overlay bodies stored in page 2, copied to overlay region at runtime
+    #   data_code   = overlay bodies stored in page 1, copied at runtime
+    #   stack_code  = overlay bodies stored in page 2, copied at runtime
     # Sections EXCLUDED from validation:
-    #   page3_kernel = init-extraction kernel, which INTENTIONALLY calls helpers
-    #     placed in stage-1 `code` at addresses past kernel_size (so they survive
-    #     self-copy). Validator can't distinguish those from stage-1-only helpers
-    #     without address tracking — exclude to avoid false positives.
+    #   page3_kernel = init-extraction kernel, which INTENTIONALLY calls
+    #     helpers placed in stage-1 `code` at addresses past kernel_size
+    #     (so they survive self-copy). Validator can't distinguish those
+    #     from stage-1-only helpers without address tracking.
     RUNTIME_SECTIONS = {'page3_code', 'data_code', 'stack_code'}
     STAGE1_ONLY = 'code'
 
-    # Second pass: for each jal/j in a runtime section, check the target.
-    section = 'code'
-    errors = []
-    for line in lines:
-        s = line.strip()
-        if s.startswith('section '):
-            section = s.split()[1]
-            continue
-        if section not in RUNTIME_SECTIONS:
-            continue
-        # Check jal/j (not conditional branches — those take local labels)
-        for op in ('jal ', 'j '):
-            if s.startswith(op):
-                target = s[len(op):].strip().split()[0]
-                if target.startswith('.'):
-                    break  # local label, same function
-                if target in label_section and label_section[target] == STAGE1_ONLY:
-                    errors.append(
-                        f"{op.strip()} {target}: caller is in '{section}' "
-                        f"(runtime), target is in '{STAGE1_ONLY}' (stage-1 only). "
-                        f"After self-copy, the target address is overwritten "
-                        f"by kernel code — this jal will execute garbage."
-                    )
-                break
+    # IR-based validation: parse once, use the labels index directly.
+    import mk1ir as _ir_v
+    prog = _ir_v.parse_program(lines)
+    errors = _ir_v.validate_section_jumps(prog, RUNTIME_SECTIONS, STAGE1_ONLY)
 
     if errors:
         print("  !! SECTION-MISMATCH ERROR: runtime code references stage-1-only labels:",

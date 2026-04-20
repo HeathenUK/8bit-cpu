@@ -533,6 +533,53 @@ def pass_2_window(prog: Program, rewrite_fn) -> int:
     return count
 
 
+def validate_section_jumps(prog: Program, runtime_sections: set,
+                            stage1_section: str) -> list[str]:
+    """Cross-section jump validator. For each `jal X` or `j X` in a
+    chunk whose section is in `runtime_sections`, check X's definition
+    section. If X is defined in `stage1_section` only, that's a bug:
+    runtime code will execute garbage after self-copy overwrote the
+    stage-1 bytes.
+
+    Returns a list of human-readable error strings. Empty list = clean.
+    Local labels (starting with '.') are skipped — they're function-
+    local and can't cross sections. Targets undefined in prog.labels
+    are also skipped (external or yet-to-resolve)."""
+    # Build label → section-name map from the IR's label index.
+    label_section: dict[str, str] = {}
+    for name, (chunk_idx, _item_idx) in prog.labels.items():
+        label_section[name] = prog.chunks[chunk_idx].name
+
+    errors: list[str] = []
+    for chunk in prog.chunks:
+        if chunk.name not in runtime_sections:
+            continue
+        for item in chunk.items:
+            if not isinstance(item, Instr):
+                continue
+            if item.mnemonic not in ('jal', 'j'):
+                continue
+            # Extract the target from the raw line (operands may be
+            # stored as a single string).
+            body = item.raw.strip().split(';')[0].strip()
+            parts = body.split(None, 1)
+            if len(parts) != 2:
+                continue
+            target = parts[1].strip().split()[0]
+            if target.startswith('.'):
+                continue  # local label
+            target_section = label_section.get(target)
+            if target_section == stage1_section:
+                errors.append(
+                    f"{item.mnemonic} {target}: caller is in '{chunk.name}' "
+                    f"(runtime), target is in '{stage1_section}' "
+                    f"(stage-1 only). After self-copy, the target address "
+                    f"is overwritten by kernel code — this jal will "
+                    f"execute garbage."
+                )
+    return errors
+
+
 def round_trip_identical(lines: list[str]) -> tuple[bool, str]:
     """Parse then serialize the given lines. Returns (identical, diff)
     where identical is True iff the serialization exactly matches the
