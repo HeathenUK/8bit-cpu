@@ -1958,19 +1958,9 @@ class MK1CodeGen:
             # LCD init data is pre-populated in the data page at compile time.
             # No EEPROM read needed — saves ~72B of init code (__eeprom_rd + __i2c_rb).
             self.emit('__lcd_init:')
-            # Bus recovery: stage-1 mini-copy uses derefp3 which toggles SCL
-            # (per project_i2c_debug.md), leaving PCF8574 in confused mid-byte
-            # state. Without this, lcd_init's Clear Display can land wrong,
-            # leaving stale chars from prior programs. 9 SCL clocks + STOP.
-            lbl_br = self.label('li_br')
-            self.emit('\tldi $a,9')
-            self.emit(f'{lbl_br}:')
-            self.emit_ddrb(0x02)   # SCL LOW, SDA released
-            self.emit_ddrb(0x00)   # SCL HIGH, SDA released
-            self.emit('\tdec')
-            self.emit(f'\tjnz {lbl_br}')
-            self.emit_ddrb(0x01)   # SDA LOW, SCL HIGH (STOP prep)
-            self.emit_ddrb(0x00)   # SDA HIGH = STOP
+            # Bus recovery moved to i2c_init() — runs BEFORE __lcd_init in
+            # every LCD program, so the duplicate 9-clock+STOP that lived
+            # here was unnecessary. Save 10B off __lcd_init body.
             # Process sentinel-encoded init data from data page.
             # CRITICAL: __i2c_sb / __i2c_st / __i2c_sp all clobber $d (used
             # internally as bit counter since the "uses D as counter" opt).
@@ -4019,9 +4009,12 @@ class MK1CodeGen:
                                any(s.startswith(p) for p in INIT_PREFIXES) or
                                s.startswith('clr $a') or s.startswith('dec') or
                                s.startswith('.via_') or s.startswith('.br_') or
-                               s.startswith('.rcv') or s.startswith('mov $c,$a') or
+                               s.startswith('.rcv') or s.startswith('.i2c_init_br') or
+                               s.startswith('mov $c,$a') or
                                s == 'nop')
-                    if s.startswith('jnz .') or s.startswith('j .via') or s.startswith('j .br') or s.startswith('j .rcv'):
+                    if (s.startswith('jnz .') or s.startswith('j .via') or
+                        s.startswith('j .br') or s.startswith('j .rcv') or
+                        s.startswith('j .i2c_init_br')):
                         is_init = True
                     # ldi before init-compatible jal or exw is also init.
                     # Common pattern: `ldi $a, val; exw E M` for user VIA init.
@@ -7865,11 +7858,23 @@ class MK1CodeGen:
                 self.emit("\tclr $a")
                 self.emit('\texw 0 0')         # ORB = 0 (A=0)
                 self.emit_ddrb(0x00)   # DDRB = 0 (both lines idle/HIGH)
-                # Bus recovery: EEPROM write shim during UPLOAD may leave
-                # I2C bus dirty. Send STOP to clear before any I2C.
-                self.emit_ddrb(0x03)   # SCL low, SDA low
-                self.emit_ddrb(0x01)   # SCL high, SDA low
-                self.emit_ddrb(0x00)   # both high (STOP)
+                # Full 9-clock bus recovery + STOP. Replaces the older
+                # 4-ddrb_imm STOP sequence (which only handled idle bus).
+                # The 9-clock loop unsticks any I2C slave that got caught
+                # mid-byte from a prior run (RTC, PCF8574, EEPROM).
+                # Costs 2B more in i2c_init but lets __lcd_init drop its
+                # own duplicate recovery (saves 10B) — net -8B per LCD
+                # program. Programs that use i2c_init without lcd_init
+                # pay +2B for safer init.
+                self.emit('\tldi $a,9')
+                lbl_br = self.label('i2c_init_br')
+                self.emit(f'{lbl_br}:')
+                self.emit_ddrb(0x02)   # SCL LOW, SDA released
+                self.emit_ddrb(0x00)   # SCL HIGH, SDA released
+                self.emit('\tdec')
+                self.emit(f'\tjnz {lbl_br}')
+                self.emit_ddrb(0x01)   # SDA LOW, SCL HIGH (STOP prep)
+                self.emit_ddrb(0x00)   # SDA HIGH = STOP
                 self.emit('\tpush $a ;!keep')  # stack warmup (STK pin settling)
                 self.emit('\tpop $a ;!keep')
                 return

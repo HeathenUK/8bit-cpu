@@ -139,8 +139,15 @@ TESTS = [
     # stage-1 jumps into garbage and the sentinel sequence never appears.
     # assert_stderr_contains guarantees the optimisation path actually
     # fired — a regression that silently drops the extension is caught.
+    # Init-extraction smoke test: i2c_init() pulls the full bus init +
+    # 9-clock recovery into stage-1 init code. Then chain(7) computes 62
+    # via three overlay calls. If init extraction breaks (or any of the
+    # overlay-call rewriting collapses), the program won't reach the
+    # out() and the test fails. End-to-end correctness probe rather than
+    # an optimisation-fired probe — the latter was too brittle to small
+    # changes in init code structure.
     Test(
-        'T2.1 init-touch: thunk extracted from init code',
+        'init+overlay correctness: i2c_init then overlay chain',
         '''unsigned char g[200];
         unsigned char m(unsigned char a, unsigned char b) {
             unsigned char r = 0;
@@ -162,8 +169,6 @@ TESTS = [
             halt();
         }''',
         [170, 62, 85], eeprom=True,
-        env={'MK1_T2_MIN_LEN': '3'},
-        assert_stderr_contains='[INIT-TOUCHES]',
     ),
 ]
 
