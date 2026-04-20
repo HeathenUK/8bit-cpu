@@ -29116,7 +29116,7 @@
     "output_hash": "e3b0c44298fc1c14",
     "output_len": 0,
     "halted": true,
-    "cycles_run": 66304
+    "cycles_run": 66574
   },
   "overlay_dashboard": null,
   "overlay_demo": {
@@ -29140,7 +29140,7 @@
     "output_hash": "e3b0c44298fc1c14",
     "output_len": 0,
     "halted": true,
-    "cycles_run": 66304
+    "cycles_run": 66544
   },
   "overlay_stopwatch": {
     "output_history": [],
@@ -29161,7 +29161,7 @@
     "output_hash": "e3b0c44298fc1c14",
     "output_len": 0,
     "halted": true,
-    "cycles_run": 66304
+    "cycles_run": 66574
   },
   "test2_temp": {
     "output_history": [],
@@ -29175,7 +29175,7 @@
     "output_hash": "e3b0c44298fc1c14",
     "output_len": 0,
     "halted": true,
-    "cycles_run": 66304
+    "cycles_run": 66544
   },
   "test4_info": {
     "output_history": [],
@@ -29196,11 +29196,42 @@
     "cycles_run": 5173
   },
   "test_eeprom_overlay": {
-    "output_history": [],
-    "output_hash": "e3b0c44298fc1c14",
-    "output_len": 0,
-    "halted": false,
-    "cycles_run": 500000
+    "output_history": [
+      4,
+      11,
+      25,
+      53,
+      106,
+      12,
+      28,
+      60,
+      124,
+      248,
+      20,
+      45,
+      95,
+      195,
+      134,
+      28,
+      62,
+      130,
+      10,
+      20,
+      36,
+      79,
+      165,
+      81,
+      162,
+      44,
+      96,
+      200,
+      152,
+      48
+    ],
+    "output_hash": "b28787933e52c902",
+    "output_len": 30,
+    "halted": true,
+    "cycles_run": 28245
   },
   "test_i2c_ack_diag": {
     "output_history": [
@@ -29254,7 +29285,7 @@
     "output_hash": "e1f115f1f45a1670",
     "output_len": 8,
     "halted": true,
-    "cycles_run": 24347
+    "cycles_run": 24189
   },
   "test_pcf8574_writeread": {
     "output_history": [

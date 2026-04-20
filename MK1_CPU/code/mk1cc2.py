@@ -4642,7 +4642,22 @@ class MK1CodeGen:
                     # saved ≈ budget bytes saved to a first approximation.
                     init_delta = unit_occ.get('init', 0) * occ_delta
                     budget_improvement = (cur_budget - post_budget) + init_delta
-                    if budget_improvement < 0:
+                    # Strict gate: kernel + max_overlay must not grow.
+                    # Relaxed gate (when strict fails): accept if raw_savings > 0
+                    # AND the post-state still fits the 250B code page. Catches
+                    # cross-overlay extractions that shrink a non-largest
+                    # overlay — kernel grows a little but total code-page
+                    # utilization fits. Shrinking overlays can also be the
+                    # difference between fitting all overlays in SRAM vs.
+                    # spilling the last one to EEPROM (which is slower and
+                    # depends on I2C hardware the simulator doesn't model).
+                    LOADER_APPROX = 42
+                    post_total = post_kernel + post_max_ov + LOADER_APPROX
+                    CODE_PAGE_LIMIT = 250
+                    accept = (budget_improvement >= 0) or (
+                        raw_savings > 0 and post_total <= CODE_PAGE_LIMIT
+                    )
+                    if not accept:
                         if _debug_t2 and raw_savings >= 1:
                             _t2_near_miss.append((raw_savings, budget_improvement, K, S, mode, key[:3]))
                         continue
