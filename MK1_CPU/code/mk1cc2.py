@@ -6304,6 +6304,52 @@ class MK1CodeGen:
         self._overlay_region = OVERLAY_REGION
         self._overlay_shared_size = shared_helper_size
 
+        # Named size breakdown for --why-not-smaller. Captured here rather
+        # than re-derived from `assembled` later because we have the
+        # partition data in hand (runtime_resident_helpers, overlay_meta).
+        _why = {
+            'mode': 'overlay',
+            'loader': loader_size,
+            'main': actual_main_size,
+            'helpers_total': runtime_helper_size,
+            'shared_helpers_total': shared_helper_size,
+            'kernel_total': KERNEL_SIZE,
+            'stage1_init': None,      # set by caller after emit
+            'resident_helpers': {},   # name -> bytes
+            'overlay_slots': [],      # (name, page, size, offset)
+        }
+        # Walk runtime_resident_helpers to name each top-level helper.
+        _cur_name = None
+        _cur_size = 0
+        _two_byte_set = {'ldsp','stsp','push_imm','jal','jc','jz','jnc','jnz','j','ldi',
+                         'cmp','addi','subi','andi','ori','ld','st','ldsp_b','ldp3','stp3',
+                         'setjmp','ocall','tst','out_imm','cmpi','ddrb_imm','ddra_imm',
+                         'ora_imm','orb_imm'}
+        for _line in runtime_resident_helpers:
+            _s = _line.strip().split(';')[0].strip()
+            if _s.endswith(':') and not _s.startswith('.'):
+                if _cur_name is not None:
+                    _why['resident_helpers'][_cur_name] = _cur_size
+                _cur_name = _s[:-1]
+                _cur_size = 0
+                continue
+            if not _s or _s.endswith(':') or _s.startswith('section') or _s.startswith('org'):
+                continue
+            _mn = _s.split()[0]
+            if _mn == 'cmp':
+                _parts = _s.split()
+                _cur_size += 1 if (len(_parts) > 1 and _parts[1].startswith('$')) else 2
+            elif _mn in _two_byte_set:
+                _cur_size += 2
+            else:
+                _cur_size += 1
+        if _cur_name is not None:
+            _why['resident_helpers'][_cur_name] = _cur_size
+        # Overlay slot info for the report.
+        for _idx, _name, _sz in overlay_meta:
+            _why['overlay_slots'].append({'idx': _idx, 'name': _name, 'size': _sz})
+        self._why_breakdown = _why
+
         # ── Diagnostics ──
         print(f"Two-stage boot overlay system:", file=sys.stderr)
         print(f"  Kernel: {KERNEL_SIZE}B (loader={loader_size}B + main={actual_main_size}B"
@@ -9271,6 +9317,50 @@ def _validate_section_jumps(lines):
         sys.exit(1)
 
 
+def _emit_why_not_smaller(gen, args, metrics, code_bytes, MAX_CODE):
+    """Detailed per-component byte breakdown. First tool to reach for when
+    a program overflows. No-op when the --why-not-smaller flag isn't set."""
+    if not getattr(args, 'why_not_smaller', False):
+        return
+    import sys
+    _why = getattr(gen, '_why_breakdown', None)
+    print("\n── Byte Sink Report ──", file=sys.stderr)
+    if _why is None:
+        print("  (flat mode — no overlay partition to break down)", file=sys.stderr)
+        print(f"  code_bytes: {code_bytes}B / {MAX_CODE}B", file=sys.stderr)
+        print("───────────────────────", file=sys.stderr)
+        return
+    _why['stage1_init'] = code_bytes
+    print(f"  Mode: {_why['mode']}", file=sys.stderr)
+    print(f"  Stage-1 init: {_why['stage1_init']}B / {MAX_CODE}B",
+          file=sys.stderr)
+    print(f"  Kernel total: {_why['kernel_total']}B "
+          f"(loader={_why['loader']}B + main={_why['main']}B "
+          f"+ helpers={_why['helpers_total']}B"
+          + (f" + shared={_why['shared_helpers_total']}B"
+             if _why['shared_helpers_total'] else "")
+          + ")", file=sys.stderr)
+    _named = _why['resident_helpers']
+    if _named:
+        print("  Resident helpers (largest first):", file=sys.stderr)
+        for _n, _sz in sorted(_named.items(), key=lambda kv: -kv[1])[:10]:
+            _pct = 100.0 * _sz / max(1, _why['kernel_total'])
+            print(f"    {_n:<28} {_sz:>4}B  ({_pct:>4.1f}% of kernel)",
+                  file=sys.stderr)
+    if _why['overlay_slots']:
+        print("  Overlay slots (largest first):", file=sys.stderr)
+        for _slot in sorted(_why['overlay_slots'], key=lambda s: -s['size'])[:10]:
+            print(f"    [{_slot['idx']}] {_slot['name']:<24} {_slot['size']:>4}B",
+                  file=sys.stderr)
+    _tight = 'stage1' if _why['stage1_init'] > MAX_CODE - 10 else 'kernel'
+    print(f"  Top 5 sinks (tight budget: {_tight}):", file=sys.stderr)
+    _sinks = [('loader', _why['loader']),
+              ('main', _why['main'])] + list(_named.items())
+    for _n, _sz in sorted(_sinks, key=lambda kv: -kv[1])[:5]:
+        print(f"    {_n:<28} {_sz:>4}B", file=sys.stderr)
+    print("───────────────────────", file=sys.stderr)
+
+
 def main():
     ap = argparse.ArgumentParser(description='MK1 C Compiler v2')
     ap.add_argument('input', help='C source file')
@@ -9280,6 +9370,10 @@ def main():
     ap.add_argument('--eeprom-base', type=lambda x: int(x, 0), default=0x0200,
                     help='EEPROM base address for overlay storage (default: 0x0200)')
     ap.add_argument('--metrics-out', help='Write size metrics as JSON to this path (for size-regression harness)')
+    ap.add_argument('--why-not-smaller', action='store_true',
+                    help='Emit a per-section byte breakdown and top-5 byte sinks to stderr. '
+                         'Useful when a program overflows or is near-limit; shows exactly '
+                         'which resident helpers and overlay bodies are eating budget.')
     args = ap.parse_args()
 
     with open(args.input) as f: source = f.read()
@@ -9558,6 +9652,9 @@ def main():
         # assembler's 256B code buffer, leaving the MK1 running garbage and
         # corrupting state for subsequent programs. Refuse to emit.
         print("───────────────────────", file=sys.stderr)
+        # Emit the byte-sink report BEFORE exiting — overflow is exactly
+        # when the user needs it most.
+        _emit_why_not_smaller(gen, args, metrics, code_bytes, MAX_CODE)
         if args.metrics_out:
             import json as _json
             with open(args.metrics_out, 'w') as _mf:
@@ -9570,8 +9667,14 @@ def main():
 
     print("───────────────────────", file=sys.stderr)
 
+    _emit_why_not_smaller(gen, args, metrics, code_bytes, MAX_CODE)
+
     if args.metrics_out:
         import json as _json
+        # Merge the size breakdown into metrics when available.
+        _why = getattr(gen, '_why_breakdown', None)
+        if _why is not None:
+            metrics['breakdown'] = _why
         with open(args.metrics_out, 'w') as _mf:
             _json.dump(metrics, _mf, indent=2)
 
