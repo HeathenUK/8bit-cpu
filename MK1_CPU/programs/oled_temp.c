@@ -1,10 +1,10 @@
-// SSD1306 OLED temperature display — fully data-driven, no overlays
-// All I2C via i2c_stream. Glyphs built dynamically in page3 buffer.
-
-// 0xFE=START, 0xFD=STOP, 0xFC N=REPEAT 0x00 N times,
+// SSD1306 OLED temperature display — i2c_stream ONLY, no inline i2c_start/send.
+// Rewritten 2026-04-21 to fit 250B code page.
+//
+// Bytecode sentinels: 0xFE=START, 0xFD=STOP, 0xFC N=REPEAT 0x00 N times,
 // 0xFB=READ byte (result in C), 0xFF=END
 
-// OLED init stream (offset 0)
+// OLED init stream (page3 offset 0)
 unsigned char init_seq[] = {
     0xFE, 0x78, 0x00,
     0xAE, 0xA8, 0x3F, 0x8D, 0x14,
@@ -33,7 +33,12 @@ unsigned char temp_seq[] = {
     0xFE, 0xD1, 0xFB, 0xFD, 0xFF
 };
 
-// Font (65 bytes at offset 135)
+// Position-set stream (offset 135)
+unsigned char pos_seq[] = {
+    0xFE, 0x78, 0x00, 0xB3, 0x08, 0x12, 0xFD, 0xFF
+};
+
+// Font (65 bytes at offset 143)
 unsigned char font[] = {
     0x3E, 0x51, 0x49, 0x45, 0x3E,
     0x00, 0x42, 0x7F, 0x40, 0x00,
@@ -50,63 +55,49 @@ unsigned char font[] = {
     0x3E, 0x41, 0x41, 0x41, 0x22
 };
 
-// Glyph display buffer at page3 offset 200
-// Built dynamically: START 78 40 [5 bytes] 00 [5 bytes] 00 ... STOP END
-unsigned char glyph_buf[30];
+// Glyph bytecode scratch (offset 208)
+unsigned char glyph_seq[] = {
+    0xFE, 0x78, 0x40,
+    0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0xFD, 0xFF
+};
 
 void send_glyph(unsigned char idx) {
-    // Read 5 font bytes and send via I2C
     unsigned char base;
     unsigned char i;
-    base = idx * 5 + 135;
-    i2c_start();
-    i2c_send_byte(0x78);
-    i2c_send_byte(0x40);
-    for (i = 0; i < 5; i++) {
-        i2c_send_byte(peek3(base + i));
+    base = idx * 5 + 143;
+    i = 0;
+    while (i < 5) {
+        poke3(peek3(base + i), 208 + 3 + i);
+        i = i + 1;
     }
-    i2c_send_byte(0x00);
-    i2c_stop();
+    i2c_stream(208);
 }
 
-void main() {
-    unsigned char temp;
+// Factor display logic out of main so Phase 7 / overlay can place it.
+void show_temp(unsigned char temp) {
     unsigned char tens;
     unsigned char ones;
-
-    i2c_init();
-    i2c_bus_reset();
-    i2c_stream(0);
-    i2c_stream(21);
-
-    i2c_stream(126);
-    temp = i2c_stream_result();
-
     tens = 0;
     ones = temp;
-    while (ones >= 10) {
-        ones = ones - 10;
-        tens = tens + 1;
-    }
-
-    // Set position: page 3, col 40
-    i2c_start();
-    i2c_send_byte(0x78);
-    i2c_send_byte(0x00);
-    i2c_send_byte(0xB3);
-    i2c_send_byte(0x08);
-    i2c_send_byte(0x12);
-    i2c_stop();
-
-    if (tens > 0) {
-        send_glyph(tens);
-    } else {
-        send_glyph(10);
-    }
+    while (ones >= 10) { ones = ones - 10; tens = tens + 1; }
+    i2c_stream(135);   // position
+    if (tens > 0) { send_glyph(tens); }
+    else          { send_glyph(10); }
     send_glyph(ones);
     send_glyph(11);
     send_glyph(12);
+}
 
-    out(temp);
+void main() {
+    unsigned char t;
+    i2c_init();
+    i2c_bus_reset();
+    i2c_stream(0);      // OLED init
+    i2c_stream(21);     // clear
+    i2c_stream(126);    // temp read
+    t = i2c_stream_result();
+    show_temp(t);
+    out(t);
     halt();
 }
