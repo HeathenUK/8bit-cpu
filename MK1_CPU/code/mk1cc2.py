@@ -38,7 +38,8 @@ TOKEN_PATTERNS = [
     ('NUMBER',   r'0[xX][0-9a-fA-F]+|0[bB][01]+|\d+'),
     ('STRING',   r'"(?:[^"\\]|\\.)*"'),
     ('IDENT',    r'[a-zA-Z_]\w*'),
-    ('OP2',      r'&&|\|\||[+\-&|^]=|==|!=|<=|>=|<<|>>|\+\+|\-\-'),
+    # Longer-first: <<= >>= before << >>; /= %= with the rest.
+    ('OP2',      r'<<=|>>=|&&|\|\||[+\-*/%&|^]=|==|!=|<=|>=|<<|>>|\+\+|\-\-'),
     ('OP1',      r'[+\-*/%&|^~!<>=(){},;\[\]?:]'),
     ('SKIP',     r'[ \t]+'),
     ('NEWLINE',  r'\n'),
@@ -46,13 +47,48 @@ TOKEN_PATTERNS = [
 ]
 KEYWORDS = {'if', 'else', 'while', 'for', 'do', 'return', 'unsigned', 'char',
             'void', 'int', 'switch', 'case', 'default', 'break', 'continue',
-            'u8', 'u16', 'eeprom'}
+            'u8', 'u16', 'eeprom', 'sizeof', 'typedef', 'static'}
 
 class Token:
     def __init__(self, type, value, line):
         self.type, self.value, self.line = type, value, line
 
+def preprocess(source):
+    """Simple `#define NAME value` substitution. Lines starting with `#define`
+    are stripped and their body replaces later whole-word occurrences.
+    Blank lines are inserted for stripped directives so error messages keep
+    the right line numbers.
+    Function-like macros (`#define F(x) ...`) are NOT supported."""
+    macros = {}
+    out = []
+    for line in source.split('\n'):
+        stripped = line.lstrip()
+        if stripped.startswith('#define'):
+            parts = stripped.split(None, 2)
+            if len(parts) >= 2:
+                name = parts[1]
+                value = parts[2] if len(parts) > 2 else '1'
+                # strip trailing comments
+                value = re.sub(r'//.*$|/\*[\s\S]*?\*/', '', value).rstrip()
+                macros[name] = value
+            out.append('')
+            continue
+        if stripped.startswith('#'):
+            out.append('')          # silently ignore other directives
+            continue
+        # Iterate until stable so macros referencing other macros fully expand.
+        for _ in range(8):   # plenty; real programs rarely chain this deep
+            prev = line
+            for name, value in macros.items():
+                line = re.sub(rf'\b{re.escape(name)}\b', value, line)
+            if line == prev:
+                break
+        out.append(line)
+    return '\n'.join(out)
+
+
 def tokenize(source):
+    source = preprocess(source)
     tokens = []
     line = 1
     pat = '|'.join(f'(?P<{n}>{p})' for n, p in TOKEN_PATTERNS)
@@ -81,6 +117,8 @@ def tokenize(source):
 class Parser:
     def __init__(self, tokens):
         self.tokens, self.pos = tokens, 0
+        self.typedefs = {}           # alias → type string ('u8'/'u16')
+        self.globals_sizes = {}      # name → size in bytes (arrays: length)
 
     def peek(self): return self.tokens[self.pos]
     def advance(self):
@@ -97,6 +135,13 @@ class Parser:
     def parse_program(self):
         functions, globals_ = [], []
         while self.peek().type != 'EOF':
+            # Top-level `typedef <type> <alias>;` — records alias, no codegen.
+            if self.match('typedef'):
+                typ = self.parse_type()
+                alias = self.expect('IDENT').value
+                self.expect(';')
+                self.typedefs[alias] = typ
+                continue
             # Check for 'eeprom' storage qualifier before type
             storage = 'eeprom' if self.match('eeprom') else 'ram'
             typ = self.parse_type()
@@ -107,6 +152,7 @@ class Parser:
             elif self.match('='):
                 val = self.expect('NUMBER').value; self.expect(';')
                 globals_.append((name, val, storage))
+                self.globals_sizes[name] = 2 if typ == 'u16' else 1
             elif self.match('['):
                 if self.peek().type == 'NUMBER':
                     size = self.expect('NUMBER').value
@@ -123,17 +169,25 @@ class Parser:
                     if size is not None and len(vals) < size:
                         vals.extend([0] * (size - len(vals)))
                     globals_.append((name, vals, storage))
+                    self.globals_sizes[name] = size if size is not None else len(vals)
                 else:
                     self.expect(';')
                     if size is None:
                         raise SyntaxError(f'Line {self.peek().line}: array {name} needs size or initializer')
                     globals_.append((name, [0]*size, storage))
+                    self.globals_sizes[name] = size
             elif self.match(';'):
                 globals_.append((name, 0, storage))
+                self.globals_sizes[name] = 2 if typ == 'u16' else 1
             else: raise SyntaxError(f'Line {self.peek().line}: unexpected after {name}')
         return globals_, functions
 
     def parse_type(self):
+        # Typedef aliases resolve before the built-in types.
+        t = self.peek()
+        if t.type == 'IDENT' and t.value in self.typedefs:
+            self.advance()
+            return self.typedefs[t.value]
         if self.match('void'): return 'void'
         if self.match('u8'): return 'u8'
         if self.match('u16'): return 'u16'
@@ -186,7 +240,9 @@ class Parser:
             self.advance()
             if self.match(';'): return ('return', None)
             e = self.parse_expr(); self.expect(';'); return ('return', e)
-        if t.value in ('unsigned', 'char', 'int', 'u8', 'u16'): return self.parse_local_decl()
+        if t.value in ('unsigned', 'char', 'int', 'u8', 'u16', 'static'): return self.parse_local_decl()
+        # Typedef alias in statement position: behave like a local declaration.
+        if t.type == 'IDENT' and t.value in self.typedefs: return self.parse_local_decl()
         if t.value == '{': return self.parse_block()
         e = self.parse_expr(); self.expect(';'); return ('expr_stmt', e)
 
@@ -239,6 +295,7 @@ class Parser:
         return ('for', init, cond, update, self.parse_statement())
 
     def parse_local_decl(self):
+        is_static = bool(self.match('static'))
         typ = self.parse_type(); name = self.expect('IDENT').value
         if self.match('['):
             size = self.expect('NUMBER').value; self.expect(']')
@@ -251,14 +308,19 @@ class Parser:
                     if not self.match(','): break
                 self.expect('}')
             self.expect(';')
+            if is_static:
+                return ('static_local_arr', name, size, init_vals)
             return ('local_arr', name, size, init_vals)
         init = self.parse_expr() if self.match('=') else None
-        self.expect(';'); return ('local', name, init, typ)
+        self.expect(';')
+        if is_static:
+            return ('static_local', name, init, typ)
+        return ('local', name, init, typ)
 
     def parse_expr(self): return self.parse_assign()
     def parse_assign(self):
         left = self.parse_ternary()
-        if self.peek().value in ('=','+=','-=','&=','|=','^='):
+        if self.peek().value in ('=','+=','-=','*=','/=','%=','&=','|=','^=','<<=','>>='):
             op = self.advance().value; right = self.parse_assign()
             return ('assign', op, left, right)
         return left
@@ -338,14 +400,68 @@ class Parser:
         return e
     def parse_primary(self):
         t = self.peek()
+        # `sizeof(type)` or `sizeof(ident)` → compile-time integer constant.
+        # For an array global, returns its length. For u8/char/unsigned: 1.
+        # For u16/int: 2. Unknown scalar identifiers default to 1.
+        if t.value == 'sizeof':
+            self.advance()
+            self.expect('(')
+            n = self.peek()
+            if n.value in ('u8', 'char', 'unsigned'):
+                self.advance()
+                if n.value == 'unsigned':
+                    self.match('char') or self.match('int')
+                size = 1
+            elif n.value in ('u16', 'int'):
+                self.advance()
+                size = 2
+            elif n.type == 'IDENT':
+                name = self.advance().value
+                if name in self.typedefs:
+                    size = 2 if self.typedefs[name] == 'u16' else 1
+                else:
+                    size = self.globals_sizes.get(name, 1)
+            else:
+                raise SyntaxError(f'Line {t.line}: sizeof expects a type or identifier')
+            self.expect(')')
+            return ('num', size)
         if t.type == 'NUMBER': self.advance(); return ('num', t.value)
         if t.type == 'STRING':
             self.advance()
-            # Strip quotes and decode escapes
-            s = t.value[1:-1]
-            s = s.replace('\\n', '\n').replace('\\r', '\r').replace('\\t', '\t')
-            s = s.replace('\\0', '\0').replace('\\\\', '\\')
-            return ('string', s)
+            # Strip quotes and decode escapes, including `\xNN` for non-ASCII
+            # LCD glyphs (e.g. HD44780 0xDF = °).
+            raw = t.value[1:-1]
+            out_s = []
+            i = 0
+            while i < len(raw):
+                c = raw[i]
+                if c != '\\':
+                    out_s.append(c); i += 1; continue
+                if i + 1 >= len(raw):
+                    out_s.append('\\'); i += 1; continue
+                esc = raw[i + 1]
+                if esc == 'n': out_s.append('\n'); i += 2
+                elif esc == 'r': out_s.append('\r'); i += 2
+                elif esc == 't': out_s.append('\t'); i += 2
+                elif esc == '0': out_s.append('\0'); i += 2
+                elif esc == '\\': out_s.append('\\'); i += 2
+                elif esc == '"': out_s.append('"'); i += 2
+                elif esc == "'": out_s.append("'"); i += 2
+                elif esc == 'x' and i + 3 < len(raw):
+                    try:
+                        out_s.append(chr(int(raw[i+2:i+4], 16)))
+                        i += 4
+                    except ValueError:
+                        out_s.append(c); i += 1
+                else:
+                    out_s.append(c); i += 1
+            result = ''.join(out_s)
+            # Adjacent string literals concatenate: `"abc" "def"` → `"abcdef"`.
+            # Just recurse into parse_primary while another STRING follows.
+            while self.peek().type == 'STRING':
+                nxt = self.parse_primary()   # will eat the next STRING & decode
+                result += nxt[1]
+            return ('string', result)
         if t.type == 'IDENT':
             name = self.advance().value
             if self.match('('):
@@ -1270,6 +1386,22 @@ class MK1CodeGen:
         # Two-stage boot overlay partitioning
         self._overlay_partition()
 
+        # Flat mode SP init: in overlay/init-extract modes, _main gets a
+        # preamble (`ldi $b,0xFF; mov $b,$sp`) that initializes SP. Flat
+        # mode skips that. Without SP init, the first push runs at SP=0
+        # (reset), wraps SP to 0xFF, and the next stsp at SP=0xFF triggers
+        # the unfixed stsp microcode carry race (writes the wrong stack
+        # slot when SP+N wraps). Inject the same 3B preamble here so flat
+        # programs have the same invariant.
+        flat_mode = (getattr(self, '_overlay_kernel_size', None) is None
+                     and not getattr(self, '_init_extraction_done', False))
+        if flat_mode:
+            for mi, line in enumerate(self.code):
+                if line.strip() == '_main:':
+                    self.code.insert(mi + 1, '\tldi $b,0xFF')
+                    self.code.insert(mi + 2, '\tmov $b,$sp')
+                    break
+
         # Emit page 1 globals ONLY if overlay partitioning didn't inline them.
         # Overlay mode emits them inside the data section before overlay bodies;
         # skip the separate emission here to avoid double-defining the labels.
@@ -1671,14 +1803,18 @@ class MK1CodeGen:
         # Optimized: uses ddrb_imm (bus-safe, preserves A), merged tst+shift,
         # zero NOPs, no push/pop in ACK clock. Uses D as counter (was C) to
         # save 1B on entry (no need to route 8 via A).
+        # Byte in $d, counter in $b. decb (flashed) lets the loop tail do
+        # B-- without round-tripping through A, saving 2B over the old
+        # mov/dec/mov pattern. ddrb_imm preserves $a across both branches,
+        # so no redundant reload at isbn needed.
         self.emit('__i2c_sb:')
-        self.emit('\tmov $a,$b')
-        self.emit('\tldi $d,8')          # D = counter (direct — saves 1B)
+        self.emit('\tmov $a,$d')         # D = byte (survives ldi's A clobber)
+        self.emit('\tldi $b,8')          # B = counter
         lbl_s = self.label('isb')
         lbl_h = self.label('isbh')
         lbl_n = self.label('isbn')
         self.emit(f'{lbl_s}:')
-        self.emit('\tmov $b,$a')
+        self.emit('\tmov $d,$a')         # A = byte (reload for test)
         self.emit('\ttst 0x80')
         self.emit(f'\tjnz {lbl_h}')
         self.emit_ddrb(0x03)
@@ -1690,12 +1826,9 @@ class MK1CodeGen:
         self.emit_ddrb(0x00)
         self.emit_ddrb(0x02)
         self.emit(f'{lbl_n}:')
-        self.emit('\tmov $b,$a')
-        self.emit('\tsll')
-        self.emit('\tmov $a,$b')
-        self.emit('\tmov $d,$a')
-        self.emit('\tdec')
-        self.emit('\tmov $a,$d')
+        self.emit('\tsll')               # A = byte << 1
+        self.emit('\tmov $a,$d')         # D = shifted byte for next iter
+        self.emit('\tdecb')              # B--, sets Z
         self.emit(f'\tjnz {lbl_s}')
         # ACK clock: no NOPs needed (ddrb_imm has built-in settling),
         # no push/pop needed (ddrb_imm preserves A)
@@ -1776,9 +1909,7 @@ class MK1CodeGen:
             self.emit('\tmov $a,$b')       # B = result
             self.emit(f'{lbl_rz}:')
             self.emit_ddrb(0x02)   # SCL LOW
-            self.emit('\tmov $d,$a')       # A = counter
-            self.emit('\tdec')
-            self.emit('\tmov $a,$d')       # D--
+            self.emit('\tdecd')            # D--, A clobbered (unused here)
             self.emit(f'\tjnz {lbl_rb}')
             self.emit('\tmov $b,$d')       # D = B (result)
             self.emit('\tret')
@@ -2123,6 +2254,88 @@ class MK1CodeGen:
             self.emit('\tpop $a')            # balance stack
             self.emit('\tret')
 
+        # __print_u8_dec: A = number 0-255, prints decimal with leading-zero
+        # suppression. Structure: if num >= 100, print hundreds + force-print
+        # tens + print ones. Else-if num >= 10, print tens + ones. Else print
+        # ones only. Fall-throughs avoid needing a "seen nonzero" flag.
+        # incc clobbers $a so each subtract-loop saves/restores A around it.
+        # MK1 carry convention: `cmp A,imm; jnc L` branches when A < imm.
+        if '__print_u8_dec' in helpers:
+            lbl_lt100 = self.label('pd_lt100')
+            lbl_h = self.label('pd_h')
+            lbl_hd = self.label('pd_hd')
+            lbl_dotens = self.label('pd_dotens')
+            lbl_lt10 = self.label('pd_lt10')
+            lbl_t = self.label('pd_t')
+            lbl_td = self.label('pd_td')
+            self.emit('__print_u8_dec:')
+            # --- branch on magnitude ---
+            self.emit('\tcmpi 100')
+            self.emit(f'\tjnc {lbl_lt100}')         # < 100 → skip hundreds
+            # hundreds path (counter in $c, save/restore A around incc)
+            self.emit('\tldi $c,0')
+            self.emit(f'{lbl_h}:')
+            self.emit('\tcmpi 100')
+            self.emit(f'\tjnc {lbl_hd}')
+            self.emit('\tsubi 100,$a')
+            self.emit('\tpush $a'); self.emit('\tincc'); self.emit('\tpop $a')
+            self.emit(f'\tj {lbl_h}')
+            self.emit(f'{lbl_hd}:')
+            self.emit('\tpush $a')                  # save remainder
+            self.emit('\tmov $c,$a')
+            self.emit('\taddi 48,$a')
+            self.emit('\tjal __lcd_chr')
+            self.emit('\tpop $a')
+            self.emit(f'\tj {lbl_dotens}')          # always print tens after hundreds
+            self.emit(f'{lbl_lt100}:')
+            self.emit('\tcmpi 10')
+            self.emit(f'\tjnc {lbl_lt10}')          # < 10 → just print ones
+            self.emit(f'{lbl_dotens}:')
+            # tens path
+            self.emit('\tldi $c,0')
+            self.emit(f'{lbl_t}:')
+            self.emit('\tcmpi 10')
+            self.emit(f'\tjnc {lbl_td}')
+            self.emit('\tsubi 10,$a')
+            self.emit('\tpush $a'); self.emit('\tincc'); self.emit('\tpop $a')
+            self.emit(f'\tj {lbl_t}')
+            self.emit(f'{lbl_td}:')
+            self.emit('\tpush $a')
+            self.emit('\tmov $c,$a')
+            self.emit('\taddi 48,$a')
+            self.emit('\tjal __lcd_chr')
+            self.emit('\tpop $a')
+            self.emit(f'{lbl_lt10}:')
+            # --- ones ---
+            self.emit('\taddi 48,$a')
+            self.emit('\tjal __lcd_chr')
+            self.emit('\tret')
+
+        # __print_u8_hex: A = byte, prints 2 hex digits via __lcd_chr.
+        # `jnc` = branch when digit < 10 (skip the +7 for 'A'-'F' offset).
+        if '__print_u8_hex' in helpers:
+            lbl_hd1 = self.label('px_hd1')
+            lbl_hd2 = self.label('px_hd2')
+            self.emit('__print_u8_hex:')
+            self.emit('\tpush $a')                  # save low nibble for later
+            self.emit('\tslr'); self.emit('\tslr')
+            self.emit('\tslr'); self.emit('\tslr')  # A = high nibble
+            self.emit('\tcmpi 10')
+            self.emit(f'\tjnc {lbl_hd1}')           # digit < 10 → plain +48
+            self.emit('\taddi 7,$a')                # 'A' - '0' - 10
+            self.emit(f'{lbl_hd1}:')
+            self.emit('\taddi 48,$a')
+            self.emit('\tjal __lcd_chr')
+            self.emit('\tpop $a')                   # restore byte
+            self.emit('\tandi 0x0F,$a')
+            self.emit('\tcmpi 10')
+            self.emit(f'\tjnc {lbl_hd2}')
+            self.emit('\taddi 7,$a')
+            self.emit(f'{lbl_hd2}:')
+            self.emit('\taddi 48,$a')
+            self.emit('\tjal __lcd_chr')
+            self.emit('\tret')
+
         # __delay_cal: calibrate delay against SQW, store D/4 in data[0]
         # Single-phase: counts HIGH phase only (D_half), stores D_half/2 = D/4.
         # Saves ~23 bytes vs dual-phase counting.
@@ -2147,8 +2360,9 @@ class MK1CodeGen:
             self.emit_ddrb(0x03)   # both LOW
             self.emit_ddrb(0x01)   # SDA LOW, SCL HIGH
             self.emit_ddrb(0x00)   # both HIGH (idle)
-            self.emit('\tclr $a')
-            self.emit('\texw 0 3')         # clear DDRA before sync
+            # Clear DDRA so PA0 reads SQW. Routed through emit_ddra so any
+            # active port-A claim (e.g. tone's PA1) keeps its bits driven.
+            self.emit_ddra(0x00)
             # Sync: wait LOW then HIGH (rising edge)
             self.emit(f'{lbl_s1}:')
             self.emit('\texrw 1')
@@ -2287,8 +2501,10 @@ class MK1CodeGen:
             self.emit('\tmov $d,$a')       # A = D (high)
             self.emit('\ttst 0xFF')
             self.emit(f'\tjz {lbl_done}')  # D==0, all done
-            self.emit('\tdec')
-            self.emit('\tmov $a,$d')       # D = D-1
+            # decd = D-- in 1B (was `dec; mov $a,$d` 2B). A := D-1, but A is
+            # immediately reloaded from C at the top of the loop so the
+            # clobber doesn't matter.
+            self.emit('\tdecd')
             self.emit(f'\tj {lbl_loop}')
             self.emit(f'{lbl_done}:')
             self.emit_ora(0x00)    # PA1 LOW before disabling
@@ -6654,7 +6870,7 @@ class MK1CodeGen:
                     self.const_vars[e[2][1]] = c
                 else:
                     self.const_vars.pop(e[2][1], None)
-            elif e[0] == 'assign' and e[1] in ('+=','-=','*=','&=','|=','^=') and e[2][0] == 'var':
+            elif e[0] == 'assign' and e[1] in ('+=','-=','*=','/=','%=','&=','|=','^=','<<=','>>=') and e[2][0] == 'var':
                 self.const_vars.pop(e[2][1], None)  # compound assign invalidates
             elif e[0] in ('postinc','postdec','preinc','predec') and e[1][0] == 'var':
                 self.const_vars.pop(e[1][1], None)
@@ -7037,11 +7253,14 @@ class MK1CodeGen:
                             return self._CANT_EVAL
                         if op == '=':
                             env[name] = rhs & 0xFFFF
-                        elif op in ('+=','-=','*=','&=','|=','^='):
+                        elif op in ('+=','-=','*=','/=','%=','&=','|=','^=','<<=','>>='):
                             cur = env.get(name, 0)
                             ops = {'+':lambda a,b:a+b, '-':lambda a,b:a-b,
                                    '*':lambda a,b:a*b, '&':lambda a,b:a&b,
-                                   '|':lambda a,b:a|b, '^':lambda a,b:a^b}
+                                   '|':lambda a,b:a|b, '^':lambda a,b:a^b,
+                                   '/':lambda a,b:a//b if b else 0,
+                                   '%':lambda a,b:a%b if b else 0,
+                                   '<':lambda a,b:a<<b, '>':lambda a,b:a>>b}
                             env[name] = ops[op[0]](cur, rhs) & 0xFFFF
                     else:
                         v = self._eval_const_expr(update, env)
@@ -7318,6 +7537,23 @@ class MK1CodeGen:
             else:
                 self.emit(f'\tldi $a,{expr[1] & 0xFF}')
 
+        elif kind == 'string':
+            # General string-literal codegen: emit the string into page 3 (null-
+            # terminated), return its page-3 offset in $a. Strings are deduped
+            # by content, and lcd_print's special-case path reuses this.
+            s = expr[1]
+            if not hasattr(self, '_lcd_print_strings'):
+                self._lcd_print_strings = []
+            # dedupe: if the same string is already stored, reuse its offset
+            for off, existing in self._lcd_print_strings:
+                if existing == s:
+                    self.emit(f'\tldi $a,{off}')
+                    return
+            p3_off = self.page3_alloc
+            self._lcd_print_strings.append((p3_off, s))
+            self.page3_alloc += len(s) + 1
+            self.emit(f'\tldi $a,{p3_off}')
+
         elif kind == 'var':
             name = expr[1]
             if name in self.locals:
@@ -7353,14 +7589,25 @@ class MK1CodeGen:
             if left[0] == 'index':
                 arr_name = left[1][1] if left[1][0] == 'var' else None
                 is_page3 = arr_name and arr_name in self.page3_globals
-                self.gen_expr(right)
-                self.emit('\tpush $a')
-                self.local_count += 1
-                self.gen_expr(left[2])
                 if is_page3:
                     base = self.page3_globals.get(arr_name, 0)
                 else:
                     base = self.globals.get(arr_name, 0)
+                # Fast path: constant index → `ldi $b,addr` preserves A, so we
+                # can skip the push/clr/mov/pop save-restore (saves 4B). Also
+                # folds base+index at compile time. Works because ldi $b doesn't
+                # touch A, and gen_expr(right) is evaluated BEFORE we load B.
+                const_idx = self._const_eval(left[2])
+                if const_idx is not None:
+                    addr = (base + const_idx) & 0xFF
+                    self.gen_expr(right)
+                    self.emit(f'\tldi $b,{addr}')
+                    self.emit('\tiderefp3' if is_page3 else '\tideref')
+                    return
+                self.gen_expr(right)
+                self.emit('\tpush $a')
+                self.local_count += 1
+                self.gen_expr(left[2])
                 if base:
                     self.emit(f'\taddi {base},$a')
                 self.emit('\tmov $a,$b')
@@ -7370,11 +7617,12 @@ class MK1CodeGen:
                 return
 
             if op != '=':
-                self.gen_expr(left)
-                self.emit('\tmov $a,$b')
-                self.gen_expr(right)
-                self.emit('\tswap')
-                self._emit_binop(op[0])
+                # Compound assign: rewrite `x OP= y` as `x = x OP y` so all
+                # operators (including <<, >>, /, %) go through the general
+                # binop codegen which has constant-folding, strength reduction,
+                # and reg-reg fast paths.
+                op_bare = op[:-1]
+                self.gen_expr(('binop', op_bare, left, right))
             else:
                 self.gen_expr(right)
 
@@ -7446,9 +7694,28 @@ class MK1CodeGen:
                         self.emit('\tsll')  # *4
                         self.emit('\tsll')  # *8
                         self.emit('\tadd $b,$a')  # *2 + *8 = *10
+                    elif val == 7:           # *7 = (x<<3) - x
+                        self.emit('\tmov $a,$b')
+                        self.emit('\tsll'); self.emit('\tsll'); self.emit('\tsll')
+                        self.emit('\tsub $b,$a')
+                    elif val == 9:           # *9 = (x<<3) + x
+                        self.emit('\tmov $a,$b')
+                        self.emit('\tsll'); self.emit('\tsll'); self.emit('\tsll')
+                        self.emit('\tadd $b,$a')
+                    elif val == 12:          # *12 = (3x) << 2
+                        self.emit('\tmov $a,$b')
+                        self.emit('\tsll')
+                        self.emit('\tadd $b,$a')
+                        self.emit('\tsll'); self.emit('\tsll')
+                    elif val == 16:          # *16 = 4 × sll
+                        self.emit('\tsll'); self.emit('\tsll')
+                        self.emit('\tsll'); self.emit('\tsll')
+                    elif val == 32:          # *32 = 5 × sll
+                        self.emit('\tsll'); self.emit('\tsll')
+                        self.emit('\tsll'); self.emit('\tsll'); self.emit('\tsll')
                     else:
                         pass  # fall through to general multiply
-                    if val in (0, 1, 2, 3, 4, 5, 6, 8, 10):
+                    if val in (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 16, 32):
                         return
                 elif op == '/':
                     if val == 1: pass  # identity
@@ -7474,7 +7741,11 @@ class MK1CodeGen:
                         self.emit('\tslr')
                 else:
                     pass  # fall through to general case for ^, *
-                if op not in ('^', '*'):
+                # Fall through to the general register-based path for ops
+                # that don't have a complete constant-only expansion above:
+                #   ^ and *  → always (general case handles via B)
+                #   / and %  → when val is not a power-of-2 handled above
+                if op not in ('^', '*', '/', '%'):
                     return
 
             # Optimization: if right operand is in register C or D, use direct
@@ -8171,6 +8442,10 @@ class MK1CodeGen:
                 if not hasattr(self, '_tone_ddra_emitted'):
                     self._tone_ddra_emitted = True
                     self._needs_tone_init = True
+                    # Claim PA1 (push-pull buzzer output). Future port-A users
+                    # will OR this bit into their DDRA writes so PA1 stays
+                    # driven across e.g. delay_cal's DDRA clear.
+                    self._claim_port_bits('DDRA', 0x02, 'tone')
                 if len(args) < 2:
                     raise Exception("tone() requires 2 arguments: freq_hz, duration_ms")
                 freq = self._const_eval(args[0])
@@ -8293,22 +8568,93 @@ class MK1CodeGen:
                 return
 
             if name == 'lcd_print':
-                # lcd_print("string") — store string in page 3, emit loop to print
-                if args and args[0][0] == 'string':
-                    s = args[0][1]
-                    # Allocate string bytes in page 3 (null-terminated)
-                    p3_off = self.page3_alloc
-                    if not hasattr(self, '_lcd_print_strings'):
-                        self._lcd_print_strings = []
-                    self._lcd_print_strings.append((p3_off, s))
-                    self.page3_alloc += len(s) + 1  # +1 for null terminator
-                    # Emit call to shared __lcd_print helper
-                    self.emit(f'\tldi $a,{p3_off}')
+                # lcd_print(string or page3-offset) — gen_expr's string case
+                # allocates + dedupes; a bare integer offset just lands in $a.
+                if args:
+                    self.gen_expr(args[0])
                     if not hasattr(self, '_lcd_helpers'):
                         self._lcd_helpers = set()
                     self._lcd_helpers.add('__lcd_print')
-                    self._lcd_helpers.add('__lcd_chr')  # __lcd_print calls __lcd_chr
+                    self._lcd_helpers.add('__lcd_chr')
                     self.emit('\tjal __lcd_print')
+                return
+
+            if name == 'printf':
+                # Compile-time format-string expansion. Targets the LCD via
+                # existing __lcd_print / __lcd_chr / __print_u8_dec / __print_u8_hex.
+                # Supported specifiers: %d (u8 decimal, 3 digits), %x (u8 hex,
+                # 2 digits), %c (char), %s (string or page3 offset), %% (literal
+                # '%'). Escape \xNN in the literal text passes through as-is to
+                # the LCD — use 0xDF for the HD44780 degree symbol, etc.
+                if not args or args[0][0] != 'string':
+                    self.gen_error("printf requires a string literal as first argument")
+                    return
+                if not hasattr(self, '_lcd_helpers'):
+                    self._lcd_helpers = set()
+                self._lcd_helpers.add('__lcd_chr')
+                fmt = args[0][1]
+                arg_idx = 1
+                buf = []       # accumulating literal chunk
+
+                def _flush():
+                    if not buf:
+                        return
+                    s = ''.join(buf)
+                    buf.clear()
+                    if len(s) == 1:
+                        # one-char literal → lcd_char(ch) is 3+3B, cheaper than lcd_print
+                        self.emit(f'\tldi $a,{ord(s) & 0xFF}')
+                        self.emit('\tjal __lcd_chr')
+                    else:
+                        # stash the multi-char literal as a string expr → gen_expr
+                        self.gen_expr(('string', s))
+                        self._lcd_helpers.add('__lcd_print')
+                        self.emit('\tjal __lcd_print')
+
+                i = 0
+                while i < len(fmt):
+                    ch = fmt[i]
+                    if ch != '%':
+                        buf.append(ch)
+                        i += 1
+                        continue
+                    i += 1
+                    if i >= len(fmt):
+                        self.gen_error("printf: trailing '%' in format string")
+                        return
+                    spec = fmt[i]
+                    i += 1
+                    if spec == '%':
+                        buf.append('%')
+                        continue
+                    _flush()
+                    if arg_idx >= len(args):
+                        self.gen_error(f"printf: not enough arguments for '%{spec}'")
+                        return
+                    arg = args[arg_idx]
+                    arg_idx += 1
+                    if spec == 'd':
+                        self.gen_expr(arg)
+                        self._lcd_helpers.add('__print_u8_dec')
+                        self.emit('\tjal __print_u8_dec')
+                    elif spec == 'x':
+                        self.gen_expr(arg)
+                        self._lcd_helpers.add('__print_u8_hex')
+                        self.emit('\tjal __print_u8_hex')
+                    elif spec == 'c':
+                        self.gen_expr(arg)
+                        self.emit('\tjal __lcd_chr')
+                    elif spec == 's':
+                        self.gen_expr(arg)   # string literal → offset, or integer offset
+                        self._lcd_helpers.add('__lcd_print')
+                        self.emit('\tjal __lcd_print')
+                    else:
+                        self.gen_error(f"printf: unsupported specifier '%{spec}'")
+                        return
+                _flush()
+                if arg_idx < len(args):
+                    # Not fatal — just warn via emit comment. Keeps compilation going.
+                    self.emit(f'; printf: {len(args) - arg_idx} extra argument(s) ignored')
                 return
 
             # peek/poke for page 3 (convenience wrappers)
@@ -8377,6 +8723,25 @@ class MK1CodeGen:
 
         elif kind == 'index':
             base_expr, idx_expr = expr[1], expr[2]
+            # Fast path: constant index with non-EEPROM array. Fold base+index
+            # at compile time → single `ldi $a,addr` (2B) vs `ldi $a,idx; addi
+            # base,$a` (4B). Saves 2B per fold.
+            const_idx = self._const_eval(idx_expr)
+            if (const_idx is not None
+                and base_expr[0] == 'var'
+                and base_expr[1] not in self.eeprom_globals):
+                if base_expr[1] in self.page3_globals:
+                    base = self.page3_globals[base_expr[1]]
+                    addr = (base + const_idx) & 0xFF
+                    self.emit(f'\tldi $a,{addr}')
+                    self.emit('\tderefp3')
+                    return
+                if base_expr[1] in self.globals:
+                    base = self.globals[base_expr[1]]
+                    addr = (base + const_idx) & 0xFF
+                    self.emit(f'\tldi $a,{addr}')
+                    self.emit('\tderef')
+                    return
             self.gen_expr(idx_expr)
             if base_expr[0] == 'var' and base_expr[1] in self.eeprom_globals:
                 # EEPROM array: A = index, read EEPROM[base + A]
