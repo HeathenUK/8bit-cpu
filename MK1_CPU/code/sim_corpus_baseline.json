@@ -112,7 +112,13 @@
     "halted": true,
     "cycles_run": 93030
   },
-  "oled_temp": null,
+  "oled_temp": {
+    "output_history": [],
+    "output_hash": "e3b0c44298fc1c14",
+    "output_len": 0,
+    "halted": false,
+    "cycles_run": 500000
+  },
   "oled_test": {
     "output_history": [
       252,
@@ -29118,7 +29124,13 @@
     "halted": true,
     "cycles_run": 66574
   },
-  "overlay_dashboard": null,
+  "overlay_dashboard": {
+    "output_history": [],
+    "output_hash": "e3b0c44298fc1c14",
+    "output_len": 0,
+    "halted": false,
+    "cycles_run": 500000
+  },
   "overlay_demo": {
     "output_history": [
       130
@@ -29195,6 +29207,19 @@
     "halted": true,
     "cycles_run": 5173
   },
+  "test_bisect_ov": {
+    "output_history": [
+      160,
+      161,
+      162,
+      163,
+      192
+    ],
+    "output_hash": "0635eb329cd1c156",
+    "output_len": 5,
+    "halted": true,
+    "cycles_run": 3581
+  },
   "test_eeprom_overlay": {
     "output_history": [
       4,
@@ -29233,6 +29258,18 @@
     "halted": true,
     "cycles_run": 28245
   },
+  "test_flat_markers": {
+    "output_history": [
+      160,
+      161,
+      162,
+      192
+    ],
+    "output_hash": "cb88717e0885a8c7",
+    "output_len": 4,
+    "halted": true,
+    "cycles_run": 323
+  },
   "test_i2c_ack_diag": {
     "output_history": [
       161,
@@ -29257,10 +29294,59 @@
     "halted": false,
     "cycles_run": 500000
   },
-  "test_lcd_eeprom": {
+  "test_idx_eeprom": {
+    "output_history": [
+      0,
+      254,
+      237,
+      190,
+      239
+    ],
+    "output_hash": "f8b28a07a0c690aa",
+    "output_len": 5,
+    "halted": true,
+    "cycles_run": 8252
+  },
+  "test_idx_lcd": {
     "output_history": [],
     "output_hash": "e3b0c44298fc1c14",
     "output_len": 0,
+    "halted": true,
+    "cycles_run": 67993
+  },
+  "test_idx_markers": {
+    "output_history": [
+      160,
+      161,
+      162,
+      163,
+      164,
+      165,
+      192
+    ],
+    "output_hash": "4b7319694bd80a63",
+    "output_len": 7,
+    "halted": true,
+    "cycles_run": 106525
+  },
+  "test_idx_simple": {
+    "output_history": [
+      160,
+      161,
+      162,
+      192
+    ],
+    "output_hash": "cb88717e0885a8c7",
+    "output_len": 4,
+    "halted": true,
+    "cycles_run": 3453
+  },
+  "test_lcd_eeprom": {
+    "output_history": [
+      17
+    ],
+    "output_hash": "4523540f1504cd17",
+    "output_len": 1,
     "halted": false,
     "cycles_run": 500000
   },

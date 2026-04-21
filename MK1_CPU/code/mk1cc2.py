@@ -8288,30 +8288,28 @@ class MK1CodeGen:
                 # HD44780 execution delay after lcd_cmd (not needed for lcd_char).
                 if not is_char:
                     if c is not None and c in (0x01, 0x02):
-                        # T2.4 specialisation: clear-display / return-home need
-                        # ≥1.52ms. A raw 256-iter dec/jnz loop on $a takes
-                        # ~1024 CPU cycles, which is 1–10ms across the supported
-                        # clock range (100k–1MHz). That's safely ≥1.52ms with
-                        # zero __delay_Nms / __delay_cal infrastructure pulled
-                        # in. Same trick lcd_clear() already uses; here we apply
-                        # it whenever the const argument is 0x01 / 0x02.
-                        # Saves ~50B (delay_Nms ≈ 35B + delay_cal ≈ 65B init,
-                        # not all kernel-resident but each adds compile cost).
+                        # Clear-display / return-home require ≥1.52ms. A raw
+                        # 256-iter dec/jnz loop on $a takes ~1024 CPU cycles,
+                        # which is 1–10ms across the supported clock range
+                        # (100k–1MHz). Safely ≥1.52ms with zero __delay_Nms /
+                        # __delay_cal infrastructure pulled in.
                         lbl_c = self.label('lcd_cmd_d')
                         self.emit('\tldi $a,0')
                         self.emit(f'{lbl_c}:')
                         self.emit('\tdec')
                         self.emit(f'\tjnz {lbl_c}')
-                    else:
-                        # Generic command: 37µs minimum. Calibrated delay needed
-                        # because programs may use lcd_cmd in tight runtime
-                        # loops where over-delay matters.
-                        if not hasattr(self, '_lcd_helpers'):
-                            self._lcd_helpers = set()
-                        self._lcd_helpers.add('__delay_Nms')
-                        self._needs_delay_calibrate = True
-                        self.emit('\tldi $b,1')    # 1ms
-                        self.emit('\tjal __delay_Nms')
+                    # Any other lcd_cmd (set DDRAM 0x80/0xC0, function set,
+                    # entry mode, display on/off, etc): HD44780 datasheet
+                    # minimum is 37µs. The I2C transaction to SEND the
+                    # command via PCF8574 is ~300 clocks = ≥300µs at the
+                    # max MK1 clock (1MHz). Any subsequent lcd op triggers
+                    # another I2C transaction, again far longer than 37µs.
+                    # No explicit delay needed — the transport itself is
+                    # the delay. Dropping the jal __delay_Nms here removes
+                    # __delay_Nms (34B) + __delay_cal (~65B init) from any
+                    # program whose only non-0x01/0x02 lcd_cmd calls come
+                    # through this path. That's every "display time/temp"
+                    # program. (Unblocks overlay_dashboard 2026-04-21.)
                 return
 
             if name == 'lcd_print':
