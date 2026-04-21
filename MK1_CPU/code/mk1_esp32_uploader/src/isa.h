@@ -57,6 +57,8 @@ enum InstrArgs {
     ARGS_NONE,   // no arguments
     ARGS_IMM,    // one immediate byte (label or number)
     ARGS_REG,    // one register
+    ARGS_IMM2,   // two immediate bytes (ddrb2_imm A B)
+    ARGS_IMM3,   // three immediate bytes (ddrb3_imm A B C)
 };
 
 struct FixedInstr {
@@ -123,8 +125,8 @@ static const FixedInstr FIXED_INSTRUCTIONS[] = {
     { "incb",    0xF5,  ARGS_NONE },  // B = B + 1 (A := old B + 1)
     { "jnc",     0xCA,  ARGS_IMM  },  // jump if not carry
     { "jnz",     0xCE,  ARGS_IMM  },  // jump if not zero
-    { "setjmp",  0xCB,  ARGS_IMM  },  // cross-page jump (future)
-    { "setret",  0xCF,  ARGS_NONE },  // cross-page return (future)
+    { "ddrb2_imm", 0xCB, ARGS_IMM2 },  // two consecutive DDRB writes (retired setjmp)
+    { "ddrb3_imm", 0xCF, ARGS_IMM3 },  // three consecutive DDRB writes (retired setret)
 
     // ── Overlay system ──
     { "derefp3", 0xD5,  ARGS_NONE },  // A = page3[A] (indirect page 3 read)

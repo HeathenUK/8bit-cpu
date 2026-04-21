@@ -667,9 +667,18 @@ private:
             for (int i = 0; FIXED_INSTRUCTIONS[i].mnemonic; i++) {
                 if (strcasecmp(extMnem, FIXED_INSTRUCTIONS[i].mnemonic) == 0) {
                     emitCode(FIXED_INSTRUCTIONS[i].opcode, pass1);
-                    if (FIXED_INSTRUCTIONS[i].args == ARGS_IMM) {
+                    InstrArgs ak = FIXED_INSTRUCTIONS[i].args;
+                    int nImm = (ak == ARGS_IMM) ? 1 :
+                               (ak == ARGS_IMM2) ? 2 :
+                               (ak == ARGS_IMM3) ? 3 : 0;
+                    const char* tp = afterExt;
+                    for (int k = 0; k < nImm; k++) {
+                        skipWs(tp);
                         char tok[32];
-                        parseToken(afterExt, tok, sizeof(tok));
+                        int n = parseToken(tp, tok, sizeof(tok));
+                        tp += n;
+                        // Skip separator (comma or space) between operands.
+                        while (*tp == ',' || *tp == ' ' || *tp == '\t') tp++;
                         int v = resolveValue(tok, lineNum, pass1);
                         emitCode(v & 0xFF, pass1);
                     }

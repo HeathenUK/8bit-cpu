@@ -245,14 +245,28 @@ ucode_template[0xCA] = ('jnc', [MI|PO, RO|II|PE, PO|MI, RO|PI, RST, RST, RST, RS
 # JNZ: jump if NOT zero (base template = take jump, patched to skip when ZF=1)
 ucode_template[0xCE] = ('jnz', [MI|PO, RO|II|PE, PO|MI, RO|PI, RST, RST, RST, RST], True)
 
-# SETJMP: toggle code page and jump (forward-compatible — NOP on current hardware)
-# On current hardware SETPG goes to floating U76 D2, so this is just a regular jump.
-# When code banking flip-flop is wired to D2, this toggles the code page.
-ucode_template[0xCB] = ('setjmp', [MI|PO, RO|II|PE, PO|MI, RO|PI|SETPG, RST, RST, RST, RST], True)
+# DDRB2_IMM A B: two consecutive DDRB writes in one opcode (3 bytes total).
+# Retires setjmp (0xCB). setjmp was "toggle code page and jump" reserved for
+# future code banking — SETPG is unwired (U76 D2 floats), so it was function-
+# ally identical to `j imm` and never emitted. Frees the slot for DDRB pair
+# fusion. Corpus has 291 ddrb_imm pairs × 1B saved = ~291B corpus-wide.
+# Plus 200 triples and 42 quads benefit (pairs within them).
+ucode_template[0xCB] = ('ddrb2_imm',
+    [MI|PO, RO|II|PE,
+     PO|MI, PE|RO|E0|U1,     # read imm1, write to DDRB, PC++
+     PO|MI, PE|RO|E0|U1,     # read imm2, write to DDRB, PC++
+     RST, RST], True)
 
-# SETRET: toggle code page and return (forward-compatible — NOP on current hardware)
-# Step 5 PE is required: jal pushes PC+1, ret needs to advance to PC+2 (past jal's immediate)
-ucode_template[0xCF] = ('setret', [MI|PO, RO|II|PE, SETPG|SU, SO|MI, STK|RO|PI, PE, RST, RST], False)
+# DDRB3_IMM A B C: three consecutive DDRB writes in one opcode (4 bytes total).
+# Retires setret (0xCF). Same rationale — setret was reserved for code banking
+# return, which requires hw wiring we don't have. Frees the slot for DDRB
+# triple fusion, the densest pattern in I2C code (200 triples corpus-wide).
+# Uses all 8 microsteps (counter wraps naturally after last write).
+ucode_template[0xCF] = ('ddrb3_imm',
+    [MI|PO, RO|II|PE,
+     PO|MI, PE|RO|E0|U1,
+     PO|MI, PE|RO|E0|U1,
+     PO|MI, PE|RO|E0|U1], True)
 
 # STSP: stack[SP + offset] = A (clobbers D)
 # Step 2: D=A (save value), Step 3: E=SP, Step 4-5: read offset+PC++
