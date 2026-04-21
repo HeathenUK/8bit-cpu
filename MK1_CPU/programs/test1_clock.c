@@ -12,6 +12,8 @@ unsigned char rtc_reg(unsigned char reg) {
     return v;
 }
 
+/* BCD digits are nibbles; inline extraction is 10B, cheaper than pulling in
+ * the ~31B __print_u8_hex helper for this single callsite. */
 void show_hm(unsigned char h, unsigned char m) {
     lcd_cmd(0x01);
     lcd_char((h >> 4) + 48);

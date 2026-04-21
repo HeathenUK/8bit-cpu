@@ -1,14 +1,12 @@
-/* Display RTC temperature on LCD as "NN°C" */
+/* Display RTC temperature on LCD as "NN°C".
+ * Uses inline digit extraction (not printf) because this single-number
+ * display would pay ~60B for __print_u8_dec just for one call. */
 void main() {
     i2c_init();
     lcd_init();
     unsigned char temp;
     temp = rtc_read_temp();
-    /* Bus recovery: clears any slave confused by RTC transaction before
-     * we write to LCD. Required when switching between slaves. */
     i2c_bus_reset();
-    /* Note: lcd_init already clears the display (0x01 is in its init sequence),
-     * so an explicit lcd_clear() here is redundant and blows code budget. */
     unsigned char tens;
     tens = 0;
     while (temp >= 10) {
@@ -19,7 +17,6 @@ void main() {
     lcd_char(temp + 48);
     lcd_char(0xDF);
     lcd_char('C');
-    /* out after lcd_chars so RUN captures temp once display is drawn. */
     out(temp);
     halt();
 }
