@@ -6,16 +6,7 @@ unsigned char read_temp() {
 
 void display(unsigned char t) {
     lcd_cmd(0x01);
-    lcd_print("Temp: ");
-    unsigned char tens;
-    unsigned char ones;
-    tens = 0;
-    ones = t;
-    while (ones >= 10) { ones = ones - 10; tens = tens + 1; }
-    if (tens > 0) { lcd_char(tens + 48); }
-    lcd_char(ones + 48);
-    lcd_char(0xDF);
-    lcd_char('C');
+    printf("Temp: %d\xDFC", t);
 }
 
 void main() {
