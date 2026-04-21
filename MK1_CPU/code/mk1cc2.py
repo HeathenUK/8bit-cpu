@@ -2186,53 +2186,30 @@ class MK1CodeGen:
             # SQW left enabled — no coupling issue, saves ~20B
             self.emit('\tret')
 
-        # __delay_Nms: B = delay count (ms). Reads ipm from data[0].
-        # Computes total = N × ipm (16-bit), runs flat dec+jnz countdown.
-        # Same inner loop as calibration. No per-ms overhead.
-        # At 500kHz: ipm≈54, <2% error for any N from 1-255.
-        # B = N on entry. Uses C for multiply accumulator.
+        # __delay_Nms: B = delay count (ms). Reads ipm from page3[240].
+        # Runs B outer iterations × ipm inner (bare dec+jnz) iterations.
+        # Same bare inner loop as the calibrator — timing is accurate
+        # to within the outer-loop overhead (3 insns per ms, ~0.6% at
+        # 500kHz). Matches the calibrator's own outer overhead, so net
+        # error stays inside the existing ±2% tolerance.
+        #
+        # 12B vs old 34B multiply+countdown approach. Same semantics
+        # (delay(N) ms for N=1..255, monotonically increasing), better
+        # byte cost.
         if '__delay_Nms' in helpers:
-            lbl_mul = self.label('dmul')
-            lbl_loop = self.label('dlp')
-            lbl_done = self.label('ddn')
+            lbl_outer = self.label('dms_o')
+            lbl_inner = self.label('dms_i')
             self.emit('__delay_Nms:')
-            # Multiply B × ipm: result in D:C (hi:lo)
             self.emit('\tldi $a,240')
             self.emit('\tderefp3')         # A = ipm from page3[240]
             self.emit('\tmov $a,$c')       # C = ipm
-            self.emit('\tldi $d,0')        # D = result high byte
-            self.emit('\tclr $a')          # A = result low byte
-            # Add C to D:A, B times
-            self.emit(f'{lbl_mul}:')
-            self.emit('\tadd $c,$a')       # A += C (with carry)
-            self.emit('\tjnc .noc%d' % self.label_id)
-            self.emit('\tpush $a')
-            self.emit('\tmov $d,$a')
-            self.emit('\tinc')
-            self.emit('\tmov $a,$d')
-            self.emit('\tpop $a')
-            self.emit('.noc%d:' % self.label_id)
-            self.emit('\tmov $b,$a')       # check B
+            self.emit(f'{lbl_outer}:')
+            self.emit('\tmov $c,$a')       # A = ipm (reload per ms)
+            self.emit(f'{lbl_inner}:')
             self.emit('\tdec')
-            self.emit('\tmov $a,$b')
-            self.emit(f'\tjnz {lbl_mul}')
-            # D:A = total iterations (D=high, A=low). Need B=high, A=low.
-            self.emit('\tpush $a')         # save low byte
-            self.emit('\tmov $d,$a')       # A = D = high byte
-            self.emit('\tmov $a,$b')       # B = high byte
-            self.emit('\tpop $a')          # A = low byte restored
-            # 16-bit countdown: A counts down, B decrements on A wrap
-            self.emit(f'{lbl_loop}:')
-            self.emit('\tdec')
-            self.emit(f'\tjnz {lbl_loop}')
-            self.emit('\tmov $b,$a')       # A = B (high byte)
-            self.emit('\ttst 0xFF')        # B == 0?
-            self.emit(f'\tjz {lbl_done}')
-            self.emit('\tdec')
-            self.emit('\tmov $a,$b')
-            self.emit('\tclr $a')
-            self.emit(f'\tj {lbl_loop}')
-            self.emit(f'{lbl_done}:')
+            self.emit(f'\tjnz {lbl_inner}')
+            self.emit('\tdecb')            # B--
+            self.emit(f'\tjnz {lbl_outer}')
             self.emit('\tret')
 
         # __tone_setup: B = ratio → C = half_period = (ipm × ratio) >> 4.
