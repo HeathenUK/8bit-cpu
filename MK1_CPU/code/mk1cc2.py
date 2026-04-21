@@ -2626,8 +2626,9 @@ class MK1CodeGen:
         # ── Two-byte instruction set for size estimation ──
         two_byte = {'ldsp','stsp','push_imm','jal','jc','jz','jnc','jnz','j','ldi',
                     'cmp','addi','subi','andi','ori','ld','st','ldsp_b','ldp3','stp3',
-                    'setjmp','ocall','tst','out_imm','cmpi','ddrb_imm','ddra_imm',
+                    'ocall','tst','out_imm','cmpi','ddrb_imm','ddra_imm',
                     'ora_imm','orb_imm'}
+        # ddrb2_imm is 3B (opcode + 2 imm), ddrb3_imm is 4B (opcode + 3 imm).
 
         def measure_lines(lines):
             """Measure byte size of assembly lines."""
@@ -2640,6 +2641,10 @@ class MK1CodeGen:
                 if mn == 'cmp':
                     parts = s.split()
                     size += 1 if (len(parts) > 1 and parts[1].startswith('$')) else 2
+                elif mn == 'ddrb2_imm':
+                    size += 3
+                elif mn == 'ddrb3_imm':
+                    size += 4
                 elif mn in two_byte:
                     size += 2
                 else:
@@ -4771,6 +4776,10 @@ class MK1CodeGen:
                         if mn == 'cmp':
                             parts = s.split()
                             S += 1 if (len(parts) > 1 and parts[1].startswith('$')) else 2
+                        elif mn == 'ddrb2_imm':
+                            S += 3
+                        elif mn == 'ddrb3_imm':
+                            S += 4
                         elif mn in two_byte:
                             S += 2
                         else:
@@ -6170,6 +6179,10 @@ class MK1CodeGen:
                     if mn == 'cmp':
                         parts = s.split()
                         sz += 1 if (len(parts) > 1 and parts[1].startswith('$')) else 2
+                    elif mn == 'ddrb2_imm':
+                        sz += 3
+                    elif mn == 'ddrb3_imm':
+                        sz += 4
                     elif mn in two_byte:
                         sz += 2
                     else:
@@ -6516,7 +6529,7 @@ class MK1CodeGen:
         _cur_size = 0
         _two_byte_set = {'ldsp','stsp','push_imm','jal','jc','jz','jnc','jnz','j','ldi',
                          'cmp','addi','subi','andi','ori','ld','st','ldsp_b','ldp3','stp3',
-                         'setjmp','ocall','tst','out_imm','cmpi','ddrb_imm','ddra_imm',
+                         'ocall','tst','out_imm','cmpi','ddrb_imm','ddra_imm',
                          'ora_imm','orb_imm'}
         for _line in runtime_resident_helpers:
             _s = _line.strip().split(';')[0].strip()
@@ -6532,6 +6545,10 @@ class MK1CodeGen:
             if _mn == 'cmp':
                 _parts = _s.split()
                 _cur_size += 1 if (len(_parts) > 1 and _parts[1].startswith('$')) else 2
+            elif _mn == 'ddrb2_imm':
+                _cur_size += 3
+            elif _mn == 'ddrb3_imm':
+                _cur_size += 4
             elif _mn in _two_byte_set:
                 _cur_size += 2
             else:
@@ -9858,7 +9875,7 @@ def main():
     section = 'code'
     two_byte_set = {'ldsp','stsp','push_imm','jal','jc','jz','jnc','jnz','j','ldi',
                     'cmp','addi','subi','andi','ori','ld','st','ldsp_b','ldp3','stp3',
-                    'setjmp','ocall','tst','out_imm','cmpi','ddrb_imm','ddra_imm',
+                    'ocall','tst','out_imm','cmpi','ddrb_imm','ddra_imm',
                     'ora_imm','orb_imm'}
     for line in lines:
         s = line.strip()
@@ -9879,6 +9896,10 @@ def main():
         elif mn == 'cmp':
             parts = s.split()
             b = 1 if (len(parts) > 1 and parts[1].startswith('$')) else 2
+        elif mn == 'ddrb2_imm':
+            b = 3
+        elif mn == 'ddrb3_imm':
+            b = 4
         elif mn in two_byte_set:
             b = 2
         else:

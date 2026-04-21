@@ -135,10 +135,13 @@ _TWO_BYTE_MNEMONICS = {
     'push_imm', 'ldsp', 'stsp', 'ldsp_b',
     'ldp3', 'stp3',
     'ddrb_imm', 'ddra_imm', 'orb_imm', 'ora_imm',
-    'ocall', 'setjmp',
+    'ocall',
     'tst', 'cmpi', 'out_imm',
     'je0', 'je1',
 }
+
+# Multi-immediate opcodes: opcode + N immediate bytes.
+_MULTI_IMM = {'ddrb2_imm': 3, 'ddrb3_imm': 4}
 
 
 def instr_size(mnemonic: str, operand_str: str) -> int:
@@ -147,6 +150,8 @@ def instr_size(mnemonic: str, operand_str: str) -> int:
     cmp opcode), `cmp N` is 2 bytes (cmpi)."""
     if mnemonic == 'cmp':
         return 1 if operand_str.strip().startswith('$') else 2
+    if mnemonic in _MULTI_IMM:
+        return _MULTI_IMM[mnemonic]
     if mnemonic in _TWO_BYTE_MNEMONICS:
         return 2
     return 1
@@ -756,14 +761,15 @@ def reg_live_after(lines, idx: int, reg: str, **kwargs) -> bool:
 TWO_BYTE: frozenset = frozenset({
     'ldsp', 'stsp', 'push_imm', 'jal', 'jc', 'jz', 'jnc', 'jnz', 'j',
     'ldi', 'cmp', 'addi', 'subi', 'andi', 'ori', 'ld', 'st', 'ldsp_b',
-    'ldp3', 'stp3', 'setjmp', 'ocall', 'tst', 'out_imm', 'cmpi',
+    'ldp3', 'stp3', 'ocall', 'tst', 'out_imm', 'cmpi',
     'ddrb_imm', 'ddra_imm', 'ora_imm', 'orb_imm',
 })
 
 
 def instr_byte_size(line: str, two_byte_set: frozenset = TWO_BYTE) -> int:
     """Byte size of an asm line. 0 for labels / comments / blanks /
-    directives. `cmp $X` is 1 byte (reg-reg); `cmp N` is 2 (reg-imm)."""
+    directives. `cmp $X` is 1 byte (reg-reg); `cmp N` is 2 (reg-imm).
+    ddrb2_imm is 3B (opcode+2imm), ddrb3_imm is 4B (opcode+3imm)."""
     s = line.strip()
     if not s or s.endswith(':') or s.startswith(';'):
         return 0
@@ -773,6 +779,10 @@ def instr_byte_size(line: str, two_byte_set: frozenset = TWO_BYTE) -> int:
     mn = parts[0]
     if mn == 'cmp':
         return 1 if (len(parts) > 1 and parts[1].startswith('$')) else 2
+    if mn == 'ddrb2_imm':
+        return 3
+    if mn == 'ddrb3_imm':
+        return 4
     if mn in two_byte_set:
         return 2
     return 1
