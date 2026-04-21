@@ -9412,11 +9412,18 @@ def peephole(lines):
             regs[r] = None
             continue
 
-        # stsp: clobbers A, but D = original A (microcode saves A→D first)
+        # stsp: clobbers A, but D = original A (microcode saves A→D first).
+        # Also mark D as holding the value at stack[SP+off]: after `stsp off`,
+        # stack[SP+off] = A and D = A (= stack[SP+off]). That lets the
+        # follow-up `mov $d,$a; ldsp off` elide the ldsp, since A would match.
         if mn == 'stsp':
             out.append(line)
-            regs['d'] = regs['a']  # D gets the value A had before stsp
-            regs['a'] = fresh_unknown()       # A is clobbered (holds offset)
+            try:
+                off = int(parts[1]) if len(parts) == 2 else None
+            except ValueError:
+                off = None
+            regs['d'] = ('sp', off) if off is not None else regs['a']
+            regs['a'] = fresh_unknown()
             continue
 
         # jal/jal_r/ocall: function call, all bets off
