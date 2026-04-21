@@ -7,7 +7,7 @@
     "cycles_run": 500000
   },
   "eeprom_compile_test": {
-    "error": "assemble: ASM error: {'ok': False, 'errors': 2, 'detail': [{'line': 22, 'msg': 'Undefined symbol: _eeprom_write'}, {'line': 29, 'msg': 'Undefined symbol: _eeprom_read'}]}"
+    "error": "assemble: ASM error: {'ok': False, 'errors': 2, 'detail': [{'line': 23, 'msg': 'Undefined symbol: _eeprom_write'}, {'line': 30, 'msg': 'Undefined symbol: _eeprom_read'}]}"
   },
   "eeprom_demo": {
     "output_history": [

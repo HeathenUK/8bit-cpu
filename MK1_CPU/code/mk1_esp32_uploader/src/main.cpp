@@ -516,6 +516,11 @@ static volatile uint8_t lastOutputVal = 0;
 static volatile bool outputCaptured = false;
 static volatile uint32_t oiCount = 0;        // total OI events (may exceed 256)
 static volatile uint8_t oiHistory[256];      // ring buffer — keeps LAST 256
+// Parallel ring buffer of per-event timestamps (MK1-cycle counts).
+// Set to `actualCycles` at capture time inside the RUNLOG/RUNNB loop;
+// the ISR-capture path sets it to 0 (no cycle counter available there).
+// Reporting: RUNNB/RUNLOG emit a `ts` array alongside `hist`/`vals`.
+static volatile uint32_t oiTimes[256];
 
 // Ring-buffer accessors. Before this change, the code stored only the
 // first 256 events and dropped the rest. That's fatal for I2C-heavy
@@ -532,6 +537,10 @@ static inline uint8_t oiHistAt(uint32_t i) {
     if (oiCount <= 256) return oiHistory[i];
     // Wrapped: physical index of oldest kept event = oiCount (mod 256).
     return oiHistory[(oiCount + i) & 0xFF];
+}
+static inline uint32_t oiTimeAt(uint32_t i) {
+    if (oiCount <= 256) return oiTimes[i];
+    return oiTimes[(oiCount + i) & 0xFF];
 }
 
 static uint32_t oiGpioMask = 0;  // precomputed at startOIMonitor
@@ -567,7 +576,11 @@ static void IRAM_ATTR onOIRising() {
     // ISR: snapshot GPIO now and decode, keeping OI+bus consistent.
     uint32_t gpio = GPIO.in;
     uint8_t val = decodeBus(gpio);
+    // ISR can't access the per-cycle `actualCycles` counter used by
+    // RUN/RUNNB/RUNLOG. Record wall-clock microseconds instead — enough
+    // for external timing verification (ms delay accuracy etc.).
     oiHistory[oiCount & 0xFF] = val;
+    oiTimes[oiCount & 0xFF] = now;
     oiCount++;
     lastOutputVal = val;
     outputCaptured = true;
@@ -789,7 +802,7 @@ static void handleRunCycles() {
         uint32_t gpio1 = GPIO.in;
         if (gpio1 & oiMask) {
             uint8_t val = decodeBus(gpio1);
-            oiHistory[oiCount & 0xFF] = val;
+            oiHistory[oiCount & 0xFF] = val; oiTimes[oiCount & 0xFF] = actualCycles;
             oiCount++;
             lastOutputVal = val;
             outputCaptured = true;
@@ -807,7 +820,7 @@ static void handleRunCycles() {
         uint32_t gpio2 = GPIO.in;
         if (gpio2 & oiMask) {
             uint8_t val = decodeBus(gpio2);
-            oiHistory[oiCount & 0xFF] = val;
+            oiHistory[oiCount & 0xFF] = val; oiTimes[oiCount & 0xFF] = actualCycles;
             oiCount++;
             lastOutputVal = val;
             outputCaptured = true;
@@ -1745,7 +1758,7 @@ static void handleSerialCommand(const String& line) {
             uint32_t gpio1 = GPIO.in;
             if (gpio1 & oiMask) {
                 uint8_t val = decodeBus(gpio1);
-                oiHistory[oiCount & 0xFF] = val;
+                oiHistory[oiCount & 0xFF] = val; oiTimes[oiCount & 0xFF] = actualCycles;
                 oiCount++;
                 lastOutputVal = val;
                 outputCaptured = true;
@@ -1759,7 +1772,7 @@ static void handleSerialCommand(const String& line) {
             uint32_t gpio2 = GPIO.in;
             if (gpio2 & oiMask) {
                 uint8_t val = decodeBus(gpio2);
-                oiHistory[oiCount & 0xFF] = val;
+                oiHistory[oiCount & 0xFF] = val; oiTimes[oiCount & 0xFF] = actualCycles;
                 oiCount++;
                 lastOutputVal = val;
                 outputCaptured = true;
@@ -1838,7 +1851,7 @@ static void handleSerialCommand(const String& line) {
             uint32_t gpio1 = GPIO.in;
             if (gpio1 & oiMask) {
                 uint8_t val = decodeBus(gpio1);
-                oiHistory[oiCount & 0xFF] = val;
+                oiHistory[oiCount & 0xFF] = val; oiTimes[oiCount & 0xFF] = actualCycles;
                 oiCount++;
                 lastOutputVal = val;
                 outputCaptured = true;
@@ -1850,7 +1863,7 @@ static void handleSerialCommand(const String& line) {
             uint32_t gpio2 = GPIO.in;
             if (gpio2 & oiMask) {
                 uint8_t val = decodeBus(gpio2);
-                oiHistory[oiCount & 0xFF] = val;
+                oiHistory[oiCount & 0xFF] = val; oiTimes[oiCount & 0xFF] = actualCycles;
                 oiCount++;
                 lastOutputVal = val;
                 outputCaptured = true;
@@ -1868,11 +1881,19 @@ static void handleSerialCommand(const String& line) {
         // Send the NEWEST 32 events in chronological order. We keep the
         // last 256 in the ring buffer; the tail (where the program's
         // real output emissions live) is what we want to report.
+        // Also emit per-event timestamps (MK1 cycle count at capture
+        // time) so callers can verify e.g. ms-delay accuracy by taking
+        // cycle-count deltas between successive out() events.
         uint32_t stored = oiHistStored();
         uint32_t start = stored > 32 ? stored - 32 : 0;
         for (uint32_t i = start; i < stored; i++) {
             if (i > start) Serial.print(',');
             Serial.print(oiHistAt(i));
+        }
+        Serial.print("],\"ts\":[");
+        for (uint32_t i = start; i < stored; i++) {
+            if (i > start) Serial.print(',');
+            Serial.print(oiTimeAt(i));
         }
         Serial.printf("]%s}\n", aborted ? ",\"aborted\":true" : "");
     }
@@ -2125,7 +2146,7 @@ static void handleSerialCommand(const String& line) {
             uint32_t gpio1 = GPIO.in;
             if (gpio1 & oiMask) {
                 uint8_t val = decodeBus(gpio1);
-                oiHistory[oiCount & 0xFF] = val;
+                oiHistory[oiCount & 0xFF] = val; oiTimes[oiCount & 0xFF] = actualCycles;
                 oiCount++;
                 lastOutputVal = val;
                 outputCaptured = true;
@@ -2136,7 +2157,7 @@ static void handleSerialCommand(const String& line) {
             uint32_t gpio2 = GPIO.in;
             if (gpio2 & oiMask) {
                 uint8_t val = decodeBus(gpio2);
-                oiHistory[oiCount & 0xFF] = val;
+                oiHistory[oiCount & 0xFF] = val; oiTimes[oiCount & 0xFF] = actualCycles;
                 oiCount++;
                 lastOutputVal = val;
                 outputCaptured = true;
@@ -2159,6 +2180,15 @@ static void handleSerialCommand(const String& line) {
         for (uint32_t i = 0; i < show; i++) {
             if (i) Serial.print(',');
             Serial.print(oiHistAt(i));
+        }
+        // Per-event MK1-cycle timestamps (alongside `vals`). Delta between
+        // successive timestamps gives the cycle count between two out()s.
+        // Divide by the measured `khz` to convert to ms for delay
+        // verification.
+        Serial.print("],\"ts\":[");
+        for (uint32_t i = 0; i < show; i++) {
+            if (i) Serial.print(',');
+            Serial.print(oiTimeAt(i));
         }
         Serial.println("]}");
     }

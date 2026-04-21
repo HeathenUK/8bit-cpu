@@ -8142,8 +8142,10 @@ class MK1CodeGen:
                 return
 
             if name == 'delay':
-                # delay N ms using calibrated value from data[0].
-                # A = ms count. Calls __delay_Nms.
+                # delay N ms using calibrated value from page3[240].
+                # A = ms count. Calls __delay_Nms. Auto-inserts
+                # __delay_cal into _main — otherwise page3[240] is
+                # uninitialised and the delay runs an undefined duration.
                 if args:
                     c = self._const_eval(args[0])
                     if c is not None:
@@ -8153,6 +8155,7 @@ class MK1CodeGen:
                 if not hasattr(self, '_lcd_helpers'):
                     self._lcd_helpers = set()
                 self._lcd_helpers.add('__delay_Nms')
+                self._needs_delay_calibrate = True
                 self.emit('\tmov $a,$b')    # B = ms count
                 self.emit('\tjal __delay_Nms')
                 return
