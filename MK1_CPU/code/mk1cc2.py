@@ -7011,6 +7011,17 @@ class MK1CodeGen:
         # largest target helper's body.
         R_HELPER_SIZE = 70
 
+        # Run peephole first — the main compile pipeline runs a peephole
+        # pass after this transform returns, and any divergence between
+        # pre-peephole (what we'd snapshot) and post-peephole (what
+        # actually runs) yields off-by-N label addresses and different
+        # instruction sequences in the body. Verified 2026-04-22 via
+        # /tmp/verify_helper_bytes.py — without peephole here, the
+        # resident __lcd_chr and the overlay __lcd_chr body differ in
+        # both instruction form (`ldi $a,N; push $a` vs `push_imm N`)
+        # AND in all jal target addresses (off by 1).
+        self.code = peephole(self.code)
+
         # ── Step 1-2: locate target helpers in self.code ──
         # A helper body runs from its `__foo:` label until the next
         # top-level `_something:` label OR a `section` directive OR a
@@ -7082,12 +7093,6 @@ class MK1CodeGen:
                     f"helper '{name}' body is {size}B but R_helper is only "
                     f"{R_HELPER_SIZE}B — increase R_HELPER_SIZE or exclude it")
 
-        # Snapshot self.code as it was at the start of the transform —
-        # used later (step 7-8) to look up external label addresses
-        # (like `__i2c_sb`) that helper bodies reference. Must be
-        # captured BEFORE we mutate self.code with thunks / loader /
-        # manifest, because the loader contains forward refs to
-        # `__helper_manifest` that can't resolve until we emit it.
         _saved_pre_transform = list(self.code)
 
         # Compute R_HELPER_BASE so R_helper lives past the end of kernel
@@ -7242,14 +7247,12 @@ class MK1CodeGen:
         pages_main = _pa.assemble_asm('\n'.join(_saved_pre_transform))
         labels = pages_main['labels']
 
-        # For each body, assemble it in isolation AT R_HELPER_BASE so
-        # internal `.local:` labels resolve to the runtime code address
-        # the helper will actually execute from (not org 0, which would
-        # make internal jumps point to the kernel's reset vector).
-        # External jal/j targets (like `__i2c_sb`) are substituted with
-        # their absolute addresses from the main program's symbol table —
-        # py_asm doesn't support `NAME = N` constant definitions, hence
-        # the textual substitution.
+        # For each body, assemble in isolation at R_HELPER_BASE. Because
+        # self.code was peephole'd before the scan, body lines are
+        # already in their final form — no further optimisation needed.
+        # External jal/j targets get rewritten to absolute addresses
+        # from the main program's label table (substituted textually
+        # because py_asm doesn't support `NAME = N` constants).
         import re as _re
         body_bytes = []  # list of (name, bytes)
         for name, body, size in helper_bodies:
@@ -7269,8 +7272,6 @@ class MK1CodeGen:
                 raise Exception(
                     f"helper-overlay: could not assemble {name} body "
                     f"in isolation: {e}") from e
-            # Body bytes live at code[R_HELPER_BASE..R_HELPER_BASE+size-1]
-            # in the probe assembly.
             bb = bytes(pages_body['code'][R_HELPER_BASE:R_HELPER_BASE + size])
             body_bytes.append((name, bb))
 
