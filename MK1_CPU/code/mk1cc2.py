@@ -7003,13 +7003,87 @@ class MK1CodeGen:
         # is easy to reason about and test. Extending to more helpers is
         # just adding names (and verifying each is safe under the leaf
         # rule: `__lcd_chr` calls `__i2c_sb` which stays resident).
-        HELPER_OVERLAY_NAMES = {'__lcd_chr', '__lcd_init'}
+        # Helpers moved to page3 / R_helper. Each must be non-leaf (not
+        # called from another overlay helper). The leaf rule today:
+        #   resident (leaf): __i2c_sb (called by __lcd_chr, __i2c_st,
+        #     __i2c_rs), __i2c_st (called by __lcd_init), __i2c_sp,
+        #     __xsthunk_0 (peephole abstraction of nibble-send).
+        #   overlay-eligible: __lcd_chr, __lcd_init, __lcd_cmd,
+        #     __print_u8_dec, __print_u8_hex, __i2c_rb (only if not used
+        #     by runtime I2C-read callers still resident).
+        # Start conservative; widen when the 3-layer regression stays green.
+        HELPER_OVERLAY_NAMES = {'__lcd_chr', '__lcd_init', '__print_u8_dec'}
+
+        # Phase A is currently flat-mode only: R_helper is placed at the
+        # tail of the code page, which would collide with the user
+        # overlay region in overlay-mode programs. Detect overlay mode
+        # and skip the transform cleanly (default path still runs, with
+        # the target helpers resident or bundled per the existing
+        # placement engine). Covered by the §5 Phase A follow-up work.
+        if kernel_size is not None:
+            print(f'  [HELPER_OVERLAY] overlay-mode program — transform '
+                  f'not yet supported (see OVERLAY_REDESIGN.md §5 Phase A); '
+                  f'falling back to resident/bundled helpers',
+                  file=_sys.stderr)
+            return
+
+        # ── Leaf-rule enforcement (§4.3 of the design doc) ──
+        # If helper A (in the overlay set) calls helper B (also in the
+        # set), loading B at runtime overwrites A in R_helper mid-exec,
+        # and B's `ret` lands on garbage. Detected on 2026-04-22 after a
+        # printf-via-__print_u8_dec test hung: __print_u8_dec → __lcd_chr
+        # chained through R_helper.
+        # Resolution: drop the caller (A) from the overlay set and leave
+        # it resident. The callee (B) stays as an overlay, which
+        # preserves the bigger win — B is usually the shared leaf-ish
+        # helper called from many places.
+        def _body_jal_targets(name: str) -> set[str]:
+            """Scan the helper's body and return all external `jal X`
+            targets. Used to find overlay→overlay chains."""
+            found = set()
+            for i, ln in enumerate(self.code):
+                s = ln.strip()
+                if s == f'{name}:':
+                    j = i + 1
+                    while j < len(self.code):
+                        ns = self.code[j].strip()
+                        if (ns.endswith(':') and not ns.startswith('.')
+                                and ns.startswith('_')):
+                            break
+                        if ns.startswith('section ') or ns.startswith('org '):
+                            break
+                        if ns.startswith('jal '):
+                            tgt = ns.split()[1]
+                            if not tgt.startswith('.'):
+                                found.add(tgt)
+                        if ns == 'ret':
+                            break   # body ends
+                        j += 1
+                    return found
+            return found
+
+        changed = True
+        while changed:
+            changed = False
+            for caller in list(HELPER_OVERLAY_NAMES):
+                targets = _body_jal_targets(caller)
+                bad = targets & HELPER_OVERLAY_NAMES
+                if bad:
+                    print(f'  [HELPER_OVERLAY] leaf-rule demotion: '
+                          f'{caller} calls overlay helper(s) {bad} — '
+                          f'demoting {caller} to resident (nested loads '
+                          f'into R_helper would clobber mid-execution)',
+                          file=_sys.stderr)
+                    HELPER_OVERLAY_NAMES.discard(caller)
+                    changed = True
+                    break   # restart scan — the set shrank
         # R_HELPER_BASE is computed below from the actual kernel+loader
         # extent so it can't collide with code we're emitting. The copy
         # loop would otherwise overwrite its own trailing `j R_helper`
-        # instruction mid-run. R_HELPER_SIZE must accommodate the
-        # largest target helper's body.
-        R_HELPER_SIZE = 70
+        # instruction mid-run. R_HELPER_SIZE is set below based on the
+        # actually-found helpers' sizes — small programs that only use
+        # one helper don't pay for the worst-case reservation.
+        R_HELPER_SIZE = None   # computed after scan
 
         # Run peephole first — the main compile pipeline runs a peephole
         # pass after this transform returns, and any divergence between
@@ -7088,10 +7162,11 @@ class MK1CodeGen:
             body = list(self.code[start + 1:end])
             size = _measure(body)
             helper_bodies.append((name, body, size))
-            if size > R_HELPER_SIZE:
-                raise Exception(
-                    f"helper '{name}' body is {size}B but R_helper is only "
-                    f"{R_HELPER_SIZE}B — increase R_HELPER_SIZE or exclude it")
+
+        # Size R_helper to the largest actually-used helper. No pessimistic
+        # reservation — a program that only calls __lcd_chr (41B) doesn't
+        # need 70B of region just in case __lcd_init (48B) might show up.
+        R_HELPER_SIZE = max((s for _, _, s in helper_bodies), default=0)
 
         _saved_pre_transform = list(self.code)
 
@@ -7148,12 +7223,17 @@ class MK1CodeGen:
 
         R_HELPER_BASE = kernel_end + LOADER_SIZE_EST
         if R_HELPER_BASE + R_HELPER_SIZE > 250:
-            raise Exception(
-                f"helper-overlay: no room — kernel_end={kernel_end}, "
-                f"loader={LOADER_SIZE_EST}B, R_helper={R_HELPER_SIZE}B, "
-                f"would land R_helper at {R_HELPER_BASE}..{R_HELPER_BASE + R_HELPER_SIZE - 1} "
-                f"(max 250). Shrink kernel or helper, or fall back to "
-                f"resident helpers (unset MK1_HELPER_OVERLAY).")
+            # Transform can't fit — the program's kernel (with helpers
+            # still resident) is already near the limit, so moving them
+            # to an overlay + loader only adds bytes. Fall back silently:
+            # RESTORE self.code from the pre-transform snapshot so the
+            # thunks we inserted get undone, leaving the resident helpers.
+            print(f'  [HELPER_OVERLAY] no room for R_helper '
+                  f'(kernel={kernel_end}B + loader={LOADER_SIZE_EST}B + '
+                  f'helper={R_HELPER_SIZE}B = {R_HELPER_BASE + R_HELPER_SIZE}B > 250B) '
+                  f'— reverting to resident helpers', file=_sys.stderr)
+            self.code = _saved_pre_transform
+            return
 
         # ── Step 5: emit `_load_helper` into the static code section ──
         # Uses the same copy-and-tail-jump design as the hand-assembled

@@ -146,30 +146,46 @@ def test_byte_equivalence(name: str, src: str, helpers: list[str]):
         asm_ov = f.read()
     res_pages = assemble_asm(asm_res)
     ov_pages = assemble_asm(asm_ov)
+    # If the overlay build has no _load_helper, the transform was
+    # skipped (e.g. program fits resident, or leaf-rule demoted all
+    # candidates). Both builds are semantically the same compile —
+    # compare as resident-vs-resident with no rebasing.
+    transform_ran = '_load_helper' in ov_pages['labels']
     for h in helpers:
         rb, e1 = helper_bytes_resident(asm_res, h)
-        ob, e2 = helper_bytes_overlay(asm_ov, h)
         if rb is None:
             return False, f'{h} not found in resident: {e1}'
+        rb = trim_trailing_zeros(rb)
+        if not transform_ran:
+            ob, e2 = helper_bytes_resident(asm_ov, h)
+            if ob is None:
+                return False, f'{h} not found in overlay (fallback path): {e2}'
+            ob = trim_trailing_zeros(ob)
+            if rb != ob:
+                return False, (f'{h}: transform skipped but resident-form '
+                               f'bytes still differ between builds')
+            continue
+        ob, e2 = helper_bytes_overlay(asm_ov, h)
+        # If this specific helper wasn't overlayed (e.g. leaf-rule demoted
+        # it), it will still be resident in the overlay build.
+        if ob is None and e2 and 'missing ldi $c' in e2:
+            ob, e2 = helper_bytes_resident(asm_ov, h)
+            if ob is None:
+                return False, f'{h} not found in overlay: {e2}'
+            ob = trim_trailing_zeros(ob)
+            if rb != ob:
+                return False, (f'{h}: fell back to resident but bytes differ '
+                               f'between builds')
+            continue
         if ob is None:
             return False, f'{h} not found in overlay: {e2}'
-        rb = trim_trailing_zeros(rb)
         ob = trim_trailing_zeros(ob)
         res_base = res_pages['labels'].get(h, 0)
-        # Overlay's body runs at R_HELPER_BASE — which we can recover
-        # from the loader's `ldi $b, R_HELPER_BASE` or just read the
-        # final byte of the loader: `j R_HELPER_BASE` target.
-        # Simplest: the overlay body was assembled with org R_HELPER_BASE
-        # inside the transform, so internal jumps are absolute to
-        # R_HELPER_BASE. We find R_HELPER_BASE from _load_helper's tail-
-        # jump target.
+        # Recover R_HELPER_BASE from the loader's tail-jump target.
         lh = ov_pages['labels'].get('_load_helper')
         ov_base = 0
         if lh is not None:
             code = ov_pages['code']
-            # Scan forward from _load_helper for the last j imm (our
-            # `j R_HELPER_BASE` tail). Loader is ~28B, opcode 0x3D
-            # appears once at the end.
             for k in range(lh, min(lh + 40, 255)):
                 if code[k] == 0x3D:
                     ov_base = code[k + 1]
@@ -182,9 +198,7 @@ def test_byte_equivalence(name: str, src: str, helpers: list[str]):
             return False, (
                 f'{h} bytes differ after normalising internal jumps: '
                 f'{len(diffs)} bytes, resident_base={res_base} '
-                f'overlay_base={ov_base}. '
-                f'First: {diffs[:5]}. '
-                f'res={rb.hex()[:40]}... ov={ob.hex()[:40]}...')
+                f'overlay_base={ov_base}. First: {diffs[:5]}')
     return True, f'{len(helpers)} helper(s) semantically identical'
 
 
@@ -260,6 +274,21 @@ TESTS = [
         ['__lcd_chr', '__lcd_init'],
         [0xA0, 0xA1, 0xA2, 0xA3, 0xA4],
     ),
+    (
+        # No lcd_init so kernel stays small enough for flat mode
+        # (overlay-mode integration is Phase A follow-up). printf still
+        # exercises __print_u8_dec → __lcd_chr helper chain.
+        'printf via __print_u8_dec (flat)',
+        """void main() {
+            out(0xA0); i2c_init();
+            out(0xA1);
+            unsigned char n; n = 42;
+            printf(\"%d\", n);
+            out(0xA2); halt();
+        }""",
+        ['__lcd_chr', '__print_u8_dec'],
+        [0xA0, 0xA1, 0xA2],
+    ),
 ]
 
 
@@ -288,6 +317,21 @@ IO_TESTS = [
         }""",
         # Expected: [0xA0, 0xA1, TEMP, 0xA2]. We check TEMP is the
         # same byte in both builds.
+    ),
+    (
+        # This is the class the user caught on 2026-04-22 — printf
+        # appearing to work (markers fire) but LCD shows garbage.
+        # Layer 3 runs both builds and confirms the OI-observable
+        # behaviour is identical. If helper-overlay breaks the printf
+        # path, the OI stream lengths or values will diverge.
+        'printf via overlay (flat) — catches helper chain bugs',
+        """void main() {
+            out(0xA0); i2c_init();
+            out(0xA1);
+            unsigned char n; n = 42;
+            printf("%d", n);
+            out(0xA2); halt();
+        }""",
     ),
 ]
 
