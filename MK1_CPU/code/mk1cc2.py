@@ -6832,6 +6832,21 @@ class MK1CodeGen:
         self._overlay_region = OVERLAY_REGION
         self._overlay_shared_size = shared_helper_size
 
+        # Phase A hook: if MK1_HELPER_OVERLAY=1, run the helper-overlay
+        # transform on `self.code`. The transform moves a selected set of
+        # helpers (`__lcd_chr`, `__lcd_cmd`, `__print_u8_dec` to start) from
+        # kernel-resident to helper-overlay, which loads on demand into a
+        # reserved R_helper region. See MK1_CPU/OVERLAY_REDESIGN.md Phase A
+        # for the design; the hand-assembled proof-of-concept lives at
+        # MK1_CPU/programs/spikes/helper_overlay_v1.asm.
+        import os as _ho_os
+        if _ho_os.environ.get('MK1_HELPER_OVERLAY') == '1':
+            self._apply_helper_overlay_transform(
+                runtime_resident_helpers=runtime_resident_helpers,
+                kernel_size=KERNEL_SIZE,
+                overlay_region=OVERLAY_REGION,
+            )
+
         # Named size breakdown for --why-not-smaller. Captured here rather
         # than re-derived from `assembled` later because we have the
         # partition data in hand (runtime_resident_helpers, overlay_meta).
@@ -6945,6 +6960,45 @@ class MK1CodeGen:
                   f"{sum(f for _,_,_,f,_ in ee_overlays)}B [MK1 init preload]",
                   file=sys.stderr)
 
+
+    # ── Phase A: helper-overlay transform ──────────────────────────
+    #
+    # Given the post-overlay-partition asm in self.code, move designated
+    # helpers from kernel-resident to helper-overlay status. See
+    # MK1_CPU/OVERLAY_REDESIGN.md §4 for the architecture and §5 Phase A
+    # for migration strategy; MK1_CPU/programs/spikes/helper_overlay_v1.asm
+    # is the hand-assembled proof that the mechanism works.
+    #
+    # Target helpers (first iteration): __lcd_chr, __lcd_cmd, __print_u8_dec.
+    # The `__i2c_sb` inner-loop helper stays RESIDENT by the leaf rule
+    # (it's called from every overlay helper; nested overlay loading into
+    # R_helper would clobber the outer overlay mid-run).
+    #
+    # Transform steps:
+    #   1. Scan self.code and locate each target helper's body.
+    #   2. Measure body size; record (name, body_lines, size).
+    #   3. Strip body from its current location (kernel or bundled).
+    #   4. Emit a kernel thunk at the helper's label:
+    #          __lcd_chr:
+    #              ldi $c, HELPER_IDX
+    #              j _load_helper
+    #   5. Emit the shared `_load_helper` routine in kernel (~28B).
+    #   6. Reserve R_helper region at the tail of the code page, shrinking
+    #      the user overlay region. Update OVERLAY_REGION bookkeeping.
+    #   7. Emit a `__helper_manifest` table in page3 (2B per entry:
+    #      [offset, size]).
+    #   8. Emit the helper body bytes sequentially in page3 following the
+    #      manifest (raw `byte` directives, as in the spike — `section
+    #      page3_code` with org pads with HLT and clobbers page3).
+    #
+    # NOT YET IMPLEMENTED. Next session picks up here.
+    def _apply_helper_overlay_transform(self, runtime_resident_helpers,
+                                         kernel_size, overlay_region):
+        raise NotImplementedError(
+            "Phase A helper-overlay transform not yet implemented. "
+            "See MK1_CPU/OVERLAY_REDESIGN.md §5 Phase A for the plan. "
+            "Unset MK1_HELPER_OVERLAY to use the old bundling path."
+        )
 
     def _emit_user_call(self, name, args):
         """Emit code to call a user-defined function by name. Factored out of
