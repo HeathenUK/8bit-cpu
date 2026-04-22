@@ -1951,8 +1951,29 @@ class MK1CodeGen:
         import os as _ho_os
         self._helper_overlay_active = False
         if _ho_os.environ.get('MK1_HELPER_OVERLAY') == '1':
-            HELPER_OVERLAY_NAMES = {'__lcd_chr', '__print_u8_dec'}
+            # Phase B candidate set (OVERLAY_REDESIGN.md §4.3).
+            # Leaf-rule residents (excluded): __i2c_sb (called via `jal`
+            # from many overlay helpers — nested jal-load would clobber
+            # the caller), __i2c_sp (inlined), __i2c_st (init-only),
+            # __delay_Nms (small & hot).
+            # __lcd_send is INCLUDED: __lcd_chr/__lcd_cmd call it via
+            # tail-jump (`j __lcd_send`), which is safe — the caller's
+            # PC has moved into the kernel thunk before R_helper is
+            # clobbered. The leaf-rule demotion below scans for `jal`
+            # targets only, so tail-called helpers don't demote their
+            # callers.
+            HELPER_OVERLAY_NAMES = {
+                '__lcd_chr', '__lcd_cmd', '__lcd_send',
+                '__print_u8_dec', '__print_u8_hex',
+                '__i2c_rb', '__i2c_rs',
+            }
             active = HELPER_OVERLAY_NAMES & helpers
+            # __lcd_send is emitted implicitly when __lcd_chr or __lcd_cmd
+            # is present (it's the shared I2C-send tail), but never added
+            # to `_lcd_helpers`. Include it here so the split sees it.
+            if (('__lcd_chr' in helpers or '__lcd_cmd' in helpers)
+                    and '__lcd_send' in HELPER_OVERLAY_NAMES):
+                active.add('__lcd_send')
             if active:
                 self._helper_overlay_active = True
                 self._helper_overlay_candidates = active
@@ -3704,6 +3725,16 @@ class MK1CodeGen:
         # Helpers marked _conditionally_resident can be bundled into overlays
         # if they're never called from non-helper resident code (_main, loader).
         # This must run AFTER step 8 builds new_resident with overlay calls rewritten.
+        #
+        # Note (OVERLAY_REDESIGN.md §5 Phase D): bundling is slated for
+        # removal once helper-paging is universal. For Phase A/B we keep
+        # bundling as a fallback — helpers that the split can't extract
+        # (leaf-rule residents, small bodies) still benefit from the
+        # existing bundle-vs-resident knapsack. Disabling bundling
+        # wholesale regressed ~16 programs in a corpus sweep because
+        # those programs had only 1 extractable helper (or none that fit
+        # the cost-benefit guard) and the now-resident-everywhere helpers
+        # blew the kernel budget.
         cond_res = getattr(self, '_conditionally_resident', set())
         if cond_res:
             # Find all helper body ranges in new_resident
@@ -7134,10 +7165,45 @@ class MK1CodeGen:
                 sz += _ir.instr_byte_size(s, two_byte)
             return sz
 
+        # Inject explicit tail-jump for helpers that rely on fall-through.
+        # Emission sequences like `__lcd_cmd: push $a; ldi $a,0x00` fall
+        # through into `__lcd_send:` — fine when both live adjacent in
+        # the kernel, but catastrophic when __lcd_cmd gets extracted to
+        # R_helper (body runs, falls off the end into HLT padding).
+        # If a body has no `ret`/`j`/`jal` terminator AND the next
+        # top-level helper label is another overlay candidate, append
+        # `j <next>` so the extracted body continues correctly.
+        def _has_terminator(body):
+            for ln in reversed(body):
+                s = ln.strip()
+                if not s or s.startswith(';') or s.endswith(':'):
+                    continue
+                mn = s.split()[0]
+                return mn in ('ret', 'j', 'jal')
+            return False
+
+        # Walk top-level labels in helpers_list to find fall-through targets.
+        next_label = {}
+        prev = None
+        for i, ln in enumerate(helpers_list):
+            s = ln.strip()
+            if s.endswith(':') and not s.startswith('.') and s.startswith('__'):
+                if prev is not None:
+                    next_label[prev] = s[:-1]
+                prev = s[:-1]
+
         helper_infos = []
         for i, name in enumerate(sorted(found.keys())):
             s, e = found[name]
             body = list(helpers_list[s + 1:e])
+            if not _has_terminator(body):
+                nxt = next_label.get(name)
+                if nxt:
+                    body = body + [f'\tj {nxt}']
+                    print(f'  [HELPER_OVERLAY] {name}: injected `j {nxt}` '
+                          f'(body had no terminator — would fall through '
+                          f'into HLT padding after extraction)',
+                          file=_sys.stderr)
             size = _measure(body)
             helper_infos.append({'name': name, 'body': body, 'size': size,
                                  'idx': i, 'start': s, 'end': e})
@@ -7145,11 +7211,15 @@ class MK1CodeGen:
         R_HELPER_SIZE = max(h['size'] for h in helper_infos)
         R_HELPER_BASE = 250 - R_HELPER_SIZE
 
-        # Cost-benefit guard. Loader ≈ 28B and R_HELPER_SIZE comes out of
-        # the overlay region, so a single-helper split costs more than it
-        # saves (measured on lcd_temp_overlay: -32B net fit). Only split
-        # when ≥2 helpers are extractable — then the loader is amortized
-        # and the kernel shrinks enough to outweigh the reservation.
+        # Cost-benefit guard. Both budgets compete for the 250B code page:
+        #   kernel_save  = sum(body-thunk) - loader
+        #   overlay_cost = R_HELPER_SIZE
+        # kernel_save > overlay_cost means the program has MORE bytes for
+        # overlay region after the split — this is what programs failing
+        # baseline with wrapping overlays need. Looser guards caused
+        # regressions on programs whose overlays fit today via "safe
+        # wrapping" (largest loaded last): shrinking the overlay region
+        # by overlay_cost turned the wrap unsafe. Keep the strict form.
         THUNK_SIZE = 4        # ldi $c,N + j _load_helper
         LOADER_SIZE = 28      # _load_helper template above
         kernel_save = sum(h['size'] - THUNK_SIZE for h in helper_infos) - LOADER_SIZE
