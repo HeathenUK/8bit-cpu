@@ -43,20 +43,43 @@ import microcode as _mc
 # ── Build the canonical-mnemonic → opcode map ────────────────────────
 
 def _build_opcode_map():
-    """Returns (by_mnemonic, has_imm_map).
-    by_mnemonic[canonical_str] = opcode_byte
-    has_imm_map[opcode_byte] = True/False
+    """Returns (by_mnemonic, has_imm_by_mnemonic).
+
+    `by_mnemonic[canonical_str]` = opcode_byte.
+    `has_imm_by_mnemonic[canonical_str]` = True iff the instruction takes
+    an immediate (i.e. is ≥ 2 bytes total). Microcode is the authoritative
+    source for this — do not duplicate the list anywhere else in this file.
     """
     by_mn = {}
-    has_imm = {}
+    has_imm_mn = {}
     for opc, entry in _mc.ucode_template.items():
         mn, steps, imm = entry
         by_mn[mn] = opc
-        has_imm[opc] = imm
-    return by_mn, has_imm
+        has_imm_mn[mn] = imm
+    return by_mn, has_imm_mn
 
 
-CANON, HAS_IMM = _build_opcode_map()
+CANON, HAS_IMM_MN = _build_opcode_map()
+
+# Multi-immediate opcodes (more than 1 imm byte). Microcode's has_imm is
+# a single bool, so fusion opcodes are special-cased here. Keep this in
+# sync with mk1ir._MULTI_IMM.
+_MULTI_IMM = {'ddrb2_imm': 3, 'ddrb3_imm': 4}  # total instruction size incl. opcode
+
+# Opcodes that are 2 bytes in binary but which microcode's has_imm flag
+# gets wrong. Two reasons the flag lies:
+#   1. Flag-set conditionals (`jcf`, `jzf`, `je0`, `je1`) consume a filler
+#      byte via PE without reading it as data — the has_imm flag tracks
+#      data-use, not PC-advance.
+#   2. `stor $pc, [$sp]` (canonical form of `jal imm`) is post-hacked at
+#      microcode.py line 419 to read an imm byte as jump target, but the
+#      has_imm flag on its template entry was set from the generic stor
+#      for-loop (`second == 7 or first == 7` — both false for $pc/$sp)
+#      and the patch doesn't update it.
+# ESP32's isa.h correctly marks all of these as ARGS_IMM. Until we rework
+# microcode's third tuple element to mean "instruction size in bytes",
+# this set covers the gap.
+_IMM_SKIP_MN = {'jcf', 'jzf', 'je0', 'je1', 'stor $pc, [$sp]'}
 
 
 # ── mk1cc2 dialect → canonical mnemonic translator ───────────────────
@@ -185,7 +208,11 @@ def _translate_instr(s):
                 raise ValueError(f'bad {alu}: {s!r}')
             return (f'{alu} {m.group(1)}, {m.group(2)}', None)
 
-    # cmp $X → cmp $X (1B); cmp N → cmp imm (2B) — mk1cc2 writes both as `cmp ...`
+    # cmp $X → cmp $X (1B, clobbers nothing useful).
+    # cmp N  → cmpi (opcode 0xFD, 2B, doesn't clobber $b).
+    # ESP32 emits cmpi for the immediate form (see assembler.h line 738).
+    # The legacy `cmp imm` opcode (0x86, clobbers $b via EI) exists in
+    # microcode but is not emitted by either ESP32 or mk1cc2 in practice.
     if mn == 'cmp':
         m = re.match(r'\s*(\S+)\s*$', rest)
         if not m:
@@ -193,7 +220,7 @@ def _translate_instr(s):
         operand = m.group(1)
         if operand.startswith('$'):
             return (f'cmp {operand}', None)
-        return ('cmp imm', operand)
+        return ('cmpi', operand)
     # cmpi N → cmp imm (but there's a separate 0xFD opcode for cmpi)
     if mn == 'cmpi':
         return ('cmpi', rest)
@@ -220,10 +247,23 @@ def _translate_instr(s):
             src, dst = m.group(1), m.group(2)
             return (f'move {src}, {dst}', None if src != 'imm' else '0')
 
-    # ddrb_imm N, ddra_imm N, orb_imm N, ora_imm N, out_imm N
+    # ddrb_imm N, ddra_imm N, orb_imm N, ora_imm N, out_imm N — single imm
     for specimm in ('ddrb_imm', 'ddra_imm', 'orb_imm', 'ora_imm', 'out_imm'):
         if mn == specimm:
             return (specimm, rest)
+
+    # ddrb2_imm A,B and ddrb3_imm A,B,C — multi-imm. `rest` holds the
+    # comma-joined imms; the emit path splits them in pass 2.
+    if mn in ('ddrb2_imm', 'ddrb3_imm'):
+        return (mn, rest)
+
+    # ocall N — overlay call with immediate index
+    if mn == 'ocall':
+        return ('ocall', rest)
+
+    # je0 / je1 — flag-set PC moves with imm (skip-semantics).
+    if mn in ('je0', 'je1'):
+        return (mn, rest)
 
     # ldsp N, stsp N, ldsp_b N, ldp3 N, stp3 N
     for specmn in ('ldsp', 'stsp', 'ldsp_b', 'ldp3', 'stp3'):
@@ -277,24 +317,24 @@ def _eval_imm(expr, labels):
 
 # ── Pass 1: measure sizes + collect label addresses ──────────────────
 
-_TWO_BYTE_MNS = {'move imm, $a', 'move imm, $b', 'move imm, $c', 'move imm, $d',
-                 'move imm, $sp', 'move imm, $pc', 'push_imm', 'out_imm',
-                 'ddrb_imm', 'ddra_imm', 'orb_imm', 'ora_imm',
-                 'add imm, $a', 'add imm, $b', 'add imm, $c', 'add imm, $d',
-                 'sub imm, $a', 'sub imm, $b', 'sub imm, $c', 'sub imm, $d',
-                 'and imm, $a', 'and imm, $b', 'and imm, $c', 'and imm, $d',
-                 'or imm, $a', 'or imm, $b', 'or imm, $c', 'or imm, $d',
-                 'cmp imm', 'cmpi', 'tst',
-                 'ldsp', 'stsp', 'ldsp_b', 'ldp3', 'stp3',
-                 'stor $pc, [$sp]',   # jal imm
-                 'stor $a, [imm]', 'stor $b, [imm]', 'stor $c, [imm]',
-                 'stor $d, [imm]', 'stor $pc, [imm]', 'stor $sp, [imm]',
-                 'load $a, [imm]', 'load $b, [imm]', 'load $c, [imm]',
-                 'load $d, [imm]', 'load $pc, [imm]', 'load $sp, [imm]'}
-
-
 def _instr_size(canon_mn):
-    return 2 if canon_mn in _TWO_BYTE_MNS else 1
+    """Byte size of an instruction given its canonical mnemonic.
+
+    Sources of truth (authoritative in order):
+      1. `_MULTI_IMM` — explicit fusion opcodes that span >2 bytes.
+      2. `HAS_IMM_MN` — from microcode, for instructions that READ an imm.
+      3. `_IMM_SKIP_MN` — for instructions that consume a filler byte via
+         PE without reading it (flag-skip conditionals).
+
+    Any divergence from the ESP32 assembler is a bug in one of these three
+    tables, not a judgment call here."""
+    if canon_mn in _MULTI_IMM:
+        return _MULTI_IMM[canon_mn]
+    if HAS_IMM_MN.get(canon_mn, False):
+        return 2
+    if canon_mn in _IMM_SKIP_MN:
+        return 2
+    return 1
 
 
 def _parse_lines(asm_text):
@@ -392,15 +432,76 @@ def assemble_asm(asm_text):
     page3 = bytearray(256)
     eeprom = bytearray(4096)
 
-    # For data_code/stack_code: sequential offset in target page
-    data_offset = 0
-    stack_offset = 0
+    # Running write pointers per output BUFFER (not per section). The
+    # ESP32 assembler has a single `result.data_size` that's advanced by
+    # both `section data` (byte directives) and `section data_code`
+    # (instructions) — they share the buffer. Same for stack, page3,
+    # eeprom. py_asm mirrors that.
+    #
+    # sec_pc still exists separately and tracks the VIRTUAL code PC for
+    # label resolution (in code/page3_code/data_code/stack_code sections).
+    # sec_pc has no bearing on where bytes land in the output buffers
+    # for *_code sections.
+    buf_pos = {'code': 0, 'data': 0, 'stack': 0, 'page3': 0, 'eeprom': 0}
 
     sec_pc = {k: 0 for k in set(SECTIONS.values())}
     cur_section = 'code'
-    # Track whether data_code's current org was set (first org after the
-    # section switch defines the base; bytes are placed sequentially at
-    # data_offset which is independent of the virtual org).
+
+    def emit(section, byte):
+        """Emit one byte to the right buffer, advancing the matching
+        buf_pos and (for *_code sections) sec_pc so labels resolve to
+        the correct virtual address."""
+        if section == 'code':
+            if 0 <= sec_pc['code'] < 256:
+                code[sec_pc['code']] = byte
+            sec_pc['code'] += 1
+            buf_pos['code'] = sec_pc['code']   # kept in sync for diagnostics
+        elif section == 'page3_code':
+            # Bytes go ONLY to page3 buffer (at buf_pos['page3']), not to
+            # the code buffer. These are stage-2 kernel bytes that
+            # self-copy will blit into the code page at runtime. Label
+            # addresses advance in sec_pc['page3_code'] so they resolve
+            # to the code-page address they'll occupy after self-copy.
+            if 0 <= buf_pos['page3'] < 256:
+                page3[buf_pos['page3']] = byte
+            buf_pos['page3'] += 1
+            sec_pc['page3_code'] += 1
+        elif section == 'data_code':
+            # Bytes go into the data buffer sequentially (shared pointer
+            # with `section data`), but the virtual code PC advances so
+            # labels inside the overlay body resolve to the runtime code
+            # address they will be loaded at.
+            if 0 <= buf_pos['data'] < 256:
+                data[buf_pos['data']] = byte
+            buf_pos['data'] += 1
+            sec_pc['data_code'] += 1
+        elif section == 'stack_code':
+            if 0 <= buf_pos['stack'] < 256:
+                stack[buf_pos['stack']] = byte
+            buf_pos['stack'] += 1
+            sec_pc['stack_code'] += 1
+        elif section == 'data':
+            # Raw data: ESP32 advances data_size on every byte directive
+            # regardless of `org`. We match by writing at buf_pos['data'].
+            if 0 <= buf_pos['data'] < 256:
+                data[buf_pos['data']] = byte
+            buf_pos['data'] += 1
+            sec_pc['data'] = buf_pos['data']
+        elif section == 'page3':
+            if 0 <= buf_pos['page3'] < 256:
+                page3[buf_pos['page3']] = byte
+            buf_pos['page3'] += 1
+            sec_pc['page3'] = buf_pos['page3']
+        elif section == 'stack':
+            if 0 <= buf_pos['stack'] < 256:
+                stack[buf_pos['stack']] = byte
+            buf_pos['stack'] += 1
+            sec_pc['stack'] = buf_pos['stack']
+        elif section == 'eeprom':
+            if 0 <= buf_pos['eeprom'] < 4096:
+                eeprom[buf_pos['eeprom']] = byte
+            buf_pos['eeprom'] += 1
+            sec_pc['eeprom'] = buf_pos['eeprom']
 
     for sec_at_line, text in pass1_lines:
         cur_section = sec_at_line
@@ -415,76 +516,36 @@ def assemble_asm(asm_text):
         if text.startswith('byte '):
             expr = text.split(None, 1)[1]
             val = _eval_imm(expr, labels) & 0xFF
-            _emit_byte(cur_section, sec_pc[cur_section], val,
-                       code, data, stack, page3, eeprom,
-                       data_offset_ref=None, stack_offset_ref=None)
-            sec_pc[cur_section] += 1
+            emit(cur_section, val)
             continue
         canon, imm_expr = _translate_instr(text)
         opcode = CANON.get(canon)
         if opcode is None:
             raise ValueError(f'No opcode for canonical {canon!r} (from {text!r})')
-        addr = sec_pc[cur_section]
-        _emit_byte(cur_section, addr, opcode, code, data, stack, page3, eeprom,
-                   data_offset_ref=None, stack_offset_ref=None)
-        sec_pc[cur_section] += 1
-        if canon in _TWO_BYTE_MNS:
+        emit(cur_section, opcode)
+        # Emit immediate byte(s). For ddrb2_imm/ddrb3_imm the `rest` string
+        # is comma-separated; split and emit each. For all other 2-byte
+        # instructions, a single imm follows.
+        if canon in _MULTI_IMM:
+            if imm_expr is None:
+                raise ValueError(f'Expected imms for {canon!r}: {text!r}')
+            parts = [p.strip() for p in imm_expr.split(',') if p.strip()]
+            expected = _MULTI_IMM[canon] - 1  # minus the opcode byte
+            if len(parts) != expected:
+                raise ValueError(
+                    f'{canon} expects {expected} imms, got {len(parts)}: {text!r}')
+            for p in parts:
+                emit(cur_section, _eval_imm(p, labels) & 0xFF)
+        elif HAS_IMM_MN.get(canon, False) or canon in _IMM_SKIP_MN:
+            # _IMM_SKIP_MN emits a target byte too (ESP32 ARGS_IMM) — the
+            # hardware consumes it via PE even though microcode's has_imm
+            # flag is False.
             if imm_expr is None:
                 raise ValueError(f'Expected immediate for {canon!r}: {text!r}')
-            imm_val = _eval_imm(imm_expr, labels) & 0xFF
-            _emit_byte(cur_section, sec_pc[cur_section], imm_val,
-                       code, data, stack, page3, eeprom,
-                       data_offset_ref=None, stack_offset_ref=None)
-            sec_pc[cur_section] += 1
+            emit(cur_section, _eval_imm(imm_expr, labels) & 0xFF)
 
     return {'code': code, 'data': data, 'stack': stack, 'page3': page3,
             'eeprom': eeprom, 'labels': labels}
-
-
-def _emit_byte(section, addr, val, code, data, stack, page3, eeprom,
-               data_offset_ref, stack_offset_ref):
-    """Place one byte into the appropriate buffer given the current section
-    and the current section's address counter."""
-    if section == 'code':
-        if 0 <= addr < 256:
-            code[addr] = val
-    elif section == 'page3_code':
-        # Dual-residence: bytes go to BOTH the code page AND page3 at
-        # the same offset. Stage-1 init contains bytes that live in the
-        # code page initially; self-copy then reads them from page3 (where
-        # they were also written) and copies back to code addresses 0..N.
-        if 0 <= addr < 256:
-            code[addr] = val
-            page3[addr] = val
-    elif section == 'data_code':
-        # Overlay body bytes — stored in DATA page sequentially; the
-        # `org N` on the section just determines the runtime code address
-        # for label resolution. We use the label-relative offset (addr
-        # minus whatever the first org was) to find the data-page slot.
-        # Simpler: each data_code section starts at the current data_alloc;
-        # compute relative offset from first instruction of this body.
-        # For now, place bytes sequentially starting at data[0] — the
-        # manifest must have been generated with consistent offsets.
-        # (mk1cc2 does this: manifest offsets are computed after overlay
-        # layout, and the first overlay body goes at data[0].)
-        # addr here is the virtual code-page address; we need data offset.
-        # Hack: assume data_code bodies start at data[0] and use address
-        # relative to first seen addr.
-        pass   # handled by simple-append logic below
-    elif section == 'stack_code':
-        pass   # same as data_code but for stack page
-    elif section == 'data':
-        if 0 <= addr < 256:
-            data[addr] = val
-    elif section == 'page3':
-        if 0 <= addr < 256:
-            page3[addr] = val
-    elif section == 'stack':
-        if 0 <= addr < 256:
-            stack[addr] = val
-    elif section == 'eeprom':
-        if 0 <= addr < 4096:
-            eeprom[addr] = val
 
 
 if __name__ == '__main__':

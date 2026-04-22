@@ -865,13 +865,159 @@ class MK1CodeGen:
                     first_lcd = i
                     break
 
-            if last_i2c < 0 or first_lcd >= len(stmts) or last_i2c >= first_lcd:
-                # No clear I2C→LCD transition
+            # Phase 7 "ambitious" split selection:
+            #   1. Prefer I2C→LCD boundary (domain transition).
+            #   2. If none, fall back to size-driven split at the statement
+            #      midpoint when the function has enough LCD/compute work
+            #      to plausibly exceed a single overlay slot. This handles
+            #      display functions like show_temp that do compute + many
+            #      lcd_char calls in a single domain but are still too big.
+            split = None
+            if last_i2c >= 0 and first_lcd < len(stmts) and last_i2c < first_lcd:
+                split = last_i2c + 1
+            else:
+                # Size-driven fallback. Count LCD/tone calls as the dominant
+                # cost driver (each pulls ~3-4B into the overlay plus the
+                # bundled helper body). If ≥ 6 such calls, the function is
+                # very likely to exceed the overlay region.
+                def _count_lcd_calls(ss):
+                    n = 0
+                    for s in ss:
+                        if not isinstance(s, tuple):
+                            continue
+                        if s[0] == 'expr_stmt':
+                            e = s[1]
+                            if (isinstance(e, tuple) and e[0] == 'call'
+                                    and e[1] in self.LCD_CALLS):
+                                n += 1
+                        elif s[0] in ('if', 'while', 'for', 'do_while'):
+                            for sub in s[1:]:
+                                if isinstance(sub, tuple) and sub[0] == 'block':
+                                    n += _count_lcd_calls(sub[1])
+                    return n
+                lcd_call_count = _count_lcd_calls(stmts)
+                # Threshold of 4+ LCD calls triggers size-driven split.
+                # Each LCD call costs ~3-6B of overlay body + pulls in
+                # bundled helpers (~10-30B each). 4 lcd_char calls with
+                # surrounding setup typically land a single-domain
+                # function in the 40-70B range — over a typical overlay
+                # region of 30-50B. Splitting in half + promoting shared
+                # __lcd_chr (which Phase 9 knapsack does once it sees the
+                # helper in B≥2 overlays) recovers fit.
+                # Estimate unsplit function size; skip split when it would
+                # likely fit as a single overlay. Splitting a function that
+                # already fits just duplicates prologue/epilogue and adds
+                # xfer-global overhead for no gain.
+                def _whole_size_est(ss):
+                    total = 0
+                    for s in ss:
+                        if not isinstance(s, tuple):
+                            continue
+                        t = s[0]
+                        if t == 'local':
+                            total += 3 if s[2] else 0
+                        elif t == 'expr_stmt':
+                            e = s[1]
+                            if isinstance(e, tuple) and e[0] == 'call':
+                                total += 3 + 2 * len(e[2] or [])
+                            else:
+                                total += 3
+                        elif t in ('if', 'while', 'do_while'):
+                            total += 5
+                            for sub in s[1:]:
+                                if isinstance(sub, tuple) and sub[0] == 'block':
+                                    total += _whole_size_est(sub[1])
+                        elif t == 'for':
+                            total += 8
+                            for sub in s[1:]:
+                                if isinstance(sub, tuple) and sub[0] == 'block':
+                                    total += _whole_size_est(sub[1])
+                        elif t == 'return':
+                            total += 3
+                        else:
+                            total += 3
+                    return total
+                # Split trigger: either the function is LCD-heavy (≥ 6
+                # calls — almost certainly exceeds any overlay region) or
+                # the estimated body size is >45B and has enough LCD work
+                # to benefit from Phase 7 sharing the __lcd_chr helper
+                # across the two halves.
+                _heavy = (lcd_call_count >= 6 and len(stmts) >= 8)
+                _mid = (lcd_call_count >= 4 and len(stmts) >= 6 and
+                        _whole_size_est(stmts) > 45)
+                if _heavy or _mid:
+                    # Estimate per-statement overlay cost and pick the
+                    # split that minimizes max(p1_cost, p2_cost). LCD/I2C
+                    # calls each pull in bundled helper bodies, but those
+                    # bundles are SHARED across the two halves (each half
+                    # becomes a separate overlay so the knapsack sees the
+                    # helper in B≥2 overlays and promotes it resident).
+                    # Under that assumption, helpers contribute zero to
+                    # either piece's size; only the call sites and
+                    # non-helper code contribute.
+                    def _stmt_size_est(s):
+                        if not isinstance(s, tuple):
+                            return 0
+                        t = s[0]
+                        if t == 'local':
+                            return 3 if s[2] else 0
+                        if t == 'expr_stmt':
+                            e = s[1]
+                            if isinstance(e, tuple) and e[0] == 'call':
+                                # Each arg: 2-3B setup; call itself: 2B.
+                                return 3 + 2 * len(e[2] or [])
+                            return 3  # assign, etc.
+                        if t == 'return':
+                            return 3
+                        if t == 'if':
+                            # cond + branch + body
+                            size = 5
+                            for sub in s[1:]:
+                                if isinstance(sub, tuple) and sub[0] == 'block':
+                                    size += sum(_stmt_size_est(x) for x in sub[1])
+                            return size
+                        if t in ('while', 'do_while'):
+                            size = 6
+                            for sub in s[1:]:
+                                if isinstance(sub, tuple) and sub[0] == 'block':
+                                    size += sum(_stmt_size_est(x) for x in sub[1])
+                            return size
+                        if t == 'for':
+                            size = 8
+                            for sub in s[1:]:
+                                if isinstance(sub, tuple) and sub[0] == 'block':
+                                    size += sum(_stmt_size_est(x) for x in sub[1])
+                            return size
+                        return 3
+                    stmt_costs = [_stmt_size_est(s) for s in stmts]
+                    best_split = None
+                    best_score = (1 << 30, 1 << 30)  # (max_piece, live_count)
+                    for cand in range(1, len(stmts)):
+                        p1_cost = sum(stmt_costs[:cand])
+                        p2_cost = sum(stmt_costs[cand:])
+                        # Both pieces need ≥ 1 LCD call (else trivial)
+                        p1_lcd = _count_lcd_calls(stmts[:cand])
+                        p2_lcd = _count_lcd_calls(stmts[cand:])
+                        if p1_lcd == 0 or p2_lcd == 0:
+                            continue
+                        max_piece = max(p1_cost, p2_cost)
+                        a_ass, a_used = set(), set()
+                        for s in stmts[:cand]:
+                            self._find_vars_in_stmt(s, a_ass, a_used)
+                        b_ass, b_used = set(), set()
+                        for s in stmts[cand:]:
+                            self._find_vars_in_stmt(s, b_ass, b_used)
+                        lv = (a_ass & b_used) | (set(params) & b_used)
+                        score = (max_piece, len(lv))
+                        if score < best_score:
+                            best_score = score
+                            best_split = cand
+                    if best_split is not None:
+                        split = best_split
+
+            if split is None:
                 new_functions.append((name, params, body, ret_type))
                 continue
-
-            # Split point: after last_i2c, before first_lcd
-            split = last_i2c + 1
 
             # Find live variables at the split point
             before_assigned = set()
@@ -884,12 +1030,21 @@ class MK1CodeGen:
             for s in stmts[split:]:
                 self._find_vars_in_stmt(s, after_assigned, after_used)
 
-            live_vars = list(before_assigned & after_used - set(params))
+            # Live vars across the split = everything phase2 reads that was
+            # either assigned in phase1 OR is a parameter still needed. In
+            # the old design, params were subtracted (assumed always in
+            # scope); with user-function splits (not just main), phase2 is a
+            # separate function, so any param referenced in phase2 must also
+            # be a parameter of phase2.
+            params_used_in_p2 = set(params) & after_used
+            locals_crossing = (before_assigned & after_used) - set(params)
+            live_vars = list(params_used_in_p2) + list(locals_crossing)
 
             if len(live_vars) == 0:
-                # No live vars → phase1 is void, phase2 takes no extra params
-                new_functions.append((name, params, body, ret_type))
-                continue
+                # Nothing phase2 reads — phase1 can run as a pure side-effect
+                # function and phase2 takes no extra params. Still worth
+                # splitting if the function is large.
+                pass
 
             # Only split if the function has enough statements to benefit.
             # Small functions (< 8 statements) are better left unsplit — the
@@ -1069,61 +1224,74 @@ class MK1CodeGen:
                 self.func_bodies[p1_name] = ([], p1_body)
                 continue
 
-            if len(live_vars) <= 2:
-                p1_name = f'{name}_p1'
-                p2_name = f'{name}_p2'
-                p1_stmts = list(stmts[:split])
+            # General N-live-var split using xfer globals. For 0 live vars,
+            # phase1 returns void, phase2 takes no extra params. For 1 live
+            # var we pass it via the return value (cheapest: no global). For
+            # 2+ vars we allocate one xfer global per var and the last var
+            # rides in the return value.
+            p1_name = f'{name}_p1'
+            p2_name = f'{name}_p2'
+            p1_stmts = list(stmts[:split])
 
-                if len(live_vars) == 1:
-                    # Phase 1 returns the live var
-                    p1_stmts.append(('return', ('var', live_vars[0])))
-                    p1_body = ('block', p1_stmts)
-                    new_functions.append((p1_name, list(params), p1_body, 'u8'))
-                    # Phase 2 takes it as parameter
-                    p2_stmts = list(stmts[split:])
-                    p2_body = ('block', p2_stmts)
-                    new_functions.append((p2_name, [live_vars[0]], p2_body, ret_type))
-
-                elif len(live_vars) == 2:
-                    # Phase 1: return second var, output first via out_imm
-                    # Use a data page global as the transfer slot
-                    xfer_name = f'__xfer_{name}'
-                    self.globals[xfer_name] = self.data_alloc
-                    self.data_alloc += 1
-                    # Store first var to global, return second
+            if len(live_vars) == 0:
+                p1_body = ('block', p1_stmts)
+                new_functions.append((p1_name, list(params), p1_body, 'void'))
+                p2_stmts = list(stmts[split:])
+                p2_body = ('block', p2_stmts)
+                new_functions.append((p2_name, [], p2_body, ret_type))
+                p2_actual_params = []
+            elif len(live_vars) == 1:
+                # Phase 1 returns the single live var
+                p1_stmts.append(('return', ('var', live_vars[0])))
+                p1_body = ('block', p1_stmts)
+                new_functions.append((p1_name, list(params), p1_body, 'u8'))
+                # Phase 2 takes it as parameter
+                p2_stmts = list(stmts[split:])
+                p2_body = ('block', p2_stmts)
+                new_functions.append((p2_name, [live_vars[0]], p2_body, ret_type))
+                p2_actual_params = [live_vars[0]]
+            else:
+                # 2+ live vars: first N-1 go through xfer globals, last is
+                # returned from phase1 and taken as phase2's single param.
+                xfer_globals = {}
+                for lv in live_vars[:-1]:
+                    xfer_name = f'__xfer_{name}_{lv}'
+                    if xfer_name not in self.globals and xfer_name not in self.page3_globals:
+                        if self.data_alloc < 256:
+                            self.globals[xfer_name] = self.data_alloc
+                            self.data_alloc += 1
+                        else:
+                            self.page3_globals[xfer_name] = self.page3_alloc
+                            self.page3_alloc += 1
+                    xfer_globals[lv] = xfer_name
+                # Phase 1: store first N-1 vars to their globals, return last var
+                for lv in live_vars[:-1]:
                     p1_stmts.append(('expr_stmt',
                         ('assign', '=',
-                         ('index', ('var', xfer_name), ('num', 0)),
-                         ('var', live_vars[0]))))
-                    p1_stmts.append(('return', ('var', live_vars[1])))
-                    p1_body = ('block', p1_stmts)
-                    new_functions.append((p1_name, list(params), p1_body, 'u8'))
-                    # Phase 2 takes second var as param, reads first from global
-                    p2_stmts = [
-                        ('local', live_vars[0],
-                         ('index', ('var', xfer_name), ('num', 0)), 'u8')
-                    ] + list(stmts[split:])
-                    p2_body = ('block', p2_stmts)
-                    new_functions.append((p2_name, [live_vars[1]], p2_body, ret_type))
+                         ('index', ('var', xfer_globals[lv]), ('num', 0)),
+                         ('var', lv))))
+                p1_stmts.append(('return', ('var', live_vars[-1])))
+                p1_body = ('block', p1_stmts)
+                new_functions.append((p1_name, list(params), p1_body, 'u8'))
+                # Phase 2: reload first N-1 vars from globals, then run tail.
+                p2_stmts = []
+                for lv in live_vars[:-1]:
+                    p2_stmts.append(('local', lv,
+                        ('index', ('var', xfer_globals[lv]), ('num', 0)), 'u8'))
+                p2_stmts.extend(stmts[split:])
+                p2_body = ('block', p2_stmts)
+                new_functions.append((p2_name, [live_vars[-1]], p2_body, ret_type))
+                p2_actual_params = [live_vars[-1]]
 
-                main_rewrites[name] = (p1_name, p2_name, len(live_vars))
-
-                # Determine phase2 params
-                p2_actual_params = [live_vars[0]] if len(live_vars) == 1 else [live_vars[1]]
-                # Update func_params for the new functions
-                self.func_params[p1_name] = len(params)
-                self.func_params[p2_name] = len(p2_actual_params)
-                self.func_bodies[p1_name] = (list(params), p1_body)
-                self.func_bodies[p2_name] = (p2_actual_params, p2_body)
-            else:
-                import sys
-                print(f"  Phase 7: {name} has {len(live_vars)} live vars "
-                      f"at split — too many, keeping unsplit", file=sys.stderr)
-                new_functions.append((name, params, body, ret_type))
-                continue
+            main_rewrites[name] = (p1_name, p2_name, len(live_vars))
+            self.func_params[p1_name] = len(params)
+            self.func_params[p2_name] = len(p2_actual_params)
+            self.func_bodies[p1_name] = (list(params), p1_body)
+            self.func_bodies[p2_name] = (p2_actual_params, p2_body)
 
         # Rewrite main's calls to split functions
         if main_rewrites:
+            _split_tmp_ctr = [0]
             for i, (name, params, body, ret_type) in enumerate(new_functions):
                 if name == 'main' and body[0] == 'block':
                     new_stmts = []
@@ -1134,17 +1302,21 @@ class MK1CodeGen:
                             if call_name in main_rewrites:
                                 p1, p2, n_live = main_rewrites[call_name]
                                 call_args = s[1][2]
-                                # Phase 1: result = p1(args)
-                                # Phase 2: p2(result) or p2(result, peek(254))
-                                if n_live == 1:
-                                    # temp = p1(args); p2(temp)
-                                    new_stmts.append(('local', '__split_tmp', ('call', p1, call_args), 'u8'))
-                                    new_stmts.append(('expr_stmt', ('call', p2, [('var', '__split_tmp')])))
-                                elif n_live == 2:
-                                    # tmp2 = p1(args); p2(tmp2)
-                                    # (p1 stores first var to data[254], returns second)
-                                    new_stmts.append(('local', '__split_tmp', ('call', p1, call_args), 'u8'))
-                                    new_stmts.append(('expr_stmt', ('call', p2, [('var', '__split_tmp')])))
+                                if n_live == 0:
+                                    # p1(args); p2()
+                                    new_stmts.append(('expr_stmt', ('call', p1, call_args)))
+                                    new_stmts.append(('expr_stmt', ('call', p2, [])))
+                                else:
+                                    # tmp = p1(args); p2(tmp)
+                                    # (for n_live ≥ 2, p1 stored the first
+                                    # N-1 vars via xfer globals — p2 reloads
+                                    # them internally.)
+                                    tmp_name = f'__split_tmp_{_split_tmp_ctr[0]}'
+                                    _split_tmp_ctr[0] += 1
+                                    new_stmts.append(('local', tmp_name,
+                                                       ('call', p1, call_args), 'u8'))
+                                    new_stmts.append(('expr_stmt',
+                                                       ('call', p2, [('var', tmp_name)])))
                                 rewritten = True
                         if not rewritten:
                             new_stmts.append(s)
@@ -2743,9 +2915,15 @@ class MK1CodeGen:
         INIT_ONLY_NAMES = {
             '__lcd_init',
             '__i2c_st', '__i2c_sp',  # START/STOP inlined in __lcd_chr at runtime
+            # __delay_cal used to run as a runtime overlay (freed ~57B of
+            # stage-1 space). But __delay_cal is 58B and often wraps past
+            # code[255], overwriting `_overlay_load` before subsequent
+            # runtime overlay calls — silent corruption. Since it's always
+            # called once at the start of _main, moving it back into stage-1
+            # init (so its wrap, if any, is wiped by self-copy) trades +57B
+            # stage-1 for wrap-safety.
+            '__delay_cal',
         }
-        # __delay_cal is NOT init-only: it becomes an overlay in the overlay system,
-        # freeing ~57B of init space. Called at _main start via overlay dispatch.
         # __eeprom_rd is init-only when not used by runtime eeprom array access
         if not getattr(self, '_needs_runtime_eeprom_rd', False):
             INIT_ONLY_NAMES.add('__eeprom_rd')
@@ -2859,8 +3037,8 @@ class MK1CodeGen:
                 'push $a ;!keep', 'pop $a ;!keep',
             }
             INIT_PREFIXES_SET = ('ddrb_imm', 'exrw 2', 'exw ', 'ldi $d,', 'ddra_imm', 'push_imm')
-            INIT_JAL_TARGETS = {'__lcd_init', '__tone_setup'}
-            # __delay_cal excluded: runs as overlay at _main start (not init)
+            INIT_JAL_TARGETS = {'__lcd_init', '__tone_setup', '__delay_cal'}
+            # __delay_cal included: wrap-safety (see INIT_ONLY_NAMES comment).
             # Note: __i2c_stream, __i2c_st, __i2c_sp are NOT init-only targets —
             # they can appear in runtime code too. Only delay_cal/lcd_init/tone_setup
             # are definitively init-only calls that extend the init phase.
@@ -4148,7 +4326,8 @@ class MK1CodeGen:
             # Helpers that are safe to call during init (don't end init phase)
             INIT_COMPAT_HELPERS = {'__i2c_stream', '__i2c_st', '__i2c_sp',
                                    '__i2c_rs',
-                                   '__lcd_init', '__tone_setup'}
+                                   '__lcd_init', '__tone_setup',
+                                   '__delay_cal'}
 
             # Pre-scan: find overlay_load call sequences
             overlay_call_lines = set()
@@ -4668,6 +4847,7 @@ class MK1CodeGen:
                 seqs = {}   # (mode, key_tuple) → [(uid, stream_start, gidx, param_val), …]
                 for uid, stream in units.items():
                     texts = [t for (_g, t) in stream]
+                    gidxs = [g for (g, _t) in stream]
                     for i in range(len(texts)):
                         for L in range(MIN_LEN, min(MAX_LEN, len(texts) - i) + 1):
                             # Tail-merge candidate: the sequence's last instruction
@@ -4682,6 +4862,21 @@ class MK1CodeGen:
                             if ok and not _t2_extractable(last, allow_ret_terminal=True):
                                 ok = False
                             if not ok:
+                                continue
+                            # Contiguity guard: reject sequences whose instructions
+                            # are separated by labels (or comments/directives) in
+                            # the original source. The stream strips labels, so a
+                            # sequence spanning a loop-start label would extract
+                            # the loop body into a thunk but leave the label + its
+                            # remaining code behind — breaking the loop (the jnz
+                            # targets the label, but its body is now gone, just
+                            # the jnz remains → infinite loop).
+                            contiguous = True
+                            for k in range(1, L):
+                                if gidxs[i + k] != gidxs[i + k - 1] + 1:
+                                    contiguous = False
+                                    break
+                            if not contiguous:
                                 continue
                             key = tuple(texts[i:i + L])
                             if not _t2_balanced(key):
@@ -5526,58 +5721,138 @@ class MK1CodeGen:
                         _call_order.append(int(_s.split(',')[1]))
                     except ValueError:
                         pass
+            # ── Wrap-safety analysis ──
+            # A wrapping overlay writes its tail bytes into code[0..N-1]
+            # where N = overlay_size - region_size. That region of code is
+            # ALSO where the kernel lives post-self-copy: code[0..1] is
+            # `j _main`, code[2..~loader_size+1] is `_overlay_load`, and
+            # subsequent bytes are resident helpers. A wrap is only safe if:
+            #   (a) every byte overwritten by the wrap belongs to code that
+            #       is never re-executed after the wrapping overlay, AND
+            #   (b) the overlay itself doesn't fall through code[255]→code[0]
+            #       into an address range containing wrap-polluted bytes
+            #       from a DIFFERENT earlier overlay.
+            # Condition (b) forbids any PREVIOUS overlay wrap (since it
+            # would have clobbered what's now under PC if this overlay
+            # falls off the end). Condition (a) is hard to prove in full
+            # generality, but we approximate it with: the wrapping overlay
+            # is the LAST overlay loaded AND called EXACTLY ONCE, AND the
+            # wrap span N doesn't extend into `_main`'s body (which
+            # continues executing after the overlay returns).
             _unsafe_wrap = False
-            if _wrapping_indices and _call_order:
-                _last_call = _call_order[-1]
+            _main_start_in_code = (
+                # `j _main` (2B) + `_overlay_load` body + all
+                # runtime_resident_helpers are what the self-copied page3
+                # writes to code[0..KERNEL_SIZE_est-main_size-1]. _main
+                # starts at code[KERNEL_SIZE_est - main_size].
+                (_kernel_chk - main_size) if main_size > 0 else _kernel_chk
+            )
+            if _wrapping_indices:
+                # Partition wrapping overlays by whether they're called from
+                # _main (runtime) or only from init. An overlay that only
+                # runs during stage-1 init writes its wrap bytes BEFORE
+                # self-copy runs — self-copy then overwrites code[0..199]
+                # with the page3 kernel image, wiping any wrap damage. So
+                # init-only overlay wraps are inherently safe.
+                _runtime_wraps = _wrapping_indices & set(_call_order)  # _main-called
+                _init_wraps = _wrapping_indices - set(_call_order)
+                # Any overlay that wraps INTO _main's body is always unsafe
+                # (the caller would return to overwritten code), even for
+                # init-called overlays the wrap would destroy the init flow.
                 for _wi in _wrapping_indices:
-                    # A wrap is safe only if this overlay is called exactly
-                    # once (the last call). Multiple calls = later load
-                    # re-copies and the wrap may clobber in between.
-                    if _wi != _last_call or _call_order.count(_wi) > 1:
+                    _, _, _sz = overlay_asm_blocks[_wi]
+                    _wrap_span = _sz - _ov_avail
+                    if _wrap_span > _main_start_in_code:
                         _unsafe_wrap = True
                         break
-            elif len(_wrapping_indices) > 1:
-                _unsafe_wrap = True
-            if _unsafe_wrap and _placement_retries < 5 and bundleable_helpers:
-                # Find the helper that, if promoted, best reduces the number
-                # of UNSAFELY wrapping overlays. Reject promotions that would
-                # make the overlay region too small to hold any current overlay
-                # (net loss — promoting eats region faster than it shrinks ovs).
+                # For runtime-called overlays, apply the last-call-once
+                # heuristic: wrap is safe only if the overlay is the final
+                # runtime overlay load (no subsequent _overlay_load call
+                # reads overwritten loader bytes) and called exactly once.
+                if not _unsafe_wrap and _call_order and _runtime_wraps:
+                    _last_call = _call_order[-1]
+                    for _wi in _runtime_wraps:
+                        if _wi != _last_call or _call_order.count(_wi) > 1:
+                            _unsafe_wrap = True
+                            break
+                if not _unsafe_wrap and len(_runtime_wraps) > 1:
+                    _unsafe_wrap = True
+            if _unsafe_wrap and _placement_retries < 8 and bundleable_helpers:
+                # Find the best helper to promote. Prefer the one that
+                # eliminates the most wraps; tie-break by smallest worst-
+                # excess (so we make progress even when no single promotion
+                # eliminates all wraps yet).
                 best_helper = None
-                best_unsafe_count = len(_wrapping_indices)
-                # Reject promotions that would grow the kernel past a safe
-                # cap — once kernel ≥210B we've lost too much overlay region
-                # for the remaining user functions to fit.
-                _kernel_cap = 210
+                best_unsafe_count = len(_wrapping_indices) + 1
+                best_worst_excess = 1 << 30
+                # Promotion math: for a helper bundled in B of N overlays,
+                # promoting it grows kernel by +h, shrinks region by -h, and
+                # shrinks each of the B bundled-in overlays by -h (approx).
+                # The per-overlay excess = (ov - region) is INVARIANT under
+                # promotion unless the promoted helper shrinks an overlay
+                # by MORE than it shrinks the region. That happens only
+                # when the helper is BUNDLED IN MULTIPLE OVERLAYS: kernel
+                # grows once, each of B overlays loses the body, net
+                # effective region-per-overlay grows by (B-1)*h.
+                #
+                # So restrict promotion to helpers with B ≥ 2 (shared
+                # helpers). Promoting a single-bundled helper is always a
+                # net zero or loss for wrap fitness.
                 for h in bundleable_helpers:
-                    hsize_h = measure_lines(helper_bodies.get(h, (0, 0, []))[2]) + 1
+                    hsize_h = measure_lines(helper_bodies.get(h, (0, 0, []))[2])
+                    bundled_in = 0
+                    for _, olines, _ in overlay_asm_blocks:
+                        if any(ol.strip().startswith(f'{h}_ov') and
+                               ol.strip().endswith(':') for ol in olines):
+                            bundled_in += 1
+                    if bundled_in < 2:
+                        continue  # won't help the wrap
                     proj_region = _ov_avail - hsize_h
                     if proj_region < 16:
                         continue
-                    if _kernel_chk + hsize_h > _kernel_cap:
-                        continue
                     proj_wraps = 0
+                    proj_worst_excess = 0
                     for oi, (_, olines, _s) in enumerate(overlay_asm_blocks):
                         has_h = any(ol.strip().startswith(f'{h}_ov') and
                                     ol.strip().endswith(':') for ol in olines)
-                        new_sz = _s - (hsize_h if has_h else 0)
+                        new_sz = _s - (hsize_h + 1 if has_h else 0)
                         if new_sz > proj_region:
                             proj_wraps += 1
-                    if proj_wraps < best_unsafe_count:
+                            excess = new_sz - proj_region
+                            if excess > proj_worst_excess:
+                                proj_worst_excess = excess
+                    if (proj_wraps < best_unsafe_count or
+                        (proj_wraps == best_unsafe_count and
+                         proj_worst_excess < best_worst_excess)):
                         best_unsafe_count = proj_wraps
+                        best_worst_excess = proj_worst_excess
                         best_helper = h
                 if best_helper:
                     hsize_h = measure_lines(helper_bodies.get(best_helper, (0, 0, []))[2])
                     import sys
-                    print(f"  Wrap-safety retry: {len(_wrapping_indices)} overlays wrap unsafely; "
+                    print(f"  Wrap-safety retry: {len(_wrapping_indices)} overlays wrap; "
                           f"promoting {best_helper} ({hsize_h}B) resident "
-                          f"→ projected {best_unsafe_count} wraps",
+                          f"→ projected {best_unsafe_count} wraps "
+                          f"(worst excess {best_worst_excess}B)",
                           file=sys.stderr)
                     _NO_OVERLAY.add(f'{best_helper}:')
                     bundleable_helpers = [h for h in bundleable_helpers if h != best_helper]
                     _placement_retries += 1
                     _retry_bundling = True
                     continue  # continue outer while — rebundle & re-place
+            if _unsafe_wrap:
+                # No promotion converges — fail loud.
+                _wraps_info = []
+                for _wi in sorted(_wrapping_indices):
+                    _n, _, _sz = overlay_asm_blocks[_wi]
+                    _wraps_info.append(f"{_n}({_sz}B > {_ov_avail}B)")
+                raise Exception(
+                    f"overlay(s) wrap past code[255] into critical kernel: "
+                    f"{', '.join(_wraps_info)}. Kernel={_kernel_chk}B leaves "
+                    f"{_ov_avail}B overlay region (_main at code[{_main_start_in_code}]). "
+                    f"No helper promotion converges — reduce program size, "
+                    f"split a function, or move resident code to init-only."
+                )
 
         has_p1 = len(p1_overlays) > 0
         has_p2 = len(p2_overlays) > 0
@@ -6101,6 +6376,16 @@ class MK1CodeGen:
             # shift kernel offsets), so we have to fold the pattern here.
             assembled.append('\tdecd')
             assembled.append(f'\tjnz {mc_lbl}')
+            # After mini-copy, skip over any pre-mc init helpers (their bodies
+            # are placed in the slack between mini-copy code and mini-copy
+            # target, but execution MUST NOT fall through them — they're
+            # subroutines reached only via `jal <label>` from init code).
+            # Without this jump, the CPU falls through from the mini-copy
+            # jnz into __i2c_st (or whichever helper lands there) and hits
+            # `jal __i2c_sb` before the stack pointer is initialized. Cost:
+            # 2B per overlay program, always emitted because _pre_mc_helpers
+            # is computed later and we can't defer label emission.
+            assembled.append('\tj __stage1_init')
             for line in runtime_resident_helpers:
                 s = line.strip()
                 if s.endswith(':') and s.startswith('__'):
@@ -6196,7 +6481,20 @@ class MK1CodeGen:
             # helpers placed there won't be overwritten by mini-copy. Fit as
             # many init helpers as possible into that slack before padding
             # up to mc_end for the rest.
-            _pre_mc_budget = helper_start - _cur_addr
+            #
+            # CRITICAL: init_code_lines will ALSO be emitted into this slack
+            # (after pre-mc helpers), so deduct its size from the budget. If
+            # we don't, pre-mc helpers + init code together can overflow past
+            # helper_start, pushing the init code into the mini-copy target
+            # range — meaning the CPU starts executing mini-copied kernel
+            # bytes mid-init, causing a silent hang.
+            # Also count the trailing `j __selfcopy` (2B) which is emitted
+            # after init_code_lines but still shares the slack.
+            _init_code_size = _measure_code_section(['\tsection code'] + list(init_code_lines))
+            _init_code_size += 2  # for `j __selfcopy`
+            _pre_mc_budget = helper_start - _cur_addr - _init_code_size
+            if _pre_mc_budget < 0:
+                _pre_mc_budget = 0
             _pre_mc_helpers = []        # (name, start, end, fsize) placed pre-mini-copy
             _post_mc_helpers = []
             if _pre_mc_budget > 0:
@@ -6241,11 +6539,31 @@ class MK1CodeGen:
                     body = _rename_shared_refs(self.code[start:end])
                     assembled.extend(body)
 
+            # Decide whether init code fits in the slack [cur_addr..helper_start-1].
+            # If not, emit pad + init code AFTER the mini-copy target range,
+            # so the CPU never executes mini-copied bytes as if they were init.
+            _cur_addr_after_premc = _measure_code_section(assembled)
+            _init_fits_pre = (_cur_addr_after_premc + _init_code_size) <= helper_start
+            if not _init_fits_pre:
+                # Pad first so init code lands past the mini-copy destination.
+                _pad_needed = _mc_end - _cur_addr_after_premc
+                if _pad_needed > 0:
+                    print(f"  Init code overflows pre-mc slack ({_init_code_size}B > "
+                          f"{helper_start - _cur_addr_after_premc}B remaining); "
+                          f"padding {_pad_needed}B to place init code past mini-copy target",
+                          file=sys.stderr)
+                    assembled.append('__mc_pad:')
+                    for _ in range(_pad_needed):
+                        assembled.append('\tnop')
+
             # Emit init code AFTER pre-mc helpers (was previously above
             # mini-copy code, before pre-mc placement). The reorder gives
             # the pre-mc slack budget the room init code used to occupy
             # — typical LCD program slack went from ~15B to ~30B, fitting
             # 2 init helpers instead of 1.
+            # Label the start of init code so the post-mini-copy jump lands
+            # here (skipping any pre-mc helper bodies in the slack).
+            assembled.append('__stage1_init:')
             assembled.extend(init_code_lines)
             if init_only_funcs:
                 assembled.append('\tj __selfcopy')
@@ -6261,13 +6579,17 @@ class MK1CodeGen:
                 # the nops are semantically load-bearing (they push init
                 # helpers past the mini-copy target range so mini-copy doesn't
                 # overwrite them mid-execution).
-                assembled.append('__mc_pad:')
+                assembled.append('__mc_pad2:')
                 for _ in range(_pad_needed):
                     assembled.append('\tnop')
         else:
             # No init-only helpers → no pre-mc / post-mc dance, just emit
             # init code straight after mini-copy. Init code is unconditional;
             # the reorder block above only runs when init helpers exist.
+            # Still need __stage1_init label: the `j __stage1_init` emitted
+            # after mini-copy loop always jumps here, even without pre-mc
+            # helpers (net cost is 2B — cleaner than conditionally emitting).
+            assembled.append('__stage1_init:')
             assembled.extend(init_code_lines)
 
         _deferred_init_only_bodies = []
