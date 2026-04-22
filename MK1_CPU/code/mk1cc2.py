@@ -7003,7 +7003,7 @@ class MK1CodeGen:
         # is easy to reason about and test. Extending to more helpers is
         # just adding names (and verifying each is safe under the leaf
         # rule: `__lcd_chr` calls `__i2c_sb` which stays resident).
-        HELPER_OVERLAY_NAMES = {'__lcd_chr'}
+        HELPER_OVERLAY_NAMES = {'__lcd_chr', '__lcd_init'}
         # R_HELPER_BASE is computed below from the actual kernel+loader
         # extent so it can't collide with code we're emitting. The copy
         # loop would otherwise overwrite its own trailing `j R_helper`
@@ -7242,9 +7242,12 @@ class MK1CodeGen:
         pages_main = _pa.assemble_asm('\n'.join(_saved_pre_transform))
         labels = pages_main['labels']
 
-        # For each body, assemble it in isolation. We substitute external
-        # jal/j targets with their absolute addresses (from `labels`) so
-        # the body can assemble without the main program's symbol table.
+        # For each body, assemble it in isolation AT R_HELPER_BASE so
+        # internal `.local:` labels resolve to the runtime code address
+        # the helper will actually execute from (not org 0, which would
+        # make internal jumps point to the kernel's reset vector).
+        # External jal/j targets (like `__i2c_sb`) are substituted with
+        # their absolute addresses from the main program's symbol table —
         # py_asm doesn't support `NAME = N` constant definitions, hence
         # the textual substitution.
         import re as _re
@@ -7253,22 +7256,22 @@ class MK1CodeGen:
             rewritten = []
             for bl in body:
                 s = bl
-                # Replace `jal __foo` / `j __foo` targets with absolute
-                # numbers when the target resolves to a known address.
                 m = _re.match(r'^(\s*)(j|jal)\s+(\S+)\s*$', bl.rstrip())
                 if m:
                     lead, op, tgt = m.group(1), m.group(2), m.group(3)
                     if not tgt.startswith('.') and tgt in labels:
                         s = f'{lead}{op} {labels[tgt]}'
                 rewritten.append(s)
-            synth = ['\tsection code', '\torg 0'] + rewritten
+            synth = ['\tsection code', f'\torg {R_HELPER_BASE}'] + rewritten
             try:
                 pages_body = _pa.assemble_asm('\n'.join(synth))
             except Exception as e:
                 raise Exception(
                     f"helper-overlay: could not assemble {name} body "
                     f"in isolation: {e}") from e
-            bb = bytes(pages_body['code'][:size])
+            # Body bytes live at code[R_HELPER_BASE..R_HELPER_BASE+size-1]
+            # in the probe assembly.
+            bb = bytes(pages_body['code'][R_HELPER_BASE:R_HELPER_BASE + size])
             body_bytes.append((name, bb))
 
         # Now emit: manifest pointing to byte offsets, then byte
