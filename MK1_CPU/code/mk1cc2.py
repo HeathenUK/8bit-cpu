@@ -1938,6 +1938,25 @@ class MK1CodeGen:
                 if h in helpers:
                     no_ov.add(f'{h}:')
 
+        # Phase A helper-overlay (OVERLAY_REDESIGN.md §4.3): when
+        # MK1_HELPER_OVERLAY=1, record the candidate set. We do NOT force
+        # them resident here — doing so would trigger propagation (e.g.
+        # __lcd_chr → __lcd_send) that adds helpers we can't extract, and
+        # the net effect was a kernel bloat (measured on overlay_clock:
+        # +84B kernel growth swamping the intended savings). Instead let
+        # the normal knapsack/bundling pick resident helpers; the Phase A
+        # transform later extracts whichever candidates happen to land in
+        # `runtime_resident_helpers`. Programs that benefit are those
+        # where the natural classification keeps 2+ candidates resident.
+        import os as _ho_os
+        self._helper_overlay_active = False
+        if _ho_os.environ.get('MK1_HELPER_OVERLAY') == '1':
+            HELPER_OVERLAY_NAMES = {'__lcd_chr', '__print_u8_dec'}
+            active = HELPER_OVERLAY_NAMES & helpers
+            if active:
+                self._helper_overlay_active = True
+                self._helper_overlay_candidates = active
+
         self._dynamic_no_overlay = no_ov
 
         # Conditionally resident: helpers that are marked _NO_OVERLAY now but
@@ -1958,6 +1977,9 @@ class MK1CodeGen:
         # __i2c_rb and __eeprom_rd are init-only (emitted in stage 1).
         if getattr(self, 'eeprom_mode', False):
             unconditional.add('__i2c_sb')
+        # (Helper-overlay candidates are no longer force-resident here;
+        # see the note above — propagation bloated the kernel more than
+        # the split saved.)
         # __lcd_send's residency is handled by step 8b propagation (scans
         # resident __lcd_cmd body for 'j __lcd_send' reference)
         for label in no_ov:
@@ -5236,6 +5258,31 @@ class MK1CodeGen:
                 print(f"  T2.1 total cross-section savings: {_t2_total_saved}B",
                       file=sys.stderr)
 
+            # Phase A helper-overlay split (OVERLAY_REDESIGN.md §4.3).
+            # Runs AFTER T2.1 so helper bodies are final, BEFORE kernel
+            # sizing (line ~5519) so the reduced runtime_resident_helpers
+            # shrinks KERNEL_SIZE and OVERLAY_REGION. Each extracted helper
+            # becomes a 5B thunk in the kernel; the body lives in page3 and
+            # loads into R_helper on demand. Leaves `self._helper_overlay_info`
+            # populated for later page3 byte-data emission.
+            self._helper_overlay_info = None
+            if getattr(self, '_helper_overlay_active', False):
+                _ov_info = self._split_helpers_for_overlay(
+                    runtime_resident_helpers,
+                    self._helper_overlay_candidates,
+                )
+                if _ov_info is not None:
+                    runtime_resident_helpers = _ov_info['modified']
+                    runtime_resident_helpers = peephole(runtime_resident_helpers)
+                    self._helper_overlay_info = _ov_info
+                    print(f"  [HELPER_OVERLAY] split "
+                          f"{len(_ov_info['helpers'])} helper(s) into R_helper: "
+                          f"{[h['name'] for h in _ov_info['helpers']]} "
+                          f"(R_HELPER_SIZE={_ov_info['R_HELPER_SIZE']}B, "
+                          f"kernel saves "
+                          f"{_ov_info['bytes_saved']}B pre-loader)",
+                          file=sys.stderr)
+
             # ── T3.1: Liveness-based overlay call-site push/pop elision ──
             # Overlay call sites emit the uniform pattern:
             #   push $b; push $a; ldi $a, IDX; jal _overlay_load
@@ -5724,6 +5771,12 @@ class MK1CodeGen:
                 eeprom_addr_hi=ee_overlay_hi)
             _kernel_chk = measure_lines(_loader_chk) + main_size + runtime_helper_size
             _ov_avail = 250 - _kernel_chk
+            # Phase A helper-overlay: reserve R_HELPER_SIZE at top of code
+            # page for runtime-loaded helper bodies. User overlays must not
+            # extend past code[250 - R_HELPER_SIZE].
+            _hov_info = getattr(self, '_helper_overlay_info', None)
+            if _hov_info:
+                _ov_avail -= _hov_info['R_HELPER_SIZE']
             _wrapping_indices = {i for i, (_, _, sz) in enumerate(overlay_asm_blocks)
                                  if sz > _ov_avail}
             # Determine call order from main_lines. T3.3 thin-dispatch puts
@@ -6261,6 +6314,23 @@ class MK1CodeGen:
                 assembled.append('\tbyte 2')
             else:
                 assembled.append('\tbyte 3')  # fallback: page3
+
+        # Phase A helper-overlay: emit __helper_manifest + body bytes in
+        # page3 (same section as the other manifest so code_size stays in
+        # sync with page3_size). Bodies are pre-assembled bytes, so any
+        # internal labels and external jals are resolved relative to the
+        # post-split `self.code` once it settles. See §4.6 of the design
+        # doc for the 2-byte manifest layout.
+        if getattr(self, '_helper_overlay_info', None):
+            _hinfo = self._helper_overlay_info
+            assembled.append('__helper_manifest:')
+            _body_labels = []
+            for _i, _h in enumerate(_hinfo['helpers']):
+                _lbl = f'__h_body_{_i}'
+                _body_labels.append(_lbl)
+                assembled.append(f'\tbyte {_lbl}')
+                assembled.append(f'\tbyte {_h["size"]}')
+            _hinfo['body_labels'] = _body_labels
 
         # __ov_entry: marks the start of the overlay region (address OVERLAY_REGION).
         # Emitted after manifest so it resolves to the correct code address.
@@ -6911,6 +6981,9 @@ class MK1CodeGen:
         print(f"  {len(overlay_slots)} overlay slots, largest={max_bundled_size}B"
               f" (func={max_slot_size}B + bundled helpers)", file=sys.stderr)
         avail = 250 - OVERLAY_REGION
+        _hov_info_final = getattr(self, '_helper_overlay_info', None)
+        if _hov_info_final:
+            avail -= _hov_info_final['R_HELPER_SIZE']
         if max_bundled_size > avail:
             wrap = max_bundled_size - avail
             # Find which overlay(s) wrap and check if they're loaded last
@@ -6965,6 +7038,249 @@ class MK1CodeGen:
                   file=sys.stderr)
 
 
+    def _split_helpers_for_overlay(self, helpers_list, candidates):
+        """Phase A overlay-mode split: extract each helper in `candidates`
+        from `helpers_list` (a list of asm lines containing kernel-resident
+        helper bodies). Replaces each body with a 5B thunk
+        (`ldi $c,IDX; j _load_helper`) and appends `_load_helper:` + its
+        body. Returns a dict with:
+          modified:        new helpers_list
+          helpers:         list of {'name','body','size','idx'} for extracted helpers
+          R_HELPER_SIZE:   max body size across helpers (top-of-page reservation)
+          R_HELPER_BASE:   250 - R_HELPER_SIZE (where bodies land at runtime)
+          bytes_saved:     kernel shrink from body→thunk replacement (pre-loader)
+        or None if no candidates were found or leaf-rule eliminated them all.
+        """
+        import sys as _sys
+        import mk1ir as _ir
+
+        def _find(lines, nameset):
+            found = {}
+            i = 0
+            while i < len(lines):
+                s = lines[i].strip()
+                if (s.endswith(':') and not s.startswith('.')
+                        and s[:-1] in nameset):
+                    name = s[:-1]
+                    start = i
+                    i += 1
+                    last_ret = None
+                    while i < len(lines):
+                        ns = lines[i].strip()
+                        if (ns.endswith(':') and not ns.startswith('.')
+                                and ns.startswith('_')):
+                            break
+                        if ns.startswith('section ') or ns.startswith('org '):
+                            break
+                        if ns == 'ret':
+                            last_ret = i + 1
+                        i += 1
+                    end = last_ret if last_ret is not None else i
+                    found[name] = (start, end)
+                    continue
+                i += 1
+            return found
+
+        def _body_jal_targets(body_lines):
+            found = set()
+            for ln in body_lines:
+                s = ln.strip()
+                if s.startswith('jal '):
+                    tgt = s.split()[1]
+                    if not tgt.startswith('.'):
+                        found.add(tgt)
+            return found
+
+        # Leaf-rule enforcement: demote callers of other overlay helpers.
+        active = set(candidates)
+        changed = True
+        while changed and active:
+            changed = False
+            found = _find(helpers_list, active)
+            for caller in list(active):
+                if caller not in found:
+                    continue
+                s, e = found[caller]
+                body = helpers_list[s + 1:e]
+                bad = _body_jal_targets(body) & active
+                if bad:
+                    print(f'  [HELPER_OVERLAY] leaf-rule demotion: {caller} '
+                          f'calls overlay helper(s) {bad} — leaving resident',
+                          file=_sys.stderr)
+                    active.discard(caller)
+                    changed = True
+                    break
+
+        if not active:
+            return None
+
+        found = _find(helpers_list, active)
+        if not found:
+            return None
+
+        two_byte = {'ldsp', 'stsp', 'push_imm', 'jal', 'jc', 'jz', 'jnc',
+                    'jnz', 'j', 'ldi', 'cmp', 'addi', 'subi', 'andi', 'ori',
+                    'ldsp_b', 'ldp3', 'stp3', 'ocall', 'tst', 'out_imm',
+                    'cmpi', 'ddrb_imm', 'ddra_imm', 'ora_imm', 'orb_imm'}
+
+        def _measure(lines):
+            sz = 0
+            for ln in lines:
+                s = ln.strip()
+                if not s or s.startswith(';') or s.endswith(':'):
+                    continue
+                if s.startswith('section') or s.startswith('org'):
+                    continue
+                sz += _ir.instr_byte_size(s, two_byte)
+            return sz
+
+        helper_infos = []
+        for i, name in enumerate(sorted(found.keys())):
+            s, e = found[name]
+            body = list(helpers_list[s + 1:e])
+            size = _measure(body)
+            helper_infos.append({'name': name, 'body': body, 'size': size,
+                                 'idx': i, 'start': s, 'end': e})
+
+        R_HELPER_SIZE = max(h['size'] for h in helper_infos)
+        R_HELPER_BASE = 250 - R_HELPER_SIZE
+
+        # Cost-benefit guard. Loader ≈ 28B and R_HELPER_SIZE comes out of
+        # the overlay region, so a single-helper split costs more than it
+        # saves (measured on lcd_temp_overlay: -32B net fit). Only split
+        # when ≥2 helpers are extractable — then the loader is amortized
+        # and the kernel shrinks enough to outweigh the reservation.
+        THUNK_SIZE = 4        # ldi $c,N + j _load_helper
+        LOADER_SIZE = 28      # _load_helper template above
+        kernel_save = sum(h['size'] - THUNK_SIZE for h in helper_infos) - LOADER_SIZE
+        overlay_cost = R_HELPER_SIZE
+        if len(helper_infos) < 2 or kernel_save <= overlay_cost:
+            print(f'  [HELPER_OVERLAY] split not beneficial '
+                  f'({len(helper_infos)} helper(s), kernel_save={kernel_save}B, '
+                  f'overlay_cost={overlay_cost}B) — leaving helpers resident.',
+                  file=_sys.stderr)
+            return None
+
+        # Replace bodies back-to-front so earlier indices stay valid.
+        modified = list(helpers_list)
+        bytes_saved = 0
+        THUNK_SIZE = 5  # ldi $c,N (2B) + j _load_helper (2B) + .. wait 4B
+        # Actually: ldi $c,IDX (2B) + j _load_helper (2B) = 4B thunk.
+        THUNK_SIZE = 4
+        for h in sorted(helper_infos, key=lambda x: -x['start']):
+            thunk = [
+                modified[h['start']],
+                f'\tldi $c,{h["idx"]}',
+                '\tj _load_helper',
+            ]
+            modified[h['start']:h['end']] = thunk
+            bytes_saved += (h['size'] - THUNK_SIZE)
+
+        # Append the `_load_helper` routine to the kernel helpers list so
+        # it lands in runtime_resident_helpers (= kernel image). Mirrors
+        # the loader emitted in _apply_helper_overlay_transform flat-mode;
+        # hand-assembled proof at spikes/helper_overlay_v1.asm.
+        loader = [
+            '_load_helper:',
+            '\tpush $b',
+            '\tpush $a',
+            '\tmov $c,$a',
+            '\tsll',
+            '\taddi __helper_manifest,$a',
+            '\tmov $a,$d',
+            '\tderefp3',
+            '\tmov $a,$c',
+            '\tmov $d,$a',
+            '\tinc',
+            '\tderefp3',
+            f'\taddi {R_HELPER_BASE},$a',
+            '\tmov $a,$d',
+            f'\tldi $b,{R_HELPER_BASE}',
+            '.hcopy:',
+            '\tmov $c,$a',
+            '\tderefp3',
+            '\tistc_inc',
+            '\tincc',
+            '\tmov $b,$a',
+            '\tcmp $d',
+            '\tjnz .hcopy',
+            '\tpop $a',
+            '\tpop $b',
+            f'\tj {R_HELPER_BASE}',
+        ]
+        modified.extend(loader)
+
+        return {
+            'modified': modified,
+            'helpers': helper_infos,
+            'R_HELPER_SIZE': R_HELPER_SIZE,
+            'R_HELPER_BASE': R_HELPER_BASE,
+            'bytes_saved': bytes_saved,
+        }
+
+    def _emit_helper_overlay_bodies(self, info):
+        """Overlay-mode companion to _split_helpers_for_overlay. Given the
+        split info (helper bodies in asm form), pre-assemble each body
+        with external labels resolved to their current addresses, then
+        append `__h_body_N: byte ...` entries to self.code so that the
+        `__helper_manifest` entries emitted earlier resolve correctly.
+        Runs AFTER `_overlay_partition` finalizes self.code — all labels
+        the body references are stable by now.
+        """
+        import sys as _sys
+        import re as _re
+        import mk1_py_asm as _pa
+
+        # Assemble self.code once to resolve external label addresses.
+        try:
+            pages_main = _pa.assemble_asm('\n'.join(self.code))
+        except Exception as e:
+            print(f"  [HELPER_OVERLAY] could not assemble to resolve labels: "
+                  f"{e}. Helper bodies may reference unresolvable jals.",
+                  file=_sys.stderr)
+            return
+        labels = pages_main['labels']
+        R_HELPER_BASE = info['R_HELPER_BASE']
+
+        body_bytes = []
+        for h in info['helpers']:
+            name = h['name']
+            body = h['body']
+            size = h['size']
+            rewritten = []
+            for bl in body:
+                s = bl
+                m = _re.match(r'^(\s*)(j|jal)\s+(\S+)\s*$', bl.rstrip())
+                if m:
+                    lead, op, tgt = m.group(1), m.group(2), m.group(3)
+                    if not tgt.startswith('.') and tgt in labels:
+                        s = f'{lead}{op} {labels[tgt]}'
+                rewritten.append(s)
+            synth = ['\tsection code', f'\torg {R_HELPER_BASE}'] + rewritten
+            try:
+                pages_body = _pa.assemble_asm('\n'.join(synth))
+            except Exception as e:
+                print(f"  [HELPER_OVERLAY] could not assemble body for "
+                      f"{name}: {e}", file=_sys.stderr)
+                return
+            bb = bytes(pages_body['code'][R_HELPER_BASE:R_HELPER_BASE + size])
+            body_bytes.append((name, bb))
+
+        # Append body bytes into page3 section (same section as manifest)
+        # so addresses are contiguous with the `byte __h_body_N` refs.
+        self.code.append('\tsection page3_code')
+        for i, (name, bb) in enumerate(body_bytes):
+            self.code.append(f'__h_body_{i}:')
+            for b in bb:
+                self.code.append(f'\tbyte 0x{b:02X}')
+
+        print(f"  [HELPER_OVERLAY] emitted {len(body_bytes)} helper body "
+              f"blocks in page3 (R_helper loads into "
+              f"code[{R_HELPER_BASE}..{R_HELPER_BASE + info['R_HELPER_SIZE'] - 1}])",
+              file=_sys.stderr)
+        for h in info['helpers']:
+            print(f"    {h['name']}: {h['size']}B", file=_sys.stderr)
+
     # ── Phase A: helper-overlay transform ──────────────────────────
     #
     # Given the post-overlay-partition asm in self.code, move designated
@@ -6998,6 +7314,22 @@ class MK1CodeGen:
     def _apply_helper_overlay_transform(self, runtime_resident_helpers,
                                          kernel_size, overlay_region):
         import sys as _sys
+
+        # Overlay-mode path: `_overlay_partition` already ran
+        # `_split_helpers_for_overlay` (before kernel sizing) so
+        # `self._helper_overlay_info` has the split helpers. We just need
+        # to emit the body bytes that the manifest references. Label
+        # addresses for external `jal` targets are resolved by assembling
+        # the current self.code once (labels are stable at this point).
+        _hov_info = getattr(self, '_helper_overlay_info', None)
+        if kernel_size is not None:
+            # Overlay mode: the inline split (if any) is the sole path.
+            # The flat-mode logic below doesn't understand overlay regions
+            # and would clobber them on its tail-of-code-page carve.
+            if _hov_info is not None:
+                self._emit_helper_overlay_bodies(_hov_info)
+            return
+
         # ── Phase A initial target set ──
         # Start with a single helper for the first pass so the integration
         # is easy to reason about and test. Extending to more helpers is
@@ -7014,18 +7346,14 @@ class MK1CodeGen:
         # Start conservative; widen when the 3-layer regression stays green.
         HELPER_OVERLAY_NAMES = {'__lcd_chr', '__lcd_init', '__print_u8_dec'}
 
-        # Phase A is currently flat-mode only: R_helper is placed at the
-        # tail of the code page, which would collide with the user
-        # overlay region in overlay-mode programs. Detect overlay mode
-        # and skip the transform cleanly (default path still runs, with
-        # the target helpers resident or bundled per the existing
-        # placement engine). Covered by the §5 Phase A follow-up work.
-        if kernel_size is not None:
-            print(f'  [HELPER_OVERLAY] overlay-mode program — transform '
-                  f'not yet supported (see OVERLAY_REDESIGN.md §5 Phase A); '
-                  f'falling back to resident/bundled helpers',
-                  file=_sys.stderr)
-            return
+        # Overlay-mode note: when invoked on an overlay-mode program, the
+        # user overlay region already exists at code[OVERLAY_REGION..250).
+        # We carve R_helper from the tail of the code page. Before doing
+        # so, verify no user overlay's body is large enough to reach into
+        # the carved region after it's loaded. If any would, bail — the
+        # program needs to shrink or we need a smarter layout (§5 Phase A
+        # follow-up).
+        is_overlay_mode = (kernel_size is not None)
 
         # ── Leaf-rule enforcement (§4.3 of the design doc) ──
         # If helper A (in the overlay set) calls helper B (also in the
@@ -7221,19 +7549,73 @@ class MK1CodeGen:
                   file=_sys.stderr)
             kernel_end = 160
 
-        R_HELPER_BASE = kernel_end + LOADER_SIZE_EST
-        if R_HELPER_BASE + R_HELPER_SIZE > 250:
-            # Transform can't fit — the program's kernel (with helpers
-            # still resident) is already near the limit, so moving them
-            # to an overlay + loader only adds bytes. Fall back silently:
-            # RESTORE self.code from the pre-transform snapshot so the
-            # thunks we inserted get undone, leaving the resident helpers.
-            print(f'  [HELPER_OVERLAY] no room for R_helper '
-                  f'(kernel={kernel_end}B + loader={LOADER_SIZE_EST}B + '
-                  f'helper={R_HELPER_SIZE}B = {R_HELPER_BASE + R_HELPER_SIZE}B > 250B) '
-                  f'— reverting to resident helpers', file=_sys.stderr)
-            self.code = _saved_pre_transform
-            return
+        # R_HELPER_BASE placement depends on mode:
+        #   Flat mode: place R_helper right after the loader. Kernel
+        #   extends downward naturally, no overlay region to worry about.
+        #
+        #   Overlay mode: place R_helper at the TOP of the code page
+        #   (code[250 - R_HELPER_SIZE..249]). This way user overlays
+        #   continue to load at OVERLAY_REGION and grow upward, and we
+        #   just verify no user overlay's length reaches R_helper.
+        if is_overlay_mode:
+            R_HELPER_BASE = 250 - R_HELPER_SIZE
+            _user_ov_top = R_HELPER_BASE
+            # Check: no existing user overlay can occupy R_HELPER_BASE
+            # or above. The largest overlay is what we need to check.
+            # Read `__manifest` bytes from self.code (it's a page3
+            # section with `byte N` directives).
+            max_user_sz = 0
+            for i, ln in enumerate(self.code):
+                if ln.strip() == '__manifest:':
+                    # Manifest is pairs of (offset, size). Count from
+                    # the next `byte` lines.
+                    j = i + 1
+                    entries = []
+                    while j < len(self.code):
+                        s = self.code[j].strip()
+                        if not s:
+                            j += 1; continue
+                        if s.startswith('byte '):
+                            try:
+                                entries.append(int(s.split()[1], 0))
+                            except ValueError:
+                                break
+                        else:
+                            break
+                        j += 1
+                    # Every other entry is a size.
+                    for k in range(1, len(entries), 2):
+                        max_user_sz = max(max_user_sz, entries[k])
+                    break
+            if overlay_region is not None:
+                user_region_size = _user_ov_top - overlay_region
+                if max_user_sz > user_region_size:
+                    print(f'  [HELPER_OVERLAY] overlay-mode program: '
+                          f'largest user overlay ({max_user_sz}B) exceeds '
+                          f'shrunk user region ({user_region_size}B after '
+                          f'carving R_helper={R_HELPER_SIZE}B). '
+                          f'Reverting to resident helpers.',
+                          file=_sys.stderr)
+                    self.code = _saved_pre_transform
+                    return
+            if LOADER_SIZE_EST > (R_HELPER_BASE - kernel_end):
+                print(f'  [HELPER_OVERLAY] overlay-mode: no slack between '
+                      f'kernel ({kernel_end}B) and R_helper ({R_HELPER_BASE}) '
+                      f'for loader ({LOADER_SIZE_EST}B). Reverting.',
+                      file=_sys.stderr)
+                self.code = _saved_pre_transform
+                return
+        else:
+            R_HELPER_BASE = kernel_end + LOADER_SIZE_EST
+            if R_HELPER_BASE + R_HELPER_SIZE > 250:
+                # Flat-mode: transform can't fit. Fall back silently.
+                print(f'  [HELPER_OVERLAY] no room for R_helper '
+                      f'(kernel={kernel_end}B + loader={LOADER_SIZE_EST}B + '
+                      f'helper={R_HELPER_SIZE}B = '
+                      f'{R_HELPER_BASE + R_HELPER_SIZE}B > 250B) '
+                      f'— reverting to resident helpers', file=_sys.stderr)
+                self.code = _saved_pre_transform
+                return
 
         # ── Step 5: emit `_load_helper` into the static code section ──
         # Uses the same copy-and-tail-jump design as the hand-assembled
