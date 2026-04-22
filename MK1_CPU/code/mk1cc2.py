@@ -7004,13 +7004,12 @@ class MK1CodeGen:
         # just adding names (and verifying each is safe under the leaf
         # rule: `__lcd_chr` calls `__i2c_sb` which stays resident).
         HELPER_OVERLAY_NAMES = {'__lcd_chr'}
-        # __lcd_chr compiles to ~64B after peephole/__xsthunk inlining.
-        # For the Phase A smoke test we sacrifice user overlay region to
-        # accommodate it; a future pass will either shrink __lcd_chr (e.g.
-        # by reinstating the extracted thunk) or pick a smaller starting
-        # helper like __print_u8_dec (~20B).
-        R_HELPER_BASE = 180
-        R_HELPER_SIZE = 70   # code[180..249] — 70B reserved
+        # R_HELPER_BASE is computed below from the actual kernel+loader
+        # extent so it can't collide with code we're emitting. The copy
+        # loop would otherwise overwrite its own trailing `j R_helper`
+        # instruction mid-run. R_HELPER_SIZE must accommodate the
+        # largest target helper's body.
+        R_HELPER_SIZE = 70
 
         # ── Step 1-2: locate target helpers in self.code ──
         # A helper body runs from its `__foo:` label until the next
@@ -7091,6 +7090,18 @@ class MK1CodeGen:
         # `__helper_manifest` that can't resolve until we emit it.
         _saved_pre_transform = list(self.code)
 
+        # Compute R_HELPER_BASE so R_helper lives past the end of kernel
+        # code after we emit the loader. The transform sequence is:
+        #   (a) replace helper body with thunk → kernel shrinks
+        #   (b) emit loader → kernel grows by ~28B (LOADER_SIZE)
+        #   (c) whatever code ends up in the `code` section lands at
+        #       code[0..kernel_end]
+        # We need R_HELPER_BASE >= kernel_end, and R_HELPER_BASE +
+        # R_HELPER_SIZE <= 250. Compute kernel_end by assembling the
+        # transformed source below; the assembler's `code_size` tells us
+        # where the next byte would have gone.
+        LOADER_SIZE_EST = 30   # matches the loader template emitted below
+
         # ── Step 3-4: replace each helper body with its thunk ──
         # Work back-to-front so line indices stay valid.
         for name, start, end in sorted(targets, key=lambda t: -t[1]):
@@ -7102,10 +7113,47 @@ class MK1CodeGen:
             ]
             self.code[start:end] = thunk
 
+        # Measure kernel end at this point (after body→thunk replacement,
+        # before loader emission) so we know where the loader will land.
+        # R_HELPER_BASE is then placed past the loader, and the loader
+        # uses that base in its copy-and-jump sequence.
+        #
+        # We append a sentinel label and read its address back — that's
+        # the address of the next byte the assembler would emit into
+        # section code.
+        # Assemble with a stub `_load_helper:` label appended so the
+        # probe can resolve `j _load_helper` references in the thunk.
+        # Actual loader lands later; we only care about code-section
+        # size here.
+        import mk1_py_asm as _pa_size
+        probe_src = list(self.code) + ['\tsection code', '_load_helper:']
+        try:
+            pages_now = _pa_size.assemble_asm('\n'.join(probe_src))
+            probe_code = pages_now['code']
+            last_nz = 0
+            for i in range(255, -1, -1):
+                if probe_code[i] != 0:
+                    last_nz = i + 1
+                    break
+            kernel_end = last_nz
+        except Exception as _e:
+            print(f'  [HELPER_OVERLAY] probe assembly failed: {_e}',
+                  file=_sys.stderr)
+            kernel_end = 160
+
+        R_HELPER_BASE = kernel_end + LOADER_SIZE_EST
+        if R_HELPER_BASE + R_HELPER_SIZE > 250:
+            raise Exception(
+                f"helper-overlay: no room — kernel_end={kernel_end}, "
+                f"loader={LOADER_SIZE_EST}B, R_helper={R_HELPER_SIZE}B, "
+                f"would land R_helper at {R_HELPER_BASE}..{R_HELPER_BASE + R_HELPER_SIZE - 1} "
+                f"(max 250). Shrink kernel or helper, or fall back to "
+                f"resident helpers (unset MK1_HELPER_OVERLAY).")
+
         # ── Step 5: emit `_load_helper` into the static code section ──
         # Uses the same copy-and-tail-jump design as the hand-assembled
         # spike (MK1_CPU/programs/spikes/helper_overlay_v1.asm). Dest is
-        # hardcoded to R_HELPER_BASE so this loader is helper-specific.
+        # baked in as R_HELPER_BASE so this loader is helper-specific.
         loader = [
             '\tsection code',
             '_load_helper:',
