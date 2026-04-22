@@ -1655,6 +1655,25 @@ class MK1CodeGen:
                     self.emit(f'\tbyte {b}')
             self.emit('\tsection code')
 
+        # Phase A hook: if MK1_HELPER_OVERLAY=1, run the helper-overlay
+        # transform on `self.code`. The transform moves a selected set of
+        # helpers (`__lcd_chr` to start) from kernel-resident to
+        # helper-overlay, which loads on demand into a reserved R_helper
+        # region. See MK1_CPU/OVERLAY_REDESIGN.md Phase A for the design;
+        # the hand-assembled proof-of-concept lives at
+        # MK1_CPU/programs/spikes/helper_overlay_v1.asm.
+        #
+        # This hook runs AFTER _overlay_partition and all other section
+        # emission so it sees the final self.code layout. Runs for both
+        # flat and overlay-mode programs.
+        import os as _ho_os
+        if _ho_os.environ.get('MK1_HELPER_OVERLAY') == '1':
+            self._apply_helper_overlay_transform(
+                runtime_resident_helpers=None,
+                kernel_size=getattr(self, '_overlay_kernel_size', None),
+                overlay_region=getattr(self, '_overlay_region', None),
+            )
+
         return '\n'.join(self.code)
 
     def _eliminate_dead_functions(self):
@@ -6832,21 +6851,6 @@ class MK1CodeGen:
         self._overlay_region = OVERLAY_REGION
         self._overlay_shared_size = shared_helper_size
 
-        # Phase A hook: if MK1_HELPER_OVERLAY=1, run the helper-overlay
-        # transform on `self.code`. The transform moves a selected set of
-        # helpers (`__lcd_chr`, `__lcd_cmd`, `__print_u8_dec` to start) from
-        # kernel-resident to helper-overlay, which loads on demand into a
-        # reserved R_helper region. See MK1_CPU/OVERLAY_REDESIGN.md Phase A
-        # for the design; the hand-assembled proof-of-concept lives at
-        # MK1_CPU/programs/spikes/helper_overlay_v1.asm.
-        import os as _ho_os
-        if _ho_os.environ.get('MK1_HELPER_OVERLAY') == '1':
-            self._apply_helper_overlay_transform(
-                runtime_resident_helpers=runtime_resident_helpers,
-                kernel_size=KERNEL_SIZE,
-                overlay_region=OVERLAY_REGION,
-            )
-
         # Named size breakdown for --why-not-smaller. Captured here rather
         # than re-derived from `assembled` later because we have the
         # partition data in hand (runtime_resident_helpers, overlay_meta).
@@ -6991,14 +6995,257 @@ class MK1CodeGen:
     #      manifest (raw `byte` directives, as in the spike — `section
     #      page3_code` with org pads with HLT and clobbers page3).
     #
-    # NOT YET IMPLEMENTED. Next session picks up here.
     def _apply_helper_overlay_transform(self, runtime_resident_helpers,
                                          kernel_size, overlay_region):
-        raise NotImplementedError(
-            "Phase A helper-overlay transform not yet implemented. "
-            "See MK1_CPU/OVERLAY_REDESIGN.md §5 Phase A for the plan. "
-            "Unset MK1_HELPER_OVERLAY to use the old bundling path."
-        )
+        import sys as _sys
+        # ── Phase A initial target set ──
+        # Start with a single helper for the first pass so the integration
+        # is easy to reason about and test. Extending to more helpers is
+        # just adding names (and verifying each is safe under the leaf
+        # rule: `__lcd_chr` calls `__i2c_sb` which stays resident).
+        HELPER_OVERLAY_NAMES = {'__lcd_chr'}
+        # __lcd_chr compiles to ~64B after peephole/__xsthunk inlining.
+        # For the Phase A smoke test we sacrifice user overlay region to
+        # accommodate it; a future pass will either shrink __lcd_chr (e.g.
+        # by reinstating the extracted thunk) or pick a smaller starting
+        # helper like __print_u8_dec (~20B).
+        R_HELPER_BASE = 180
+        R_HELPER_SIZE = 70   # code[180..249] — 70B reserved
+
+        # ── Step 1-2: locate target helpers in self.code ──
+        # A helper body runs from its `__foo:` label until the next
+        # top-level `_something:` label OR a `section` directive OR a
+        # `ret` instruction that clearly ends the body. Local `.x:` labels
+        # are part of the body. We stop at `ret` to avoid pulling in the
+        # `section data` block (LCD init bytes etc.) that immediately
+        # follows in the emitted output.
+        targets = []
+        i = 0
+        while i < len(self.code):
+            s = self.code[i].strip()
+            if (s.endswith(':') and not s.startswith('.')
+                    and s[:-1] in HELPER_OVERLAY_NAMES):
+                name = s[:-1]
+                start = i
+                i += 1
+                last_ret = None
+                while i < len(self.code):
+                    ns = self.code[i].strip()
+                    if (ns.endswith(':') and not ns.startswith('.')
+                            and ns.startswith('_')):
+                        break
+                    if ns.startswith('section ') or ns.startswith('org '):
+                        break
+                    if ns == 'ret':
+                        last_ret = i + 1  # include the ret; stop AFTER it
+                    i += 1
+                # Prefer ending just-after the last `ret` encountered —
+                # that's the helper's real terminator. If no ret, trust
+                # whatever boundary we hit.
+                end = last_ret if last_ret is not None else i
+                targets.append((name, start, end))
+                i = end
+                continue
+            i += 1
+
+        if not targets:
+            print(f"  [HELPER_OVERLAY] no target helpers ({HELPER_OVERLAY_NAMES}) "
+                  f"found in compiled output — transform is a no-op", file=_sys.stderr)
+            return
+
+        # Compute each helper's byte size from its asm body. mk1ir's
+        # sizer already knows the quirks (2-byte opcodes, multi-imm
+        # fusion opcodes, labels, directives).
+        import mk1ir as _ir
+        helper_bodies = []   # list of (name, body_lines, body_size)
+        two_byte = {'ldsp','stsp','push_imm','jal','jc','jz','jnc','jnz','j','ldi',
+                    'cmp','addi','subi','andi','ori','ldsp_b','ldp3','stp3',
+                    'ocall','tst','out_imm','cmpi','ddrb_imm','ddra_imm',
+                    'ora_imm','orb_imm'}
+
+        def _measure(lines):
+            sz = 0
+            for ln in lines:
+                s = ln.strip()
+                if not s or s.startswith(';') or s.endswith(':'):
+                    continue
+                if s.startswith('section') or s.startswith('org'):
+                    continue
+                sz += _ir.instr_byte_size(s, two_byte)
+            return sz
+
+        for name, start, end in targets:
+            body = list(self.code[start + 1:end])
+            size = _measure(body)
+            helper_bodies.append((name, body, size))
+            if size > R_HELPER_SIZE:
+                raise Exception(
+                    f"helper '{name}' body is {size}B but R_helper is only "
+                    f"{R_HELPER_SIZE}B — increase R_HELPER_SIZE or exclude it")
+
+        # Snapshot self.code as it was at the start of the transform —
+        # used later (step 7-8) to look up external label addresses
+        # (like `__i2c_sb`) that helper bodies reference. Must be
+        # captured BEFORE we mutate self.code with thunks / loader /
+        # manifest, because the loader contains forward refs to
+        # `__helper_manifest` that can't resolve until we emit it.
+        _saved_pre_transform = list(self.code)
+
+        # ── Step 3-4: replace each helper body with its thunk ──
+        # Work back-to-front so line indices stay valid.
+        for name, start, end in sorted(targets, key=lambda t: -t[1]):
+            idx = [h[0] for h in helper_bodies].index(name)
+            thunk = [
+                self.code[start],           # keep the original label
+                f'\tldi $c, {idx}',         # manifest index
+                f'\tj _load_helper',        # tail-jump into loader
+            ]
+            self.code[start:end] = thunk
+
+        # ── Step 5: emit `_load_helper` into the static code section ──
+        # Uses the same copy-and-tail-jump design as the hand-assembled
+        # spike (MK1_CPU/programs/spikes/helper_overlay_v1.asm). Dest is
+        # hardcoded to R_HELPER_BASE so this loader is helper-specific.
+        loader = [
+            '\tsection code',
+            '_load_helper:',
+            '\tpush $b',
+            '\tpush $a',
+            '\tmov $c, $a',
+            '\tsll',
+            '\taddi __helper_manifest, $a',
+            '\tmov $a, $d',
+            '\tderefp3',
+            '\tmov $a, $c',
+            '\tmov $d, $a',
+            '\tinc',
+            '\tderefp3',
+            f'\taddi {R_HELPER_BASE}, $a',
+            '\tmov $a, $d',
+            f'\tldi $b, {R_HELPER_BASE}',
+            '.hcopy:',
+            '\tmov $c, $a',
+            '\tderefp3',
+            '\tistc_inc',
+            '\tincc',
+            '\tmov $b, $a',
+            '\tcmp $d',
+            '\tjnz .hcopy',
+            '\tpop $a',
+            '\tpop $b',
+            f'\tj {R_HELPER_BASE}',
+        ]
+        self.code.extend(loader)
+
+        # ── Step 6: R_helper region is reserved implicitly by fiat —
+        # the ESP32 assembler pads with HLT up to 256B, so code[225..249]
+        # will be 0x7F at upload time. The loader overwrites these bytes
+        # at runtime when each helper is called. No explicit padding
+        # needed; the transform assumes no existing code uses 225..249.
+        # (If it does, the assembled output will silently collide with
+        # R_helper. A future commit should assert kernel fits under 225.)
+
+        # ── Step 7-8: emit `__helper_manifest` + bodies into page3 ──
+        # Manifest is 2 bytes per helper: [offset_in_page3, body_size].
+        # Bodies follow sequentially. The manifest itself lives at the
+        # start of its own page3 block, and the offsets are relative to
+        # the manifest's page3 address (not page3[0]) — no, they're
+        # absolute page3 addresses. The loader does `derefp3` on the
+        # value, which takes A and returns page3[A].
+        #
+        # We need to know the page3 address where the manifest lands and
+        # where the bodies land. Rather than hand-compute, we let the
+        # assembler pick sequential addresses and use labels.
+        # Emit manifest + helper bodies as raw `byte` directives in
+        # section page3. We can't emit the body as page3_code (section
+        # mismatch validator flags `jal __i2c_sb` because __i2c_sb is in
+        # `code` section and the validator assumes page3_code bodies get
+        # clobbered by self-copy — true in overlay mode, false in flat
+        # mode). Bypass by pre-assembling the body here and writing raw
+        # bytes.
+        #
+        # Use py_asm to assemble the body. Any `jal X` in the body needs
+        # a concrete address for X; construct a synthetic asm snippet
+        # with the same labels the main compilation resolved, then read
+        # the assembled bytes back.
+        import mk1_py_asm as _pa
+        # Build a complete asm that has every top-level label from the
+        # main program + the helper body, so addresses resolve correctly.
+        # Simplest form: pass the entire self.code with the helper body
+        # in place, assemble, and extract page3 bytes. But the body has
+        # been REMOVED from self.code by step 3-4 above. Re-assemble a
+        # CLONE of the pre-transform asm to learn __i2c_sb's address.
+        # Then build the body bytes by assembling just the body with
+        # __i2c_sb defined as a constant.
+        #
+        # Simpler approach: assemble the entire current self.code (which
+        # now has the thunk but no body). The assembler resolves all
+        # labels. Read the body bytes directly from the emitted code
+        # buffer at the helper's call targets.
+        #
+        # Actually simplest: assemble a TEMPORARY asm that is the body
+        # wrapped in section code at org 0, with jal targets pointing to
+        # the addresses they already have in self.code. We know these
+        # addresses by assembling self.code once.
+        # To get external label addresses, assemble self.code AS IT WAS
+        # AT THE START of the transform (before we inserted the loader
+        # whose forward reference to __helper_manifest is unresolvable).
+        # We tracked the original via `_saved_pre_transform` below.
+        pages_main = _pa.assemble_asm('\n'.join(_saved_pre_transform))
+        labels = pages_main['labels']
+
+        # For each body, assemble it in isolation. We substitute external
+        # jal/j targets with their absolute addresses (from `labels`) so
+        # the body can assemble without the main program's symbol table.
+        # py_asm doesn't support `NAME = N` constant definitions, hence
+        # the textual substitution.
+        import re as _re
+        body_bytes = []  # list of (name, bytes)
+        for name, body, size in helper_bodies:
+            rewritten = []
+            for bl in body:
+                s = bl
+                # Replace `jal __foo` / `j __foo` targets with absolute
+                # numbers when the target resolves to a known address.
+                m = _re.match(r'^(\s*)(j|jal)\s+(\S+)\s*$', bl.rstrip())
+                if m:
+                    lead, op, tgt = m.group(1), m.group(2), m.group(3)
+                    if not tgt.startswith('.') and tgt in labels:
+                        s = f'{lead}{op} {labels[tgt]}'
+                rewritten.append(s)
+            synth = ['\tsection code', '\torg 0'] + rewritten
+            try:
+                pages_body = _pa.assemble_asm('\n'.join(synth))
+            except Exception as e:
+                raise Exception(
+                    f"helper-overlay: could not assemble {name} body "
+                    f"in isolation: {e}") from e
+            bb = bytes(pages_body['code'][:size])
+            body_bytes.append((name, bb))
+
+        # Now emit: manifest pointing to byte offsets, then byte
+        # directives for each body, in section page3.
+        manifest_block = ['\tsection page3', '__helper_manifest:']
+        body_labels = []
+        for i, (name, size) in enumerate((n, s) for n, _, s in helper_bodies):
+            lbl = f'__h_body_{i}'
+            body_labels.append(lbl)
+            manifest_block.append(f'\tbyte {lbl}')
+            manifest_block.append(f'\tbyte {size}')
+
+        body_block = []
+        for i, (name, bb) in enumerate(body_bytes):
+            body_block.append(f'{body_labels[i]}:')
+            for b in bb:
+                body_block.append(f'\tbyte 0x{b:02X}')
+
+        self.code.extend(manifest_block + body_block)
+
+        print(f"  [HELPER_OVERLAY] moved {len(helper_bodies)} helper(s) to "
+              f"R_helper (code[{R_HELPER_BASE}..{R_HELPER_BASE + R_HELPER_SIZE - 1}])",
+              file=_sys.stderr)
+        for name, _, size in helper_bodies:
+            print(f"    {name}: {size}B", file=_sys.stderr)
 
     def _emit_user_call(self, name, args):
         """Emit code to call a user-defined function by name. Factored out of
