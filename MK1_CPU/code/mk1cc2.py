@@ -5301,10 +5301,17 @@ class MK1CodeGen:
                 _ov_info = self._split_helpers_for_overlay(
                     runtime_resident_helpers,
                     self._helper_overlay_candidates,
+                    overlay_blocks=overlay_asm_blocks,
                 )
                 if _ov_info is not None:
                     runtime_resident_helpers = _ov_info['modified']
                     runtime_resident_helpers = peephole(runtime_resident_helpers)
+                    # Apply per-overlay rewrites: bundled bodies removed,
+                    # `jal __X_ovN` calls retargeted to the kernel thunk.
+                    for _oi, _new_olines in _ov_info.get('overlay_rewrites', {}).items():
+                        oname, _, _ = overlay_asm_blocks[_oi]
+                        overlay_asm_blocks[_oi] = (oname, _new_olines,
+                                                    measure_lines(_new_olines))
                     self._helper_overlay_info = _ov_info
                     print(f"  [HELPER_OVERLAY] split "
                           f"{len(_ov_info['helpers'])} helper(s) into R_helper: "
@@ -7069,20 +7076,32 @@ class MK1CodeGen:
                   file=sys.stderr)
 
 
-    def _split_helpers_for_overlay(self, helpers_list, candidates):
-        """Phase A overlay-mode split: extract each helper in `candidates`
-        from `helpers_list` (a list of asm lines containing kernel-resident
-        helper bodies). Replaces each body with a 5B thunk
-        (`ldi $c,IDX; j _load_helper`) and appends `_load_helper:` + its
-        body. Returns a dict with:
-          modified:        new helpers_list
-          helpers:         list of {'name','body','size','idx'} for extracted helpers
-          R_HELPER_SIZE:   max body size across helpers (top-of-page reservation)
-          R_HELPER_BASE:   250 - R_HELPER_SIZE (where bodies land at runtime)
-          bytes_saved:     kernel shrink from body→thunk replacement (pre-loader)
-        or None if no candidates were found or leaf-rule eliminated them all.
+    def _split_helpers_for_overlay(self, helpers_list, candidates,
+                                    overlay_blocks=None):
+        """Helper-paging split. Extracts helpers in `candidates` to R_helper.
+
+        Sources scanned for helper bodies:
+        1. `helpers_list` (kernel-resident helpers) — full bodies replaced
+           with 4B thunks (`ldi $c,IDX; j _load_helper`).
+        2. `overlay_blocks` if provided (overlay assembly per slot) —
+           bundled `__X_ov{N}:` copies removed and `jal __X_ov{N}`
+           callers retargeted to the canonical kernel thunk `__X`. This
+           is the deduplication win: a helper bundled across N overlays
+           costs N×body-bytes today, replaced by 1 R_helper body + N
+           thunk redirects + amortized loader.
+
+        Returns a dict with:
+          modified:          new helpers_list (with thunks + _load_helper)
+          helpers:           [{'name','body','size','idx'}, ...] for R_helper
+          R_HELPER_SIZE:     max body size (top-of-page reservation)
+          R_HELPER_BASE:     250 - R_HELPER_SIZE
+          bytes_saved:       net kernel + per-overlay shrinkage
+          overlay_rewrites:  {overlay_idx: new_olines} when bundled copies
+                             were extracted (caller applies to overlay_blocks)
+        or None if no candidates were extractable / cost-benefit fails.
         """
         import sys as _sys
+        import re as _re
         import mk1ir as _ir
 
         def _find(lines, nameset):
@@ -7122,21 +7141,79 @@ class MK1CodeGen:
                         found.add(tgt)
             return found
 
+        # ── Find bundled occurrences in overlay_blocks ──
+        # A bundled label is `__X_ov{N}:` where X strips to a candidate.
+        # Each occurrence: (overlay_idx, body_start_idx, body_end_idx).
+        # The body slice is olines[body_start+1 : body_end].
+        bundled_found = {}    # canonical_name -> [(oi, start, end), ...]
+        suffix_re = _re.compile(r'^(__\w+?)_ov\d+$')
+        if overlay_blocks:
+            for oi, (oname, olines, ofsize) in enumerate(overlay_blocks):
+                bi = 0
+                while bi < len(olines):
+                    s = olines[bi].strip()
+                    if s.endswith(':'):
+                        lbl = s[:-1]
+                        m = suffix_re.match(lbl)
+                        if m and m.group(1) in candidates:
+                            canonical = m.group(1)
+                            start = bi
+                            bi += 1
+                            last_ret = None
+                            while bi < len(olines):
+                                ns = olines[bi].strip()
+                                # Stop at next top-level label (also allow _ovN
+                                # labels since they're bundled siblings).
+                                if (ns.endswith(':') and not ns.startswith('.')
+                                        and ns.startswith('_')):
+                                    break
+                                if ns.startswith('section ') or ns.startswith('org '):
+                                    break
+                                if ns == 'ret':
+                                    last_ret = bi + 1
+                                bi += 1
+                            end = last_ret if last_ret is not None else bi
+                            bundled_found.setdefault(canonical, []).append(
+                                (oi, start, end))
+                            continue
+                    bi += 1
+
+        # Combined active set: helpers visible in either source. Resident
+        # always wins (it's already in kernel — we just relabel as thunk).
+        # Bundled-only helpers contribute when ≥2 overlays bundle them.
+        resident_found = _find(helpers_list, candidates)
+        active = set(resident_found.keys())
+        for name, occs in bundled_found.items():
+            if len(occs) >= 2 or name in resident_found:
+                active.add(name)
+
         # Leaf-rule enforcement: demote callers of other overlay helpers.
-        active = set(candidates)
+        # Scan each candidate's canonical body (resident if available,
+        # else first bundled occurrence) for `jal` into the active set.
+        def _canonical_body(name):
+            if name in resident_found:
+                s, e = resident_found[name]
+                return list(helpers_list[s + 1:e])
+            if name in bundled_found and bundled_found[name]:
+                oi, s, e = bundled_found[name][0]
+                _, olines, _ = overlay_blocks[oi]
+                # Strip _ovN suffix from internal jal/j targets so the
+                # canonical body refers to canonical helper labels.
+                body = []
+                for ln in olines[s + 1:e]:
+                    body.append(_re.sub(r'(__\w+?)_ov\d+\b', r'\1', ln))
+                return body
+            return []
+
         changed = True
         while changed and active:
             changed = False
-            found = _find(helpers_list, active)
             for caller in list(active):
-                if caller not in found:
-                    continue
-                s, e = found[caller]
-                body = helpers_list[s + 1:e]
+                body = _canonical_body(caller)
                 bad = _body_jal_targets(body) & active
                 if bad:
                     print(f'  [HELPER_OVERLAY] leaf-rule demotion: {caller} '
-                          f'calls overlay helper(s) {bad} — leaving resident',
+                          f'calls overlay helper(s) {bad} — leaving resident/bundled',
                           file=_sys.stderr)
                     active.discard(caller)
                     changed = True
@@ -7145,9 +7222,10 @@ class MK1CodeGen:
         if not active:
             return None
 
-        found = _find(helpers_list, active)
-        if not found:
-            return None
+        # Drop resident_found entries that lost the leaf-rule.
+        resident_found = {n: v for n, v in resident_found.items() if n in active}
+        bundled_found = {n: v for n, v in bundled_found.items() if n in active}
+        found = resident_found  # preserved name for downstream
 
         two_byte = {'ldsp', 'stsp', 'push_imm', 'jal', 'jc', 'jz', 'jnc',
                     'jnz', 'j', 'ldi', 'cmp', 'addi', 'subi', 'andi', 'ori',
@@ -7193,9 +7271,8 @@ class MK1CodeGen:
                 prev = s[:-1]
 
         helper_infos = []
-        for i, name in enumerate(sorted(found.keys())):
-            s, e = found[name]
-            body = list(helpers_list[s + 1:e])
+        for i, name in enumerate(sorted(active)):
+            body = _canonical_body(name)
             if not _has_terminator(body):
                 nxt = next_label.get(name)
                 if nxt:
@@ -7205,46 +7282,104 @@ class MK1CodeGen:
                           f'into HLT padding after extraction)',
                           file=_sys.stderr)
             size = _measure(body)
-            helper_infos.append({'name': name, 'body': body, 'size': size,
-                                 'idx': i, 'start': s, 'end': e})
+            info = {'name': name, 'body': body, 'size': size, 'idx': i}
+            if name in resident_found:
+                info['resident_range'] = resident_found[name]
+            info['bundled_occurrences'] = bundled_found.get(name, [])
+            helper_infos.append(info)
 
         R_HELPER_SIZE = max(h['size'] for h in helper_infos)
         R_HELPER_BASE = 250 - R_HELPER_SIZE
 
         # Cost-benefit guard. Both budgets compete for the 250B code page:
         #   kernel_save  = sum(body-thunk) - loader
-        #   overlay_cost = R_HELPER_SIZE
-        # kernel_save > overlay_cost means the program has MORE bytes for
-        # overlay region after the split — this is what programs failing
-        # baseline with wrapping overlays need. Looser guards caused
-        # regressions on programs whose overlays fit today via "safe
-        # wrapping" (largest loaded last): shrinking the overlay region
-        # by overlay_cost turned the wrap unsafe. Keep the strict form.
+        #   bundled_save = sum(body × bundled_count) — actual bytes freed
+        #                  from overlay slots (these were duplicated copies)
+        #   overlay_cost = R_HELPER_SIZE (top-of-page reservation)
+        # We accept when total_save > overlay_cost. The bundled-save term
+        # is the new contribution: previously the cost-benefit only saw
+        # resident kernel savings. With overlay-body extraction, even one
+        # candidate bundled in 3 overlays saves 3×body − 3×4 = lots of
+        # bytes from overlay slots, easily covering the R_HELPER reserve.
         THUNK_SIZE = 4        # ldi $c,N + j _load_helper
         LOADER_SIZE = 28      # _load_helper template above
-        kernel_save = sum(h['size'] - THUNK_SIZE for h in helper_infos) - LOADER_SIZE
+        kernel_save = sum((h['size'] - THUNK_SIZE) for h in helper_infos
+                          if 'resident_range' in h) - LOADER_SIZE
+        bundled_save = sum((h['size']) * len(h['bundled_occurrences'])
+                           for h in helper_infos)
+        # Each bundled callsite gets a 2B `jal` retarget — same length, no
+        # caller-side cost. Bundled body removal frees full body bytes.
+        total_save = kernel_save + bundled_save
         overlay_cost = R_HELPER_SIZE
-        if len(helper_infos) < 2 or kernel_save <= overlay_cost:
+        if total_save <= overlay_cost:
             print(f'  [HELPER_OVERLAY] split not beneficial '
                   f'({len(helper_infos)} helper(s), kernel_save={kernel_save}B, '
-                  f'overlay_cost={overlay_cost}B) — leaving helpers resident.',
+                  f'bundled_save={bundled_save}B, '
+                  f'overlay_cost={overlay_cost}B) — leaving as-is.',
                   file=_sys.stderr)
             return None
 
-        # Replace bodies back-to-front so earlier indices stay valid.
+        # ── Replace resident bodies with thunks (back-to-front) ──
         modified = list(helpers_list)
         bytes_saved = 0
-        THUNK_SIZE = 5  # ldi $c,N (2B) + j _load_helper (2B) + .. wait 4B
-        # Actually: ldi $c,IDX (2B) + j _load_helper (2B) = 4B thunk.
-        THUNK_SIZE = 4
-        for h in sorted(helper_infos, key=lambda x: -x['start']):
+        resident_helpers = [h for h in helper_infos if 'resident_range' in h]
+        for h in sorted(resident_helpers,
+                        key=lambda x: -x['resident_range'][0]):
+            rs, re_ = h['resident_range']
             thunk = [
-                modified[h['start']],
+                modified[rs],
                 f'\tldi $c,{h["idx"]}',
                 '\tj _load_helper',
             ]
-            modified[h['start']:h['end']] = thunk
+            modified[rs:re_] = thunk
             bytes_saved += (h['size'] - THUNK_SIZE)
+
+        # ── For helpers found ONLY in bundled overlays, append a kernel
+        # thunk so callers can `jal __X` ──
+        for h in helper_infos:
+            if 'resident_range' in h:
+                continue
+            modified.append(f'{h["name"]}:')
+            modified.append(f'\tldi $c,{h["idx"]}')
+            modified.append('\tj _load_helper')
+            bytes_saved -= THUNK_SIZE     # thunk costs kernel bytes
+
+        # ── Build overlay rewrites: remove bundled bodies + retarget calls ──
+        overlay_rewrites = {}
+        if overlay_blocks:
+            # First, collect per-overlay (start, end) ranges to remove.
+            per_overlay_removals = {}    # oi -> [(start, end), ...]
+            extracted_names = {h['name'] for h in helper_infos}
+            for h in helper_infos:
+                for (oi, s, e) in h['bundled_occurrences']:
+                    per_overlay_removals.setdefault(oi, []).append((s, e))
+            for oi, ranges in per_overlay_removals.items():
+                _, olines, _ = overlay_blocks[oi]
+                new_olines = list(olines)
+                # Retarget `jal __X_ovN` and `j __X_ovN` to canonical __X
+                # for every extracted helper, before we slice ranges out.
+                _suf_re = _re.compile(r'\b(__\w+?)_ov\d+\b')
+                for li in range(len(new_olines)):
+                    new_olines[li] = _suf_re.sub(
+                        lambda m: m.group(1) if m.group(1) in extracted_names
+                        else m.group(0),
+                        new_olines[li])
+                # Remove bundled body ranges back-to-front.
+                for (s, e) in sorted(ranges, key=lambda r: -r[0]):
+                    bytes_saved += sum(_ir.instr_byte_size(
+                        new_olines[k].strip(),
+                        {'ldsp','stsp','push_imm','jal','jc','jz','jnc','jnz',
+                         'j','ldi','cmp','addi','subi','andi','ori','ldsp_b',
+                         'ldp3','stp3','ocall','tst','out_imm','cmpi',
+                         'ddrb_imm','ddra_imm','ora_imm','orb_imm'})
+                        for k in range(s, e)
+                        if new_olines[k].strip()
+                        and not new_olines[k].strip().startswith(';')
+                        and not new_olines[k].strip().endswith(':')
+                        and not new_olines[k].strip().startswith('section')
+                        and not new_olines[k].strip().startswith('org'))
+                    del new_olines[s:e]
+                overlay_rewrites[oi] = new_olines
 
         # Append the `_load_helper` routine to the kernel helpers list so
         # it lands in runtime_resident_helpers (= kernel image). Mirrors
@@ -7286,6 +7421,7 @@ class MK1CodeGen:
             'R_HELPER_SIZE': R_HELPER_SIZE,
             'R_HELPER_BASE': R_HELPER_BASE,
             'bytes_saved': bytes_saved,
+            'overlay_rewrites': overlay_rewrites,
         }
 
     def _emit_helper_overlay_bodies(self, info):
