@@ -1964,6 +1964,7 @@ class MK1CodeGen:
             # callers.
             HELPER_OVERLAY_NAMES = {
                 '__lcd_chr', '__lcd_cmd', '__lcd_send',
+                '__lcd_print',
                 '__print_u8_dec', '__print_u8_hex',
                 '__i2c_rb', '__i2c_rs',
             }
