@@ -2902,6 +2902,7 @@ class MK1CodeGen:
                 in_main = False
             if in_main:
                 if (s.startswith('exw 0') or s.startswith('ddrb_imm') or
+                    s.startswith('ddrb2_imm') or s.startswith('ddrb3_imm') or
                     s.startswith('ddra_imm') or s.startswith('exrw 2') or
                     s == 'push $a ;!keep' or s == 'pop $a ;!keep' or
                     s.startswith('clr $a') or s.startswith('ldi $d,') or
@@ -3099,7 +3100,9 @@ class MK1CodeGen:
                 'exw 0 0', 'exw 0 1', 'exw 0 3',
                 'push $a ;!keep', 'pop $a ;!keep',
             }
-            INIT_PREFIXES_SET = ('ddrb_imm', 'exrw 2', 'exw ', 'ldi $d,', 'ddra_imm', 'push_imm')
+            INIT_PREFIXES_SET = ('ddrb_imm', 'ddrb2_imm', 'ddrb3_imm',
+                                 'exrw 2', 'exw ', 'ldi $d,', 'ddra_imm',
+                                 'push_imm')
             INIT_JAL_TARGETS = {'__lcd_init', '__tone_setup', '__delay_cal'}
             # __delay_cal included: wrap-safety (see INIT_ONLY_NAMES comment).
             # Note: __i2c_stream, __i2c_st, __i2c_sp are NOT init-only targets —
@@ -3137,7 +3140,9 @@ class MK1CodeGen:
                             if ns.split()[1] in INIT_JAL_TARGETS:
                                 is_init = True
                             break
-                        if ns.startswith('exw ') or ns.startswith('ddrb_imm') or ns.startswith('ddra_imm'):
+                        if (ns.startswith('exw ') or ns.startswith('ddrb_imm')
+                                or ns.startswith('ddrb2_imm') or ns.startswith('ddrb3_imm')
+                                or ns.startswith('ddra_imm')):
                             is_init = True
                             break
                 if s.startswith('jal '):
@@ -4395,7 +4400,9 @@ class MK1CodeGen:
             # (DDR setup) — previously these ended the init phase and caused
             # subsequent lcd_init() calls to stay in runtime_main while their
             # body was placed stage-1-only (section-mismatch error).
-            INIT_PREFIXES = ('ddrb_imm', 'exrw 2', 'exw ', 'ldi $d,', 'ddra_imm', 'push_imm')
+            INIT_PREFIXES = ('ddrb_imm', 'ddrb2_imm', 'ddrb3_imm',
+                             'exrw 2', 'exw ', 'ldi $d,', 'ddra_imm',
+                             'push_imm')
             # Helpers that are safe to call during init (don't end init phase)
             INIT_COMPAT_HELPERS = {'__i2c_stream', '__i2c_st', '__i2c_sp',
                                    '__i2c_rs',
@@ -4452,7 +4459,9 @@ class MK1CodeGen:
                                 if t in INIT_COMPAT_HELPERS or is_init_only(t):
                                     is_init = True
                                 break
-                            if ns.startswith('exw ') or ns.startswith('ddrb_imm') or ns.startswith('ddra_imm'):
+                            if (ns.startswith('exw ') or ns.startswith('ddrb_imm')
+                                    or ns.startswith('ddrb2_imm') or ns.startswith('ddrb3_imm')
+                                    or ns.startswith('ddra_imm')):
                                 is_init = True
                                 break
                     if s.startswith('jal '):
@@ -6670,8 +6679,50 @@ class MK1CodeGen:
             # Decide whether init code fits in the slack [cur_addr..helper_start-1].
             # If not, emit pad + init code AFTER the mini-copy target range,
             # so the CPU never executes mini-copied bytes as if they were init.
+            #
+            # Adaptive fallback: pre-pad path costs `_init_code_size` MORE
+            # bytes than post-pad (init lands past mc_end instead of inside).
+            # If init doesn't fit pre-mc slack, pop smallest pre-mc helpers
+            # (moving them to post_mc_helpers) until it does — each popped
+            # helper frees its body-size in slack and lands in post_mc
+            # either way, so the total swap is net-neutral on bytes while
+            # avoiding the `_init_code_size` pre-pad penalty. Measured on
+            # lcd_clean post-ddrb-fusion: saves 2B of stage-1 budget.
             _cur_addr_after_premc = _measure_code_section(assembled)
             _init_fits_pre = (_cur_addr_after_premc + _init_code_size) <= helper_start
+            while (not _init_fits_pre and _pre_mc_helpers):
+                _smallest = min(_pre_mc_helpers, key=lambda h: h[3])
+                _pre_mc_helpers.remove(_smallest)
+                _post_mc_helpers.append(_smallest)
+                # Rebuild assembled: strip the smallest helper's body. Easier
+                # to recompute: rewind to before pre-mc placement and re-emit
+                # the remaining pre-mc helpers. Track the split point with a
+                # sentinel label that was appended just before the first
+                # helper. Simpler: measure the body size and truncate.
+                _removed_body_size = _smallest[3]
+                # The helper body bytes were appended directly to `assembled`.
+                # Removing them requires finding the label and slicing.
+                # Work from the end backwards until we've popped the helper.
+                _label = f'{_smallest[0]}:'
+                for _ri in range(len(assembled) - 1, -1, -1):
+                    if assembled[_ri].strip() == _label:
+                        # Find the extent: until next top-level label or end.
+                        _end = _ri + 1
+                        while _end < len(assembled):
+                            _ns = assembled[_end].strip()
+                            if (_ns.endswith(':') and not _ns.startswith('.')
+                                    and _ns.startswith('_')):
+                                break
+                            _end += 1
+                        del assembled[_ri:_end]
+                        break
+                _cur_addr_after_premc = _measure_code_section(assembled)
+                _init_fits_pre = (_cur_addr_after_premc + _init_code_size) <= helper_start
+                print(f"  Init-helper placement: popped {_smallest[0]} "
+                      f"({_removed_body_size}B) from pre-mc to fit init code "
+                      f"(saves ~{_init_code_size}B via post-pad path)",
+                      file=sys.stderr)
+
             if not _init_fits_pre:
                 # Pad first so init code lands past the mini-copy destination.
                 _pad_needed = _mc_end - _cur_addr_after_premc
@@ -10906,16 +10957,10 @@ def peephole(lines):
         ('mov $b,$a', 'inc', 'mov $a,$b'): 'incb',
     }
     # T4.1-discovered: `mov $b,$a; sll; mov $a,$b` (3B) → `sllb` (1B),
-    # saves 2B per occurrence. sllb is a new opcode (0x22) that retires
-    # the unused `move $sp, $c` — requires microcode EEPROM reflash.
-    # Gated behind MK1_NEW_OPCODES=1 so pre-flash compilation still
-    # emits the original 3-byte sequence and runs correctly on unflashed
-    # hardware. Once the user flashes the new microcode.bin to the four
-    # SST39SF040 EEPROMs (T48 + minipro, same binary all 4 chips per
-    # the project memory), they set the env var and rebuild.
-    import os as _sllb_os
-    if _sllb_os.environ.get('MK1_NEW_OPCODES') == '1':
-        COLLAPSE[('mov $b,$a', 'sll', 'mov $a,$b')] = 'sllb'
+    # saves 2B per occurrence. sllb opcode (0x22) replaces the unused
+    # `move $sp, $c`. Microcode EEPROMs flashed 2026-04-08 — permanent
+    # (previously gated behind MK1_NEW_OPCODES=1 during pre-flash phase).
+    COLLAPSE[('mov $b,$a', 'sll', 'mov $a,$b')] = 'sllb'
     # IR-based implementation — replaces the old flat-list window walk.
     # Behavior and byte output are identical (validated against every
     # corpus program); the IR version is the migration foundation that
@@ -10929,61 +10974,22 @@ def peephole(lines):
         print(f"  Peephole: collapsed {collapsed_count} reg-inc/dec patterns "
               f"(saved {collapsed_count * 2}B)", file=sys.stderr)
 
-    # ── DDRB fusion: consecutive ddrb_imm runs → ddrb2_imm/ddrb3_imm ──
-    # Post-flash only (gated). Both ops retire unused setjmp/setret slots.
-    # Encoding:
-    #   ddrb_imm  N      : 2B (opcode + imm)
-    #   ddrb2_imm A B    : 3B (opcode + 2 imm)   → saves 1B per pair
-    #   ddrb3_imm A B C  : 4B (opcode + 3 imm)   → saves 2B per triple
-    # Fusion picks ddrb3 greedily, then ddrb2, then single.
-    # For runs that span a label or branch target we split at the boundary
-    # (labels are handled here by only fusing within a contiguous raw-line
-    # block of ddrb_imm lines — any interruption breaks the run).
-    if _sllb_os.environ.get('MK1_NEW_OPCODES') == '1':
-        _ddrb_saved = 0
-        new_lines = []
-        i = 0
-        while i < len(lines):
-            # Collect a run of consecutive `\tddrb_imm N` lines.
-            run = []
-            j = i
-            while j < len(lines):
-                s = lines[j].strip().split(';')[0].strip()
-                if s.startswith('ddrb_imm '):
-                    try:
-                        val = int(s.split()[1], 0) & 0xFF
-                    except (IndexError, ValueError):
-                        break
-                    run.append(val)
-                    j += 1
-                else:
-                    break
-            if len(run) < 2:
-                # Single (or zero) — leave as-is.
-                new_lines.append(lines[i])
-                i += 1
-                continue
-            # Fuse: chunk into 3s then 2s then singles.
-            k = 0
-            while k < len(run):
-                remaining = len(run) - k
-                if remaining >= 3:
-                    new_lines.append(f'\tddrb3_imm 0x{run[k]:02X} 0x{run[k+1]:02X} 0x{run[k+2]:02X}')
-                    _ddrb_saved += 2
-                    k += 3
-                elif remaining == 2:
-                    new_lines.append(f'\tddrb2_imm 0x{run[k]:02X} 0x{run[k+1]:02X}')
-                    _ddrb_saved += 1
-                    k += 2
-                else:  # remaining == 1
-                    new_lines.append(f'\tddrb_imm 0x{run[k]:02X}')
-                    k += 1
-            i = j
-        lines = new_lines
-        if _ddrb_saved > 0:
-            import sys
-            print(f"  Peephole: fused DDRB runs (saved {_ddrb_saved}B)",
-                  file=sys.stderr)
+    # ── DDRB fusion: REMOVED 2026-04-23 ──
+    # `ddrb2_imm`/`ddrb3_imm` pack 2-3 consecutive VIA DDRB writes into one
+    # multi-byte opcode (saves 1-2B per run). Microcode EEPROMs were
+    # flashed with these opcodes 2026-04-08 and verified functionally in
+    # isolation ("hammer tests, 10/10"). BUT hardware integration found
+    # the grouped-overlay regression test hangs at 100k cycles with no
+    # output when compute_chain's main uses them. Cause: the original
+    # `ddrb_imm` worked because 4 non-VIA clocks between consecutive
+    # writes (2 RST + instruction-fetch overhead) give the VIA enough
+    # settling time. `ddrb2_imm`/`ddrb3_imm` microcode packs the writes
+    # with only 1 settling cycle between each (just the PO|MI byte-fetch)
+    # — insufficient, reproducing the same RS0 bleed bug that `ddrb_imm`
+    # was designed to avoid in the first place.
+    # Fix requires microcode edit + reflash. Until then, emitting these
+    # fused forms is unsafe. Keep the microcode opcodes (they're harmless
+    # if not emitted); the compiler no longer generates them.
 
     # ── T4.1 auto-discovered peephole rules ──────────────────────────
     # Verified equivalences found by superopt.py against mk1sim, each
