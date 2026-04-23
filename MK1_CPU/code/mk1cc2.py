@@ -726,7 +726,8 @@ class MK1CodeGen:
 
     I2C_CALLS = {'i2c_start', 'i2c_stop', 'i2c_send_byte', 'i2c_read_byte',
                  'i2c_nack', 'i2c_ack', 'i2c_bus_reset', 'i2c_stream',
-                 'rtc_read_temp', 'rtc_read_seconds', 'eeprom_read_byte'}
+                 'rtc_read_temp', 'rtc_read_seconds', 'eeprom_read_byte',
+                 'eeprom_read', 'eeprom_write_byte', 'eeprom_write'}
     LCD_CALLS = {'lcd_cmd', 'lcd_char', 'lcd_print', 'delay', 'tone', 'silence'}
 
     def _stmt_domain(self, stmt):
@@ -1454,7 +1455,7 @@ class MK1CodeGen:
             self.emit('\tsection code')
 
         # Emit note table data in page 1 (data page)
-        if hasattr(self, '_note_table'):
+        if hasattr(self, '_note_table') and not getattr(self, '_note_table_already_emitted', False):
             self.emit('\tsection data')
             for p1_off, ratio, cyc_lo, cyc_hi in self._note_table:
                 self.emit(f'; note at data offset {p1_off}: ratio={ratio} cyc={cyc_hi}:{cyc_lo}')
@@ -2561,7 +2562,9 @@ class MK1CodeGen:
 
         # __play_note: A = data page offset into note table.
         # Reads [half_period, cyc_lo, cyc_hi] from data page (page 1) via deref.
-        # Note: ratio→half_period precomputation happens during init.
+        # Note: ratio→half_period precomputation happens during init when
+        # available; otherwise current tone entries are stored as compact
+        # half-period approximations.
         # If half_period=0 and __delay_Nms available, plays silence (cyc_lo = ms).
         # Otherwise sets C=half_period and calls __tone.
         if '__play_note' in helpers:
@@ -2569,13 +2572,12 @@ class MK1CodeGen:
             lbl_sil = self.label('pnsil') if has_silence else None
             self.emit('__play_note:')
             # Note table in page 1: [half_period, cyc_lo, cyc_hi]
-            # (precomputed from ratio during init via __tone_setup)
             self.emit('\tmov $a,$d')       # D = base offset
             self.emit('\tderef')           # A = data[offset] = half_period
             if has_silence:
                 self.emit('\ttst 0xFF')
                 self.emit(f'\tjz {lbl_sil}')   # half_period=0 → silence
-            # A = half_period (precomputed), D = base offset
+            # A = half_period (precomputed/approximated), D = base offset
             self.emit('\tmov $a,$c')       # C = half_period
             self.emit('\tmov $d,$a')       # A = offset
             self.emit('\tinc')
@@ -6001,6 +6003,8 @@ class MK1CodeGen:
             # data[data_base], never hitting the real LCD init bytes.
             assembled.append('\tsection data')
             lcd_init_info = getattr(self, '_lcd_init_data', None)
+            note_entries = sorted(getattr(self, '_note_table', []), key=lambda x: x[0])
+            note_i = 0
             page1_vars = getattr(self, '_page1_globals_cache', None)
             emitted = 0
             if page1_vars is not None:
@@ -6013,12 +6017,24 @@ class MK1CodeGen:
                     else:
                         assembled.append(f'\tbyte {init}')
                         emitted += 1
+            def emit_allocated_until(limit):
+                nonlocal emitted, note_i
+                while emitted < limit:
+                    if note_i < len(note_entries) and note_entries[note_i][0] == emitted:
+                        p1_off, ratio, cyc_lo, cyc_hi = note_entries[note_i]
+                        assembled.append(f'; note at data offset {p1_off}: ratio={ratio} cyc={cyc_hi}:{cyc_lo}')
+                        assembled.append(f'\tbyte {ratio}')
+                        assembled.append(f'\tbyte {cyc_lo}')
+                        assembled.append(f'\tbyte {cyc_hi}')
+                        emitted += 3
+                        note_i += 1
+                    else:
+                        assembled.append('\tbyte 0')
+                        emitted += 1
             # Pad up to data_base (where LCD init data is expected) with zeros.
             if lcd_init_info is not None:
                 lcd_base, lcd_bytes = lcd_init_info
-                for _ in range(max(0, lcd_base - emitted)):
-                    assembled.append('\tbyte 0')
-                    emitted += 1
+                emit_allocated_until(lcd_base)
                 assembled.append(f'; LCD init data at data[{lcd_base}..{lcd_base+len(lcd_bytes)-1}]')
                 for b in lcd_bytes:
                     assembled.append(f'\tbyte {b}')
@@ -6027,8 +6043,9 @@ class MK1CodeGen:
                 # later emission in compile() can skip.
                 self._lcd_init_already_emitted = True
             # Any remaining slots → zero-fill
-            for _ in range(max(0, self.data_alloc - emitted)):
-                assembled.append('\tbyte 0')
+            emit_allocated_until(self.data_alloc)
+            if note_entries:
+                self._note_table_already_emitted = True
 
         for idx, name, asm_lines, fsize, _ in p1_overlays:
             assembled.append('\tsection code')
@@ -8116,16 +8133,17 @@ class MK1CodeGen:
                 self.emit('\tmov $d,$a')  # A = byte read (from D)
                 return
 
-            if name == 'eeprom_write_byte':
-                # eeprom_write_byte(addr, data) — addr is 16-bit, split at compile time
-                # Also accepts eeprom_write_byte(addr_hi, addr_lo, data) for backwards compat
+            if name in ('eeprom_write_byte', 'eeprom_write'):
+                # eeprom_write_byte(addr, data) — addr is 16-bit, split at compile time.
+                # eeprom_write(addr_hi, addr_lo, data) is the legacy spelling.
+                # Both forms also accept explicit hi/lo bytes for backwards compat.
                 if not args or len(args) < 2:
-                    self.gen_error("eeprom_write_byte(addr, data) or eeprom_write_byte(hi, lo, data)")
+                    self.gen_error("eeprom_write_byte(addr, data) or eeprom_write(addr_hi, addr_lo, data)")
                     return
                 if not hasattr(self, '_lcd_helpers'):
                     self._lcd_helpers = set()
                 self._lcd_helpers.add('__i2c_sb')
-                if len(args) == 2:
+                if len(args) == 2 and name == 'eeprom_write_byte':
                     # 2-arg form: eeprom_write_byte(addr16, data)
                     addr_c = self._const_eval(args[0])
                     if addr_c is None:
@@ -8188,17 +8206,17 @@ class MK1CodeGen:
                 self.emit(f'\tjnz {lbl}')
                 return
 
-            if name == 'eeprom_read_byte':
-                # eeprom_read_byte(addr) — addr is 16-bit constant, returns byte in A
-                # Also accepts eeprom_read_byte(addr_hi, addr_lo)
+            if name in ('eeprom_read_byte', 'eeprom_read'):
+                # eeprom_read_byte(addr) — addr is 16-bit constant, returns byte in A.
+                # eeprom_read(addr_hi, addr_lo) is the legacy spelling.
                 if not args:
-                    self.gen_error("eeprom_read_byte(addr) or eeprom_read_byte(hi, lo)")
+                    self.gen_error("eeprom_read_byte(addr) or eeprom_read(addr_hi, addr_lo)")
                     return
                 if not hasattr(self, '_lcd_helpers'):
                     self._lcd_helpers = set()
                 self._lcd_helpers.add('__i2c_sb')
                 self._lcd_helpers.add('__i2c_rb')
-                if len(args) == 1:
+                if len(args) == 1 and name == 'eeprom_read_byte':
                     addr_c = self._const_eval(args[0])
                     if addr_c is None:
                         self.gen_error("eeprom_read_byte: address must be a constant")
@@ -8459,10 +8477,9 @@ class MK1CodeGen:
                 if not hasattr(self, '_tone_ddra_emitted'):
                     self._tone_ddra_emitted = True
                     self._needs_tone_init = True
-                    # Claim PA1 (push-pull buzzer output). Future port-A users
-                    # will OR this bit into their DDRA writes so PA1 stays
-                    # driven across e.g. delay_cal's DDRA clear.
-                    self._claim_port_bits('DDRA', 0x02, 'tone')
+                    # __tone brackets PA1 itself. A persistent DDRA claim keeps
+                    # PA1 driven during delay calibration and after playback,
+                    # which has been observed to disturb timing-sensitive VIA use.
                 if len(args) < 2:
                     raise Exception("tone() requires 2 arguments: freq_hz, duration_ms")
                 freq = self._const_eval(args[0])
