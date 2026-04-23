@@ -7143,9 +7143,10 @@ class MK1CodeGen:
             return found
 
         # ── Find bundled occurrences in overlay_blocks ──
-        # A bundled label is `__X_ov{N}:` where X strips to a candidate.
-        # Each occurrence: (overlay_idx, body_start_idx, body_end_idx).
-        # The body slice is olines[body_start+1 : body_end].
+        # A bundled label is either `__X_ov{N}:` (multi-overlay bundling
+        # adds the suffix to dedupe symbols) or plain `__X:` (single-use
+        # bundling — no naming conflict, suffix omitted). In both cases
+        # X strips to a candidate. Each occurrence: (oi, body_start, body_end).
         bundled_found = {}    # canonical_name -> [(oi, start, end), ...]
         suffix_re = _re.compile(r'^(__\w+?)_ov\d+$')
         if overlay_blocks:
@@ -7155,9 +7156,13 @@ class MK1CodeGen:
                     s = olines[bi].strip()
                     if s.endswith(':'):
                         lbl = s[:-1]
+                        canonical = None
                         m = suffix_re.match(lbl)
                         if m and m.group(1) in candidates:
                             canonical = m.group(1)
+                        elif lbl in candidates:
+                            canonical = lbl
+                        if canonical is not None:
                             start = bi
                             bi += 1
                             last_ret = None
