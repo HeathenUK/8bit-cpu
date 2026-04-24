@@ -9940,6 +9940,65 @@ def peephole(lines):
         print(f"  Peephole: shortened DDRB-only stack save/restore "
               f"(saved {_stack_save_saved}B)", file=sys.stderr)
 
+    # Loop-local inc/dec stores often preserve A just before jumping back to a
+    # loop header that reloads the same stack slot:
+    #   ldsp N; push $a; inc; stsp N+1; mov $d,$a; pop $a; j .loop
+    #   .loop: ldsp N
+    # The saved A is dead on that edge, and stsp already leaves D equal to the
+    # updated value, so store directly to the unshifted stack slot.
+    def _next_instr_after_label(label):
+        try:
+            pos = next(i for i, line in enumerate(lines)
+                       if line.strip() == f'{label}:')
+        except StopIteration:
+            return None
+        j = pos + 1
+        while j < len(lines):
+            s = lines[j].strip()
+            if not s or s.startswith(';') or s.startswith('section ') or s.startswith('org '):
+                j += 1
+                continue
+            return s
+        return None
+
+    _loop_store_saved = 0
+    new_lines = []
+    i = 0
+    while i < len(lines):
+        if i + 6 < len(lines):
+            s0 = lines[i].strip()
+            s1 = lines[i + 1].strip()
+            s2 = lines[i + 2].strip()
+            s3 = lines[i + 3].strip()
+            s4 = lines[i + 4].strip()
+            s5 = lines[i + 5].strip()
+            s6 = lines[i + 6].strip()
+            m0 = _re.match(r'^ldsp (\d+)$', s0)
+            m3 = _re.match(r'^stsp (\d+)$', s3)
+            m6 = _re.match(r'^j (\.\w+)$', s6)
+            if (m0 and m3 and m6
+                    and s1 == 'push $a'
+                    and s2 in ('inc', 'dec')
+                    and s4 == 'mov $d,$a'
+                    and s5 == 'pop $a'
+                    and int(m3.group(1)) == int(m0.group(1)) + 1
+                    and _next_instr_after_label(m6.group(1)) == s0):
+                indent = lines[i][:len(lines[i]) - len(lines[i].lstrip())]
+                new_lines.append(lines[i])
+                new_lines.append(indent + s2)
+                new_lines.append(indent + f'stsp {m0.group(1)}')
+                new_lines.append(lines[i + 6])
+                _loop_store_saved += 3
+                i += 7
+                continue
+        new_lines.append(lines[i])
+        i += 1
+    lines = new_lines
+    if _loop_store_saved:
+        import sys
+        print(f"  Peephole: shortened loop-local inc/dec stores "
+              f"(saved {_loop_store_saved}B)", file=sys.stderr)
+
     return lines
 
 
