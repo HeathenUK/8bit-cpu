@@ -3309,22 +3309,17 @@ class MK1CodeGen:
         # If a user+library combination exceeds the overlay region → fatal error.
         overlay_slots = []  # list of ([(name, start, end, fsize), ...], total_size)
 
-        # Pre-compute external callers so we can pick the slot's entry point.
-        # An "entry" function is one called from OUTSIDE the slot (main, other
-        # slots, resident helpers). The overlay loader tail-calls
-        # `j __ov_entry` which lands at offset 0 of the loaded bundle — so
-        # whichever function appears first in the slot IS the entry. If the
-        # compiler puts a helper first (e.g., double_it before compute_chain),
-        # external callers of compute_chain silently dispatch to double_it.
+        # Pre-compute external callers so a slot's most likely entry point is
+        # first. Multi-entry dispatch now calls the requested function label
+        # after copying the slot, but a stable first function still keeps
+        # diagnostics and overlay reports readable.
         def _slot_entry_fn(comp_names):
-            """Pick the entry function for a slot. The overlay loader tail-
-            calls `j __ov_entry` which lands at offset 0 of the loaded bundle,
-            so slot[0] MUST be the function reachable from outside the slot.
-            Heuristic: a function called by NONE of the other functions in the
-            slot is likely the external entry point. User functions preferred
-            over library helpers. `comp_names` contains bare names (no leading
-            `_`); the asm `jal _foo` targets carry the underscore — normalize
-            on comparison.
+            """Pick a readable primary function for a slot. Heuristic: a
+            function called by NONE of the other functions in the slot is
+            likely an external entry point. User functions preferred over
+            library helpers. `comp_names` contains bare names (no leading `_`);
+            the asm `jal _foo` targets carry the underscore — normalize on
+            comparison.
             """
             comp_set = set(comp_names)
             # Build intra-component call graph: who calls whom?
@@ -3354,9 +3349,7 @@ class MK1CodeGen:
             return (user_first + candidates)[0]
 
         for comp in components:
-            # Reorder so the entry function (user fn called externally) is
-            # first. Without this, the overlay loader's `j __ov_entry` may
-            # land on a helper instead of the requested user function.
+            # Reorder so the primary externally-called user function is first.
             entry_name = _slot_entry_fn(comp)
             if entry_name and entry_name in comp:
                 comp_ordered = [entry_name] + [n for n in comp if n != entry_name]
@@ -3471,14 +3464,15 @@ class MK1CodeGen:
                         ldi_b_line = new_resident[-2]
                         new_resident = new_resident[:-3]
                         new_resident.append(ldi_b_line)
-                    # T3.3 THIN OVERLAY DISPATCH:
+                    # T3.3 MULTI-ENTRY OVERLAY DISPATCH:
                     # Caller sets $c = overlay index, leaves $a/$b as args.
-                    # `jal _overlay_load` loads the overlay body AND tail-calls
-                    # it (via loader's internal push/pop + `j __ov_entry`).
-                    # The overlay's `ret` returns to this caller directly.
-                    # Call site: 4B (ldi $c + jal) vs the old 11B pattern.
+                    # `_overlay_load` copies the slot and returns; the caller
+                    # then jumps to the requested function label inside that
+                    # loaded slot. This is required because merged slots can
+                    # have multiple externally-called functions.
                     new_resident.append(f'\tldi $c,{idx}')
                     new_resident.append('\tjal _overlay_load')
+                    new_resident.append(f'\tjal {target}')
                     rewritten = True
                 if not rewritten:
                     new_resident.append(line)
@@ -4307,24 +4301,22 @@ class MK1CodeGen:
                 EEPROM-backed overlays are preloaded into freed page3 space during init,
                 so the runtime loader only needs SRAM copy paths.
                 """
-                # ── T3.3 THIN OVERLAY DISPATCH ──
-                # Loader saves caller's $a/$b internally and tail-calls the
-                # loaded overlay via `j __ov_entry`. Call site shrinks from
-                #   push $b; push $a; ldi $a,IDX; jal _overlay_load;
-                #   pop $a; pop $b; jal __ov_entry           (11B)
-                # to
-                #   ldi $c,IDX; jal _overlay_load            (4B)
-                # with the loader gaining ~5B for its own push/pop/j.
-                # Net: 6B saved per call site above loader overhead.
+                # ── T3.3 MULTI-ENTRY OVERLAY DISPATCH ──
+                # Loader saves caller's $a/$b internally, copies the selected
+                # slot, restores $a/$b, and returns. The call site then `jal`s
+                # the specific function label inside the loaded slot. This is
+                # slightly larger than a tail-dispatch loader, but it is
+                # required when one merged overlay slot has multiple external
+                # entry points.
                 #
                 # Calling convention change:
                 #   - Caller passes overlay index in $c (was $a)
                 #   - Caller's $a/$b are the overlay's args (unchanged)
-                #   - Loader preserves $a/$b across the copy + returns via
-                #     tail-call; overlay's `ret` returns to caller directly.
+                #   - Loader preserves $a/$b across the copy and returns to
+                #     the dispatch site.
                 num_pages = sum([has_p3, has_p1, has_p2])
                 loader = [
-                    '; ── overlay loader (kernel, thin dispatch) ──',
+                    '; ── overlay loader (kernel, multi-entry dispatch) ──',
                     '_overlay_load:',
                     '\tpush $b',                    # save caller's arg2
                     '\tpush $a',                    # save caller's arg1
@@ -4351,7 +4343,7 @@ class MK1CodeGen:
                     # the page-number on the stack — still restored correctly
                     # at function exit.
                     loader = [
-                        '; ── overlay loader (kernel, thin dispatch) ──',
+                        '; ── overlay loader (kernel, multi-entry dispatch) ──',
                         '_overlay_load:',
                         '\tpush $b',                    # save caller's arg2
                         '\tpush $a',                    # save caller's arg1
@@ -4428,13 +4420,11 @@ class MK1CodeGen:
                 loader.append('\tjnz .ov_br')
                 loader.append('\tddrb_imm 0x01')   # SDA LOW, SCL HIGH (STOP prep)
                 loader.append('\tddrb_imm 0x00')   # SDA HIGH = STOP
-                # T3.3 tail-call: restore caller's arg1/arg2 and fall into
-                # the overlay body. The overlay's `ret` returns to the caller
-                # of _overlay_load (which used `jal`), skipping the loader's
-                # own return frame — so we don't emit a ret here.
+                # Restore caller's arg1/arg2 and return. The caller enters the
+                # requested function in the loaded overlay slot.
                 loader.append('\tpop $a')          # restore caller's arg1
                 loader.append('\tpop $b')          # restore caller's arg2
-                loader.append('\tj __ov_entry')    # tail-call loaded overlay
+                loader.append('\tret')
                 return loader
 
             # ── Step 13: Two-pass sizing ──
@@ -5515,7 +5505,7 @@ class MK1CodeGen:
             _ov_avail = 250 - _kernel_chk
             _wrapping_indices = {i for i, (_, _, sz) in enumerate(overlay_asm_blocks)
                                  if sz > _ov_avail}
-            # Determine call order from main_lines. T3.3 thin-dispatch puts
+            # Determine call order from main_lines. Multi-entry dispatch puts
             # the overlay index in $c (ldi $c,N) right before jal _overlay_load.
             # (Pre-T3.3 used $a; tolerated as fallback.)
             _call_order = []
@@ -5929,7 +5919,7 @@ class MK1CodeGen:
         for new_idx, (old_idx, name, asm_lines, fsize, offset) in enumerate(all_placed_ordered):
             old_to_new[old_idx] = new_idx
 
-        # Fix up overlay indices in assembled code. T3.3 thin-dispatch
+        # Fix up overlay indices in assembled code. Multi-entry dispatch
         # puts the index in $c (ldi $c,N) immediately before the load.
         # (Pre-T3.3 convention used $a; kept as fallback for any stale
         # emission path.)
@@ -5973,7 +5963,8 @@ class MK1CodeGen:
 
         # __ov_entry: marks the start of the overlay region (address OVERLAY_REGION).
         # Emitted after manifest so it resolves to the correct code address.
-        # Caller does 'jal __ov_entry' after _overlay_load copies the code.
+        # Resident dispatch calls the requested function label after
+        # _overlay_load copies the code.
         assembled.append('\tsection code')
         assembled.append(f'\torg {OVERLAY_REGION}')
         assembled.append('\tsection page3_code')

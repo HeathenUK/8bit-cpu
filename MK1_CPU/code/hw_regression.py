@@ -396,6 +396,14 @@ TESTS = [
         eeprom=True,
     ),
     Test(
+        'overlay multi-entry merged slot',
+        '''void leaf(void) { out(21); }
+        void wrap(void) { out(10); leaf(); out(11); }
+        unsigned char g[220];
+        void main(void) { wrap(); leaf(); halt(); }''',
+        [10, 21, 11, 21], eeprom=True,
+    ),
+    Test(
         'two separate overlays',
         '''unsigned char f1(unsigned char x) { return x + 1; }
         unsigned char f2(unsigned char x) { return x + 2; }
