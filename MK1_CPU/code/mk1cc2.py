@@ -1308,12 +1308,116 @@ class MK1CodeGen:
                     i += 1
             return ('block', out_stmts)
 
+        def is_lcd_char_digit(stmt, name):
+            if (isinstance(stmt, tuple) and stmt[0] == 'block'
+                    and len(stmt[1]) == 1):
+                stmt = stmt[1][0]
+            return (isinstance(stmt, tuple) and stmt[0] == 'expr_stmt'
+                    and isinstance(stmt[1], tuple) and stmt[1][0] == 'call'
+                    and stmt[1][1] == 'lcd_char'
+                    and len(stmt[1][2]) == 1
+                    and stmt[1][2][0] == ('binop', '+', ('var', name), ('num', 48)))
+
+        def is_lcd_char_const(stmt, val):
+            return (isinstance(stmt, tuple) and stmt[0] == 'expr_stmt'
+                    and isinstance(stmt[1], tuple) and stmt[1][0] == 'call'
+                    and stmt[1][1] == 'lcd_char'
+                    and len(stmt[1][2]) == 1
+                    and stmt[1][2][0] == ('num', val))
+
+        def decimal_loop_vars(stmt):
+            if not (isinstance(stmt, tuple) and stmt[0] == 'while'):
+                return None
+            cond = stmt[1]
+            body = stmt[2]
+            if not (isinstance(cond, tuple)
+                    and cond[0] == 'binop' and cond[1] == '>='
+                    and cond[3] == ('num', 10)
+                    and isinstance(cond[2], tuple) and cond[2][0] == 'var'):
+                return None
+            ones = cond[2][1]
+            if not (isinstance(body, tuple) and body[0] == 'block'
+                    and len(body[1]) == 2):
+                return None
+            s0, s1 = body[1]
+            if not (s0[0] == 'expr_stmt' and s0[1][0] == 'assign'
+                    and s0[1][1] == '=' and s0[1][2] == ('var', ones)
+                    and s0[1][3] == ('binop', '-', ('var', ones), ('num', 10))):
+                return None
+            if not (s1[0] == 'expr_stmt' and s1[1][0] == 'assign'
+                    and s1[1][1] == '=' and isinstance(s1[1][2], tuple)
+                    and s1[1][2][0] == 'var'
+                    and s1[1][3] == ('binop', '+', s1[1][2], ('num', 1))):
+                return None
+            return s1[1][2][1], ones
+
+        def is_optional_tens_print(stmt, tens):
+            return (isinstance(stmt, tuple) and stmt[0] == 'if'
+                    and stmt[1] == ('binop', '>', ('var', tens), ('num', 0))
+                    and is_lcd_char_digit(stmt[2], tens)
+                    and (len(stmt) < 4 or stmt[3] is None))
+
+        def compact_lcd_temp(block):
+            if not isinstance(block, tuple) or block[0] != 'block':
+                return block
+            stmts = list(block[1])
+            out = []
+            i = 0
+            while i < len(stmts):
+                if i + 7 < len(stmts):
+                    d0, d1 = stmts[i], stmts[i + 1]
+                    if d0[0] == 'local' and d0[2] is None \
+                            and d1[0] == 'local' and d1[2] is None:
+                        j = i + 2
+                        prefix = []
+                        while j + 6 < len(stmts):
+                            a0, a1 = stmts[j], stmts[j + 1]
+                            if (a0[0] == 'expr_stmt' and a0[1][0] == 'assign'
+                                    and a0[1][1] == '='
+                                    and a0[1][2] == ('var', d0[1])
+                                    and a0[1][3] == ('num', 0)
+                                    and a1[0] == 'expr_stmt'
+                                    and a1[1][0] == 'assign'
+                                    and a1[1][1] == '='
+                                    and a1[1][2] == ('var', d1[1])):
+                                break
+                            reads = set()
+                            self._find_vars_in_stmt(stmts[j], set(), reads)
+                            if d0[1] in reads or d1[1] in reads:
+                                break
+                            prefix.append(rewrite_stmt(stmts[j]))
+                            j += 1
+                        if j + 6 < len(stmts):
+                            a0, a1, loop, ifs, ones_print, deg, cchar = stmts[j:j+7]
+                            if (a0[0] == 'expr_stmt' and a0[1][0] == 'assign'
+                                    and a0[1][1] == '=' and a0[1][2] == ('var', d0[1])
+                                    and a0[1][3] == ('num', 0)
+                                    and a1[0] == 'expr_stmt' and a1[1][0] == 'assign'
+                                    and a1[1][1] == '=' and a1[1][2] == ('var', d1[1])):
+                                vars_ = decimal_loop_vars(loop)
+                                if (vars_ == (d0[1], d1[1])
+                                        and is_optional_tens_print(ifs, d0[1])
+                                        and is_lcd_char_digit(ones_print, d1[1])
+                                        and is_lcd_char_const(deg, 0xDF)
+                                        and is_lcd_char_const(cchar, ord('C'))):
+                                    out.extend(prefix)
+                                    out.append(('expr_stmt',
+                                                ('call', 'lcd_temp_u8', [a1[1][3]])))
+                                    i = j + 7
+                                    continue
+                out.append(rewrite_stmt(stmts[i]))
+                i += 1
+            return ('block', out)
+
+        def simplify_block(block):
+            return compact_lcd_temp(merge_local_init_runs(block))
+
         def rewrite_stmt(stmt):
             if not isinstance(stmt, tuple):
                 return stmt
             kind = stmt[0]
             if kind == 'block':
-                return merge_local_init_runs(stmt)
+                return simplify_block(stmt)
             if kind == 'if':
                 else_part = rewrite_stmt(stmt[3]) if len(stmt) > 3 and stmt[3] else None
                 return (kind, stmt[1], rewrite_stmt(stmt[2]),
@@ -1327,7 +1431,7 @@ class MK1CodeGen:
         out = []
         for name, params, body, ret_type in functions:
             if body[0] == 'block':
-                body = merge_local_init_runs(body)
+                body = simplify_block(body)
                 stmts = body[1]
                 if (len(stmts) == 3
                         and stmts[0][0] == 'local'
@@ -2497,6 +2601,39 @@ class MK1CodeGen:
             self.emit(f'{lbl_lt10}:')
             # --- ones ---
             self.emit('\taddi 48,$a')
+            self.emit('\tjal __lcd_chr')
+            self.emit('\tret')
+
+        # __lcd_temp_u8: A = 0..99-ish temp, print decimal without leading
+        # zero followed by HD44780 degree glyph and 'C'. This is deliberately
+        # smaller than generic printf("%d\xDFC") and replaces the repeated
+        # tens/ones source idiom used by several LCD temperature examples.
+        if '__lcd_temp_u8' in helpers:
+            lbl_loop = self.label('ltu_loop')
+            lbl_done = self.label('ltu_done')
+            lbl_no_tens = self.label('ltu_no_tens')
+            self.emit('__lcd_temp_u8:')
+            self.emit('\tldi $c,0')          # tens
+            self.emit(f'{lbl_loop}:')
+            self.emit('\tcmpi 10')
+            self.emit(f'\tjnc {lbl_done}')   # A < 10
+            self.emit('\tsubi 10,$a')        # ones -= 10
+            self.emit('\tincc')              # tens++
+            self.emit(f'\tj {lbl_loop}')
+            self.emit(f'{lbl_done}:')
+            self.emit('\tpush $a')           # save ones across optional tens char
+            self.emit('\tmov $c,$a')
+            self.emit('\ttst 0xFF')
+            self.emit(f'\tjz {lbl_no_tens}')
+            self.emit('\taddi 48,$a')
+            self.emit('\tjal __lcd_chr')
+            self.emit(f'{lbl_no_tens}:')
+            self.emit('\tpop $a')
+            self.emit('\taddi 48,$a')
+            self.emit('\tjal __lcd_chr')
+            self.emit('\tldi $a,223')
+            self.emit('\tjal __lcd_chr')
+            self.emit('\tldi $a,67')
             self.emit('\tjal __lcd_chr')
             self.emit('\tret')
 
@@ -8937,6 +9074,16 @@ class MK1CodeGen:
                     self._lcd_helpers.add('__lcd_print')
                     self._lcd_helpers.add('__lcd_chr')
                     self.emit('\tjal __lcd_print')
+                return
+
+            if name == 'lcd_temp_u8':
+                if args:
+                    self.gen_expr(args[0])
+                if not hasattr(self, '_lcd_helpers'):
+                    self._lcd_helpers = set()
+                self._lcd_helpers.add('__lcd_temp_u8')
+                self._lcd_helpers.add('__lcd_chr')
+                self.emit('\tjal __lcd_temp_u8')
                 return
 
             if name == 'printf':
