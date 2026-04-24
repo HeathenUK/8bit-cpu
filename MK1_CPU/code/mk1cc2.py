@@ -2043,11 +2043,18 @@ class MK1CodeGen:
         # Emit tone init code (ddra + precomp loop) as prefix to _main.
         # Must be AFTER all tone()/silence() calls are compiled (so note table is complete)
         # and BEFORE dead function elimination.
+        #
+        # Runs in BOTH flat and overlay mode. The precompute loop walks
+        # the note table, calls __tone_setup(ratio) for each entry, and
+        # writes the resulting half_period back in-place. __play_note
+        # later reads that precomputed half_period as the inner-loop
+        # count for __tone. Without this step, __play_note would
+        # consume `ratio` directly as if it were half_period — which
+        # it isn't — and tones would play at ~clock/(18*ratio+27) Hz
+        # and for ~total_cycles*(18*ratio+27)/F ms, both independent
+        # of calibration.
         if (getattr(self, '_needs_tone_init', False) and
-            hasattr(self, '_note_table') and self._note_table and
-            not getattr(self, 'eeprom_mode', False)):
-            # Non-overlay mode: insert precomp loop into main.
-            # (In overlay mode, the precomp loop is in the init section instead.)
+            hasattr(self, '_note_table') and self._note_table):
             note_end = self.data_alloc
             for mi, ml in enumerate(self.code):
                 if ml.strip() == '_main:':
@@ -3325,7 +3332,15 @@ class MK1CodeGen:
             self.emit('\tsll')
             self.emit('\tsll')
             self.emit('\tsll')             # A = D << 4
-            self.emit('\tadd $c,$a')       # A = (D<<4) + (A>>4) = half_period
+            self.emit('\tadd $c,$a')       # A = (D<<4) + (A>>4) = (blocks*ratio)/16
+            # Subtract 1 to compensate for the ~27 MK1 cycles of per-tone-cycle
+            # overhead (ora_imm, mov $c,$a, mov $b,$a, dec, mov $a,$b, jnz) that
+            # the `(blocks × ratio) / 16` formula ignores. Without this the
+            # formula over-estimates half_period by ~1 iter and every tone
+            # plays ~10–15% too long. Verified empirically across freq 500/
+            # 1000/2000 Hz at 165.5 kHz MK1 clock; also stays correct at
+            # 100 kHz and 500 kHz per model.
+            self.emit('\tdec')
             self.emit('\tmov $a,$c')       # C = half_period
             self.emit('\tret')
 

@@ -560,32 +560,32 @@ TESTS = [
     Test(
         'tone duration timing',
         # Cross-check on calibrated delay via __tone_setup. `tone(Hz, ms)`
-        # uses the same page3[240] calibration that delay() reads, but
-        # through a different runtime helper with its own integer math
-        # (`(blocks × ratio) >> 4` shift plus 16-bit cycle count). The
-        # shift rounds aggressively for low ratios, so tone duration is
-        # inherently ~20-40% off from the requested ms — audio doesn't
-        # need tight timing, so the tolerance here is wide enough to
-        # pass the current implementation while still catching gross
-        # regressions (e.g. an octave-high / half-duration bug from
-        # delay-cal storage semantics drift). A proper fix requires
-        # redesigning __tone_setup's math (tracked separately).
+        # uses the same page3[240] calibration that delay() reads, via
+        # a compile-inserted init-time precompute that converts each
+        # note's `ratio` into a `half_period` using __tone_setup. Long
+        # tone durations (250-800 ms) reduce the relative impact of
+        # the fixed per-cycle overhead (~27 cycles) so we can hold a
+        # tighter tolerance.
         '''void main(void) {
             i2c_init();
             delay_calibrate();
             out(1);
-            tone(1000, 50);
+            tone(1000, 250);
             out(2);
-            tone(500, 100);
+            tone(500, 500);
             out(3);
-            tone(2000, 50);
+            tone(2000, 250);
             out(4);
             halt();
         }''',
         [1, 2, 3, 4], eeprom=True,
-        cycles=500_000,
-        expected_intervals_ms=[50.0, 100.0, 50.0],
-        interval_tolerance_pct=50,
+        # Budget: calibration can wait up to a full 1 Hz SQW period before
+        # starting (~1 s = 166k cycles at 165.5 kHz), then counts 500 ms
+        # (83k), plus 1000 ms of tones (166k), plus sentinel/out overhead.
+        # 600k gives comfortable headroom.
+        cycles=600_000,
+        expected_intervals_ms=[250.0, 500.0, 250.0],
+        interval_tolerance_pct=10,
     ),
 ]
 
