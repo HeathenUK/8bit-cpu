@@ -3172,9 +3172,32 @@ class MK1CodeGen:
             self.emit('\tjal __lcd_chr')
             self.emit('\tret')
 
-        # __delay_cal: calibrate delay against SQW, store D/4 in data[0]
-        # Single-phase: counts HIGH phase only (D_half), stores D_half/2 = D/4.
-        # Saves ~23 bytes vs dual-phase counting.
+        # __delay_cal: calibrate delay against DS3231 1 Hz SQW.
+        #
+        # Counts 256-iter blocks of (dec+jnz) that fit in the 500 ms HIGH
+        # phase. Each inner block takes 256 * 9 cycles = 2304 cycles at
+        # 1 microcode-cycle-per-microstep (dec=5, jnz-taken=4). During
+        # 500 ms at clock rate F Hz:
+        #
+        #   blocks = (F * 0.5) / 2304 = F / 4608
+        #
+        # delay(N)'s inner loop is bare dec+jnz (9 cycles per iter) but
+        # the OUTER loop (`mov $c,$a; decb; jnz`) adds ~14 cycles of
+        # overhead per ms-iteration that the calibrator does NOT pay.
+        # So for delay(N) to produce N ms wall-clock we want a stored
+        # value `ipm` satisfying 9*ipm + 14 = F/1000, i.e.
+        #
+        #   ipm = (F/1000 - 14) / 9 ≈ F/9000 - 1.56
+        #     ≈ blocks/2 - 1          (blocks = F/4608, F/9000 ≈ blocks*0.512)
+        #
+        # Implemented as `slr; dec` on the accumulated block count: the
+        # shift divides by 2 (0.512 ≈ 0.5 within ~2%) and `dec` absorbs
+        # the outer-loop overhead (one iter ≈ 9 cycles ≈ 14 cycles of
+        # overhead minus a small residual). Total error ≈ 1–2% at
+        # 166 kHz, well inside the 5% regression tolerance.
+        #
+        # Replaces a pre-existing bug where blocks-during-HIGH was stored
+        # directly, producing delay(N) ≈ 2N ms instead of N ms.
         if '__delay_cal' in helpers:
             lbl_s1 = self.label('ds1')
             lbl_s2 = self.label('ds2')
@@ -3210,11 +3233,11 @@ class MK1CodeGen:
             self.emit('\ttst 0x01')
             self.emit(f'\tjnz {lbl_cal}')
             self.emit(f'\tj {lbl_s2}')
-            # Calibrate: count bare (dec+jnz) iterations during SQW HIGH.
-            # A loops 256→0 (bare dec+jnz). B counts A-wraps (overflows).
-            # Store B in data[0] = iterations per ~1ms at 500kHz.
-            # delay(N) runs flat N×B iterations of the same dec+jnz.
-            # Accuracy: <2% at 500kHz, ~30% at 250kHz (cal overhead mismatch).
+            # Calibrate: count bare (dec+jnz) iterations during SQW HIGH
+            # phase (500 ms). A loops 256→0 (bare dec+jnz). B counts
+            # A-wraps (256-iter blocks). On exit, A holds B divided by
+            # 2 (via `slr`) to approximate iterations-per-millisecond,
+            # which delay(N) consumes directly.
             self.emit(f'{lbl_cal}:')
             self.emit('\tldi $b,0')
             self.emit('\tclr $a')
@@ -3230,7 +3253,9 @@ class MK1CodeGen:
             self.emit('\tclr $a')
             self.emit(f'\tj {lbl_chi}')
             self.emit(f'{lbl_done}:')
-            self.emit('\tmov $b,$a')       # A = B (ipm)
+            self.emit('\tmov $b,$a')       # A = B (blocks during HIGH)
+            self.emit('\tslr')             # A = blocks/2 (≈ ipm*2 / 2 = ipm)
+            self.emit('\tdec')             # A -= 1 (compensate outer overhead)
             self.emit('\tldi $b,240')
             self.emit('\tiderefp3')        # page3[240] = ipm
             # SQW left enabled — no coupling issue, saves ~20B
