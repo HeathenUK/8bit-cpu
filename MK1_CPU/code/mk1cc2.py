@@ -8086,12 +8086,10 @@ class MK1CodeGen:
             # exw(value, mode) — write with E0/E1 + U0/U1 select
             # exr() — read external input into A
             if name == 'exw':
-                if args:
-                    self.const_vars.pop('__a_known', None)  # force reload
-                    self.gen_expr(args[0])
                 # Determine which exw variant
                 mode = 0
                 enable = 0
+                value_const = self._const_eval(args[0]) if args else None
                 if len(args) >= 2:
                     c = self._const_eval(args[1])
                     if c is not None:
@@ -8100,6 +8098,15 @@ class MK1CodeGen:
                     c = self._const_eval(args[2])
                     if c is not None:
                         enable = c & 1
+                if value_const is not None and mode == 2 and enable == 0:
+                    # Constant writes to VIA DDRB can use the compact
+                    # immediate opcode. This also routes user-written low-level
+                    # I2C/LCD code through the port-shadow preserving emitter.
+                    self.emit_ddrb(value_const)
+                    return
+                if args:
+                    self.const_vars.pop('__a_known', None)  # force reload
+                    self.gen_expr(args[0])
                 self.emit(f'\texw {enable} {mode}')
                 return
             if name == 'exr':
