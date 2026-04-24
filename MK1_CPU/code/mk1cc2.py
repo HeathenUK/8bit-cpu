@@ -496,6 +496,7 @@ class MK1CodeGen:
         self.label_id = 0
         self.optimize = optimize
         self.b_expr = None  # AST expr currently in B, for cache reuse
+        self._prefer_delay_cal_init = False
 
         # ── Port-pin shadow ──────────────────────────────────────────
         # Tracks bits each builtin claims on VIA port A/B so that every
@@ -3071,8 +3072,13 @@ class MK1CodeGen:
             '__lcd_init',
             '__i2c_st', '__i2c_sp',  # START/STOP inlined in __lcd_chr at runtime
         }
-        # __delay_cal is NOT init-only: it becomes an overlay in the overlay system,
-        # freeing ~57B of init space. Called at _main start via overlay dispatch.
+        # __delay_cal is normally NOT init-only: it becomes an overlay in the
+        # overlay system, freeing ~57B of init space. A compile-time placement
+        # retry can opt it into stage 1 when the final stage-1 budget proves
+        # there is room. That is preferable for mixed LCD/tone programs because
+        # calibration runs once and the runtime only needs page3[240].
+        if getattr(self, '_prefer_delay_cal_init', False):
+            INIT_ONLY_NAMES.add('__delay_cal')
         # __eeprom_rd is init-only when not used by runtime eeprom array access
         if not getattr(self, '_needs_runtime_eeprom_rd', False):
             INIT_ONLY_NAMES.add('__eeprom_rd')
@@ -10405,60 +10411,127 @@ def main():
 
     with open(args.input) as f: source = f.read()
 
-    gen = MK1CodeGen(optimize=args.optimize)
-    if hasattr(args, 'eeprom') and args.eeprom:
-        gen.eeprom_mode = True
-        gen.eeprom_base = args.eeprom_base
-    asm = gen.compile(source)
+    def _prepare_compile(prefer_delay_cal_init=False, capture_log=False):
+        gen = MK1CodeGen(optimize=args.optimize)
+        gen._prefer_delay_cal_init = prefer_delay_cal_init
+        if hasattr(args, 'eeprom') and args.eeprom:
+            gen.eeprom_mode = True
+            gen.eeprom_base = args.eeprom_base
+        if capture_log:
+            import contextlib as _ctx
+            import io as _io
+            _buf = _io.StringIO()
+            with _ctx.redirect_stderr(_buf):
+                asm = gen.compile(source)
+            compile_log = _buf.getvalue()
+        else:
+            asm = gen.compile(source)
+            compile_log = ''
 
-    # ── Section-mismatch validator ──
-    # Catch the class of bug where runtime code (page3_code or data_code,
-    # i.e. anything that runs AFTER self-copy) calls a label defined only
-    # in section `code` (stage-1-only helpers whose bytes get overwritten
-    # by self-copy's kernel blit). These bugs produce "jal to nonsense"
-    # and are nearly impossible to debug from hardware symptoms alone.
-    _validate_section_jumps(asm.split('\n'))
+        # ── Section-mismatch validator ──
+        # Catch the class of bug where runtime code (page3_code or data_code,
+        # i.e. anything that runs AFTER self-copy) calls a label defined only
+        # in section `code` (stage-1-only helpers whose bytes get overwritten
+        # by self-copy's kernel blit). These bugs produce "jal to nonsense"
+        # and are nearly impossible to debug from hardware symptoms alone.
+        _validate_section_jumps(asm.split('\n'))
 
-    # Run peephole optimizer — but NOT on kernel sections for overlay
-    # programs where manifest offsets were computed from pre-peepholed
-    # component sizes. A final peephole of the KERNEL would shrink it and
-    # make offsets wrong; peepholing STAGE-1 is fine because it's a
-    # separate section and doesn't affect kernel addresses.
-    lines = asm.split('\n')
-    if not getattr(gen, '_overlay_kernel_size', None):
-        # Flat or init-extraction mode: peephole everything
-        lines = peephole(lines)
-        asm = '\n'.join(lines)
-    else:
-        # Overlay mode: peephole stage-1 (`code` section) only, leave
-        # `page3_code`, `page3_kernel`, `data_code`, `stack_code`,
-        # `page3`, `data`, `eeprom` unchanged.
-        SAFE_SECTIONS = {'code'}  # stage-1 code; no manifest-offset concern
-        groups = []   # list of (section_name, [lines])
-        cur_sec = 'code'
-        cur_lines = []
+        # Run peephole optimizer — but NOT on kernel sections for overlay
+        # programs where manifest offsets were computed from pre-peepholed
+        # component sizes. A final peephole of the KERNEL would shrink it and
+        # make offsets wrong; peepholing STAGE-1 is fine because it's a
+        # separate section and doesn't affect kernel addresses.
+        lines = asm.split('\n')
+        if not getattr(gen, '_overlay_kernel_size', None):
+            # Flat or init-extraction mode: peephole everything
+            lines = peephole(lines)
+            asm = '\n'.join(lines)
+        else:
+            # Overlay mode: peephole stage-1 (`code` section) only, leave
+            # `page3_code`, `page3_kernel`, `data_code`, `stack_code`,
+            # `page3`, `data`, `eeprom` unchanged.
+            SAFE_SECTIONS = {'code'}  # stage-1 code; no manifest-offset concern
+            groups = []   # list of (section_name, [lines])
+            cur_sec = 'code'
+            cur_lines = []
+            for line in lines:
+                s = line.strip()
+                if s.startswith('section '):
+                    if cur_lines:
+                        groups.append((cur_sec, cur_lines))
+                    cur_sec = s.split()[1]
+                    cur_lines = [line]
+                else:
+                    cur_lines.append(line)
+            if cur_lines:
+                groups.append((cur_sec, cur_lines))
+            out_lines = []
+            for sec, grp in groups:
+                if sec in SAFE_SECTIONS:
+                    # Split `section` directive from body so peephole doesn't
+                    # interpret it oddly — peephole already handles these lines
+                    # but keep the directive in place.
+                    out_lines.extend(peephole(grp))
+                else:
+                    out_lines.extend(grp)
+            lines = out_lines
+            asm = '\n'.join(lines)
+
+        two_byte_set_local = {'ldsp','stsp','push_imm','jal','jc','jz','jnc','jnz','j','ldi',
+                              'cmp','addi','subi','andi','ori','ld','st','ldsp_b','ldp3','stp3',
+                              'ocall','tst','out_imm','cmpi','ddrb_imm','ddra_imm',
+                              'ora_imm','orb_imm'}
+        code_bytes_local = 0
+        section = 'code'
         for line in lines:
             s = line.strip()
-            if s.startswith('section '):
-                if cur_lines:
-                    groups.append((cur_sec, cur_lines))
-                cur_sec = s.split()[1]
-                cur_lines = [line]
+            if 'section page3_kernel' in s or 'section page3_code' in s:
+                section = 'page3'; continue
+            elif 'section page3' in s and 'kernel' not in s and 'code' not in s:
+                section = 'page3_data'; continue
+            elif 'section p3patch' in s: section = 'p3patch'; continue
+            elif 'section eeprom' in s: section = 'eeprom'; continue
+            elif 'section data_code' in s: section = 'data'; continue
+            elif 'section stack_code' in s: section = 'stack'; continue
+            elif 'section data' in s: section = 'data'; continue
+            elif 'section code' in s: section = 'code'; continue
+            if section != 'code':
+                continue
+            if not s or s.endswith(':') or s.startswith(';'): continue
+            mn = s.split()[0]
+            if mn == 'byte':
+                b = 1
+            elif mn == 'cmp':
+                parts = s.split()
+                b = 1 if (len(parts) > 1 and parts[1].startswith('$')) else 2
+            elif mn == 'ddrb2_imm':
+                b = 3
+            elif mn == 'ddrb3_imm':
+                b = 4
+            elif mn in two_byte_set_local:
+                b = 2
             else:
-                cur_lines.append(line)
-        if cur_lines:
-            groups.append((cur_sec, cur_lines))
-        out_lines = []
-        for sec, grp in groups:
-            if sec in SAFE_SECTIONS:
-                # Split `section` directive from body so peephole doesn't
-                # interpret it oddly — peephole already handles these lines
-                # but keep the directive in place.
-                out_lines.extend(peephole(grp))
-            else:
-                out_lines.extend(grp)
-        lines = out_lines
-        asm = '\n'.join(lines)
+                b = 1
+            code_bytes_local += b
+
+        init_extraction_local = getattr(gen, '_init_extraction_done', False)
+        overlay_mode_local = hasattr(gen, '_overlay_kernel_size')
+        init_limit_local = 254 if (init_extraction_local or overlay_mode_local) else 250
+        return gen, asm, lines, code_bytes_local, init_limit_local, compile_log
+
+    gen, asm, lines, _code_bytes_try, _init_limit_try, _compile_log = _prepare_compile(
+        prefer_delay_cal_init=True, capture_log=True)
+    if (_code_bytes_try > _init_limit_try and
+            getattr(gen, '_prefer_delay_cal_init', False)):
+        import sys as _retry_sys
+        print(f"  Placement retry: init-only __delay_cal overflowed stage 1 "
+              f"({_code_bytes_try}B > {_init_limit_try}B); using runtime/overlay placement",
+              file=_retry_sys.stderr)
+        gen, asm, lines, _code_bytes_try, _init_limit_try, _compile_log = _prepare_compile(
+            prefer_delay_cal_init=False)
+    elif _compile_log:
+        import sys as _compile_log_sys
+        print(_compile_log, end='', file=_compile_log_sys.stderr)
 
     if args.output:
         with open(args.output, 'w') as f: f.write(asm + '\n')
