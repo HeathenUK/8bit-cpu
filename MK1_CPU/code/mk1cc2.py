@@ -3425,9 +3425,15 @@ class MK1CodeGen:
             if v not in scc_indices:
                 strongconnect(v)
 
+        reload_thunk_edges = set()
+
         # Post-SCC merge: if any function in component X calls a function in
         # component Y, merge X and Y. This handles user-calls-user cases where
         # A→B is one-way but B must be in A's overlay (can't call across overlays).
+        # Exception: for expensive one-way user calls, keep the functions in
+        # separate overlays and insert a resident reload thunk later. The thunk
+        # costs ~11B resident but can save far more overlay-region pressure when
+        # a large caller repeatedly uses a large helper (e.g. RTC read wrappers).
         comp_of = {}
         for ci, comp in enumerate(components):
             for name in comp:
@@ -3442,11 +3448,33 @@ class MK1CodeGen:
             px, py = _find(x), _find(y)
             if px != py:
                 parent[py] = px
+        def _should_split_reload_edge(caller, callee):
+            if caller.startswith('__') or callee.startswith('__'):
+                return False
+            if not caller.startswith('_main_p'):
+                return False
+            cs = ov_by_name.get(caller, (0, 0, 0))[2]
+            ds = ov_by_name.get(callee, (0, 0, 0))[2]
+            if ds < 24:
+                return False
+            call_count = 0
+            start, end, _ = ov_by_name.get(caller, (0, 0, 0))
+            for line in self.code[start:end]:
+                if line.strip() == f'jal {callee}':
+                    call_count += 1
+            # One thunk per caller/callee edge costs about 11B resident. Split
+            # only when the avoided merge is clearly larger than that cost, and
+            # bias toward repeated calls where one thunk amortizes well.
+            return (cs + ds >= 60 and (call_count >= 2 or ds >= 40))
+
         for ci, comp in enumerate(components):
             for name in comp:
                 for called in adj.get(name, set()):
                     called_ci = comp_of.get(called)
                     if called_ci is not None and called_ci != ci:
+                        if _should_split_reload_edge(name, called):
+                            reload_thunk_edges.add((name, called))
+                            continue
                         _union(ci, called_ci)
         merged = {}
         for ci, comp in enumerate(components):
@@ -4226,6 +4254,63 @@ class MK1CodeGen:
             overlay_meta = [(idx, name, fsize) for idx, (name, _, fsize) in enumerate(overlay_asm_blocks)]
             # Track post-bundling max for diagnostics (may exceed overlay region due to wrapping)
             max_bundled_size = max((fsize for _, _, fsize in overlay_asm_blocks), default=0)
+
+            # ── Step 9a: Selective overlay-to-overlay reload thunks ──
+            # Edges recorded before the post-SCC merge are expensive one-way
+            # user calls where merging caller+callee into one slot creates
+            # more wrap pressure than an 11B resident reload thunk. The thunk:
+            #   load callee slot; call callee; reload caller slot; return.
+            # `_overlay_load` preserves $a/$b, so callee args and return value
+            # survive the reloads without extra stack traffic.
+            if reload_thunk_edges:
+                thunk_lines = []
+                made_thunks = 0
+                for caller, callee in sorted(reload_thunk_edges):
+                    caller_idx = func_to_overlay_idx.get(caller)
+                    callee_idx = func_to_overlay_idx.get(callee)
+                    if caller_idx is None or callee_idx is None or caller_idx == callee_idx:
+                        continue
+                    safe_caller = caller.lstrip('_').replace('.', '_')
+                    safe_callee = callee.lstrip('_').replace('.', '_')
+                    thunk = f'__ovreload_{safe_caller}_{safe_callee}'
+                    replaced = False
+                    oname, olines, _ofsize = overlay_asm_blocks[caller_idx]
+                    new_olines = []
+                    current_func = None
+                    for line in olines:
+                        s = line.strip()
+                        if s.endswith(':') and not s.startswith('.') and s.startswith('_'):
+                            current_func = s[:-1]
+                        if current_func == caller and s == f'jal {callee}':
+                            new_olines.append(f'\tjal {thunk}')
+                            replaced = True
+                        else:
+                            new_olines.append(line)
+                    if not replaced:
+                        continue
+                    overlay_asm_blocks[caller_idx] = (
+                        oname, new_olines, measure_lines(new_olines))
+                    thunk_lines.extend([
+                        f'{thunk}:',
+                        f'\tldi $c,{callee_idx}',
+                        '\tjal _overlay_load',
+                        f'\tjal {callee}',
+                        f'\tldi $c,{caller_idx}',
+                        '\tjal _overlay_load',
+                        '\tret',
+                    ])
+                    _NO_OVERLAY.add(f'{thunk}:')
+                    made_thunks += 1
+                if made_thunks:
+                    new_resident.extend(thunk_lines)
+                    overlay_meta = [(idx, name, fsize)
+                                    for idx, (name, _, fsize)
+                                    in enumerate(overlay_asm_blocks)]
+                    max_bundled_size = max((fsize for _, _, fsize in overlay_asm_blocks),
+                                           default=0)
+                    import sys
+                    print(f"  Overlay split: inserted {made_thunks} reload thunk(s)",
+                          file=sys.stderr)
 
             # ── Step 9b: Validate overlay self-containment (post-inlining) ──
             # Every jal in an overlay must target a function in the SAME overlay
