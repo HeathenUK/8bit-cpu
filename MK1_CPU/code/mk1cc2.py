@@ -6445,18 +6445,29 @@ class MK1CodeGen:
                 # of wrapping overlays. Reject promotions that would
                 # make the overlay region too small to hold any current overlay
                 # (net loss — promoting eats region faster than it shrinks ovs).
+                #
+                # Safety invariant (no wrap ever emitted): the terminal
+                # no-wrap check immediately below (the `raise` at line ~6488)
+                # runs after every retry and hard-fails if any overlay still
+                # wraps. This retry loop can only *try* wrap-reducing
+                # promotions; the `proj_region < 16` gate caps each step's
+                # overlay-region shrink, and `_placement_retries < 5` bounds
+                # the chain length. If the chain exhausts without reaching
+                # zero wraps, the terminal raise fires and compilation
+                # fails — no wrapping overlay is ever emitted.
+                #
+                # (Earlier a magic `_kernel_cap = 210` rejected promotions
+                # that would grow the kernel past 210B. Under the hard
+                # no-wrap policy the alternative is compile failure, which
+                # is strictly worse than a larger kernel that still fits
+                # every overlay. The cap is now the implicit ceiling from
+                # `proj_region >= 16` — i.e. kernel <= 234B.)
                 best_helper = None
                 best_unsafe_count = len(_wrapping_indices)
-                # Reject promotions that would grow the kernel past a safe
-                # cap — once kernel ≥210B we've lost too much overlay region
-                # for the remaining user functions to fit.
-                _kernel_cap = 210
                 for h in bundleable_helpers:
                     hsize_h = measure_lines(helper_bodies.get(h, (0, 0, []))[2]) + 1
                     proj_region = _ov_avail - hsize_h
                     if proj_region < 16:
-                        continue
-                    if _kernel_chk + hsize_h > _kernel_cap:
                         continue
                     proj_wraps = 0
                     for oi, (_, olines, _s) in enumerate(overlay_asm_blocks):
