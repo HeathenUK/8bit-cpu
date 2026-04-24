@@ -2265,9 +2265,7 @@ class MK1CodeGen:
             self.emit_ddrb(0x01)
             self.emit_ddrb(0x03)
             self.emit('\tldi $a,0x4E')
-            self.emit('\tnop')           # inter-I2C-byte timing (was `out`)
             self.emit('\tjal __i2c_sb')
-            self.emit('\tnop')
             # High nibble: reload char from stack (A clobbered by __i2c_sb).
             # Stack = [char, flags], SP at flags, char at SP+2.
             self.emit('\tldsp 2')         # A = char
@@ -2277,13 +2275,9 @@ class MK1CodeGen:
             self.emit('\tor $b,$a')       # A = nibble | flags
             self.emit('\tpush $a')        # save nibble+flags
             self.emit('\tori 0x04,$a')    # + EN
-            self.emit('\tnop')
             self.emit('\tjal __i2c_sb')   # send with EN
-            self.emit('\tnop')
             self.emit('\tpop $a')         # restore nibble+flags (no EN)
-            self.emit('\tnop')
             self.emit('\tjal __i2c_sb')   # send without EN
-            self.emit('\tnop')
             # Low nibble: reload char from stack, shift into high position.
             # Stack still [char, flags], SP at flags, char at SP+2.
             self.emit('\tldsp 2')         # A = char
@@ -2296,13 +2290,9 @@ class MK1CodeGen:
             self.emit('\tor $b,$a')
             self.emit('\tpush $a')        # save nibble+flags
             self.emit('\tori 0x04,$a')    # + EN
-            self.emit('\tnop')
             self.emit('\tjal __i2c_sb')
-            self.emit('\tnop')
             self.emit('\tpop $a')         # restore (no EN)
-            self.emit('\tnop')
             self.emit('\tjal __i2c_sb')
-            self.emit('\tnop')
             # Inline STOP — saves 3B vs jal __i2c_sp when __i2c_sp
             # is the only runtime caller and can be stripped from kernel
             self.emit_ddrb(0x03)
