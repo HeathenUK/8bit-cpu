@@ -20,6 +20,43 @@ import hw_regression
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 PROGRAMS_DIR = os.path.join(ROOT, 'MK1_CPU', 'programs')
 COMPILER = os.path.join(ROOT, 'MK1_CPU', 'code', 'mk1cc2.py')
+EXPECTATIONS = os.path.join(ROOT, 'MK1_CPU', 'code', 'oi_expectations.json')
+
+
+def load_expectations():
+    """Map program basename → expected OI prefix (list of ints).
+
+    Programs not in the file are treated as unverified: no assertion
+    is made, but audit still reports what it observed. Programs whose
+    expected list is empty mean "must emit no OI in the audit window"
+    (useful for halt-only smoke tests)."""
+    try:
+        with open(EXPECTATIONS) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+
+
+def check_expectation(basename, observed, expectations):
+    """Return (status, detail) where status is 'pass' | 'fail' | 'unverified'.
+
+    Expected list may contain `null` entries as wildcards — useful for
+    environment-dependent values (RTC reads, temperature, etc.) where only
+    the shape of the trace is deterministic, not every byte. A wildcard
+    only requires that SOME value appears at that position."""
+    if basename not in expectations:
+        return 'unverified', None
+    expected = expectations[basename]
+    obs = list(observed or [])
+    if len(obs) < len(expected):
+        return 'fail', f'expected prefix {expected} but got only {obs}'
+    actual = obs[:len(expected)]
+    for i, (e, a) in enumerate(zip(expected, actual)):
+        if e is None:
+            continue
+        if e != a:
+            return 'fail', f'expected {expected} got {actual}'
+    return 'pass', None
 
 
 class PortLock:
@@ -152,6 +189,11 @@ def run_program(path, args):
         'vals_first80': vals[:80],
         'error': result.get('error'),
     })
+    basename = os.path.basename(path)
+    status, detail = check_expectation(basename, vals, args._expectations)
+    row['expectation'] = status
+    if detail:
+        row['expectation_detail'] = detail
     return row
 
 
@@ -167,7 +209,10 @@ def main():
     ap.add_argument('--output', default='/tmp/hw_oi_audit.json')
     ap.add_argument('--no-eeprom', action='store_true')
     ap.add_argument('--no-optimize', action='store_true')
+    ap.add_argument('--no-expectations', action='store_true',
+                    help='Skip OI expectation comparison; only capture traces')
     opts = ap.parse_args()
+    opts._expectations = {} if opts.no_expectations else load_expectations()
 
     try:
         lock_ctx = PortLock(opts.port)
@@ -187,10 +232,13 @@ def main():
             row = run_program(path, opts)
             results.append(row)
             vals = row.get('vals_first80') or []
+            exp = row.get('expectation', 'unverified')
+            exp_detail = row.get('expectation_detail', '')
             print(
                 f"  compile={row.get('compile_ok')} upload={row.get('upload_ok')} "
                 f"oi={row.get('oi_seen')} unsafe_wrap={row.get('unsafe_wrap')} "
                 f"khz={row.get('khz')} vals={vals[:12]} "
+                f"expect={exp}{(' ' + exp_detail) if exp_detail else ''} "
                 f"err={row.get('error')}",
                 flush=True,
             )
@@ -212,13 +260,28 @@ def main():
         'oi_seen': sum(1 for r in results if r.get('oi_seen')),
         'unsafe_wrap': sum(1 for r in results if r.get('unsafe_wrap')),
         'safe_wrap': sum(1 for r in results if r.get('safe_wrap')),
+        'expect_pass': sum(1 for r in results if r.get('expectation') == 'pass'),
+        'expect_fail': sum(1 for r in results if r.get('expectation') == 'fail'),
+        'expect_unverified': sum(1 for r in results if r.get('expectation') == 'unverified'),
         'results': results,
     }
     with open(opts.output, 'w') as f:
         json.dump(summary, f, indent=2)
-    print(json.dumps({k: summary[k] for k in ('total', 'compile_ok', 'upload_ok', 'run_ok', 'oi_seen', 'unsafe_wrap', 'safe_wrap')}, indent=2))
+    print(json.dumps({k: summary[k] for k in (
+        'total', 'compile_ok', 'upload_ok', 'run_ok', 'oi_seen',
+        'unsafe_wrap', 'safe_wrap',
+        'expect_pass', 'expect_fail', 'expect_unverified',
+    )}, indent=2))
+    if summary['expect_fail']:
+        print('Expectation failures:', file=sys.stderr)
+        for r in results:
+            if r.get('expectation') == 'fail':
+                print(f"  {r['program']}: {r.get('expectation_detail')}",
+                      file=sys.stderr)
     print(opts.output)
-    return 0 if summary['compile_ok'] == summary['total'] and summary['upload_ok'] == summary['total'] else 1
+    compile_upload_ok = (summary['compile_ok'] == summary['total']
+                         and summary['upload_ok'] == summary['total'])
+    return 0 if compile_upload_ok and summary['expect_fail'] == 0 else 1
 
 
 if __name__ == '__main__':
