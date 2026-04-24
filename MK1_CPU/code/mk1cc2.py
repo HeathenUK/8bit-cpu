@@ -9901,6 +9901,38 @@ def peephole(lines):
         print(f"  Peephole: T4.1 auto-rules applied {auto_count}× "
               f"(saved ≥{auto_count}B)", file=sys.stderr)
 
+    # Save/restore through stack around pure DDRB bus toggles:
+    #   mov $d,$a; push $a; ddrb_imm...; ldsp 1; pop $d
+    # → push $d; ddrb_imm...; pop $a
+    # This appears in I2C read wrappers preserving the read byte across NACK/STOP.
+    _stack_save_saved = 0
+    new_lines = []
+    i = 0
+    while i < len(lines):
+        if (i + 4 < len(lines)
+                and lines[i].strip() == 'mov $d,$a'
+                and lines[i + 1].strip() == 'push $a'):
+            j = i + 2
+            while j < len(lines) and lines[j].strip().startswith('ddrb_imm '):
+                j += 1
+            if (j > i + 2 and j + 1 < len(lines)
+                    and lines[j].strip() == 'ldsp 1'
+                    and lines[j + 1].strip() == 'pop $d'):
+                indent = lines[i][:len(lines[i]) - len(lines[i].lstrip())]
+                new_lines.append(indent + 'push $d')
+                new_lines.extend(lines[i + 2:j])
+                new_lines.append(indent + 'pop $a')
+                _stack_save_saved += 2
+                i = j + 2
+                continue
+        new_lines.append(lines[i])
+        i += 1
+    lines = new_lines
+    if _stack_save_saved:
+        import sys
+        print(f"  Peephole: shortened DDRB-only stack save/restore "
+              f"(saved {_stack_save_saved}B)", file=sys.stderr)
+
     return lines
 
 
