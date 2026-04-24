@@ -261,13 +261,12 @@ class Test:
         self.expected = expected   # list of ints, prefix of expected OI history
         self.eeprom = eeprom
         self.cycles = cycles
-        # Clock speed: us=2 → ≈250 kHz. Per project_max_clock.md, the MK1
-        # is reliable to ~550 kHz and fails at ~600 kHz. us=1 (≈500 kHz)
-        # is at the marginal edge. Keep tests below 250 kHz so we never
-        # blame a miscompile on a clock-induced glitch.
+        # Clock speed: us=2 → ≈250 kHz. Keep tests at a speed comfortably
+        # below the MK1's reliable ceiling so we never blame a miscompile
+        # on a clock-induced glitch.
         self.us = us
         # Optional extra env vars for the compiler (e.g. MK1_T2_MIN_LEN=3 to
-        # force init-touching T2.1 extraction for validation).
+        # force init-touching cross-section extraction for validation).
         self.env = env
 
 
@@ -439,7 +438,7 @@ TESTS = [
         [21], eeprom=True,   # 10+10+1 = 21
     ),
     Test(
-        'T2.1 init-touch: thunk extracted from init code',
+        'xs-abstract init-touch: thunk extracted from init code',
         # With MIN_LEN=3, the 3-instr I2C STOP pattern (ddrb_imm 0x03/0x01/0x00)
         # extracts as a kernel thunk. The thunk occurrences span BOTH the
         # runtime main preamble's bus recovery AND the stage-1 init bus

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""T4.1 — exhaustive brute-force superoptimizer.
+"""Exhaustive brute-force superoptimizer.
 
 Scans corpus 2–3 instruction windows. For each, enumerates candidate
 replacements from a 40-opcode pool with all register/immediate

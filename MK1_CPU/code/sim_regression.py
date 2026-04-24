@@ -2,8 +2,8 @@
 """MK1 simulator-based regression harness — deterministic feature tests.
 
 Why sim, not hardware? The MK1 instruction set is verified byte-exact against
-microcode (project_cpu_hardware_verified.md). mk1sim executes the exact
-microcode used in silicon, so if sim produces the expected output_history,
+microcode (see code/microcode.py and code/microcode.txt). mk1sim executes
+the exact microcode used in silicon, so if sim produces the expected output_history,
 the chip will too. The only hardware-specific signal we lose is I/O-pin
 behaviour (which sim mocks for `out`, port writes, etc.) — fine for compiler
 correctness tests that only care about out() values.
@@ -63,7 +63,7 @@ class Test:
         self.env = env
         # If set, compile stderr must contain this substring. Lets a test
         # assert that a specific compiler optimisation path actually fired
-        # (e.g. "T2.1 xs-abstract ... [INIT-TOUCHES]") — without this, a test
+        # (e.g. "xs-abstract ... [INIT-TOUCHES]") — without this, a test
         # might pass for the wrong reason (the feature didn't fire but the
         # program still happened to produce the expected output).
         self.assert_stderr_contains = assert_stderr_contains
@@ -131,7 +131,8 @@ TESTS = [
         void main(void) { out(chain(7)); halt(); }''',
         [62], eeprom=True,
     ),
-    # The init-touch case: MK1_T2_MIN_LEN=3 forces T2.1 to extract the
+    # The init-touch case: MK1_T2_MIN_LEN=3 forces the cross-section
+    # extractor to pull out the
     # 3-instr I2C STOP pattern that occurs in BOTH main-preamble bus
     # recovery AND stage-1 init bus recovery. The thunk lives in kernel
     # (mini-copied) and is called from stage-1 init. If the init-scan

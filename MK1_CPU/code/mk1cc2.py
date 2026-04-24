@@ -15,7 +15,7 @@ Usage: python3 mk1cc2.py input.c [-o output.asm] [-O]
 import os, sys
 
 # ── Deterministic codegen ────────────────────────────────────────────
-# Several passes (T2.1 cross-section abstraction, overlay partitioning,
+# Several passes (cross-section abstraction, overlay partitioning,
 # knapsack helper selection) iterate over sets/dicts whose key order
 # depends on Python's hash randomisation. Two compiles of the same
 # source file can produce slightly different byte output — different
@@ -4250,7 +4250,7 @@ class MK1CodeGen:
                         ldi_b_line = new_resident[-2]
                         new_resident = new_resident[:-3]
                         new_resident.append(ldi_b_line)
-                    # T3.3 MULTI-ENTRY OVERLAY DISPATCH:
+                    # Multi-entry overlay dispatch:
                     # Caller sets $c = overlay index, leaves $a/$b as args.
                     # `_overlay_load` copies the slot and returns; the caller
                     # then jumps to the requested function label inside that
@@ -5144,7 +5144,7 @@ class MK1CodeGen:
                 EEPROM-backed overlays are preloaded into freed page3 space during init,
                 so the runtime loader only needs SRAM copy paths.
                 """
-                # ── T3.3 MULTI-ENTRY OVERLAY DISPATCH ──
+                # ── Multi-entry overlay dispatch ──
                 # Loader saves caller's $a/$b internally, copies the selected
                 # slot, restores $a/$b, and returns. The call site then `jal`s
                 # the specific function label inside the loaded slot. This is
@@ -5152,8 +5152,8 @@ class MK1CodeGen:
                 # required when one merged overlay slot has multiple external
                 # entry points.
                 #
-                # Calling convention change:
-                #   - Caller passes overlay index in $c (was $a)
+                # Calling convention:
+                #   - Caller passes overlay index in $c
                 #   - Caller's $a/$b are the overlay's args (unchanged)
                 #   - Loader preserves $a/$b across the copy and returns to
                 #     the dispatch site.
@@ -5248,12 +5248,12 @@ class MK1CodeGen:
                         loader.append('\tj .ov_done')
 
                 # Bus recovery + return.
-                # The copy loop uses `deref` which toggles SCL
-                # (per project_i2c_debug.md). Each iteration generates a
-                # phantom clock edge on the I2C bus. After copying an
-                # overlay the PCF8574 LCD backpack is in a confused mid-
-                # transaction state. Flush it with 9 SCL clocks (loop, not
-                # inline — saves ~27B vs the unrolled version) + STOP.
+                # The copy loop uses `deref` which toggles SCL on each
+                # iteration, generating a phantom clock edge on the I2C
+                # bus. After copying an overlay the PCF8574 LCD backpack
+                # is in a confused mid-transaction state. Flush it with
+                # 9 SCL clocks (loop, not inline — saves ~27B vs the
+                # unrolled version) + STOP.
                 loader.append('.ov_done:')
                 loader.append('\tldi $a,9')
                 loader.append('.ov_br:')
@@ -5363,7 +5363,7 @@ class MK1CodeGen:
             main_lines = peephole(main_lines)
             shared_helper_size = measure_lines(shared_helpers_ov)
 
-            # ── T2.1: Cross-section procedure abstraction ──
+            # ── Cross-section procedure abstraction ──
             # Scan runtime_resident_helpers + every overlay body for instruction
             # sequences that repeat ≥2 times across different sections. Extract
             # profitable ones as kernel-resident thunks (placed at the tail of
@@ -5375,7 +5375,7 @@ class MK1CodeGen:
             # Net:     (K × S) − (K × 2) − (S + 1) = (K−1)·S − 2K − 1
             #          > 0 when S ≥ 4 AND K ≥ 3, or S ≥ 6 AND K ≥ 2.
             #
-            # Constraints (inherit from Phase 6 + cross-section specifics):
+            # Constraints:
             #   - sequence stays within one "unit" (helper or overlay body)
             #   - no local `j .lbl` / `jnz .lbl` / etc. (labels are unit-local)
             #   - no `ret` / `hlt` inside body (thunk's own ret ends execution)
@@ -5452,9 +5452,9 @@ class MK1CodeGen:
                     """A sequence is safe to extract from init iff every `jal`
                     it contains targets a label that WILL be at its kernel
                     address before the stage-1 init code executes. That means:
-                    already-existing T2.1 thunks (always in runtime helpers)
-                    OR any label defined in runtime_resident_helpers (the
-                    mini-copied set)."""
+                    already-existing cross-section thunks (always in runtime
+                    helpers) OR any label defined in runtime_resident_helpers
+                    (the mini-copied set)."""
                     for t in key:
                         if not t.startswith('jal '):
                             continue
@@ -5850,12 +5850,12 @@ class MK1CodeGen:
                 runtime_resident_helpers.extend(thunk_lines)
 
                 _tag_map = {
-                    'call': 'T2.1 xs-abstract',
-                    'tail': 'T2.3 tail-merge',
-                    'param_call': 'T2.2 param-abstract',
-                    'param_tail': 'T2.2 param-tail',
+                    'call': 'xs-abstract',
+                    'tail': 'tail-merge',
+                    'param_call': 'param-abstract',
+                    'param_tail': 'param-tail',
                 }
-                _tag = _tag_map.get(mode, 'T2')
+                _tag = _tag_map.get(mode, 'xs')
                 _sections = set(a[0] for a in accepted)
                 _init_flag = ' [INIT-TOUCHES]' if 'init' in _sections else ''
                 print(f"  {_tag}: extracted {L}-instr {S}B sequence × "
@@ -5868,10 +5868,10 @@ class MK1CodeGen:
                 # Re-peephole after edits (thunk body + call sites may enable new
                 # peephole patterns); re-measure shared/main just in case.
                 runtime_resident_helpers = peephole(runtime_resident_helpers)
-                print(f"  T2.1 total cross-section savings: {_t2_total_saved}B",
+                print(f"  Cross-section total savings: {_t2_total_saved}B",
                       file=sys.stderr)
 
-            # ── T3.1: Liveness-based overlay call-site push/pop elision ──
+            # ── Liveness-based overlay call-site push/pop elision ──
             # Overlay call sites emit the uniform pattern:
             #   push $b; push $a; ldi $a, IDX; jal _overlay_load
             #   pop $a; pop $b; jal __ov_entry
@@ -5914,7 +5914,7 @@ class MK1CodeGen:
                                 break
                 _i += 1
 
-            # T1.2 liveness primitives live in mk1ir. These thin wrappers
+            # Liveness primitives live in mk1ir. These thin wrappers
             # bind in compiler-specific context (func_params, thunk map).
             import mk1ir as _ir_t3
 
@@ -6024,9 +6024,9 @@ class MK1CodeGen:
                         i += 1
                 return out, saved
 
-            # Apply T3.1 to main_lines, runtime_resident_helpers (which
-            # contains __xsthunk_N wrappers that make overlay calls), and
-            # every overlay body. The same overlay-call pattern + liveness
+            # Apply push/pop elision to main_lines, runtime_resident_helpers
+            # (which contains __xsthunk_N wrappers that make overlay calls),
+            # and every overlay body. The same overlay-call pattern + liveness
             # logic applies — anywhere the uniform pattern appears, we can
             # elide when the caller's flow doesn't need the saved registers.
             main_lines, _t3_main_saved = _t3_elide_overlay_saves(main_lines)
@@ -6040,12 +6040,12 @@ class MK1CodeGen:
                     _t3_ov_saved += n
             _t3_saved = _t3_main_saved + _t3_hlp_saved + _t3_ov_saved
             if _t3_saved:
-                print(f"  T3.1 elided {_t3_saved}B of dead push/pop around overlay calls "
+                print(f"  Elided {_t3_saved}B of dead push/pop around overlay calls "
                       f"(main={_t3_main_saved}B, helpers={_t3_hlp_saved}B, "
                       f"overlays={_t3_ov_saved}B)",
                       file=sys.stderr)
 
-            # ── T3.1b: General push/pop pair elision (experimental) ──
+            # ── General push/pop pair elision (experimental) ──
             # Finds matching `push $X` / `pop $X` pairs where the register is
             # dead across the pair. Currently disabled because the label-as-
             # jump-target check aborts most candidates in practice (many
@@ -6146,7 +6146,7 @@ class MK1CodeGen:
                     _t3b_ov += n
             _t3b_saved = _t3b_main + _t3b_hlp + _t3b_ov
             if _t3b_saved:
-                print(f"  T3.1b elided {_t3b_saved}B of dead push/pop pairs "
+                print(f"  Elided {_t3b_saved}B of dead push/pop pairs "
                       f"(main={_t3b_main}B, helpers={_t3b_hlp}B, "
                       f"overlays={_t3b_ov}B)",
                       file=sys.stderr)
@@ -6201,7 +6201,7 @@ class MK1CodeGen:
             runtime_resident_helpers, _rl_hlp = _elide_redundant_overlay_loads(runtime_resident_helpers)
             _rl_saved = _rl_main + _rl_hlp
             if _rl_saved:
-                print(f"  T3.2 elided {_rl_saved}B of redundant overlay loads "
+                print(f"  Elided {_rl_saved}B of redundant overlay loads "
                       f"(main={_rl_main}B, helpers={_rl_hlp}B)",
                       file=sys.stderr)
 
@@ -6417,7 +6417,7 @@ class MK1CodeGen:
                                  if sz > _ov_avail}
             # Determine call order from main_lines. Multi-entry dispatch puts
             # the overlay index in $c (ldi $c,N) right before jal _overlay_load.
-            # (Pre-T3.3 used $a; tolerated as fallback.)
+            # (Older form used $a; tolerated as fallback.)
             _call_order = []
             for _mli in range(len(main_lines) - 1):
                 _s = main_lines[_mli].strip()
@@ -6839,7 +6839,7 @@ class MK1CodeGen:
 
         # Fix up overlay indices in assembled code. Multi-entry dispatch
         # puts the index in $c (ldi $c,N) immediately before the load.
-        # (Pre-T3.3 convention used $a; kept as fallback for any stale
+        # (Older convention used $a; kept as fallback for any stale
         # emission path.)
         for ci in range(len(assembled) - 1):
             s = assembled[ci].strip()
@@ -7519,8 +7519,8 @@ class MK1CodeGen:
             # Find which overlay(s) wrap and check if they're loaded last
             wrapping_overlays = [(n, fs) for _, n, fs in overlay_meta
                                  if fs > avail]  # pre-bundling check
-            # Check assembled code for overlay call order. T3.3 uses $c;
-            # pre-T3.3 $a tolerated as fallback.
+            # Check assembled code for overlay call order. Multi-entry
+            # dispatch uses $c; older form used $a (still tolerated).
             call_order = []
             for ci, line in enumerate(assembled):
                 s = line.strip()
@@ -10607,14 +10607,12 @@ def peephole(lines):
         ('mov $c,$a', 'inc', 'mov $a,$c'): 'incc',
         ('mov $b,$a', 'inc', 'mov $a,$b'): 'incb',
     }
-    # T4.1-discovered: `mov $b,$a; sll; mov $a,$b` (3B) → `sllb` (1B),
+    # Superopt-discovered: `mov $b,$a; sll; mov $a,$b` (3B) → `sllb` (1B),
     # saves 2B per occurrence. sllb is a new opcode (0x22) that retires
     # the unused `move $sp, $c` — requires microcode EEPROM reflash.
     # Gated behind MK1_NEW_OPCODES=1 so pre-flash compilation still
     # emits the original 3-byte sequence and runs correctly on unflashed
-    # hardware. Once the user flashes the new microcode.bin to the four
-    # SST39SF040 EEPROMs (T48 + minipro, same binary all 4 chips per
-    # the project memory), they set the env var and rebuild.
+    # hardware. Set the env var after flashing the new microcode.bin.
     import os as _sllb_os
     if _sllb_os.environ.get('MK1_NEW_OPCODES') == '1':
         COLLAPSE[('mov $b,$a', 'sll', 'mov $a,$b')] = 'sllb'
@@ -10687,7 +10685,7 @@ def peephole(lines):
             print(f"  Peephole: fused DDRB runs (saved {_ddrb_saved}B)",
                   file=sys.stderr)
 
-    # ── T4.1 auto-discovered peephole rules ──────────────────────────
+    # ── Superopt auto-discovered peephole rules ──────────────────────
     # Verified equivalences found by superopt.py against mk1sim, each
     # under 64 boundary + 136 random initial register states. Adding
     # them here is safe because equivalence includes SP/ZF/CF.
@@ -10706,7 +10704,7 @@ def peephole(lines):
     #   any constant N that both registers need.
     import re as _re
 
-    # T4.1 auto-rule rewriter — shared closure over the rule set.
+    # Auto-rule rewriter — shared closure over the rule set.
     # Returns None if no match (keep both lines), else a list of
     # replacement raw lines.
     def _t41_rewrite(a, b, first_raw):
@@ -10734,7 +10732,7 @@ def peephole(lines):
     lines = _ir.serialize_program(_prog)
     if auto_count > 0:
         import sys
-        print(f"  Peephole: T4.1 auto-rules applied {auto_count}× "
+        print(f"  Peephole: auto-rules applied {auto_count}× "
               f"(saved ≥{auto_count}B)", file=sys.stderr)
 
     # Save/restore through stack around pure DDRB bus toggles:

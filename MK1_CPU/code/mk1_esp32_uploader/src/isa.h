@@ -108,7 +108,7 @@ static const FixedInstr FIXED_INSTRUCTIONS[] = {
     { "swap",    0xEE,  ARGS_NONE },  // swap A and B
     { "inc",     0xFB,  ARGS_NONE },  // A = A + 1
     { "dec",     0xFE,  ARGS_NONE },  // A = A - 1
-    // ── T4.1-discovered: shift-left-B-register in 1 byte ──
+    // ── Superopt-discovered: shift-left-B-register in 1 byte ──
     // Retires 0x22 (formerly `move $sp, $c`, 0 corpus uses). Equivalent
     // to `mov $b,$a; sll; mov $a,$b` (3B). Saves 2B per use; scan found
     // 65 occurrences of the triple → ~130B corpus savings.

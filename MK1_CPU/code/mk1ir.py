@@ -1,4 +1,4 @@
-"""T1.1 — whole-program IR.
+"""Whole-program IR.
 
 Bridge between the existing flat-asm representation that every pass in
 mk1cc2 consumes today and a structured (section → labels → instrs)
@@ -538,7 +538,7 @@ def pass_2_window(prog: Program, rewrite_fn) -> int:
     return count
 
 
-# ── T1.2: Liveness analysis ────────────────────────────────────────
+# ── Liveness analysis ──────────────────────────────────────────────
 #
 # Forward-scan register liveness for straight-line sequences.
 # Conservative on uncertainty (assumes live) so caller-side decisions
@@ -754,9 +754,9 @@ def reg_live_after(lines, idx: int, reg: str, **kwargs) -> bool:
 
 
 # ── Shared extractability / sizing primitives ────────────────────────
-# These are used by multiple passes (T2.1 cross-section abstraction,
-# Phase 6 within-overlay dedup, future tail-merge / CSE). Extracted
-# here so behavior stays consistent across passes.
+# These are used by multiple passes (cross-section abstraction,
+# within-overlay dedup, tail-merge / CSE). Extracted here so behavior
+# stays consistent across passes.
 
 TWO_BYTE: frozenset = frozenset({
     'ldsp', 'stsp', 'push_imm', 'jal', 'jc', 'jz', 'jnc', 'jnz', 'j',

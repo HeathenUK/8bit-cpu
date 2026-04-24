@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""V3 — corpus-wide simulator regression.
+"""Corpus-wide simulator regression.
 
 For every C program in MK1_CPU/programs/ that compiles cleanly: compile
 → assemble (via ESP32 DUMP path) → run on mk1sim → snapshot the
 (output_history, halted, cycles) triple. Compare against a stored
 baseline; any divergence is a miscompile (assuming mk1sim and the ESP32
 assembler are ground truth — both are byte-exact against the MK1
-microcode per project_cpu_hardware_verified.md).
+microcode).
 
 This is the compounding safety net under every optimization pass we
 add: you can make any compiler change, run `python3 sim_corpus.py`,

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Regression test: parse/serialize every corpus program's asm and
-verify byte-for-byte identity. Any mismatch is a T1.1 parser bug."""
+verify byte-for-byte identity. Any mismatch is an IR parser bug."""
 import glob
 import os
 import subprocess
