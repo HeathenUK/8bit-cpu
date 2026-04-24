@@ -1326,6 +1326,80 @@ class MK1CodeGen:
                     and len(stmt[1][2]) == 1
                     and stmt[1][2][0] == ('num', val))
 
+        def lcd_char_expr(stmt):
+            if (isinstance(stmt, tuple) and stmt[0] == 'block'
+                    and len(stmt[1]) == 1):
+                stmt = stmt[1][0]
+            if (isinstance(stmt, tuple) and stmt[0] == 'expr_stmt'
+                    and isinstance(stmt[1], tuple) and stmt[1][0] == 'call'
+                    and stmt[1][1] == 'lcd_char'
+                    and len(stmt[1][2]) == 1):
+                return stmt[1][2][0]
+            return None
+
+        def is_lcd_char_offset(stmt, name, offset):
+            return lcd_char_expr(stmt) == ('binop', '+', ('var', name), ('num', offset))
+
+        def is_hex_digit_if(stmt, name):
+            return (isinstance(stmt, tuple) and stmt[0] == 'if'
+                    and stmt[1] == ('binop', '>', ('var', name), ('num', 9))
+                    and is_lcd_char_offset(stmt[2], name, 55)
+                    and len(stmt) >= 4 and is_lcd_char_offset(stmt[3], name, 48))
+
+        def is_high_nibble(expr):
+            return (isinstance(expr, tuple) and expr[0] == 'binop'
+                    and expr[1] == '>>' and expr[3] == ('num', 4))
+
+        def is_low_nibble(expr):
+            return (isinstance(expr, tuple) and expr[0] == 'binop'
+                    and expr[1] == '&' and expr[3] == ('num', 0x0F))
+
+        def compact_lcd_hex(block):
+            """Lower common LCD hex formatting source to compact helpers.
+
+            Recognizes both:
+              - lcd_char((x >> 4) + '0'); lcd_char((x & 0x0F) + '0')
+                for BCD-like output, and
+              - hi/lo locals plus if (>9) +55 else +48 for hex output.
+            """
+            if not isinstance(block, tuple) or block[0] != 'block':
+                return block
+            stmts = list(block[1])
+            out = []
+            i = 0
+            while i < len(stmts):
+                if i + 1 < len(stmts):
+                    e0 = lcd_char_expr(stmts[i])
+                    e1 = lcd_char_expr(stmts[i + 1])
+                    if (isinstance(e0, tuple) and isinstance(e1, tuple)
+                            and e0[0] == 'binop' and e0[1] == '+'
+                            and e0[3] == ('num', 48)
+                            and e1[0] == 'binop' and e1[1] == '+'
+                            and e1[3] == ('num', 48)
+                            and is_high_nibble(e0[2]) and is_low_nibble(e1[2])
+                            and e0[2][2] == e1[2][2]
+                            and not self._has_calls(e0[2][2])):
+                        out.append(('expr_stmt',
+                                    ('call', 'lcd_bcd_u8', [e0[2][2]])))
+                        i += 2
+                        continue
+                if i + 3 < len(stmts):
+                    h, l, hi_if, lo_if = stmts[i:i+4]
+                    if (h[0] == 'local' and l[0] == 'local'
+                            and h[2] is not None and l[2] is not None
+                            and is_high_nibble(h[2]) and is_low_nibble(l[2])
+                            and h[2][2] == l[2][2]
+                            and is_hex_digit_if(hi_if, h[1])
+                            and is_hex_digit_if(lo_if, l[1])
+                            and not self._has_calls(h[2][2])):
+                        out.append(('expr_stmt',
+                                    ('call', 'lcd_hex_u8', [h[2][2]])))
+                        i += 4
+                        continue
+                out.append(stmts[i])
+                i += 1
+            return ('block', out)
+
         def decimal_loop_vars(stmt):
             if not (isinstance(stmt, tuple) and stmt[0] == 'while'):
                 return None
@@ -1411,7 +1485,7 @@ class MK1CodeGen:
             return ('block', out)
 
         def simplify_block(block):
-            return compact_lcd_temp(merge_local_init_runs(block))
+            return compact_lcd_temp(compact_lcd_hex(merge_local_init_runs(block)))
 
         def rewrite_stmt(stmt):
             if not isinstance(stmt, tuple):
@@ -2635,6 +2709,21 @@ class MK1CodeGen:
             self.emit('\tldi $a,223')
             self.emit('\tjal __lcd_chr')
             self.emit('\tldi $a,67')
+            self.emit('\tjal __lcd_chr')
+            self.emit('\tret')
+
+        # __lcd_bcd_u8: A = packed BCD byte, print high nibble then low nibble.
+        # Common for RTC hour/min/sec display where values are already BCD.
+        if '__lcd_bcd_u8' in helpers:
+            self.emit('__lcd_bcd_u8:')
+            self.emit('\tpush $a')
+            self.emit('\tslr'); self.emit('\tslr')
+            self.emit('\tslr'); self.emit('\tslr')
+            self.emit('\taddi 48,$a')
+            self.emit('\tjal __lcd_chr')
+            self.emit('\tpop $a')
+            self.emit('\tandi 0x0F,$a')
+            self.emit('\taddi 48,$a')
             self.emit('\tjal __lcd_chr')
             self.emit('\tret')
 
@@ -9090,6 +9179,26 @@ class MK1CodeGen:
                 self._lcd_helpers.add('__lcd_temp_u8')
                 self._lcd_helpers.add('__lcd_chr')
                 self.emit('\tjal __lcd_temp_u8')
+                return
+
+            if name == 'lcd_hex_u8':
+                if args:
+                    self.gen_expr(args[0])
+                if not hasattr(self, '_lcd_helpers'):
+                    self._lcd_helpers = set()
+                self._lcd_helpers.add('__print_u8_hex')
+                self._lcd_helpers.add('__lcd_chr')
+                self.emit('\tjal __print_u8_hex')
+                return
+
+            if name == 'lcd_bcd_u8':
+                if args:
+                    self.gen_expr(args[0])
+                if not hasattr(self, '_lcd_helpers'):
+                    self._lcd_helpers = set()
+                self._lcd_helpers.add('__lcd_bcd_u8')
+                self._lcd_helpers.add('__lcd_chr')
+                self.emit('\tjal __lcd_bcd_u8')
                 return
 
             if name == 'printf':
