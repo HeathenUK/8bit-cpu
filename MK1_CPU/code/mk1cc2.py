@@ -1210,9 +1210,74 @@ class MK1CodeGen:
         wrapper functions (`t = rtc_read_temp(); return t;`) and otherwise
         costs several bytes in the overlay body.
         """
+        def merge_local_init_runs(block):
+            if not isinstance(block, tuple) or block[0] != 'block':
+                return block
+            stmts = list(block[1])
+            out_stmts = []
+            i = 0
+            while i < len(stmts):
+                s = stmts[i]
+                if s[0] != 'local' or s[2] is not None:
+                    out_stmts.append(rewrite_stmt(s))
+                    i += 1
+                    continue
+                j = i
+                locals_run = []
+                while j < len(stmts) and stmts[j][0] == 'local' and stmts[j][2] is None:
+                    locals_run.append(stmts[j])
+                    j += 1
+                assigns = []
+                k = j
+                ok = True
+                for local_stmt in locals_run:
+                    if k >= len(stmts):
+                        ok = False
+                        break
+                    a = stmts[k]
+                    if not (a[0] == 'expr_stmt' and a[1][0] == 'assign'
+                            and a[1][1] == '=' and a[1][2] == ('var', local_stmt[1])
+                            and not self._has_calls(a[1][3])):
+                        ok = False
+                        break
+                    later_names = {ls[1] for ls in locals_run[locals_run.index(local_stmt)+1:]}
+                    reads = set()
+                    self._find_vars_in_expr(a[1][3], reads)
+                    if reads & later_names:
+                        ok = False
+                        break
+                    assigns.append(a[1][3])
+                    k += 1
+                if ok and assigns:
+                    for local_stmt, init in zip(locals_run, assigns):
+                        out_stmts.append((local_stmt[0], local_stmt[1], init,
+                                          local_stmt[3] if len(local_stmt) > 3 else 'u8'))
+                    i = k
+                else:
+                    out_stmts.append(rewrite_stmt(s))
+                    i += 1
+            return ('block', out_stmts)
+
+        def rewrite_stmt(stmt):
+            if not isinstance(stmt, tuple):
+                return stmt
+            kind = stmt[0]
+            if kind == 'block':
+                return merge_local_init_runs(stmt)
+            if kind == 'if':
+                else_part = rewrite_stmt(stmt[3]) if len(stmt) > 3 and stmt[3] else None
+                return (kind, stmt[1], rewrite_stmt(stmt[2]),
+                        else_part)
+            if kind in ('while', 'do_while'):
+                return (kind, stmt[1], rewrite_stmt(stmt[2]))
+            if kind == 'for':
+                return (kind, stmt[1], stmt[2], stmt[3], rewrite_stmt(stmt[4]))
+            return stmt
+
         out = []
         for name, params, body, ret_type in functions:
             if body[0] == 'block':
+                body = merge_local_init_runs(body)
                 stmts = body[1]
                 if (len(stmts) == 3
                         and stmts[0][0] == 'local'
