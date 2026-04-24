@@ -1217,6 +1217,20 @@ class MK1CodeGen:
             out_stmts = []
             i = 0
             while i < len(stmts):
+                if (i + 2 < len(stmts)
+                        and self._is_call_stmt(stmts[i], 'i2c_stop')
+                        and self._is_call_stmt(stmts[i + 1], 'i2c_start')
+                        and self._is_call_stmt(stmts[i + 2], 'i2c_send_byte')
+                        and 'i2c_stop' not in self.func_params
+                        and 'i2c_start' not in self.func_params
+                        and 'i2c_send_byte' not in self.func_params):
+                    addr = self._const_eval(stmts[i + 2][1][2][0]) if stmts[i + 2][1][2] else None
+                    if addr is not None and (addr & 1):
+                        # STOP + START + read-address can be a repeated START.
+                        # This matches the compiler's own RTC/EEPROM read
+                        # builtins and saves the STOP sequence.
+                        i += 1
+                        continue
                 s = stmts[i]
                 if s[0] != 'local' or s[2] is not None:
                     out_stmts.append(rewrite_stmt(s))
@@ -1291,6 +1305,11 @@ class MK1CodeGen:
                     body = ('block', [('return', stmts[1][1][3])])
             out.append((name, params, body, ret_type))
         return out
+
+    def _is_call_stmt(self, stmt, name):
+        return (isinstance(stmt, tuple) and stmt[0] == 'expr_stmt'
+                and isinstance(stmt[1], tuple) and stmt[1][0] == 'call'
+                and stmt[1][1] == name)
 
     def _collect_reg_candidates(self, stmts, candidates, depth=0):
         """Recursively collect register allocation candidates.
