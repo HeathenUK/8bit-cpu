@@ -1307,7 +1307,8 @@ class MK1CodeGen:
         # Auto-insert delay_calibrate when lcd_cmd uses calibrated delays.
         # The call is inserted into _main (after VIA/LCD init, before user code).
         # In overlay mode, __delay_cal becomes an overlay-eligible function.
-        if getattr(self, '_needs_delay_calibrate', False):
+        if (getattr(self, '_needs_delay_calibrate', False)
+                and not getattr(self, '_explicit_delay_calibrate', False)):
             if not hasattr(self, '_lcd_helpers'):
                 self._lcd_helpers = set()
             self._lcd_helpers.add('__delay_cal')
@@ -8444,6 +8445,7 @@ class MK1CodeGen:
                 if not hasattr(self, '_lcd_helpers'):
                     self._lcd_helpers = set()
                 self._lcd_helpers.add('__delay_cal')
+                self._explicit_delay_calibrate = True
                 self.emit('\tjal __delay_cal')
                 return
 
