@@ -2841,10 +2841,17 @@ class MK1CodeGen:
                 lcd_init_data += [START, LCD, 0x80, cmd, STOP]
                 if cmd == 0x01:
                     lcd_init_data.append(DELAY)  # clear display needs ~2ms
-            # Backlight V2.0 (Registers: 0x04=R, 0x03=G, 0x02=B)
-            lcd_init_data += [START, RGB, 0x04, 0xFF, STOP]
-            lcd_init_data += [START, RGB, 0x03, 0xFF, STOP]
-            lcd_init_data += [START, RGB, 0x02, 0xFF, STOP]
+            # Backlight V2.0 @ 0x2D (register map per DFRobot_RGBLCD1602.cpp
+            # _RGBAddr == 0x2D branch: R=0x01, G=0x02, B=0x03). Direct PWM
+            # register writes; V2.0 doesn't need MODE1/OUTPUT init (the
+            # DFRobot driver only does that for the 0x60 PCA9633 variant).
+            # Default full-white (0xFF each); lcd_init(r, g, b) user call
+            # substitutes compile-time constants here instead.
+            _rgb = getattr(self, '_lcd_init_rgb', None) or (0xFF, 0xFF, 0xFF)
+            _r, _g, _b = _rgb
+            lcd_init_data += [START, RGB, 0x01, _r, STOP]
+            lcd_init_data += [START, RGB, 0x02, _g, STOP]
+            lcd_init_data += [START, RGB, 0x03, _b, STOP]
             lcd_init_data.append(END)
 
             data_base = self.data_alloc
@@ -2945,7 +2952,7 @@ class MK1CodeGen:
             self.emit('\tjal __i2c_st_only')
             self.emit('\tldi $a,0x5A')     # RGB Address (0x2D << 1)
             self.emit('\tjal __i2c_sb')
-            self.emit('\tldi $a,0x04')     # Red register
+            self.emit('\tldi $a,0x01')     # Red register (V2.0 @ 0x2D)
             self.emit('\tjal __i2c_sb')
             self.emit('\tpop $a')          # restore R
             self.emit('\tjal __i2c_sb')
@@ -2954,7 +2961,7 @@ class MK1CodeGen:
             self.emit('\tjal __i2c_st_only')
             self.emit('\tldi $a,0x5A')
             self.emit('\tjal __i2c_sb')
-            self.emit('\tldi $a,0x03')     # Green register
+            self.emit('\tldi $a,0x02')     # Green register (V2.0 @ 0x2D)
             self.emit('\tjal __i2c_sb')
             self.emit('\tpop $a')          # restore G
             self.emit('\tjal __i2c_sb')
@@ -2963,7 +2970,7 @@ class MK1CodeGen:
             self.emit('\tjal __i2c_st_only')
             self.emit('\tldi $a,0x5A')
             self.emit('\tjal __i2c_sb')
-            self.emit('\tldi $a,0x02')     # Blue register
+            self.emit('\tldi $a,0x03')     # Blue register (V2.0 @ 0x2D)
             self.emit('\tjal __i2c_sb')
             self.emit('\tldsp 2')          # load B from stack
             self.emit('\tjal __i2c_sb')
@@ -9105,22 +9112,55 @@ class MK1CodeGen:
             if name == 'lcd_init':
                 # Complete LCD init sequence as one jal call.
                 # LCD init data is pre-populated in data page (no EEPROM read needed).
-                # Bus recovery happens inside __lcd_init itself — keeping it inline
-                # here would break init extraction (the recovery loop's `ldi $a,N`
-                # isn't in INIT_PREFIXES, so init extraction bails out before
-                # reaching `jal __lcd_init`, leaving the call in runtime main
-                # pointing at a stage-1-only helper).
+                #
+                # Optional args: lcd_init() or lcd_init(r, g, b). When provided,
+                # r/g/b must be compile-time constants (0..255); they replace
+                # the default 0xFF/0xFF/0xFF backlight brightness values baked
+                # into the init data table. No runtime cost — substitution
+                # happens at emit time. Non-const args are rejected; callers
+                # who need runtime RGB control should follow lcd_init() with
+                # an explicit lcd_rgb(r, g, b) call.
+                if args:
+                    if len(args) != 3:
+                        raise Exception(
+                            f"lcd_init() takes 0 or 3 arguments (R, G, B), got {len(args)}")
+                    rgb = []
+                    for i, a in enumerate(args):
+                        c = self._const_eval(a)
+                        if c is None:
+                            raise Exception(
+                                f"lcd_init() argument {i+1} must be a "
+                                f"compile-time constant (use lcd_rgb() for "
+                                f"runtime RGB)")
+                        c &= 0xFF
+                        # Init-data walker uses 0xFB..0xFE as sentinels
+                        # (END/DELAY/STOP/START). A brightness in that
+                        # range would be misread as a control sentinel
+                        # and terminate/derail init. Clamp into the safe
+                        # range instead of silently miscompiling.
+                        if 0xFB <= c <= 0xFE:
+                            raise Exception(
+                                f"lcd_init() RGB value 0x{c:02X} collides with "
+                                f"an __lcd_init walker sentinel "
+                                f"(0xFB..0xFE). Use 0..0xFA or 0xFF.")
+                        rgb.append(c)
+                    prev = getattr(self, '_lcd_init_rgb', None)
+                    if prev is not None and prev != tuple(rgb):
+                        raise Exception(
+                            f"lcd_init() called with conflicting RGB "
+                            f"{tuple(rgb)} vs {prev} — the init data table is "
+                            f"emitted once; use lcd_rgb() for later changes")
+                    self._lcd_init_rgb = tuple(rgb)
                 if not hasattr(self, '_lcd_helpers'):
                     self._lcd_helpers = set()
                 self._lcd_helpers.add('__lcd_init')
                 self._lcd_helpers.add('__i2c_sb')
                 # __i2c_rb NOT needed: LCD init data pre-populated in data page
                 self.emit('\tjal __lcd_init')
-                # The HD44780 init data sequence we emit includes Clear Display
-                # (0x01) as its penultimate command, so a program's
-                # `lcd_cmd(0x01)` / `lcd_clear()` immediately after `lcd_init()`
-                # is semantically redundant. Mark the flag so the lcd_cmd
-                # builtin can elide such a call when it sees this flag set.
+                # The init data sequence we emit includes Clear Display
+                # (0x01) as a command, so a program's `lcd_cmd(0x01)` /
+                # `lcd_clear()` immediately after `lcd_init()` is redundant.
+                # Mark the flag so the lcd_cmd builtin can elide such a call.
                 self._lcd_init_just_emitted = True
                 return
 
