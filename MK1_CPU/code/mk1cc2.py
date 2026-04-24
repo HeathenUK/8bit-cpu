@@ -664,6 +664,76 @@ class MK1CodeGen:
     # they use jal to subroutines that clobber B, C, D. The register
     # allocator must treat them as user function calls.
 
+    # ── $d-clobber analysis ─────────────────────────────────────────
+    # Names of compiler-emitted builtins whose generated helper clobbers
+    # $d without restoring it. A function that (transitively) calls any
+    # of these cannot use $d as a cross-call save slot for a param or
+    # local. Verified by inspection of each helper's emission in the
+    # compiler source (search for `__lcd_print`, `__i2c_rb`, etc.).
+    D_CLOBBER_BUILTINS = frozenset({
+        # User-facing builtin names (what appears as `('call', name, ...)`):
+        'printf',          # lowers to __lcd_print (+ __lcd_temp_u8 etc.)
+        'lcd_print',       # __lcd_print uses $d as pointer
+        'lcd_str',         # same
+        'lcd_init',        # data-driven, iterates via $d
+        'rtc_read_temp',   # uses __i2c_rb (bit counter in $d)
+        'rtc_read_seconds',
+        'i2c_read_byte',   # __i2c_rb directly
+        'eeprom_read_byte',
+        'eeprom_read',
+        'eeprom_write_byte',
+        'eeprom_write',
+        'i2c_stream',      # __i2c_stream pointer in $d
+        'i2c_stream_result',
+        'delay',           # __delay_Nms product high in $d
+        'tone',
+        'silence',
+    })
+
+    def _call_targets(self, node, acc):
+        """Collect every `call` target name in the AST subtree."""
+        if not isinstance(node, tuple) or len(node) == 0:
+            return
+        if node[0] == 'call':
+            acc.add(node[1])
+        for child in node[1:]:
+            if isinstance(child, tuple):
+                self._call_targets(child, acc)
+            elif isinstance(child, list):
+                for item in child:
+                    if isinstance(item, tuple):
+                        self._call_targets(item, acc)
+
+    def _body_calls_any(self, body, target_set):
+        """True if the AST body contains a `call` to any name in target_set."""
+        if not target_set:
+            return False
+        seen = set()
+        self._call_targets(body, seen)
+        return not seen.isdisjoint(target_set)
+
+    def _compute_d_clobber_funcs(self):
+        """Transitive closure: a user function clobbers $d if it calls
+        a $d-clobbering builtin, or a user function that (transitively)
+        clobbers $d. Stored on self as `_d_clobber_funcs`."""
+        clobbers = set()
+        # Seed with user functions that directly call a clobbering builtin.
+        for fname, (_p, body) in self.func_bodies.items():
+            if self._body_calls_any(body, self.D_CLOBBER_BUILTINS):
+                clobbers.add(fname)
+        # Fixed point: add user functions that call another clobberer.
+        changed = True
+        while changed:
+            changed = False
+            for fname, (_p, body) in self.func_bodies.items():
+                if fname in clobbers:
+                    continue
+                if self._body_calls_any(body, clobbers):
+                    clobbers.add(fname)
+                    changed = True
+        # Build the combined set used at reg-alloc time.
+        self._d_clobber_funcs = set(self.D_CLOBBER_BUILTINS) | clobbers
+
     def _has_calls(self, node):
         """Check if AST node contains any non-builtin function calls (jal).
         Also detects eeprom array subscripts (generate jal __eeprom_rd)."""
@@ -1895,6 +1965,17 @@ class MK1CodeGen:
         # Split functions that span both I2C and LCD domains into separate
         # phases, each needing fewer helpers → smaller overlay slots.
         functions = self._auto_split_functions(functions)
+
+        # Refresh func_bodies to reflect the final post-transform function
+        # list, then compute the $d-clobber transitive closure. The
+        # reg-alloc pass in compile_function() consults
+        # `self._d_clobber_funcs` to decide whether param 0 can be saved to
+        # $d or must be spilled to the stack. This must run after
+        # `_auto_split_functions` because that pass can introduce new
+        # phase-split functions.
+        self.func_bodies = {name: (params, body)
+                            for (name, params, body, _r) in functions}
+        self._compute_d_clobber_funcs()
 
         # Compile main first (starts at address 0, no j _main jump needed)
         # Then compile other functions after main
@@ -7658,19 +7739,32 @@ class MK1CodeGen:
             # If D is taken by a local but the param needs saving, evict the
             # local from D (it'll go to stack instead). Parameter preservation
             # takes priority over local register allocation.
+            #
+            # IMPORTANT: several compiler-emitted helpers clobber $d without
+            # restoring it. Saving param 0 to $d across a call that clobbers
+            # $d produces a silent miscompile (e.g. `t` saved to $d before
+            # `printf(...)` came back as the end-of-string pointer value
+            # instead of `t`). We use `self._d_clobber_funcs` (computed in
+            # compile() as a transitive closure over user functions) to
+            # decide precisely whether the body contains any $d-clobbering
+            # call. Calls that do NOT clobber $d (e.g. a user function that
+            # only uses $a/$b/$c) still allow the cheaper save-to-$d path.
             has_locals = any(s[0] == 'local' for s in body[1]) if body[0] == 'block' else False
+            has_calls = self._has_calls(body)
+            has_d_clobber_calls = self._body_calls_any(
+                body, getattr(self, '_d_clobber_funcs', set()))
             needs_save = (len(params) >= 1
                           and params[0] in self.read_vars
                           and self.reg_d_var is None
                           and (has_locals or len(params) > 2
-                               or self._has_calls(body)))
-            save_a_to_d = needs_save
-            # If D is unavailable but param needs saving (used in/after loops),
-            # save to stack instead. regparam 'a' is unsafe when loops clobber A.
+                               or has_calls))
+            # Save to $d only if no call in the body clobbers $d.
+            save_a_to_d = needs_save and not has_d_clobber_calls
+            # If $d is unavailable OR a $d-clobbering call exists, save to stack.
             save_a_to_stack = (not save_a_to_d
                                and len(params) >= 1
                                and params[0] in self.read_vars
-                               and (has_locals or self._has_calls(body)))
+                               and (has_locals or has_calls))
             for i, pname in enumerate(params):
                 if i == 0:
                     if save_a_to_d:

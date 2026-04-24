@@ -123,6 +123,18 @@ def dedup_consecutive(vals):
     return out
 
 
+def dedup_consecutive_with_ts(vals, ts):
+    """Like dedup_consecutive but also returns the ts (MK1 cycle count)
+    of the FIRST sample in each run. Used for timing-based assertions."""
+    out_v = []
+    out_t = []
+    for i, v in enumerate(vals):
+        if not out_v or out_v[-1] != v:
+            out_v.append(v)
+            out_t.append(ts[i] if i < len(ts) else None)
+    return out_v, out_t
+
+
 # Canonical "execution started at PC=0" sentinel. The test runner wraps
 # every program with `out(0xDE); out(0xAD); out(0xBE);` as the FIRST thing
 # after the _main preamble. If we see that 3-value sequence in the OI
@@ -255,7 +267,7 @@ def compile_c(source_path, eeprom=False, optimize=True, extra_env=None):
 
 class Test:
     def __init__(self, name, source, expected, eeprom=False, cycles=500_000, us=2,
-                 env=None):
+                 env=None, expected_intervals_ms=None, interval_tolerance_pct=5):
         self.name = name
         self.source = source
         self.expected = expected   # list of ints, prefix of expected OI history
@@ -268,6 +280,14 @@ class Test:
         # Optional extra env vars for the compiler (e.g. MK1_T2_MIN_LEN=3 to
         # force init-touching cross-section extraction for validation).
         self.env = env
+        # Optional: assert timing between consecutive `expected` values
+        # using the per-event MK1 cycle timestamps from RUNLOG. List of
+        # floats in milliseconds, length == len(expected) - 1. Tolerance
+        # applies symmetrically; default 5% — calibrated delay is
+        # supposed to match wall-clock closely, and anything worse is
+        # a real calibration bug to investigate.
+        self.expected_intervals_ms = expected_intervals_ms
+        self.interval_tolerance_pct = interval_tolerance_pct
 
 
 def run_one(ser, test, verbose=False):
@@ -294,24 +314,69 @@ def run_one(ser, test, verbose=False):
             last_notes = r['error']
             continue
         raw_vals = r.get('vals', [])
-        deduped = dedup_consecutive(raw_vals)
-        last_notes = f'cyc={r.get("cyc")} cnt={r.get("cnt")} khz={r.get("khz")}'
+        raw_ts = r.get('ts', [])
+        khz = r.get('khz') or 0
+        deduped, deduped_ts = dedup_consecutive_with_ts(raw_vals, raw_ts)
+        last_notes = f'cyc={r.get("cyc")} cnt={r.get("cnt")} khz={khz}'
         # cnt=0 = upload/reset failure. Re-upload + retry.
         if r.get('cnt', 0) == 0 and attempt < 2:
             last_notes += f' (retry: cnt=0 on attempt {attempt+1})'
             continue
         actual = find_sequence(deduped, test.expected)
         passed = actual == test.expected
-        if passed:
-            return True, actual, last_notes
-        last_notes += f' raw={deduped[:25]}'
-        # Wrong-data failure too — retry once in case it was a transient
-        # capture artefact, then give up.
-        if attempt < 2:
-            last_notes += f' (retry: wrong data attempt {attempt+1})'
-            continue
-        return False, actual, last_notes
+        if not passed:
+            last_notes += f' raw={deduped[:25]}'
+            if attempt < 2:
+                last_notes += f' (retry: wrong data attempt {attempt+1})'
+                continue
+            return False, actual, last_notes
+
+        # Values matched. If this test has timing expectations, check the
+        # per-event MK1 cycle deltas against expected ms × khz.
+        if test.expected_intervals_ms is not None and passed:
+            # Find the ts for each expected value — match the same way
+            # find_sequence does (first occurrence of the sequence).
+            seq_ts = _ts_for_sequence(deduped, deduped_ts, test.expected)
+            if seq_ts is None or len(seq_ts) < len(test.expected):
+                last_notes += f' (timing: could not locate ts for expected sequence)'
+                if attempt < 2:
+                    continue
+                return False, actual, last_notes
+            if khz <= 0:
+                last_notes += f' (timing: invalid khz={khz})'
+                if attempt < 2:
+                    continue
+                return False, actual, last_notes
+            actual_ms = []
+            for i in range(1, len(seq_ts)):
+                delta_cycles = seq_ts[i] - seq_ts[i-1]
+                actual_ms.append(delta_cycles / khz)
+            tol = test.interval_tolerance_pct / 100.0
+            bad = []
+            for i, (want, got) in enumerate(zip(test.expected_intervals_ms, actual_ms)):
+                lo, hi = want * (1 - tol), want * (1 + tol)
+                if not (lo <= got <= hi):
+                    bad.append(f'interval[{i}]: expected {want}ms±{tol*100:.0f}% got {got:.1f}ms')
+            if bad:
+                last_notes += ' timing_fail: ' + '; '.join(bad)
+                if attempt < 2:
+                    continue
+                return False, actual, last_notes
+            last_notes += f' intervals_ms={[f"{x:.1f}" for x in actual_ms]}'
+        return True, actual, last_notes
     return False, [], last_notes
+
+
+def _ts_for_sequence(vals, ts, expected):
+    """Return list of ts corresponding to the first occurrence of `expected`
+    as a contiguous subsequence within (vals, ts). None if not found."""
+    n, m = len(vals), len(expected)
+    if m == 0:
+        return []
+    for i in range(n - m + 1):
+        if vals[i:i+m] == list(expected):
+            return ts[i:i+m]
+    return None
 
 
 def run_test(ser, test, replications=3, verbose=False):
@@ -467,6 +532,30 @@ TESTS = [
         }''',
         [62], eeprom=True,
         env={'MK1_T2_MIN_LEN': '3'},
+    ),
+    Test(
+        'delay calibration: stopwatch timing',
+        # Emits 1,2,3,4 separated by delay(50), delay(100), delay(50).
+        # Verifies that calibrated delays produce the requested real-time
+        # interval (not just the right count of instructions). If
+        # delay_calibrate() miscomputes or delay() ignores calibration,
+        # the per-event ts deltas diverge from the requested ms.
+        '''void main(void) {
+            i2c_init();
+            delay_calibrate();
+            out(1);
+            delay(50);
+            out(2);
+            delay(100);
+            out(3);
+            delay(50);
+            out(4);
+            halt();
+        }''',
+        [1, 2, 3, 4], eeprom=True,
+        cycles=1_000_000,  # 200ms total delay + calibrate overhead needs headroom
+        expected_intervals_ms=[50.0, 100.0, 50.0],
+        interval_tolerance_pct=5,
     ),
 ]
 
