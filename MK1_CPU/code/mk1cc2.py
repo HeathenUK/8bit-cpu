@@ -5295,6 +5295,60 @@ class MK1CodeGen:
                       f"overlays={_t3b_ov}B)",
                       file=sys.stderr)
 
+            def _elide_redundant_overlay_loads(lines):
+                """Remove proven-redundant consecutive loads of the same slot.
+
+                Safe window is deliberately narrow: straight-line code only,
+                no branches, and no non-overlay calls between loads. Overlay
+                calls themselves do not change the loaded slot because merged
+                user call graphs are self-contained inside that slot.
+                """
+                out = []
+                loaded_idx = None
+                saved = 0
+                i = 0
+                while i < len(lines):
+                    s = lines[i].strip()
+                    if (i + 2 < len(lines)
+                            and (s.startswith('ldi $c,') or s.startswith('ldi $a,'))
+                            and lines[i + 1].strip() == 'jal _overlay_load'
+                            and lines[i + 2].strip().startswith('jal ')):
+                        target = lines[i + 2].strip().split()[1]
+                        try:
+                            idx = int(s.split(',', 1)[1])
+                        except ValueError:
+                            idx = None
+                        if idx is not None and func_to_overlay_idx.get(target) == idx:
+                            if loaded_idx == idx:
+                                out.append(lines[i + 2])
+                                saved += measure_lines([lines[i], lines[i + 1]])
+                            else:
+                                out.extend([lines[i], lines[i + 1], lines[i + 2]])
+                                loaded_idx = idx
+                            i += 3
+                            continue
+
+                    if s.endswith(':') or s.startswith('j ') or s.startswith('jz ') \
+                            or s.startswith('jnz ') or s.startswith('jc ') \
+                            or s.startswith('jnc ') or s.startswith('ret') \
+                            or s.startswith('hlt'):
+                        loaded_idx = None
+                    elif s.startswith('jal '):
+                        target = s.split()[1]
+                        if func_to_overlay_idx.get(target) != loaded_idx:
+                            loaded_idx = None
+                    out.append(lines[i])
+                    i += 1
+                return out, saved
+
+            main_lines, _rl_main = _elide_redundant_overlay_loads(main_lines)
+            runtime_resident_helpers, _rl_hlp = _elide_redundant_overlay_loads(runtime_resident_helpers)
+            _rl_saved = _rl_main + _rl_hlp
+            if _rl_saved:
+                print(f"  T3.2 elided {_rl_saved}B of redundant overlay loads "
+                      f"(main={_rl_main}B, helpers={_rl_hlp}B)",
+                      file=sys.stderr)
+
             runtime_helper_size = measure_lines(runtime_resident_helpers)
             main_size = measure_lines(main_lines)
             KERNEL_SIZE_est = loader_size + main_size + runtime_helper_size
