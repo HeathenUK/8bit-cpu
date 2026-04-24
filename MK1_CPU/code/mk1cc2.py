@@ -6496,6 +6496,14 @@ class MK1CodeGen:
                     f"{overlay_asm_blocks[i][0]}={overlay_asm_blocks[i][2]}B"
                     for i in sorted(_wrapping_indices)
                 )
+                import os as _dbg_os
+                if _dbg_os.environ.get('MK1_DUMP_WRAPPING') == '1':
+                    import sys as _dbg_sys
+                    for _oi, (_on, _olines, _osz) in enumerate(overlay_asm_blocks):
+                        print(f"[DUMP] overlay idx={_oi} name={_on} size={_osz}B",
+                              file=_dbg_sys.stderr)
+                        for _ol in _olines:
+                            print(f"[DUMP]   {_ol.rstrip()}", file=_dbg_sys.stderr)
                 raise Exception(
                     f"overlay placement would wrap into kernel; refusing codegen. "
                     f"available={_ov_avail}B, wrapping={details}"
@@ -10619,14 +10627,10 @@ def peephole(lines):
         ('mov $b,$a', 'inc', 'mov $a,$b'): 'incb',
     }
     # Superopt-discovered: `mov $b,$a; sll; mov $a,$b` (3B) → `sllb` (1B),
-    # saves 2B per occurrence. sllb is a new opcode (0x22) that retires
-    # the unused `move $sp, $c` — requires microcode EEPROM reflash.
-    # Gated behind MK1_NEW_OPCODES=1 so pre-flash compilation still
-    # emits the original 3-byte sequence and runs correctly on unflashed
-    # hardware. Set the env var after flashing the new microcode.bin.
-    import os as _sllb_os
-    if _sllb_os.environ.get('MK1_NEW_OPCODES') == '1':
-        COLLAPSE[('mov $b,$a', 'sll', 'mov $a,$b')] = 'sllb'
+    # saves 2B per occurrence. sllb is opcode 0x22 (retires the unused
+    # `move $sp, $c`). Verified safe on flashed hardware and present in
+    # the canonical microcode.bin, so it is enabled unconditionally.
+    COLLAPSE[('mov $b,$a', 'sll', 'mov $a,$b')] = 'sllb'
     # IR-based implementation — replaces the old flat-list window walk.
     # Behavior and byte output are identical (validated against every
     # corpus program); the IR version is the migration foundation that
@@ -10640,61 +10644,17 @@ def peephole(lines):
         print(f"  Peephole: collapsed {collapsed_count} reg-inc/dec patterns "
               f"(saved {collapsed_count * 2}B)", file=sys.stderr)
 
-    # ── DDRB fusion: consecutive ddrb_imm runs → ddrb2_imm/ddrb3_imm ──
-    # Post-flash only (gated). Both ops retire unused setjmp/setret slots.
-    # Encoding:
-    #   ddrb_imm  N      : 2B (opcode + imm)
-    #   ddrb2_imm A B    : 3B (opcode + 2 imm)   → saves 1B per pair
-    #   ddrb3_imm A B C  : 4B (opcode + 3 imm)   → saves 2B per triple
-    # Fusion picks ddrb3 greedily, then ddrb2, then single.
-    # For runs that span a label or branch target we split at the boundary
-    # (labels are handled here by only fusing within a contiguous raw-line
-    # block of ddrb_imm lines — any interruption breaks the run).
-    if _sllb_os.environ.get('MK1_NEW_OPCODES') == '1':
-        _ddrb_saved = 0
-        new_lines = []
-        i = 0
-        while i < len(lines):
-            # Collect a run of consecutive `\tddrb_imm N` lines.
-            run = []
-            j = i
-            while j < len(lines):
-                s = lines[j].strip().split(';')[0].strip()
-                if s.startswith('ddrb_imm '):
-                    try:
-                        val = int(s.split()[1], 0) & 0xFF
-                    except (IndexError, ValueError):
-                        break
-                    run.append(val)
-                    j += 1
-                else:
-                    break
-            if len(run) < 2:
-                # Single (or zero) — leave as-is.
-                new_lines.append(lines[i])
-                i += 1
-                continue
-            # Fuse: chunk into 3s then 2s then singles.
-            k = 0
-            while k < len(run):
-                remaining = len(run) - k
-                if remaining >= 3:
-                    new_lines.append(f'\tddrb3_imm 0x{run[k]:02X} 0x{run[k+1]:02X} 0x{run[k+2]:02X}')
-                    _ddrb_saved += 2
-                    k += 3
-                elif remaining == 2:
-                    new_lines.append(f'\tddrb2_imm 0x{run[k]:02X} 0x{run[k+1]:02X}')
-                    _ddrb_saved += 1
-                    k += 2
-                else:  # remaining == 1
-                    new_lines.append(f'\tddrb_imm 0x{run[k]:02X}')
-                    k += 1
-            i = j
-        lines = new_lines
-        if _ddrb_saved > 0:
-            import sys
-            print(f"  Peephole: fused DDRB runs (saved {_ddrb_saved}B)",
-                  file=sys.stderr)
+    # ── DDRB fusion DISABLED — ddrb2_imm/ddrb3_imm are hardware-unsafe ──
+    # Fusing consecutive ddrb_imm writes into the multi-immediate forms
+    # produces bus/timing glitches on real silicon that plain ddrb_imm
+    # does not exhibit. Root cause appears to be insufficient settling
+    # between the back-to-back RO|U1|E0 cycles. Until the microcode or
+    # hardware is updated to guarantee settling, the compiler never
+    # emits ddrb2_imm or ddrb3_imm. The sllb 1-byte shift remains
+    # safe and is still gated behind MK1_NEW_OPCODES above.
+    #
+    # The size-counters for ddrb2_imm/ddrb3_imm elsewhere are kept so
+    # any stray hand-written occurrence is still accounted for.
 
     # ── Superopt auto-discovered peephole rules ──────────────────────
     # Verified equivalences found by superopt.py against mk1sim, each

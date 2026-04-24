@@ -96,6 +96,7 @@ def _translate_instr(s):
         'istc': ('istc', None),
         'istc_inc': ('istc_inc', None),
         'sll': ('sll', None), 'slr': ('slr', None),
+        'sllb': ('sllb', None),
         'rll': ('rll', None), 'rlr': ('rlr', None),
         'swap': ('swap', None),
         'not': ('not', None), 'neg': ('neg', None),
