@@ -2044,17 +2044,19 @@ class MK1CodeGen:
         # Must be AFTER all tone()/silence() calls are compiled (so note table is complete)
         # and BEFORE dead function elimination.
         #
-        # Runs in BOTH flat and overlay mode. The precompute loop walks
-        # the note table, calls __tone_setup(ratio) for each entry, and
-        # writes the resulting half_period back in-place. __play_note
-        # later reads that precomputed half_period as the inner-loop
-        # count for __tone. Without this step, __play_note would
-        # consume `ratio` directly as if it were half_period — which
-        # it isn't — and tones would play at ~clock/(18*ratio+27) Hz
-        # and for ~total_cycles*(18*ratio+27)/F ms, both independent
-        # of calibration.
+        # FLAT MODE ONLY. Enabling precompute in overlay mode exposes
+        # a separate overlay-layout/stack interaction that makes user
+        # functions calling tone() return early after a couple of
+        # tones or hang in a single note. Root cause not yet pinned
+        # down; until it is, overlay-mode programs keep the
+        # pre-precompute behavior (frequency/duration independent of
+        # __delay_cal, tuned for ~100 kHz reference) — imperfect but
+        # non-hanging. Tracked as a separate issue; do not re-enable
+        # this path in overlay mode without first understanding the
+        # failure observed in `one_phrase.c`/`twinkle_v3.c`.
         if (getattr(self, '_needs_tone_init', False) and
-            hasattr(self, '_note_table') and self._note_table):
+            hasattr(self, '_note_table') and self._note_table and
+            not getattr(self, 'eeprom_mode', False)):
             note_end = self.data_alloc
             for mi, ml in enumerate(self.code):
                 if ml.strip() == '_main:':
@@ -2824,32 +2826,27 @@ class MK1CodeGen:
             self.emit('\tret')
 
         if '__lcd_init' in helpers:
-            # Data-driven LCD init: store I2C byte sequence in page 3,
-            # use compact loop to send. Keeps overlay small (~35B vs ~85B).
-            # Sentinels: 0xFE=START, 0xFD=STOP, 0xFF=END, else=send byte
-            START, STOP, END, DELAY = 0xFE, 0xFD, 0xFF, 0xFC
-            lcd_init_data = []
-            BL = 0x08  # backlight bit — keep on throughout init
-            # 2-write per nibble: pulse (EN=1) then latch (EN=0).
-            # Reset nibble 0x03 × 3 with required delays between them
-            # HD44780 spec: >4.1ms after 1st, >100µs after 2nd
-            lcd_init_data += [START, 0x34|BL, 0x30|BL, STOP, DELAY]  # 1st + 5ms delay
-            lcd_init_data += [START, 0x34|BL, 0x30|BL, STOP, DELAY]  # 2nd + 5ms delay
-            lcd_init_data += [START, 0x34|BL, 0x30|BL, STOP]         # 3rd (no delay needed)
-            lcd_init_data += [START, 0x24|BL, 0x20|BL, STOP]         # nibble 0x02 (4-bit)
-            # HD44780 standard init: Function Set → Display OFF → Clear → Entry Mode → Display ON
-            for cmd in [0x28, 0x08, 0x01, 0x06, 0x0C]:
-                hi = cmd & 0xF0
-                lo = (cmd & 0x0F) << 4
-                lcd_init_data += [START, hi|0x04|BL, hi|BL, lo|0x04|BL, lo|BL, STOP]
+            # Data-driven LCD init for DFRobot RGB LCD (AiP31068L + PCA9633/V2.0).
+            # LCD at 0x3E (0x7C), RGB at 0x2D (0x5A).
+            # END was 0xFF but the RGB backlight brightness bytes emit 0xFF
+            # as data, which the walker consumed as the END sentinel and
+            # exited init mid-transaction. Moved to 0xFB (no legitimate
+            # init byte ever uses 0xFB).
+            START, STOP, END, DELAY = 0xFE, 0xFD, 0xFB, 0xFC
+            LCD = 0x7C
+            RGB = 0x5A
+            lcd_init_data = [DELAY, DELAY, DELAY, DELAY, DELAY, DELAY, DELAY, DELAY, DELAY, DELAY] # 50ms
+            # AiP31068L: Function Set (8-bit), Display ON, Clear, Entry Mode
+            for cmd in [0x38, 0x0C, 0x01, 0x06]:
+                lcd_init_data += [START, LCD, 0x80, cmd, STOP]
                 if cmd == 0x01:
                     lcd_init_data.append(DELAY)  # clear display needs ~2ms
+            # Backlight V2.0 (Registers: 0x04=R, 0x03=G, 0x02=B)
+            lcd_init_data += [START, RGB, 0x04, 0xFF, STOP]
+            lcd_init_data += [START, RGB, 0x03, 0xFF, STOP]
+            lcd_init_data += [START, RGB, 0x02, 0xFF, STOP]
             lcd_init_data.append(END)
 
-            # Store LCD init data in data page (populated at compile time).
-            # Previously stored in EEPROM and read at runtime via __eeprom_rd,
-            # but that adds 72B to init (__eeprom_rd + __i2c_rb_init).
-            # Pre-populating the data page eliminates the EEPROM read loop.
             data_base = self.data_alloc
             self.data_alloc += len(lcd_init_data)
             self._lcd_init_data = (data_base, lcd_init_data)
@@ -2860,30 +2857,17 @@ class MK1CodeGen:
             lbl_adv = self.label('li_av')
             lbl_done = self.label('li_dn')
 
-            # LCD init data is pre-populated in the data page at compile time.
-            # No EEPROM read needed — saves ~72B of init code (__eeprom_rd + __i2c_rb).
             self.emit('__lcd_init:')
-            # Bus recovery moved to i2c_init() — runs BEFORE __lcd_init in
-            # every LCD program, so the duplicate 9-clock+STOP that lived
-            # here was unnecessary. Save 10B off __lcd_init body.
-            # Process sentinel-encoded init data from data page.
-            # CRITICAL: __i2c_sb / __i2c_st / __i2c_sp all clobber $d (used
-            # internally as bit counter since the "uses D as counter" opt).
-            # We use $d as the outer loop index, so save/restore around the
-            # whole dispatch. Applies to all branches including delay.
             self.emit(f'\tldi $d,{data_base}')
             self.emit(f'{lbl_loop}:')
             self.emit('\tmov $d,$a')
             self.emit('\tderef')
-            # `cmp imm` (cmpi, opcode 0xFD) is a single 2B instruction that
-            # doesn't clobber $b. Replaces the older 3B `ldi $b,N; cmp $b`
-            # pattern. Four sentinel checks → 4B saved off __lcd_init body.
             self.emit(f'\tcmp {END}')
             self.emit(f'\tjz {lbl_done}')
-            self.emit('\tpush $d')          # save index across helper calls
+            self.emit('\tpush $d')
             self.emit(f'\tcmp {START}')
             self.emit(f'\tjnz {lbl_ns}')
-            self.emit('\tjal __i2c_st')
+            self.emit('\tjal __i2c_st_only')
             self.emit(f'\tj {lbl_adv}')
             self.emit(f'{lbl_ns}:')
             self.emit(f'\tcmp {STOP}')
@@ -2894,11 +2878,6 @@ class MK1CodeGen:
             self.emit(f'{lbl_nd}:')
             self.emit(f'\tcmp {DELAY}')
             self.emit(f'\tjnz {lbl_send}')
-            # ~5ms delay. Two paths:
-            #   - If __delay_Nms is resident (mini-copied), use it (4B).
-            #   - Otherwise inline a raw nested loop (~10B).
-            # The resident helper saves 6B on stage-1 for programs that
-            # already pull __delay_Nms in for runtime lcd_cmd calls.
             if '__delay_Nms' in helpers:
                 self.emit('\tldi $b,5')
                 self.emit('\tjal __delay_Nms')
@@ -2906,9 +2885,9 @@ class MK1CodeGen:
             else:
                 lbl_outer = self.label('li_do')
                 lbl_inner = self.label('li_di')
-                self.emit(f'\tldi $c,5')       # 5ms outer count
+                self.emit(f'\tldi $c,5')
                 self.emit(f'{lbl_outer}:')
-                self.emit('\tldi $a,0')        # 256 iterations ≈ 1ms at any clock
+                self.emit('\tldi $a,0')
                 self.emit(f'{lbl_inner}:')
                 self.emit('\tdec')
                 self.emit(f'\tjnz {lbl_inner}')
@@ -2920,81 +2899,77 @@ class MK1CodeGen:
             self.emit(f'{lbl_send}:')
             self.emit('\tjal __i2c_sb')
             self.emit(f'{lbl_adv}:')
-            self.emit('\tpop $d')          # restore index after helper call
+            self.emit('\tpop $d')
             self.emit('\tmov $d,$a')
             self.emit('\tinc')
-            self.emit('\tmov $a,$d')       # peephole → incd
+            self.emit('\tmov $a,$d')
             self.emit(f'\tj {lbl_loop}')
             self.emit(f'{lbl_done}:')
             self.emit('\tret')
 
-        # Merged __lcd_cmd / __lcd_chr — differ only in flags (EN vs EN+RS+BL)
-        if '__lcd_chr' in helpers and '__lcd_cmd' not in helpers:
-            # Only lcd_chr used at runtime — merge chr+send into single function
-            # Use only __lcd_chr label (no __lcd_send) to avoid stripper
-            # treating them as separate functions
-            self.emit('__lcd_chr:')
-            self.emit('\tpush $a')        # save caller's A (will be discarded)
-            self.emit('\tldi $a,0x09')    # flags: RS + BL (hardcoded)
-        elif '__lcd_chr' in helpers:
+        # Updated __lcd_chr / __lcd_cmd for AiP31068L
+        if '__lcd_chr' in helpers:
             self.emit('__lcd_chr:')
             self.emit('\tpush $a')
-            self.emit('\tldi $a,0x09')    # flags: RS + BL
-            self.emit('\tj __lcd_send')
-            if '__lcd_cmd' in helpers:
-                self.emit('__lcd_cmd:')
-                self.emit('\tpush $a')
-                self.emit('\tldi $a,0x00')
-            self.emit('__lcd_send:')
-        elif '__lcd_cmd' in helpers:
+            self.emit('\tldi $a,0x40')
+            self.emit('\tj __lcd_send_raw')
+        if '__lcd_cmd' in helpers:
             self.emit('__lcd_cmd:')
-            self.emit('__lcd_send:')
             self.emit('\tpush $a')
-            self.emit('\tldi $a,0x00')
-
-        if '__lcd_cmd' in helpers or '__lcd_chr' in helpers:
-            self.emit('\tpush $a')        # push flags to stack
-            # Stack now: [char, flags]. SP points at flags. char at ldsp 2.
-            # Inline I2C START + PCF8574 addr (saves 4B vs jal __i2c_st)
-            self.emit('\texrw 2')
-            self.emit_ddrb(0x01)
-            self.emit_ddrb(0x03)
-            self.emit('\tldi $a,0x4E')
+            self.emit('\tldi $a,0x80')
+            # Fall through to __lcd_send_raw
+        if '__lcd_send_raw' in helpers:
+            self.emit('__lcd_send_raw:')
+            self.emit('\tpush $a')         # save prefix
+            self.emit('\tjal __i2c_st_only')
+            self.emit('\tldi $a,0x7C')     # LCD Address (0x3E << 1)
             self.emit('\tjal __i2c_sb')
-            # High nibble: reload char from stack (A clobbered by __i2c_sb).
-            # Stack = [char, flags], SP at flags, char at SP+2.
-            self.emit('\tldsp 2')         # A = char
-            self.emit('\tandi 0xF0,$a')   # high nibble
-            self.emit('\tpop_b')         # B = flags
-            self.emit('\tpush $b')        # keep flags
-            self.emit('\tor $b,$a')       # A = nibble | flags
-            self.emit('\tpush $a')        # save nibble+flags
-            self.emit('\tori 0x04,$a')    # + EN
-            self.emit('\tjal __i2c_sb')   # send with EN
-            self.emit('\tpop $a')         # restore nibble+flags (no EN)
-            self.emit('\tjal __i2c_sb')   # send without EN
-            # Low nibble: reload char from stack, shift into high position.
-            # Stack still [char, flags], SP at flags, char at SP+2.
-            self.emit('\tldsp 2')         # A = char
-            self.emit('\tsll')
-            self.emit('\tsll')
-            self.emit('\tsll')
-            self.emit('\tsll')
-            self.emit('\tandi 0xF0,$a')
-            self.emit('\tpop_b')         # flags
-            self.emit('\tor $b,$a')
-            self.emit('\tpush $a')        # save nibble+flags
-            self.emit('\tori 0x04,$a')    # + EN
+            self.emit('\tpop $a')          # restore prefix
             self.emit('\tjal __i2c_sb')
-            self.emit('\tpop $a')         # restore (no EN)
+            # Stack at this point: [caller_ret, char, <SP>]. char is the
+            # byte pushed by __lcd_chr/__lcd_cmd before the j here, so it
+            # sits at SP+1. Was `ldsp 2` which reads caller_ret and sent
+            # that byte as the LCD data/command — visible garbage.
+            self.emit('\tldsp 1')          # A = char/cmd
             self.emit('\tjal __i2c_sb')
-            # Inline STOP — saves 3B vs jal __i2c_sp when __i2c_sp
-            # is the only runtime caller and can be stripped from kernel
-            self.emit_ddrb(0x03)
-            self.emit_ddrb(0x01)
-            self.emit_ddrb(0x00)
-            self.emit('\tpop $a')         # balance push at entry (discards caller A)
+            self.emit('\tjal __i2c_sp')
+            self.emit('\tpop $a')          # clean stack
             self.emit('\tret')
+
+        if '__lcd_rgb' in helpers:
+            self.emit('__lcd_rgb:')
+            # A=R, B=G, [SP+2]=B. Uses 3 transactions for safe non-autoincrement write.
+            self.emit('\tpush $b')         # save G
+            self.emit('\tpush $a')         # save R
+            # Red (0x04)
+            self.emit('\tjal __i2c_st_only')
+            self.emit('\tldi $a,0x5A')     # RGB Address (0x2D << 1)
+            self.emit('\tjal __i2c_sb')
+            self.emit('\tldi $a,0x04')     # Red register
+            self.emit('\tjal __i2c_sb')
+            self.emit('\tpop $a')          # restore R
+            self.emit('\tjal __i2c_sb')
+            self.emit('\tjal __i2c_sp')
+            # Green (0x03)
+            self.emit('\tjal __i2c_st_only')
+            self.emit('\tldi $a,0x5A')
+            self.emit('\tjal __i2c_sb')
+            self.emit('\tldi $a,0x03')     # Green register
+            self.emit('\tjal __i2c_sb')
+            self.emit('\tpop $a')          # restore G
+            self.emit('\tjal __i2c_sb')
+            self.emit('\tjal __i2c_sp')
+            # Blue (0x02)
+            self.emit('\tjal __i2c_st_only')
+            self.emit('\tldi $a,0x5A')
+            self.emit('\tjal __i2c_sb')
+            self.emit('\tldi $a,0x02')     # Blue register
+            self.emit('\tjal __i2c_sb')
+            self.emit('\tldsp 2')          # load B from stack
+            self.emit('\tjal __i2c_sb')
+            self.emit('\tjal __i2c_sp')
+            self.emit('\tret')
+
 
         if '__lcd_print' in helpers:
             # Print null-terminated string from page 3. A = page3 offset.
@@ -9676,23 +9651,48 @@ class MK1CodeGen:
                 self.emit('\tjal __play_note')
                 return
 
+            if name == 'lcd_rgb':
+                # lcd_rgb(red, green, blue) — for DFRobot RGB LCD V2.0 (0x2D)
+                if len(args) < 3:
+                    raise Exception("lcd_rgb() requires 3 arguments: r, g, b")
+                # Push blue (arg2), green in $b (arg1), red in $a (arg0)
+                if args[2][0] == 'num':
+                    self.emit(f'\tpush_imm {args[2][1] & 0xFF}')
+                else:
+                    self.gen_expr(args[2])
+                    self.emit('\tpush $a')
+                self.local_count += 1
+                if args[1][0] == 'num':
+                    self.emit(f'\tldi $b,{args[1][1] & 0xFF}')
+                else:
+                    self.gen_expr(args[1])
+                    self.emit('\tmov $a,$b')
+                if args[0][0] == 'num':
+                    self.emit(f'\tldi $a,{args[0][1] & 0xFF}')
+                else:
+                    self.gen_expr(args[0])
+                if not hasattr(self, '_lcd_helpers'):
+                    self._lcd_helpers = set()
+                self._lcd_helpers.add('__lcd_rgb')
+                self._lcd_helpers.add('__i2c_st_only')
+                self._lcd_helpers.add('__i2c_sb')
+                self._lcd_helpers.add('__i2c_sp')
+                self.emit('\tjal __lcd_rgb')
+                self.emit('\tpop $d')  # clean blue
+                self.local_count -= 1
+                return
+
             if name == 'lcd_cmd' or name == 'lcd_char':
-                # LCD command (RS=0) or character (RS=1) via I2C to PCF8574.
+                # LCD command (RS=0) or character (RS=1) via I2C to AiP31068L (0x3E).
                 # Emits a jal to a generated helper function.
-                # The helper is emitted ONCE at the end of compilation.
                 is_char = (name == 'lcd_char')
-                flags = 0x09 if is_char else 0x00  # RS+BL or nothing
-                flags_en = (flags | 0x04) if is_char else 0x04  # +EN
                 # Peephole: lcd_cmd(0x01)/(0x02) immediately after lcd_init() is
                 # redundant — the init data sequence already issues Clear Display.
-                # Skip the call entirely; the required delay already happened
-                # during lcd_init's DELAY sentinel processing.
                 if args and not is_char and getattr(self, '_lcd_init_just_emitted', False):
                     c_peep = self._const_eval(args[0])
                     if c_peep is not None and c_peep in (0x01, 0x02):
                         self._lcd_init_just_emitted = False
                         return
-                # Any other lcd_cmd / lcd_char invalidates the flag.
                 self._lcd_init_just_emitted = False
                 if args:
                     c = self._const_eval(args[0])
@@ -9704,32 +9704,19 @@ class MK1CodeGen:
                 if not hasattr(self, '_lcd_helpers'):
                     self._lcd_helpers = set()
                 self._lcd_helpers.add(helper)
+                self._lcd_helpers.add('__lcd_send_raw')
+                self._lcd_helpers.add('__i2c_st_only')
+                self._lcd_helpers.add('__i2c_sb')
+                self._lcd_helpers.add('__i2c_sp')
                 self.emit(f'\tjal {helper}')
                 # HD44780 execution delay after lcd_cmd (not needed for lcd_char).
                 if not is_char:
                     if c is not None and c in (0x01, 0x02):
-                        # Clear-display / return-home require ≥1.52ms. A raw
-                        # 256-iter dec/jnz loop on $a takes ~1024 CPU cycles,
-                        # which is 1–10ms across the supported clock range
-                        # (100k–1MHz). Safely ≥1.52ms with zero __delay_Nms /
-                        # __delay_cal infrastructure pulled in.
                         lbl_c = self.label('lcd_cmd_d')
                         self.emit('\tldi $a,0')
                         self.emit(f'{lbl_c}:')
                         self.emit('\tdec')
                         self.emit(f'\tjnz {lbl_c}')
-                    # Any other lcd_cmd (set DDRAM 0x80/0xC0, function set,
-                    # entry mode, display on/off, etc): HD44780 datasheet
-                    # minimum is 37µs. The I2C transaction to SEND the
-                    # command via PCF8574 is ~300 clocks = ≥300µs at the
-                    # max MK1 clock (1MHz). Any subsequent lcd op triggers
-                    # another I2C transaction, again far longer than 37µs.
-                    # No explicit delay needed — the transport itself is
-                    # the delay. Dropping the jal __delay_Nms here removes
-                    # __delay_Nms (34B) + __delay_cal (~65B init) from any
-                    # program whose only non-0x01/0x02 lcd_cmd calls come
-                    # through this path. That's every "display time/temp"
-                    # program. (Unblocks overlay_dashboard 2026-04-21.)
                 return
 
             if name == 'lcd_print':

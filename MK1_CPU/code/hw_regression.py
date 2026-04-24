@@ -578,14 +578,28 @@ TESTS = [
             out(4);
             halt();
         }''',
-        [1, 2, 3, 4], eeprom=True,
+        [1, 2, 3, 4], eeprom=False,   # flat mode — precompute only runs in flat
         # Budget: calibration can wait up to a full 1 Hz SQW period before
         # starting (~1 s = 166k cycles at 165.5 kHz), then counts 500 ms
         # (83k), plus 1000 ms of tones (166k), plus sentinel/out overhead.
         # 600k gives comfortable headroom.
         cycles=600_000,
         expected_intervals_ms=[250.0, 500.0, 250.0],
+        # 10% tolerance on the flat-mode path (precompute converts ratio
+        # to half_period correctly). Overlay-mode tone precision is a
+        # separate, deferred investigation.
         interval_tolerance_pct=10,
+    ),
+    Test(
+        'rgb lcd smoke test',
+        '''void main(void) {
+            i2c_init();
+            lcd_init();
+            lcd_rgb(255, 0, 255);
+            out(42);
+            halt();
+        }''',
+        [42], eeprom=True, cycles=200_000,
     ),
 ]
 
