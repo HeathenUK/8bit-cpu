@@ -1202,6 +1202,31 @@ class MK1CodeGen:
             self._builtin_function_aliases = aliases
         return kept
 
+    def _simplify_function_bodies(self, functions):
+        """Small AST rewrites before codegen.
+
+        Keep this conservative: only remove a stack local when it is assigned
+        once and immediately returned. This commonly appears in hardware
+        wrapper functions (`t = rtc_read_temp(); return t;`) and otherwise
+        costs several bytes in the overlay body.
+        """
+        out = []
+        for name, params, body, ret_type in functions:
+            if body[0] == 'block':
+                stmts = body[1]
+                if (len(stmts) == 3
+                        and stmts[0][0] == 'local'
+                        and stmts[1][0] == 'expr_stmt'
+                        and stmts[1][1][0] == 'assign'
+                        and stmts[1][1][1] == '='
+                        and stmts[1][1][2] == ('var', stmts[0][1])
+                        and stmts[2][0] == 'return'
+                        and stmts[2][1] == ('var', stmts[0][1])
+                        and stmts[0][2] is None):
+                    body = ('block', [('return', stmts[1][1][3])])
+            out.append((name, params, body, ret_type))
+        return out
+
     def _collect_reg_candidates(self, stmts, candidates, depth=0):
         """Recursively collect register allocation candidates.
         Deeper-nested variables get higher priority (negative depth for sorting)."""
@@ -1311,6 +1336,7 @@ class MK1CodeGen:
             self.func_bodies[name] = (params, body)
 
         functions = self._alias_builtin_compatible_functions(functions)
+        functions = self._simplify_function_bodies(functions)
 
         # ── Phase 7: Auto function splitting ──
         # Split functions that span both I2C and LCD domains into separate
