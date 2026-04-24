@@ -9100,6 +9100,25 @@ class MK1CodeGen:
                     self._lcd_helpers = set()
                 self._lcd_helpers.add('__lcd_chr')
                 fmt = args[0][1]
+                if (fmt == '%d\xDFC' and len(args) >= 2):
+                    self.gen_expr(args[1])
+                    self._lcd_helpers.add('__lcd_temp_u8')
+                    self._lcd_helpers.add('__lcd_chr')
+                    self.emit('\tjal __lcd_temp_u8')
+                    if len(args) > 2:
+                        self.emit(f'; printf: {len(args) - 2} extra argument(s) ignored')
+                    return
+                if (fmt == 'Temp: %d\xDFC' and len(args) >= 2):
+                    self.gen_expr(('string', 'Temp: '))
+                    self._lcd_helpers.add('__lcd_print')
+                    self.emit('\tjal __lcd_print')
+                    self.gen_expr(args[1])
+                    self._lcd_helpers.add('__lcd_temp_u8')
+                    self._lcd_helpers.add('__lcd_chr')
+                    self.emit('\tjal __lcd_temp_u8')
+                    if len(args) > 2:
+                        self.emit(f'; printf: {len(args) - 2} extra argument(s) ignored')
+                    return
                 arg_idx = 1
                 buf = []       # accumulating literal chunk
 
