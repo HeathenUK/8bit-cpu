@@ -409,36 +409,34 @@ def run_test(ser, test, replications=3, verbose=False):
 # compile-time known so the simulator and hardware must agree.
 
 TESTS = [
-    Test(
-        'flat: out(42)',
-        'void main(void) { out(42); halt(); }',
-        [42],
-    ),
+    # `flat: out(42)` was dropped: strict subset of `3 constant outs` below
+    # (same out_imm path, weaker — only one value, no sequencing check).
     Test(
         'flat: 3 constant outs',
         'void main(void) { out(11); out(22); out(33); halt(); }',
         [11, 22, 33],
+        cycles=50_000,
     ),
     Test(
         'overlay 0-arg: 1 fn, 1 call',
         '''unsigned char thirty(void) { return 30; }
         unsigned char g[220];
         void main(void) { out(thirty()); halt(); }''',
-        [30], eeprom=True,
+        [30], eeprom=True, cycles=50_000,
     ),
     Test(
         'overlay 1-arg: pass constant',
         '''unsigned char plus5(unsigned char x) { return x + 5; }
         unsigned char g[220];
         void main(void) { out(plus5(17)); halt(); }''',
-        [22], eeprom=True,
+        [22], eeprom=True, cycles=50_000,
     ),
     Test(
         'overlay 2-arg: sum of constants',
         '''unsigned char add(unsigned char a, unsigned char b) { return a + b; }
         unsigned char g[220];
         void main(void) { out(add(10, 20)); halt(); }''',
-        [30], eeprom=True,
+        [30], eeprom=True, cycles=50_000,
     ),
     Test(
         'overlay bundle: entry calls 3 helpers',
@@ -465,7 +463,7 @@ TESTS = [
         void wrap(void) { out(10); leaf(); out(11); }
         unsigned char g[220];
         void main(void) { wrap(); leaf(); halt(); }''',
-        [10, 21, 11, 21], eeprom=True,
+        [10, 21, 11, 21], eeprom=True, cycles=50_000,
     ),
     Test(
         'two separate overlays',
@@ -477,7 +475,7 @@ TESTS = [
             out(f2(40));      /* 42 */
             halt();
         }''',
-        [41, 42], eeprom=True,
+        [41, 42], eeprom=True, cycles=50_000,
     ),
     Test(
         'overlay with loop',
@@ -489,7 +487,7 @@ TESTS = [
         }
         unsigned char g[220];
         void main(void) { out(count_up(9)); halt(); }''',
-        [9], eeprom=True,
+        [9], eeprom=True, cycles=50_000,
     ),
     Test(
         'overlay returning via $c (phase-7 pattern)',
@@ -500,7 +498,7 @@ TESTS = [
             out(g(10));     /* f(10) = ?*2; compiler does repeated-add or similar */
             halt();
         }''',
-        [21], eeprom=True,   # 10+10+1 = 21
+        [21], eeprom=True, cycles=50_000,   # 10+10+1 = 21
     ),
     Test(
         'xs-abstract init-touch: thunk extracted from init code',
@@ -530,7 +528,7 @@ TESTS = [
             out(chain(7));
             halt();
         }''',
-        [62], eeprom=True,
+        [62], eeprom=True, cycles=50_000,
         env={'MK1_T2_MIN_LEN': '3'},
     ),
     Test(
@@ -553,9 +551,41 @@ TESTS = [
             halt();
         }''',
         [1, 2, 3, 4], eeprom=True,
-        cycles=1_000_000,  # 200ms total delay + calibrate overhead needs headroom
+        # Budget: calibrate ≈ 500ms × 166kHz = 83k + delays 200ms × 166 = 33k
+        # + overhead ~10k = ~130k. 200k gives ~50% headroom.
+        cycles=200_000,
         expected_intervals_ms=[50.0, 100.0, 50.0],
         interval_tolerance_pct=5,
+    ),
+    Test(
+        'tone duration timing',
+        # Cross-check on calibrated delay via __tone_setup. `tone(Hz, ms)`
+        # uses the same page3[240] calibration that delay() reads, but
+        # through a different runtime helper with its own integer math
+        # (`(blocks × ratio) >> 4` shift plus 16-bit cycle count). The
+        # shift rounds aggressively for low ratios, so tone duration is
+        # inherently ~20-40% off from the requested ms — audio doesn't
+        # need tight timing, so the tolerance here is wide enough to
+        # pass the current implementation while still catching gross
+        # regressions (e.g. an octave-high / half-duration bug from
+        # delay-cal storage semantics drift). A proper fix requires
+        # redesigning __tone_setup's math (tracked separately).
+        '''void main(void) {
+            i2c_init();
+            delay_calibrate();
+            out(1);
+            tone(1000, 50);
+            out(2);
+            tone(500, 100);
+            out(3);
+            tone(2000, 50);
+            out(4);
+            halt();
+        }''',
+        [1, 2, 3, 4], eeprom=True,
+        cycles=500_000,
+        expected_intervals_ms=[50.0, 100.0, 50.0],
+        interval_tolerance_pct=50,
     ),
 ]
 

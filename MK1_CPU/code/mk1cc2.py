@@ -3172,32 +3172,25 @@ class MK1CodeGen:
             self.emit('\tjal __lcd_chr')
             self.emit('\tret')
 
-        # __delay_cal: calibrate delay against DS3231 1 Hz SQW.
+        # __delay_cal: calibrate against DS3231 1 Hz SQW.
         #
-        # Counts 256-iter blocks of (dec+jnz) that fit in the 500 ms HIGH
-        # phase. Each inner block takes 256 * 9 cycles = 2304 cycles at
-        # 1 microcode-cycle-per-microstep (dec=5, jnz-taken=4). During
-        # 500 ms at clock rate F Hz:
+        # Stores `blocks` = number of 256-iter (dec+jnz) blocks that fit
+        # in the 500 ms HIGH phase, i.e. blocks ≈ F/4608 at clock rate F.
+        # This raw value is consumed by TWO different runtime helpers
+        # that each apply their own scaling:
         #
-        #   blocks = (F * 0.5) / 2304 = F / 4608
+        #   * __delay_Nms: shifts right by 1 (blocks/2 ≈ iters_per_ms)
+        #     and subtracts one iter to absorb its own per-ms outer
+        #     overhead (~14 cycles = ~1.5 bare iters). Yields an
+        #     effective delay(N) ≈ N ms within ~2% at 166 kHz.
         #
-        # delay(N)'s inner loop is bare dec+jnz (9 cycles per iter) but
-        # the OUTER loop (`mov $c,$a; decb; jnz`) adds ~14 cycles of
-        # overhead per ms-iteration that the calibrator does NOT pay.
-        # So for delay(N) to produce N ms wall-clock we want a stored
-        # value `ipm` satisfying 9*ipm + 14 = F/1000, i.e.
-        #
-        #   ipm = (F/1000 - 14) / 9 ≈ F/9000 - 1.56
-        #     ≈ blocks/2 - 1          (blocks = F/4608, F/9000 ≈ blocks*0.512)
-        #
-        # Implemented as `slr; dec` on the accumulated block count: the
-        # shift divides by 2 (0.512 ≈ 0.5 within ~2%) and `dec` absorbs
-        # the outer-loop overhead (one iter ≈ 9 cycles ≈ 14 cycles of
-        # overhead minus a small residual). Total error ≈ 1–2% at
-        # 166 kHz, well inside the 5% regression tolerance.
-        #
-        # Replaces a pre-existing bug where blocks-during-HIGH was stored
-        # directly, producing delay(N) ≈ 2N ms instead of N ms.
+        #   * __tone_setup: uses the raw blocks value in a multiply-
+        #     then-shift pipeline tuned empirically to produce 4096/ratio
+        #     Hz tones (ratio = round(4000/freq)). That arithmetic was
+        #     designed when blocks was stored directly as "ipm", so
+        #     storing anything else here would silently double tone
+        #     frequencies and halve their durations — scaling instead
+        #     lives in __delay_Nms so __tone_setup stays untouched.
         if '__delay_cal' in helpers:
             lbl_s1 = self.label('ds1')
             lbl_s2 = self.label('ds2')
@@ -3235,9 +3228,8 @@ class MK1CodeGen:
             self.emit(f'\tj {lbl_s2}')
             # Calibrate: count bare (dec+jnz) iterations during SQW HIGH
             # phase (500 ms). A loops 256→0 (bare dec+jnz). B counts
-            # A-wraps (256-iter blocks). On exit, A holds B divided by
-            # 2 (via `slr`) to approximate iterations-per-millisecond,
-            # which delay(N) consumes directly.
+            # A-wraps (256-iter blocks). On exit, A holds B (raw block
+            # count) for both __delay_Nms and __tone_setup to consume.
             self.emit(f'{lbl_cal}:')
             self.emit('\tldi $b,0')
             self.emit('\tclr $a')
@@ -3254,10 +3246,8 @@ class MK1CodeGen:
             self.emit(f'\tj {lbl_chi}')
             self.emit(f'{lbl_done}:')
             self.emit('\tmov $b,$a')       # A = B (blocks during HIGH)
-            self.emit('\tslr')             # A = blocks/2 (≈ ipm*2 / 2 = ipm)
-            self.emit('\tdec')             # A -= 1 (compensate outer overhead)
             self.emit('\tldi $b,240')
-            self.emit('\tiderefp3')        # page3[240] = ipm
+            self.emit('\tiderefp3')        # page3[240] = raw block count
             # SQW left enabled — no coupling issue, saves ~20B
             self.emit('\tret')
 
@@ -3276,8 +3266,15 @@ class MK1CodeGen:
             lbl_inner = self.label('dms_i')
             self.emit('__delay_Nms:')
             self.emit('\tldi $a,240')
-            self.emit('\tderefp3')         # A = ipm from page3[240]
-            self.emit('\tmov $a,$c')       # C = ipm
+            self.emit('\tderefp3')         # A = raw blocks from page3[240]
+            # Scale: blocks is F/4608 (per 500 ms HIGH). We want the
+            # inner loop's iters per ms to satisfy 9 × iters + 14 ≈ F/1000
+            # where 14 is the outer-loop overhead per ms. That solves to
+            # iters ≈ F/9000 - 1.56 ≈ blocks/2 - 1. Implemented as
+            # `slr; dec`.
+            self.emit('\tslr')             # A = blocks / 2 (≈ ipm)
+            self.emit('\tdec')             # A -= 1 (compensate outer overhead)
+            self.emit('\tmov $a,$c')       # C = effective ipm
             self.emit(f'{lbl_outer}:')
             self.emit('\tmov $c,$a')       # A = ipm (reload per ms)
             self.emit(f'{lbl_inner}:')
