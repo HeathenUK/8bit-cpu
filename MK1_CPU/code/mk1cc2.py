@@ -1216,7 +1216,43 @@ class MK1CodeGen:
             stmts = list(block[1])
             out_stmts = []
             i = 0
+            def is_call_expr(expr, name):
+                return (isinstance(expr, tuple) and expr[0] == 'call'
+                        and expr[1] == name)
+            def is_call_stmt_args(stmt, name, args):
+                return (isinstance(stmt, tuple) and stmt[0] == 'expr_stmt'
+                        and isinstance(stmt[1], tuple) and stmt[1][0] == 'call'
+                        and stmt[1][1] == name and stmt[1][2] == args)
             while i < len(stmts):
+                if (i + 8 < len(stmts)
+                        and self._is_call_stmt(stmts[i], 'i2c_start')
+                        and self._is_call_stmt(stmts[i + 1], 'i2c_send_byte')
+                        and is_call_stmt_args(stmts[i + 2], 'exw',
+                                             [('num', 2), ('num', 2), ('num', 0)])
+                        and is_call_stmt_args(stmts[i + 3], 'nop', [('num', 5)])
+                        and is_call_stmt_args(stmts[i + 4], 'exw',
+                                             [('num', 0), ('num', 2), ('num', 0)])
+                        and is_call_stmt_args(stmts[i + 5], 'nop', [('num', 5)])
+                        and isinstance(stmts[i + 6], tuple)
+                        and stmts[i + 6][0] == 'local'
+                        and is_call_expr(stmts[i + 6][2], 'via_read_portb')
+                        and is_call_stmt_args(stmts[i + 7], 'exw',
+                                             [('num', 2), ('num', 2), ('num', 0)])
+                        and self._is_call_stmt(stmts[i + 8], 'i2c_stop')
+                        and 'i2c_start' not in self.func_params
+                        and 'i2c_send_byte' not in self.func_params
+                        and 'i2c_stop' not in self.func_params
+                        and 'via_read_portb' not in self.func_params):
+                    # __i2c_sb already returns the ACK sample in A. Replace
+                    # the hand-clocked ACK probe with the helper result while
+                    # preserving the user-visible local value and STOP.
+                    out_stmts.append(rewrite_stmt(stmts[i]))
+                    out_stmts.append((
+                        'local', stmts[i + 6][1], stmts[i + 1][1],
+                        stmts[i + 6][3] if len(stmts[i + 6]) > 3 else 'u8'))
+                    out_stmts.append(rewrite_stmt(stmts[i + 8]))
+                    i += 9
+                    continue
                 if (i + 2 < len(stmts)
                         and self._is_call_stmt(stmts[i], 'i2c_stop')
                         and self._is_call_stmt(stmts[i + 1], 'i2c_start')
