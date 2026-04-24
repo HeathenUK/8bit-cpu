@@ -64,6 +64,17 @@ def compile_one(path, optimize=True, eeprom=True):
         return f.read(), metrics, r.stderr[-2000:]
 
 
+def placement_warnings(stderr):
+    lines = stderr.splitlines() if stderr else []
+    unsafe = [l.strip() for l in lines if 'wrapping overlay NOT loaded last' in l]
+    safe = [l.strip() for l in lines if 'largest overlay wraps' in l]
+    return {
+        'unsafe_wrap': bool(unsafe),
+        'safe_wrap': bool(safe),
+        'wrap_warnings': unsafe + safe,
+    }
+
+
 def out_call_count(path):
     with open(path) as f:
         source = f.read()
@@ -83,6 +94,7 @@ def run_program(path, args):
         'metrics': metrics,
         'compile_stderr_tail': compile_stderr.splitlines()[-8:] if compile_stderr else [],
     }
+    row.update(placement_warnings(compile_stderr))
     if asm is None:
         row.update({'upload_ok': False, 'run_ok': False, 'error': 'compile failed'})
         return row
@@ -143,7 +155,8 @@ def main():
         vals = row.get('vals_first80') or []
         print(
             f"  compile={row.get('compile_ok')} upload={row.get('upload_ok')} "
-            f"oi={row.get('oi_seen')} khz={row.get('khz')} vals={vals[:12]} "
+            f"oi={row.get('oi_seen')} unsafe_wrap={row.get('unsafe_wrap')} "
+            f"khz={row.get('khz')} vals={vals[:12]} "
             f"err={row.get('error')}",
             flush=True,
         )
@@ -161,11 +174,13 @@ def main():
         'upload_ok': sum(1 for r in results if r.get('upload_ok')),
         'run_ok': sum(1 for r in results if r.get('run_ok')),
         'oi_seen': sum(1 for r in results if r.get('oi_seen')),
+        'unsafe_wrap': sum(1 for r in results if r.get('unsafe_wrap')),
+        'safe_wrap': sum(1 for r in results if r.get('safe_wrap')),
         'results': results,
     }
     with open(opts.output, 'w') as f:
         json.dump(summary, f, indent=2)
-    print(json.dumps({k: summary[k] for k in ('total', 'compile_ok', 'upload_ok', 'run_ok', 'oi_seen')}, indent=2))
+    print(json.dumps({k: summary[k] for k in ('total', 'compile_ok', 'upload_ok', 'run_ok', 'oi_seen', 'unsafe_wrap', 'safe_wrap')}, indent=2))
     print(opts.output)
     return 0 if summary['compile_ok'] == summary['total'] and summary['upload_ok'] == summary['total'] else 1
 
