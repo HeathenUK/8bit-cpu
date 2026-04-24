@@ -1153,6 +1153,55 @@ class MK1CodeGen:
 
         return new_functions
 
+    def _is_builtin_i2c_send_byte_alias(self, name, params, body, ret_type):
+        """Recognize the common looped I2C byte-send shim.
+
+        Several older examples define their own `i2c_send_byte()` even though
+        the compiler has a smaller known-good helper (`__i2c_sb`). Only alias
+        the looped implementation that includes the trailing ACK clock; leave
+        unrolled/custom senders alone because some probes intentionally handle
+        ACK timing outside the function.
+        """
+        if name != 'i2c_send_byte' or len(params) != 1 or body[0] != 'block':
+            return False
+        p_name = params[0][0] if isinstance(params[0], tuple) else params[0]
+        body_s = str(body)
+        required = [
+            "('for',",
+            "('local', 'i'",
+            f"('var', '{p_name}')",
+            "('binop', '&'",
+            "('num', 128)",
+            "('binop', '<<'",
+            "('num', 1)",
+            "('call', 'exw', [('num', 0), ('num', 2), ('num', 0)])",
+            "('call', 'exw', [('num', 64), ('num', 2), ('num', 0)])",
+            "('call', 'exw', [('num', 128), ('num', 2), ('num', 0)])",
+            "('call', 'exw', [('num', 192), ('num', 2), ('num', 0)])",
+        ]
+        if not all(token in body_s for token in required):
+            return False
+        # The looped LCD examples include a final ACK clock: 0,64,0 after the
+        # loop. Require at least two low/released writes and two high writes so
+        # we don't catch an unrolled no-ACK scan helper.
+        return (body_s.count("('call', 'exw', [('num', 0), ('num', 2), ('num', 0)])") >= 2
+                and body_s.count("('call', 'exw', [('num', 64), ('num', 2), ('num', 0)])") >= 2)
+
+    def _alias_builtin_compatible_functions(self, functions):
+        aliases = set()
+        kept = []
+        for name, params, body, ret_type in functions:
+            if self._is_builtin_i2c_send_byte_alias(name, params, body, ret_type):
+                aliases.add(name)
+                continue
+            kept.append((name, params, body, ret_type))
+        if aliases:
+            for name in aliases:
+                self.func_params.pop(name, None)
+                self.func_bodies.pop(name, None)
+            self._builtin_function_aliases = aliases
+        return kept
+
     def _collect_reg_candidates(self, stmts, candidates, depth=0):
         """Recursively collect register allocation candidates.
         Deeper-nested variables get higher priority (negative depth for sorting)."""
@@ -1260,6 +1309,8 @@ class MK1CodeGen:
         for name, params, body, ret_type in functions:
             self.func_params[name] = len(params)
             self.func_bodies[name] = (params, body)
+
+        functions = self._alias_builtin_compatible_functions(functions)
 
         # ── Phase 7: Auto function splitting ──
         # Split functions that span both I2C and LCD domains into separate
