@@ -1059,10 +1059,83 @@ class MK1CodeGen:
                 for lv in live_vars:
                     reload_stmts.append(('local', lv,
                         ('index', ('var', xfer_globals[lv]), ('num', 0)), 'u8'))
+                post_split_stmts = list(body_stmts[split_in_body:])
+
+                # If the display tail is made only of standard builtins,
+                # keep it out of resident _main as a second phase. This is the
+                # normal mixed-device shape: init/read in phase1, render/halt
+                # in phase2. Leaving the render tail resident shrinks the
+                # overlay region and can force the RTC/read phase to wrap.
+                STD_MAIN_TAIL_CALLS = {
+                    'lcd_cmd', 'lcd_char', 'lcd_print', 'lcd_temp_u8',
+                    'printf', 'out', 'halt', 'delay', 'silence', 'tone',
+                    'i2c_bus_reset',
+                }
+                def _tail_builtin_only(stmts_tail):
+                    ok = True
+                    def expr_ok(e):
+                        nonlocal ok
+                        if not isinstance(e, tuple) or not ok:
+                            return
+                        if e[0] == 'call':
+                            if e[1] not in STD_MAIN_TAIL_CALLS:
+                                ok = False
+                                return
+                            for a in e[2] or []:
+                                expr_ok(a)
+                            return
+                        for child in e[1:]:
+                            if isinstance(child, tuple):
+                                expr_ok(child)
+                            elif isinstance(child, list):
+                                for item in child:
+                                    expr_ok(item)
+                    def stmt_ok(s):
+                        nonlocal ok
+                        if not isinstance(s, tuple) or not ok:
+                            return
+                        kind = s[0]
+                        if kind == 'expr_stmt':
+                            expr_ok(s[1])
+                        elif kind == 'local':
+                            expr_ok(s[2])
+                        elif kind == 'return':
+                            expr_ok(s[1] if len(s) > 1 else None)
+                        elif kind in ('if', 'while', 'do_while', 'for'):
+                            for child in s[1:]:
+                                if isinstance(child, tuple) and child[0] == 'block':
+                                    for sub in child[1]:
+                                        stmt_ok(sub)
+                                elif isinstance(child, tuple):
+                                    expr_ok(child)
+                        elif kind == 'block':
+                            for sub in s[1]:
+                                stmt_ok(sub)
+                    for st in stmts_tail:
+                        stmt_ok(st)
+                    return ok
+
+                if post_split_stmts and _tail_builtin_only(post_split_stmts):
+                    p2_name = 'main_p2'
+                    p2_body = ('block', reload_stmts + post_split_stmts)
+                    new_main_stmts = (list(prelude_stmts)
+                                      + [('expr_stmt', ('call', p1_name, [])),
+                                         ('expr_stmt', ('call', p2_name, []))])
+                    new_main_body = ('block', new_main_stmts)
+                    p1_body = ('block', p1_inner)
+                    new_functions.append(('main', list(params), new_main_body, ret_type))
+                    new_functions.append((p1_name, [], p1_body, 'void'))
+                    new_functions.append((p2_name, [], p2_body, ret_type))
+                    self.func_params[p1_name] = 0
+                    self.func_bodies[p1_name] = ([], p1_body)
+                    self.func_params[p2_name] = 0
+                    self.func_bodies[p2_name] = ([], p2_body)
+                    continue
+
                 new_main_stmts = (list(prelude_stmts)
                                   + [('expr_stmt', ('call', p1_name, []))]
                                   + reload_stmts
-                                  + list(body_stmts[split_in_body:]))
+                                  + post_split_stmts)
                 new_main_body = ('block', new_main_stmts)
                 p1_body = ('block', p1_inner)
                 new_functions.append(('main', list(params), new_main_body, ret_type))
@@ -5496,6 +5569,19 @@ class MK1CodeGen:
                 for (mode, key), raw_occ in seqs.items():
                     if len(raw_occ) < 2:
                         continue
+                    # Do not extract a sequence that ends by setting flags
+                    # while the following instruction remains at the call
+                    # site. Classic bad case:
+                    #   ldi 9; .loop: ddrb; ddrb; dec; jnz .loop
+                    # Extracting through `dec` leaves `jnz` behind, so the
+                    # branch can spin without re-running the decrement.
+                    if mode in ('call', 'param_call'):
+                        last_mn = key[-1].split()[0] if key else ''
+                        if last_mn in {'cmp', 'cmpi', 'tst', 'dec', 'inc',
+                                       'decb', 'decc', 'decd',
+                                       'incb', 'incc', 'incd',
+                                       'sll', 'slr'}:
+                            continue
                     # Init-safety: sequences with jal to non-mini-copied labels
                     # cannot run from stage-1 init. Prune init occurrences; if
                     # that leaves <2 occurrences, drop the candidate.
@@ -6310,9 +6396,9 @@ class MK1CodeGen:
                         )
 
             # Post-placement wrap safety: an overlay that exceeds the overlay
-            # region WRAPS into kernel space when copied — safe only if it is
-            # the LAST overlay loaded (no subsequent overlay load to corrupt).
-            # Any wrapping overlay that is not called last is unsafe.
+            # region WRAPS into kernel space when copied. That is never a
+            # valid placement; even "loaded last" relies on kernel corruption
+            # not being observed, which is not a durable compiler contract.
             # Recompute kernel size with ACTUAL page dispatch flags so the
             # available overlay region matches what step 15 will finalize.
             _has_p1_chk = len(p1_overlays) > 0
@@ -6347,17 +6433,16 @@ class MK1CodeGen:
             if _wrapping_indices and _call_order:
                 _last_call = _call_order[-1]
                 for _wi in _wrapping_indices:
-                    # A wrap is safe only if this overlay is called exactly
-                    # once (the last call). Multiple calls = later load
-                    # re-copies and the wrap may clobber in between.
+                    # Keep the old unsafe classification for diagnostics, but
+                    # any wrap below is treated as a placement failure.
                     if _wi != _last_call or _call_order.count(_wi) > 1:
                         _unsafe_wrap = True
                         break
             elif len(_wrapping_indices) > 1:
                 _unsafe_wrap = True
-            if _unsafe_wrap and _placement_retries < 5 and bundleable_helpers:
+            if _wrapping_indices and _placement_retries < 5 and bundleable_helpers:
                 # Find the helper that, if promoted, best reduces the number
-                # of UNSAFELY wrapping overlays. Reject promotions that would
+                # of wrapping overlays. Reject promotions that would
                 # make the overlay region too small to hold any current overlay
                 # (net loss — promoting eats region faster than it shrinks ovs).
                 best_helper = None
@@ -6386,7 +6471,7 @@ class MK1CodeGen:
                 if best_helper:
                     hsize_h = measure_lines(helper_bodies.get(best_helper, (0, 0, []))[2])
                     import sys
-                    print(f"  Wrap-safety retry: {len(_wrapping_indices)} overlays wrap unsafely; "
+                    print(f"  Wrap-safety retry: {len(_wrapping_indices)} overlays wrap; "
                           f"promoting {best_helper} ({hsize_h}B) resident "
                           f"→ projected {best_unsafe_count} wraps",
                           file=sys.stderr)
@@ -6395,6 +6480,15 @@ class MK1CodeGen:
                     _placement_retries += 1
                     _retry_bundling = True
                     continue  # continue outer while — rebundle & re-place
+            if _wrapping_indices:
+                details = ', '.join(
+                    f"{overlay_asm_blocks[i][0]}={overlay_asm_blocks[i][2]}B"
+                    for i in sorted(_wrapping_indices)
+                )
+                raise Exception(
+                    f"overlay placement would wrap into kernel; refusing codegen. "
+                    f"available={_ov_avail}B, wrapping={details}"
+                )
 
         has_p1 = len(p1_overlays) > 0
         has_p2 = len(p2_overlays) > 0
@@ -7074,11 +7168,28 @@ class MK1CodeGen:
                     body = _rename_shared_refs(self.code[start:end])
                     assembled.extend(body)
 
-            # Emit init code AFTER pre-mc helpers (was previously above
-            # mini-copy code, before pre-mc placement). The reorder gives
-            # the pre-mc slack budget the room init code used to occupy
-            # — typical LCD program slack went from ~15B to ~30B, fitting
-            # 2 init helpers instead of 1.
+            # The mini-copy has already overwritten
+            # [helper_start.._mc_end) with runtime helper bytes. Init code
+            # executes after that copy, so it must not occupy the overwritten
+            # interval. Pre-mc helpers are safe because they are only jumped
+            # to by label; skip over the copied runtime-helper target before
+            # emitting linear init code.
+            _cur_addr = _measure_code_section(assembled)
+            if _cur_addr < _mc_end:
+                _pad_needed = _mc_end - _cur_addr
+                print(f"  Init-code placement: jumping over mini-copy target "
+                      f"({_cur_addr}->{_mc_end}) before init code",
+                      file=sys.stderr)
+                assembled.append('\tj __init_after_mc')
+                if _pad_needed > 2:
+                    assembled.append('__init_mc_pad:')
+                    for _ in range(_pad_needed - 2):
+                        assembled.append('\tnop')
+                assembled.append('__init_after_mc:')
+
+            # Emit init code after the mini-copy target. It may call pre-mc
+            # helper bodies by label, but it will not be overwritten before
+            # execution.
             assembled.extend(init_code_lines)
             if init_only_funcs:
                 assembled.append('\tj __selfcopy')
@@ -7591,7 +7702,7 @@ class MK1CodeGen:
             if (self.local_count == 0 and self.code
                     and self.code[-1].strip().startswith('jal ')
                     and self.code[-1].strip() != 'jal _overlay_load'
-                    and not self.code[-1].strip().split()[1].startswith('__')):
+                    and not self.code[-1].strip().split()[1].startswith('_')):
                 self.code[-1] = self.code[-1].replace('\tjal ', '\tj ', 1)
                 return
             self.emit('\tret')
