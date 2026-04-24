@@ -1400,6 +1400,183 @@ class MK1CodeGen:
                 i += 1
             return ('block', out)
 
+        def compact_i2c_scan(block):
+            """Lower a common I2C bus scanner into a compact primitive.
+
+            Source shape:
+              count=0; for (addr=start; addr<end; addr++) {
+                i2c_start(); val=i2c_send_byte(addr << 1); i2c_stop();
+                if ((val & 1) == 0) { results[count] = addr; count++; }
+              }
+              results[count] = 0;
+            The helper keeps count/addr in registers and stores a sentinel.
+            """
+            if not isinstance(block, tuple) or block[0] != 'block':
+                return block
+            stmts = list(block[1])
+            out = []
+            i = 0
+            while i < len(stmts):
+                if i + 3 < len(stmts):
+                    count_decl, addr_decl, loop, sentinel = stmts[i:i+4]
+                    if not (count_decl[0] == 'local'
+                            and count_decl[2] == ('num', 0)
+                            and addr_decl[0] == 'local'
+                            and addr_decl[2] is None
+                            and loop[0] == 'for'):
+                        out.append(stmts[i]); i += 1; continue
+                    count_name = count_decl[1]
+                    addr_name = addr_decl[1]
+                    init, cond, update, body = loop[1], loop[2], loop[3], loop[4]
+                    if not (isinstance(init, tuple)
+                            and init[0] == 'expr_stmt'
+                            and isinstance(init[1], tuple)
+                            and init[1][0] == 'assign'
+                            and init[1][1] == '='
+                            and init[1][2] == ('var', addr_name)
+                            and cond[0] == 'binop' and cond[1] == '<'
+                            and cond[2] == ('var', addr_name)
+                            and update == ('postinc', ('var', addr_name))
+                            and isinstance(body, tuple) and body[0] == 'block'):
+                        out.append(stmts[i]); i += 1; continue
+                    start_expr = init[1][3]
+                    end_expr = cond[3]
+                    start = self._const_eval(start_expr)
+                    end = self._const_eval(end_expr)
+                    b = body[1]
+                    if not (start is not None and end is not None
+                            and len(b) == 4
+                            and self._is_call_stmt(b[0], 'i2c_start')
+                            and b[1][0] == 'local'
+                            and isinstance(b[1][2], tuple)
+                            and b[1][2][0] == 'call'
+                            and b[1][2][1] == 'i2c_send_byte'
+                            and b[1][2][2] == [('binop', '<<', ('var', addr_name), ('num', 1))]
+                            and self._is_call_stmt(b[2], 'i2c_stop')
+                            and b[3][0] == 'if'):
+                        out.append(stmts[i]); i += 1; continue
+                    val_name = b[1][1]
+                    if_stmt = b[3]
+                    if not (if_stmt[1] == ('binop', '==',
+                                            ('binop', '&', ('var', val_name), ('num', 1)),
+                                            ('num', 0))
+                            and isinstance(if_stmt[2], tuple)
+                            and if_stmt[2][0] == 'block'
+                            and (len(if_stmt) < 4 or if_stmt[3] is None)):
+                        out.append(stmts[i]); i += 1; continue
+                    ib = if_stmt[2][1]
+                    if not (len(ib) == 2
+                            and ib[0][0] == 'expr_stmt'
+                            and isinstance(ib[0][1], tuple)
+                            and ib[0][1][0] == 'assign'
+                            and ib[0][1][1] == '='
+                            and isinstance(ib[0][1][2], tuple)
+                            and ib[0][1][2][0] == 'index'
+                            and ib[0][1][2][2] == ('var', count_name)
+                            and ib[0][1][3] == ('var', addr_name)
+                            and ib[1] == ('expr_stmt', ('postinc', ('var', count_name)))):
+                        out.append(stmts[i]); i += 1; continue
+                    arr_expr = ib[0][1][2][1]
+                    if not (isinstance(arr_expr, tuple) and arr_expr[0] == 'var'):
+                        out.append(stmts[i]); i += 1; continue
+                    arr_name = arr_expr[1]
+                    if not (sentinel[0] == 'expr_stmt'
+                            and sentinel[1] == ('assign', '=',
+                                                ('index', ('var', arr_name), ('var', count_name)),
+                                                ('num', 0))):
+                        out.append(stmts[i]); i += 1; continue
+                    if arr_name not in self.globals:
+                        out.append(stmts[i]); i += 1; continue
+                    cap = max(0, self.global_sizes.get(arr_name, 1) - 1)
+                    out.append(('expr_stmt',
+                                ('call', 'i2c_scan_results',
+                                 [('num', self.globals[arr_name]),
+                                  ('num', start & 0xFF),
+                                  ('num', end & 0xFF),
+                                  ('num', cap & 0xFF)])))
+                    i += 4
+                    continue
+                out.append(stmts[i])
+                i += 1
+            return ('block', out)
+
+        def compact_lcd_hex_results(block):
+            """Lower zero-terminated byte-array hex display loops.
+
+            Recognizes loops that print each non-zero result as
+            `" " + hex(byte)` and then output the count. This is the natural
+            companion to I2C scan result buffers, but it is phrased as a
+            general LCD byte-list formatter.
+            """
+            if not isinstance(block, tuple) or block[0] != 'block':
+                return block
+            stmts = list(block[1])
+            out = []
+            i = 0
+            while i < len(stmts):
+                if i + 3 < len(stmts):
+                    idx_decl, count_decl, loop, out_stmt = stmts[i:i+4]
+                    if not (idx_decl[0] == 'local' and idx_decl[2] is None
+                            and count_decl[0] == 'local'
+                            and count_decl[2] == ('num', 0)
+                            and loop[0] == 'for'
+                            and self._is_call_stmt(out_stmt, 'out')
+                            and out_stmt[1][2] == [('var', count_decl[1])]):
+                        out.append(stmts[i]); i += 1; continue
+                    idx_name = idx_decl[1]
+                    count_name = count_decl[1]
+                    init, cond, update, body = loop[1], loop[2], loop[3], loop[4]
+                    if not (isinstance(init, tuple)
+                            and init == ('expr_stmt', ('assign', '=', ('var', idx_name), ('num', 0)))
+                            and isinstance(cond, tuple)
+                            and cond[0] == 'binop' and cond[1] == '<'
+                            and cond[2] == ('var', idx_name)
+                            and update == ('postinc', ('var', idx_name))
+                            and isinstance(body, tuple) and body[0] == 'block'):
+                        out.append(stmts[i]); i += 1; continue
+                    limit = self._const_eval(cond[3])
+                    b = body[1]
+                    if limit is None or len(b) != 5:
+                        out.append(stmts[i]); i += 1; continue
+                    first_if = b[0]
+                    if not (first_if[0] == 'if'
+                            and first_if[1][0] == 'binop'
+                            and first_if[1][1] == '=='
+                            and first_if[1][3] == ('num', 0)
+                            and first_if[2] == ('break',)
+                            and (len(first_if) < 4 or first_if[3] is None)):
+                        out.append(stmts[i]); i += 1; continue
+                    arr_idx = first_if[1][2]
+                    if not (isinstance(arr_idx, tuple) and arr_idx[0] == 'index'
+                            and arr_idx[2] == ('var', idx_name)
+                            and isinstance(arr_idx[1], tuple)
+                            and arr_idx[1][0] == 'var'):
+                        out.append(stmts[i]); i += 1; continue
+                    arr_name = arr_idx[1][1]
+                    if arr_name not in self.globals:
+                        out.append(stmts[i]); i += 1; continue
+                    if not (self._is_call_stmt(b[1], 'lcd_char')
+                            and b[1][1][2] == [('num', 32)]
+                            and b[2][0] == 'expr_stmt'
+                            and b[2][1][0] == 'assign'
+                            and b[2][1][1] == '='
+                            and b[2][1][3] == ('index', ('var', arr_name), ('var', idx_name))
+                            and b[3][0] == 'expr_stmt'
+                            and isinstance(b[3][1], tuple)
+                            and b[3][1][0] == 'call'
+                            and b[4] == ('expr_stmt', ('postinc', ('var', count_name)))):
+                        out.append(stmts[i]); i += 1; continue
+                    out.append(('expr_stmt',
+                                ('call', 'out',
+                                 [('call', 'lcd_hex_results',
+                                   [('num', self.globals[arr_name]),
+                                    ('num', limit & 0xFF)])])))
+                    i += 4
+                    continue
+                out.append(stmts[i])
+                i += 1
+            return ('block', out)
+
         def decimal_loop_vars(stmt):
             if not (isinstance(stmt, tuple) and stmt[0] == 'while'):
                 return None
@@ -1485,7 +1662,9 @@ class MK1CodeGen:
             return ('block', out)
 
         def simplify_block(block):
-            return compact_lcd_temp(compact_lcd_hex(merge_local_init_runs(block)))
+            merged = merge_local_init_runs(block)
+            return compact_lcd_temp(compact_lcd_hex(
+                compact_lcd_hex_results(compact_i2c_scan(merged))))
 
         def rewrite_stmt(stmt):
             if not isinstance(stmt, tuple):
@@ -1609,6 +1788,8 @@ class MK1CodeGen:
         self.eeprom_globals = {}  # name → EEPROM address
         self.eeprom_alloc = 0x0010  # skip 16-byte header (checksum + reserved)
         self.eeprom_data = []  # list of (addr, bytes) for upload
+        self.global_sizes = {name: (len(init) if isinstance(init, list) else 1)
+                             for name, init, _storage in globals_}
 
         for name, init, storage in globals_:
             size = len(init) if isinstance(init, list) else 1
@@ -2216,6 +2397,60 @@ class MK1CodeGen:
         self.emit_ddrb(0x02)   # SCL LOW
         self.emit('\tret')
 
+        # Compact I2C bus scan helpers generated from C scan loops.
+        # Contract: C=count, D=addr. Stores ACKed addresses at data[base+n],
+        # then writes a zero sentinel. Uses __i2c_sb's ACK sample in A.
+        for scan_name, (base, start, end, cap) in sorted(
+                getattr(self, '_i2c_scan_helpers', {}).items()):
+            if scan_name not in helpers:
+                continue
+            lbl_loop = self.label('iscan')
+            lbl_skip = self.label('iscan_skip')
+            lbl_done = self.label('iscan_done')
+            self.emit(f'{scan_name}:')
+            self.emit('\tldi $c,0')           # result count
+            self.emit(f'\tldi $d,{start}')    # current address
+            self.emit(f'{lbl_loop}:')
+            self.emit('\tmov $d,$a')
+            self.emit(f'\tcmpi {end}')
+            self.emit(f'\tjc {lbl_done}')     # addr >= end
+            self.emit('\texrw 2')
+            self.emit_ddrb(0x01)              # START
+            self.emit_ddrb(0x03)
+            self.emit('\tpush $d')            # __i2c_sb uses D for byte state
+            self.emit('\tmov $d,$a')
+            self.emit('\tsll')                # 7-bit addr -> write address
+            self.emit('\tjal __i2c_sb')       # A = ACK sample
+            self.emit('\tmov $a,$b')          # save ACK while restoring addr
+            self.emit('\tpop $d')
+            self.emit('\tmov $b,$a')          # A = ACK sample, D = addr
+            self.emit_ddrb(0x03)              # STOP
+            self.emit_ddrb(0x01)
+            self.emit_ddrb(0x00)
+            self.emit('\ttst 0x01')
+            self.emit(f'\tjnz {lbl_skip}')    # NACK -> do not store
+            self.emit('\tmov $c,$a')
+            self.emit(f'\tcmpi {cap}')
+            self.emit(f'\tjc {lbl_skip}')      # keep room for sentinel
+            self.emit('\tmov $d,$a')          # A = addr
+            self.emit('\tmov $a,$b')          # B = addr value
+            self.emit('\tmov $c,$a')          # A = result offset
+            if base:
+                self.emit(f'\taddi {base},$a')
+            self.emit('\tideref')             # data[base+C] = addr
+            self.emit('\tincc')
+            self.emit(f'{lbl_skip}:')
+            self.emit('\tincd')
+            self.emit(f'\tj {lbl_loop}')
+            self.emit(f'{lbl_done}:')
+            self.emit('\tclr $a')
+            self.emit('\tmov $a,$b')          # B = sentinel 0
+            self.emit('\tmov $c,$a')
+            if base:
+                self.emit(f'\taddi {base},$a')
+            self.emit('\tideref')             # data[base+C] = 0
+            self.emit('\tret')
+
         # __i2c_st_only: just START (no address)
         if '__i2c_st_only' in helpers:
             self.emit('__i2c_st_only:')
@@ -2725,6 +2960,37 @@ class MK1CodeGen:
             self.emit('\tandi 0x0F,$a')
             self.emit('\taddi 48,$a')
             self.emit('\tjal __lcd_chr')
+            self.emit('\tret')
+
+        # Compact zero-terminated byte-list printer. A returns the number of
+        # bytes printed, so callers can feed it directly to out().
+        for hex_results_name, (base, limit) in sorted(
+                getattr(self, '_lcd_hex_result_helpers', {}).items()):
+            if hex_results_name not in helpers:
+                continue
+            lbl_loop = self.label('lhr_loop')
+            lbl_done = self.label('lhr_done')
+            self.emit(f'{hex_results_name}:')
+            self.emit('\tldi $c,0')          # count
+            self.emit(f'{lbl_loop}:')
+            self.emit('\tmov $c,$a')
+            self.emit(f'\tcmpi {limit}')
+            self.emit(f'\tjc {lbl_done}')
+            self.emit('\tmov $c,$a')
+            if base:
+                self.emit(f'\taddi {base},$a')
+            self.emit('\tderef')
+            self.emit('\ttst 0xFF')
+            self.emit(f'\tjz {lbl_done}')
+            self.emit('\tpush $a')
+            self.emit('\tldi $a,32')
+            self.emit('\tjal __lcd_chr')
+            self.emit('\tpop $a')
+            self.emit('\tjal __print_u8_hex')
+            self.emit('\tincc')
+            self.emit(f'\tj {lbl_loop}')
+            self.emit(f'{lbl_done}:')
+            self.emit('\tmov $c,$a')
             self.emit('\tret')
 
         # __print_u8_hex: A = byte, prints 2 hex digits via __lcd_chr.
@@ -3652,7 +3918,7 @@ class MK1CodeGen:
         for name, start, end, _ in overlay_funcs:
             for li in range(start, end):
                 s = self.code[li].strip()
-                if s.startswith('jal '):
+                if s.startswith('jal ') or s.startswith('j '):
                     target = s.split()[1]
                     if target in ov_names and target != name:
                         adj[name].add(target)
@@ -4592,7 +4858,7 @@ class MK1CodeGen:
             for idx, (oname, olines, ofsize) in enumerate(overlay_asm_blocks):
                 for oline in olines:
                     s = oline.strip()
-                    if s.startswith('jal '):
+                    if s.startswith('jal ') or s.startswith('j '):
                         target = s.split()[1]
                         if target.startswith('.'):
                             continue  # local label
@@ -7317,6 +7583,17 @@ class MK1CodeGen:
             self.emit('\tpop $d')
         # Don't emit ret if the last instruction is already ret (from a return statement)
         if not self.code or self.code[-1].strip() != 'ret':
+            # Tail-call a final subroutine when there is no local cleanup. A
+            # direct jump lets the callee return to our caller, saving 1B and
+            # avoiding a redundant return hop. This is especially useful for
+            # compiler-lowered device primitives whose wrapper function body is
+            # just one helper call.
+            if (self.local_count == 0 and self.code
+                    and self.code[-1].strip().startswith('jal ')
+                    and self.code[-1].strip() != 'jal _overlay_load'
+                    and not self.code[-1].strip().split()[1].startswith('__')):
+                self.code[-1] = self.code[-1].replace('\tjal ', '\tj ', 1)
+                return
             self.emit('\tret')
 
     def _sp_offset(self, name):
@@ -8678,6 +8955,41 @@ class MK1CodeGen:
                     self._lcd_helpers = set()
                 self._lcd_helpers.add('__i2c_sb')
                 self.emit('\tjal __i2c_sb')
+                return
+
+            if name == 'i2c_scan_results':
+                vals = [self._const_eval(a) for a in (args or [])]
+                if len(vals) != 4 or any(v is None for v in vals):
+                    self.gen_error("i2c_scan_results requires constant base/start/end/capacity")
+                    return
+                base, start, end, cap = [v & 0xFF for v in vals]
+                helper = f'__i2c_scan_{base}_{start}_{end}_{cap}'
+                if not hasattr(self, '_lcd_helpers'):
+                    self._lcd_helpers = set()
+                self._lcd_helpers.add('__i2c_sb')
+                self._lcd_helpers.add(helper)
+                if not hasattr(self, '_i2c_scan_helpers'):
+                    self._i2c_scan_helpers = {}
+                self._i2c_scan_helpers[helper] = (base, start, end, cap)
+                self.emit(f'\tjal {helper}')
+                return
+
+            if name == 'lcd_hex_results':
+                vals = [self._const_eval(a) for a in (args or [])]
+                if len(vals) != 2 or any(v is None for v in vals):
+                    self.gen_error("lcd_hex_results requires constant base/limit")
+                    return
+                base, limit = [v & 0xFF for v in vals]
+                helper = f'__lcd_hex_results_{base}_{limit}'
+                if not hasattr(self, '_lcd_helpers'):
+                    self._lcd_helpers = set()
+                self._lcd_helpers.add('__lcd_chr')
+                self._lcd_helpers.add('__print_u8_hex')
+                self._lcd_helpers.add(helper)
+                if not hasattr(self, '_lcd_hex_result_helpers'):
+                    self._lcd_hex_result_helpers = {}
+                self._lcd_hex_result_helpers[helper] = (base, limit)
+                self.emit(f'\tjal {helper}')
                 return
 
             if name == 'i2c_read_byte':
