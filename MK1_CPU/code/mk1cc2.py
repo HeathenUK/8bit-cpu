@@ -11650,7 +11650,28 @@ def main():
                     help='Emit a per-section byte breakdown and top-5 byte sinks to stderr. '
                          'Useful when a program overflows or is near-limit; shows exactly '
                          'which resident helpers and overlay bodies are eating budget.')
+    ap.add_argument('--timeout', type=int, default=30,
+                    help='Wall-clock timeout in seconds (default: 30). MK1 is a small ISA '
+                         'targeting 256-byte pages; a healthy compile is <2s. A run >30s '
+                         'indicates a pathological optimizer path or infinite loop. Set to '
+                         '0 to disable.')
     args = ap.parse_args()
+
+    if args.timeout > 0:
+        import signal as _signal, os as _os
+        _to = args.timeout
+        _input = args.input
+        def _timeout_handler(signum, frame):
+            # Write to fd 2 directly — sys.stderr may be redirected by
+            # _prepare_compile's contextlib.redirect_stderr at the moment
+            # the alarm fires, which would swallow this message.
+            _os.write(2, (f"mk1cc2: aborting — compile exceeded {_to}s wall-clock "
+                          f"timeout on {_input}. Likely a pathological optimizer "
+                          f"path or infinite loop. Use --timeout 0 to disable; "
+                          f"--timeout N to raise.\n").encode())
+            _os._exit(2)
+        _signal.signal(_signal.SIGALRM, _timeout_handler)
+        _signal.alarm(_to)
 
     with open(args.input) as f: source = f.read()
 
