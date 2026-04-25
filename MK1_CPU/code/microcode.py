@@ -146,6 +146,27 @@ ucode_template[0b01111000] = ('exr 0 0', [MI|PO, RO|II|PE, XI|E0|AI, RST, RST, R
 ucode_template[0b01111001] = ('exr 1 0', [MI|PO, RO|II|PE, XI, XI|E1|AI, RST, RST, RST, RST], False)
 
 ucode_template[0b01111010] = ('not', [MI|PO, RO|II|PE,  AO|EI, AI, NOT|EO|AI, RST, RST, RST], False)
+# ── HARDWARE NOTE: SHF / ROT carry-out is NOT wired to the CF flop ──
+# `sll`/`slr`/`rll`/`rlr`/`sllb` all declare `SHF|...|FI` (and ROT|...|FI),
+# meaning the FI signal latches the flag register. On THIS hardware the
+# shifter/rotator's bit-shifted-out is NOT connected to the input that
+# FI latches, so CF is left unchanged (whatever the previous ALU op set).
+# ZF is also unreliable for shifts on this hardware.
+#
+# Empirically verified 2026-04-25 by direct hardware probe (see WORKLOG
+# Round 10): subi/addi/cmpi/inc set CF correctly; sll/slr/rll/rlr leave
+# CF unchanged regardless of operand. The simulator (mk1sim.py) models
+# the FI declaration straight, so sim DIVERGES from silicon for these
+# ops — code that uses `sll; jnc` will pass sim and fail hardware.
+#
+# DO NOT rely on CF (or ZF) after a shift. For "did MSB shift out?",
+# use `tst 0x80; jnz` BEFORE the shift (AND-unit ZF works correctly).
+# For arithmetic carry, use addi/subi/inc and friends.
+#
+# Microcode kept as-is to match the EEPROM bytes that are actually
+# flashed; changing FI here would only matter if the EEPROM is
+# reflashed (and it should match — the FI bit is asserted but
+# unconsumed by the flag flop's CF input).
 ucode_template[0b01111011] = ('sll', [MI|PO, RO|II|PE,  SHF|AI|FI, RST,     RST, RST, RST, RST], False)
 
 # sllb: shift B left by 1, result stored in both A and B, flags from shift.
@@ -153,6 +174,7 @@ ucode_template[0b01111011] = ('sll', [MI|PO, RO|II|PE,  SHF|AI|FI, RST,     RST,
 # Retires 0x22 (move $sp, $c) — 0 uses across the 42-program corpus.
 # Corpus scan identified 65 occurrences of the shift-B triple; sllb saves
 # 2B per use = ~130B corpus-wide.
+# (Same SHF-CF-not-wired caveat as sll above.)
 ucode_template[0b00100010] = ('sllb', [MI|PO, RO|II|PE, BO|AI, SHF|AI|FI, AO|BI, RST, RST, RST], False)
 ucode_template[0b01111100] = ('slr', [MI|PO, RO|II|PE,  SHF|RGT|AI|FI, RST, RST, RST, RST, RST], False)
 ucode_template[0b01111101] = ('rll', [MI|PO, RO|II|PE,  ROT|AI|FI, RST,     RST, RST, RST, RST], False)
