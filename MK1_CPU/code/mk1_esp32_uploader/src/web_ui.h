@@ -55,9 +55,13 @@ main { flex: 1; display: flex; flex-direction: column; overflow: hidden; min-hei
 .modal-input input { flex:1; background:#0a0a1a; border:1px solid #335; border-radius:4px; padding:6px 8px; color:#e0e0e0; font-size:13px; }
 .modal-close { align-self:flex-end; }
 .empty-msg { color:#555; font-size:13px; padding:8px; }
+#wheel-pop { display:none; position:absolute; top:45px; right:110px; z-index:1000; background:#16213e; padding:8px; border:1px solid #0f3460; border-radius:8px; box-shadow:0 4px 15px rgba(0,0,0,0.5); }
+#wheel-pop.show { display:block; }
+#wheel { width:180px; height:180px; border-radius:50%; background:radial-gradient(circle, #fff, transparent), conic-gradient(red, #ff0, lime, aqua, blue, #f0f, red); cursor:crosshair; border:2px solid #0f3460; }
+#wheel-btn { width:28px; height:28px; border-radius:50%; background:conic-gradient(red, #ff0, lime, aqua, blue, #f0f, red); border:2px solid #e94560; cursor:pointer; flex-shrink:0; }
 </style>
 </head>
-<body>
+<body onclick="if(!event.target.closest('#wheel-pop')&&!event.target.closest('#wheel-btn'))document.getElementById('wheel-pop').classList.remove('show')">
 <header>
   <h1>MK1 CPU</h1>
   <select id="examples" onchange="loadExample()">
@@ -94,6 +98,8 @@ main { flex: 1; display: flex; flex-direction: column; overflow: hidden; min-hei
     <option value="500000">500 kHz (max)</option>
   </select>
   <button class="btn btn-sec" onclick="i2cScan()">I2C Scan</button>
+  <div id="wheel-btn" onclick="document.getElementById('wheel-pop').classList.toggle('show')" title="LCD RGB Color"></div>
+  <div id="wheel-pop"><div id="wheel" onclick="pickColor(event)"></div></div>
   <button class="btn btn-run" onclick="asmRun()">Assemble &amp; Run</button>
 </header>
 <div id="cpubar">
@@ -273,6 +279,41 @@ async function i2cScan() {
     o.innerHTML = '<span class="err">I2C scan failed: ' + esc(e.message) + '</span>';
     document.getElementById('status').textContent = 'Scan failed';
   }
+}
+
+async function setLcdColor(r, g, b) {
+  document.getElementById('status').textContent = 'Setting LCD color...';
+  try {
+    const res = await fetch(`/set_lcd_color?r=${r}&g=${g}&b=${b}`, { method: 'POST' });
+    const j = await res.json();
+    if (j.ok) {
+      document.getElementById('status').textContent = 'LCD Color Set';
+    } else {
+      document.getElementById('status').textContent = 'LCD Color Failed';
+    }
+  } catch(e) {
+    document.getElementById('status').textContent = 'Error setting color';
+  }
+}
+
+function pickColor(e) {
+  const r = e.target.getBoundingClientRect();
+  const x = e.clientX - r.left - 90;
+  const y = e.clientY - r.top - 90;
+  const dist = Math.sqrt(x*x + y*y);
+  if (dist > 90) return;
+  
+  let hue = Math.atan2(y, x) * (180 / Math.PI) + 90;
+  if (hue < 0) hue += 360;
+  if (hue >= 360) hue -= 360;
+  const sat = dist / 90;
+  
+  const hsv2rgb = (h, s, v) => {
+    let f = (n, k = (n + h / 60) % 6) => v - v * s * Math.max(Math.min(k, 4 - k, 1), 0);
+    return [Math.round(f(5)*255), Math.round(f(3)*255), Math.round(f(1)*255)];
+  };
+  const [red, green, blue] = hsv2rgb(hue, sat, 1);
+  setLcdColor(red, green, blue);
 }
 
 async function mk1halt() {

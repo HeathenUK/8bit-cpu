@@ -1559,6 +1559,12 @@ static void handleRead() {
 }
 
 static const char* AUTOSAVE_PATH = "/last.asm";
+static const char* LCD_COLOR_PATH = "/lcd_color.cfg";
+
+// Global LCD color (default to white)
+static uint8_t g_lcdR = 0xFF;
+static uint8_t g_lcdG = 0xFF;
+static uint8_t g_lcdB = 0xFF;
 static const char* PROGRAMS_DIR = "/programs";
 
 static void ensureProgramsDir() {
@@ -1673,6 +1679,26 @@ static void loadWifiConfig() {
     if (ssid.length() > 0) {
         strncpy(staSSID, ssid.c_str(), sizeof(staSSID) - 1);
         strncpy(staPSK, psk.c_str(), sizeof(staPSK) - 1);
+    }
+}
+
+static void loadLcdColor() {
+    File f = FFat.open(LCD_COLOR_PATH, "r");
+    if (f) {
+        g_lcdR = (uint8_t)f.read();
+        g_lcdG = (uint8_t)f.read();
+        g_lcdB = (uint8_t)f.read();
+        f.close();
+    }
+}
+
+static void saveLcdColor(uint8_t r, uint8_t g, uint8_t b) {
+    File f = FFat.open(LCD_COLOR_PATH, "w");
+    if (f) {
+        f.write(r);
+        f.write(g);
+        f.write(b);
+        f.close();
     }
 }
 
@@ -3116,6 +3142,34 @@ static bool runBootLCDInitSnippet(uint8_t r, uint8_t g, uint8_t b) {
     return runBootLCDSnippet(asmBuf, "init", 1500000);
 }
 
+static bool runLCDColorSnippet(uint8_t r, uint8_t g, uint8_t b) {
+    static char asmBuf[4000];
+    int n = snprintf(asmBuf, sizeof(asmBuf),
+        "; LCD Color snippet (PCA9633 V2.0 @ 0x2D: R=0x01, G=0x02, B=0x03)\n"
+        BOOT_LCD_VIA_PROLOGUE_ASM
+        "    jal __i2c_st\n"
+        "    ldi $a, 0x5A\n    jal __i2c_sb\n"
+        "    ldi $a, 0x01\n    jal __i2c_sb\n"
+        "    ldi $a, %u\n      jal __i2c_sb\n"
+        "    jal __i2c_sp\n"
+        "    jal __i2c_st\n"
+        "    ldi $a, 0x5A\n    jal __i2c_sb\n"
+        "    ldi $a, 0x02\n    jal __i2c_sb\n"
+        "    ldi $a, %u\n      jal __i2c_sb\n"
+        "    jal __i2c_sp\n"
+        "    jal __i2c_st\n"
+        "    ldi $a, 0x5A\n    jal __i2c_sb\n"
+        "    ldi $a, 0x03\n    jal __i2c_sb\n"
+        "    ldi $a, %u\n      jal __i2c_sb\n"
+        "    jal __i2c_sp\n"
+        "    out_imm 0xDD\n"
+        "    hlt\n"
+        BOOT_LCD_I2C_HELPERS_ASM,
+        r, g, b);
+    if (n < 0 || n >= (int)sizeof(asmBuf)) return false;
+    return runBootLCDSnippet(asmBuf, "color", 1000000);
+}
+
 static bool runBootLCDLineSnippet(uint8_t setAddrCmd, const uint8_t* chars,
                                   int count, const char* tag) {
     if (count < 1 || count > 16) return false;
@@ -3277,11 +3331,44 @@ static bool updateBootLCD(int tempC, bool rtcSet, uint8_t hourBcd, uint8_t minBc
         tempChars[1] = '0' + (-tempC);
     }
 
-    if (!runBootLCDInitSnippet(0xFF, 0xFF, 0xFF)) return false;
+    if (!runBootLCDInitSnippet(g_lcdR, g_lcdG, g_lcdB)) return false;
     if (!runBootLCDLineSnippet(0x80, timeChars, 5, "time")) return false;
     if (!runBootLCDLineSnippet(0x8C, tempChars, 4, "temp")) return false;
     runBootBeepSnippet(896, 200);  // best-effort PC-style boot beep
     return true;
+}
+
+static void handleSetLcdColor() {
+    if (!server.hasArg("r") || !server.hasArg("g") || !server.hasArg("b")) {
+        server.send(400, "application/json", "{\"ok\":false,\"error\":\"Missing r, g, or b\"}");
+        return;
+    }
+    uint8_t r = (uint8_t)server.arg("r").toInt();
+    uint8_t g = (uint8_t)server.arg("g").toInt();
+    uint8_t b = (uint8_t)server.arg("b").toInt();
+
+    bool ok = runLCDColorSnippet(r, g, b);
+    if (ok) {
+        g_lcdR = r; g_lcdG = g; g_lcdB = b;
+        saveLcdColor(r, g, b);
+    }
+
+    // Restore the saved program (snippet overwrote RAM)
+    File f = FFat.open(AUTOSAVE_PATH, "r");
+    if (f) {
+        String source = f.readString();
+        f.close();
+        if (source.length() > 0) {
+            assembler.assemble(source.c_str());
+            const AsmResult& res = assembler.result;
+            if (res.error_count == 0) {
+                loadAsmResultForUpload(res);
+                uploadToMK1(uploadBuf, uploadSize);
+            }
+        }
+    }
+
+    server.send(200, "application/json", ok ? "{\"ok\":true}" : "{\"ok\":false}");
 }
 
 // ── Setup & Loop ─────────────────────────────────────────────────────
@@ -3313,6 +3400,7 @@ void setup() {
         FFat.begin(true);
     }
     loadWifiConfig();
+    loadLcdColor();
 
     // Restore last program from flash (or upload HLT as safe default)
     {
@@ -3543,14 +3631,14 @@ void setup() {
         if (tempC >= 0) {
             Serial.printf("DS3231 temperature: %d°C (on 7-seg)\n", tempC);
             if (lcdFound) {
-                bool rtcSet = rtcStatus >= 0 && (rtcStatus & 0x80) == 0 &&
+                bool lcdSet = rtcStatus >= 0 && (rtcStatus & 0x80) == 0 &&
                               rtcHour >= 0 && rtcMin >= 0;
-                bool lcdOk = updateBootLCD(tempC, rtcSet,
+                bool lcdOk = updateBootLCD(tempC, lcdSet,
                                            (uint8_t)rtcHour, (uint8_t)rtcMin);
                 readDS3231Temp();  // restore visible out() after LCD completion marker
                 Serial.printf("Boot LCD status: %s%s\n",
                     lcdOk ? "OK" : "FAIL",
-                    rtcSet ? "" : " (RTC time unset)");
+                    lcdSet ? "" : " (RTC time unset)");
             } else {
                 Serial.println("Boot LCD status: not found at 0x3E");
             }
@@ -3598,6 +3686,7 @@ void setup() {
     server.on("/upload_and_wait", HTTP_POST, handleUploadAndWait);
     server.on("/run_cycles", HTTP_POST, handleRunCycles);
     server.on("/i2cscan", HTTP_GET, handleI2CScan);
+    server.on("/set_lcd_color", HTTP_POST, handleSetLcdColor);
     server.on("/readtest", HTTP_GET, handleReadTest);
     server.on("/stepn", HTTP_GET, handleStepN);
     server.on("/probe", HTTP_GET, handleProbe);
