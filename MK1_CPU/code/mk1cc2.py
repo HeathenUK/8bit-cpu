@@ -47,32 +47,33 @@ KSlot = namedtuple('KSlot', ['page', 'offset', 'size', 'owner', 'description'])
 
 KERNEL_STATE = {
     'calib_blocks': KSlot(
-        page=3, offset=240, size=1, owner='__delay_cal',
+        page=2, offset=0x80, size=1, owner='__delay_cal',
         description='F/4608 — DS3231 SQW HIGH-phase block count, '
                     'consumed by __delay_Nms and __tone_setup'),
     'tone_precomp_done': KSlot(
-        page=3, offset=241, size=1, owner='__tone_precompute',
+        page=2, offset=0x81, size=1, owner='__tone_precompute',
         description='one-shot guard: non-zero means the note table '
                     'has been converted from ratios to half_periods '
                     'and a second precompute would corrupt it'),
     'overlay_r2c_count': KSlot(
-        page=3, offset=242, size=1, owner='__eeprom_r2c_loop',
+        page=2, offset=0x82, size=1, owner='__eeprom_r2c_loop',
         description='remaining-bytes counter for sequential I2C → '
                     'code page reads (EEPROM overlay loader)'),
 }
 
-# Convenience aliases for f-string emission sites.
-K_CALIB_BLOCKS      = KERNEL_STATE['calib_blocks'].offset
-K_TONE_PRECOMP_DONE = KERNEL_STATE['tone_precomp_done'].offset
-K_OVERLAY_R2C_COUNT = KERNEL_STATE['overlay_r2c_count'].offset
+# Phase 1 introduced f-string aliases (`K_CALIB_BLOCKS`, etc.) for
+# emission sites; Phase 3 made them obsolete by routing all accesses
+# through `emit_kstate_load`/`emit_kstate_store` which are page-aware.
+# The registry entry is now the single source of truth for both page
+# and offset; helper methods fan out the correct opcode pair.
 
-# ── Page-2 partition (Phase 2: defined, not yet used) ────────────────
-# Plan-of-record memory layout for page 2. Phase 2 only DEFINES these
-# regions and adds a stack-depth assertion against the reserved stack
-# area. Phase 3 will migrate kernel state from page 3 to the kstate
-# region. Phase 4 will activate the overlay slot. Until then page 2
-# remains stack-only at runtime — these constants are documentation
-# plus a precommit gate.
+# ── Page-2 partition ─────────────────────────────────────────────────
+# Plan-of-record memory layout for page 2. Phase 2 defined the regions
+# and added stack-depth assertion. Phase 3 migrated KERNEL_STATE slots
+# from page 3 into the kstate region (see `KERNEL_STATE['*'].page`).
+# Phase 4 will activate the overlay slot. Stack still grows down from
+# 0xFF; the reserved range is guarded by static analysis and a 16-byte
+# guard band before kstate begins.
 #
 # Page-2 byte layout (low to high):
 #   0x00 .. 0x7F   overlay slot     (128 B; Phase 4 activates)
@@ -685,6 +686,48 @@ class MK1CodeGen:
         elif shadow and augmented != value:
             line += f'\t; (0x{value:02X} widened by shadow 0x{shadow:02X})'
         self.emit(line)
+
+    # ── Kernel-state slot access (page-aware) ────────────────────────
+    # All reads/writes to KERNEL_STATE slots go through these helpers
+    # so a future page migration (Phase 5 may move slots to free up
+    # page-3 space) requires only a registry edit, not a code-site
+    # rewrite. The opcode pair for each page is the only difference:
+    #   page 2 (stack page): deref2 / ideref2
+    #   page 3 (extended):   derefp3 / iderefp3
+    # No other supported page; helper raises if the registry entry
+    # uses an unsupported page.
+
+    def _kstate_load_lines(self, slot_name):
+        """Return asm lines that read slot into A. Convention: A is
+        clobbered both as the address (input) and the value (output)."""
+        slot = KERNEL_STATE[slot_name]
+        if slot.page == 3:
+            op = 'derefp3'
+        elif slot.page == 2:
+            op = 'deref2'
+        else:
+            raise ValueError(f'kstate {slot_name}: unsupported page {slot.page}')
+        return [f'\tldi $a,{slot.offset}', f'\t{op}']
+
+    def _kstate_store_lines(self, slot_name):
+        """Return asm lines that write A to slot. B is clobbered (set
+        to slot offset). Caller must place the value in A before."""
+        slot = KERNEL_STATE[slot_name]
+        if slot.page == 3:
+            op = 'iderefp3'
+        elif slot.page == 2:
+            op = 'ideref2'
+        else:
+            raise ValueError(f'kstate {slot_name}: unsupported page {slot.page}')
+        return [f'\tldi $b,{slot.offset}', f'\t{op}']
+
+    def emit_kstate_load(self, slot_name):
+        for line in self._kstate_load_lines(slot_name):
+            self.emit(line)
+
+    def emit_kstate_store(self, slot_name):
+        for line in self._kstate_store_lines(slot_name):
+            self.emit(line)
 
     # ── Dead variable analysis ───────────────────────────────────────
 
@@ -2192,8 +2235,7 @@ class MK1CodeGen:
                     # on the 3rd. The kernel-state slot is zero on upload
                     # and persists across MK1 resets, making it a safe
                     # one-shot latch.
-                    f'\tldi $a,{K_TONE_PRECOMP_DONE}',
-                    '\tderefp3',
+                    *self._kstate_load_lines('tone_precomp_done'),
                     '\ttst 0xFF',
                     '\tjnz .__tpc_already',
                     f'\tldi $a,{note_base}',
@@ -2218,8 +2260,7 @@ class MK1CodeGen:
                     f'\tcmpi {note_end}',
                     '\tjnz .__tpc_loop',
                     '\tldi $a,1',
-                    f'\tldi $b,{K_TONE_PRECOMP_DONE}',
-                    '\tiderefp3',
+                    *self._kstate_store_lines('tone_precomp_done'),
                     '.__tpc_already:',
                     '\tret',
                 ])
@@ -3495,8 +3536,7 @@ class MK1CodeGen:
             self.emit(f'\tj {lbl_chi}')
             self.emit(f'{lbl_done}:')
             self.emit('\tmov $b,$a')       # A = B (blocks during HIGH)
-            self.emit(f'\tldi $b,{K_CALIB_BLOCKS}')
-            self.emit(f'\tiderefp3')       # page3[{K_CALIB_BLOCKS}] = raw block count
+            self.emit_kstate_store('calib_blocks')
             # SQW left enabled — no coupling issue, saves ~20B
             self.emit('\tret')
 
@@ -3514,8 +3554,7 @@ class MK1CodeGen:
             lbl_outer = self.label('dms_o')
             lbl_inner = self.label('dms_i')
             self.emit('__delay_Nms:')
-            self.emit(f'\tldi $a,{K_CALIB_BLOCKS}')
-            self.emit(f'\tderefp3')        # A = raw blocks from page3[{K_CALIB_BLOCKS}]
+            self.emit_kstate_load('calib_blocks')
             # Scale: blocks is F/4608 (per 500 ms HIGH). We want the
             # inner loop's iters per ms to satisfy 9 × iters + 14 ≈ F/1000
             # where 14 is the outer-loop overhead per ms. That solves to
@@ -3542,8 +3581,7 @@ class MK1CodeGen:
             lbl_mul = self.label('tsmul')
             lbl_noc = self.label('tsnoc')
             self.emit('__tone_setup:')
-            self.emit(f'\tldi $a,{K_CALIB_BLOCKS}')
-            self.emit(f'\tderefp3')        # A = ipm from page3[{K_CALIB_BLOCKS}]
+            self.emit_kstate_load('calib_blocks')
             self.emit('\tmov $a,$c')       # C = ipm
             self.emit('\tldi $d,0')        # D = product high
             self.emit('\tclr $a')          # A = product low
@@ -3641,14 +3679,12 @@ class MK1CodeGen:
         if '__eeprom_r2c_loop' in helpers:
             lbl_loop = self.label('r2c')
             lbl_last = self.label('r2cl')
-            P3_COUNT = K_OVERLAY_R2C_COUNT   # alias for local readability
             self.emit('__eeprom_r2c_loop:')
             # Entry: B = code dest, stack = [ret_addr, count, ...]
-            # Save B (dest), store count to page3, restore B.
+            # Save B (dest), store count to kernel-state, restore B.
             self.emit('\tpush_b')            # save dest
             self.emit('\tldsp 3')            # A = count (past: dest_pushed, ret_addr)
-            self.emit(f'\tldi $b,{P3_COUNT}')
-            self.emit('\tiderefp3')          # page3[242] = count
+            self.emit_kstate_store('overlay_r2c_count')
             self.emit('\tpop_b')             # B = dest (restored)
             # Read loop: B = dest (auto-incremented by istc_inc)
             self.emit(f'{lbl_loop}:')
@@ -3659,11 +3695,9 @@ class MK1CodeGen:
             self.emit('\tistc_inc')          # code[B] = A; B = dest+1
             # Decrement count: save B (dest+1), do count--, restore B
             self.emit('\tpush_b')            # save dest+1
-            self.emit(f'\tldi $a,{P3_COUNT}')
-            self.emit('\tderefp3')           # A = remaining
+            self.emit_kstate_load('overlay_r2c_count')   # A = remaining
             self.emit('\tdec')               # A = remaining-1, ZF set
-            self.emit(f'\tldi $b,{P3_COUNT}')
-            self.emit('\tiderefp3')          # page3[242] = remaining-1 (ZF preserved)
+            self.emit_kstate_store('overlay_r2c_count')  # writeback (ZF preserved)
             self.emit('\tpop_b')             # B = dest+1 (ZF preserved: pop_b has no FI)
             self.emit(f'\tjz {lbl_last}')    # ZF from dec survives ldi+ideref
             # ACK
