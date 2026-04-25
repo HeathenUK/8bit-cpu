@@ -66,6 +66,45 @@ K_CALIB_BLOCKS      = KERNEL_STATE['calib_blocks'].offset
 K_TONE_PRECOMP_DONE = KERNEL_STATE['tone_precomp_done'].offset
 K_OVERLAY_R2C_COUNT = KERNEL_STATE['overlay_r2c_count'].offset
 
+# ── Page-2 partition (Phase 2: defined, not yet used) ────────────────
+# Plan-of-record memory layout for page 2. Phase 2 only DEFINES these
+# regions and adds a stack-depth assertion against the reserved stack
+# area. Phase 3 will migrate kernel state from page 3 to the kstate
+# region. Phase 4 will activate the overlay slot. Until then page 2
+# remains stack-only at runtime — these constants are documentation
+# plus a precommit gate.
+#
+# Page-2 byte layout (low to high):
+#   0x00 .. 0x7F   overlay slot     (128 B; Phase 4 activates)
+#   0x80 .. 0xAF   kernel state     ( 48 B; Phase 3 migrates from p3)
+#   0xB0 .. 0xBF   guard band       ( 16 B; unused — overflow buffer)
+#   0xC0 .. 0xFF   stack reserved   ( 64 B; SP grows down from 0xFF)
+#
+# Sizing rationale:
+#   - 64B stack: empirical observation that the existing corpus uses
+#     well under this; Phase 2 confirms via static analysis below.
+#   - 16B guard: catches a runaway stack before it corrupts kernel
+#     state; small enough that the budget loss is trivial.
+#   - 48B kstate: 3 entries today, room for ~45 more without
+#     refactoring. Includes future home for the overlay manifest.
+#   - 128B overlay: matches the typical overlay slot size in the
+#     existing partitioner; gives us a useful third tier alongside
+#     page-1 (data_code) and page-3 (page3_code).
+
+P2_OVERLAY_LO        = 0x00
+P2_OVERLAY_HI        = 0x7F
+P2_KSTATE_LO         = 0x80
+P2_KSTATE_HI         = 0xAF
+P2_GUARD_LO          = 0xB0
+P2_GUARD_HI          = 0xBF
+P2_STACK_LO          = 0xC0   # stack must not descend below this
+P2_STACK_HI          = 0xFF   # SP starts here
+
+P2_OVERLAY_BYTES     = P2_OVERLAY_HI - P2_OVERLAY_LO + 1   # 128
+P2_KSTATE_BYTES      = P2_KSTATE_HI  - P2_KSTATE_LO  + 1   #  48
+P2_GUARD_BYTES       = P2_GUARD_HI   - P2_GUARD_LO   + 1   #  16
+P2_STACK_BUDGET      = P2_STACK_HI   - P2_STACK_LO   + 1   #  64
+
 # ── Tokenizer (from mk1cc.py) ────────────────────────────────────────
 
 TOKEN_PATTERNS = [
@@ -2296,6 +2335,13 @@ class MK1CodeGen:
                     self.emit(f'\tbyte {b}')
             self.emit('\tsection code')
 
+        # Phase 2: static stack-depth analysis against the page-2 stack
+        # reservation. Reports observed depth to stderr; warns (but does
+        # not fail) if the budget is exceeded so the gate is informational
+        # while we collect data on the corpus. Phase 4 may promote this
+        # to a hard error before re-enabling page-2 overlay storage.
+        self._analyze_stack_depth()
+
         return '\n'.join(self.code)
 
     def _eliminate_dead_functions(self):
@@ -2505,6 +2551,125 @@ class MK1CodeGen:
         if current:
             chunks.append((current, current_size))
         return chunks
+
+    def _analyze_stack_depth(self):
+        """Static analysis of maximum stack depth from `_main`.
+
+        Walks the final assembled code, partitions into functions by
+        global label, computes per-function local push depth, builds
+        the call graph from `jal` references, and recursively combines.
+        Counts each `jal` as +1 (return address) plus the called
+        function's total depth. Linear-flow analysis: branches that
+        skip over pushes can in principle yield underestimates, but
+        the corpus's tone-table loops and overlay dispatchers are
+        balanced (push/pop pairs within the same basic block) so the
+        approximation is tight in practice.
+
+        Reports observed depth to stderr. WARNs if the budget defined
+        by P2_STACK_BUDGET (Phase 2 partition) is exceeded. Phase 2
+        does not hard-fail on excess; Phase 4 may promote this to an
+        error before re-enabling page-2 overlay storage.
+
+        Indirect calls (`jal_r`) are conservative: assume 0 callee
+        depth and emit a note. The corpus uses `jal_r` only for
+        compile-time-resolved targets in __overlay_load, where the
+        target's depth would already be counted via direct refs.
+        """
+        PUSH_OPS  = {'push', 'push_b', 'push_imm'}
+        POP_OPS   = {'pop',  'pop_b'}
+
+        # Partition into per-function bodies by global label.
+        functions = {}      # name -> list of stripped lines
+        current   = None
+        for line in self.code:
+            s = line.strip()
+            if not s or s.startswith(';'):
+                continue
+            # Strip inline comments & directives that aren't analysis-relevant.
+            if s.startswith('section ') or s.startswith('org '):
+                continue
+            if s.endswith(':') and not s.startswith('.'):
+                current = s[:-1]
+                functions[current] = []
+                continue
+            if current is not None:
+                functions[current].append(s)
+
+        # Per-function local analysis: local_max (peak P during body
+        # ignoring callee bodies) and call_sites (P at each jal).
+        local_max    = {}
+        call_sites   = {}   # name -> [(P_at_jal, callee), ...]
+        has_jal_r    = set()
+        for name, body in functions.items():
+            P = 0
+            peak = 0
+            calls = []
+            for ln in body:
+                tokens = ln.split(None, 1)
+                op = tokens[0]
+                arg = tokens[1].split(';', 1)[0].strip() if len(tokens) > 1 else ''
+                if op in PUSH_OPS:
+                    P += 1
+                    peak = max(peak, P)
+                elif op in POP_OPS:
+                    P -= 1
+                elif op == 'jal':
+                    target = arg.split(',')[0].split()[0] if arg else ''
+                    if target and not target.startswith('.'):
+                        calls.append((P, target))
+                    P += 1                    # return-addr push
+                    peak = max(peak, P)
+                    P -= 1                    # callee's ret undoes it
+                elif op == 'jal_r':
+                    has_jal_r.add(name)
+                    P += 1
+                    peak = max(peak, P)
+                    P -= 1
+                # Other ops (j, jnz, jz, ret, …) leave P unchanged for
+                # this analysis (ret marks end-of-path but we keep
+                # scanning to find max across paths).
+            local_max[name]  = peak
+            call_sites[name] = calls
+
+        # Recursive total depth memoised on function name.
+        memo = {}
+        def total(fn, visited):
+            if fn in memo:
+                return memo[fn]
+            if fn in visited:
+                # Recursion not supported by the runtime — flag and bail.
+                sys.stderr.write(f'  WARNING: recursive call cycle through {fn}\n')
+                return 0
+            visited = visited | {fn}
+            if fn not in functions:
+                # External / inline-asm helper — assume 0 (its pushes
+                # would have been counted at its definition site if
+                # present in self.code).
+                return 0
+            own  = local_max[fn]
+            best = 0
+            for P_before, callee in call_sites[fn]:
+                # peak when entering callee = P_before + 1 (jal push)
+                #                           + total(callee)
+                d = P_before + 1 + total(callee, visited)
+                best = max(best, d)
+            memo[fn] = max(own, best)
+            return memo[fn]
+
+        if '_main' not in functions:
+            return  # no main (e.g., regression-test snippet); nothing to gate.
+
+        depth = total('_main', set())
+        msg = f'stack-depth: max={depth}B from _main (budget={P2_STACK_BUDGET}B)'
+        if has_jal_r:
+            msg += f' [jal_r in {",".join(sorted(has_jal_r))} — depth may be underestimated]'
+        sys.stderr.write(msg + '\n')
+        if depth > P2_STACK_BUDGET:
+            sys.stderr.write(
+                f'  WARNING: stack depth exceeds page-2 reservation '
+                f'({depth}B > {P2_STACK_BUDGET}B). Page-2 overlay '
+                f'storage cannot be safely activated for this program '
+                f'until the stack is bounded below {P2_STACK_LO:#x}.\n')
 
     def _classify_helpers(self):
         """Classify helpers into resident vs overlay-eligible categories.
