@@ -601,6 +601,39 @@ TESTS = [
         }''',
         [42], eeprom=True, cycles=200_000,
     ),
+    Test(
+        # Issue #1: regparam in $a was elided (no save) for functions
+        # without locals/calls/extra-params, on the assumption that $a
+        # always holds the param. But intermediate `inc`/`addi`/etc
+        # clobber $a between expressions, so a second read of the param
+        # silently used the clobbered value. compile_function now also
+        # forces a save when the param is read more than once.
+        'multi-read regparam preserves x across expressions',
+        '''unsigned char buf[10];
+        void f(unsigned char x) {
+            buf[0] = x + 1;
+            buf[1] = x + 2;
+            buf[2] = x + 3;
+            out(buf[0]); out(buf[1]); out(buf[2]);
+        }
+        void main(void) { f(5); halt(); }''',
+        [6, 7, 8], cycles=50_000,
+    ),
+    Test(
+        # Same hazard for param 1, which lives in $b. `ldi $b,N` for
+        # array indexing clobbers the param between reads. Fixed by
+        # the symmetric save_b_to_stack path in compile_function.
+        'multi-read regparam preserves x in $b across expressions',
+        '''unsigned char buf[10];
+        void g(unsigned char y, unsigned char x) {
+            buf[0] = x + 1;
+            buf[1] = x + 2;
+            buf[2] = x + 3;
+            out(buf[0]); out(buf[1]); out(buf[2]);
+        }
+        void main(void) { g(0, 5); halt(); }''',
+        [6, 7, 8], cycles=50_000,
+    ),
 ]
 
 

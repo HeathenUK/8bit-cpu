@@ -778,6 +778,43 @@ class MK1CodeGen:
         self._collect_reads(body, reads)
         return reads  # return the SET of read vars (dead = declared - reads)
 
+    def _count_reads(self, node, name):
+        """Count occurrences where `name` is READ in the AST. Mirrors
+        the structural rules of `_collect_reads` (LHS is written not
+        read, compound assign reads the LHS, etc). Used to decide
+        whether a regparam in $a needs to be saved at function entry:
+        a single read can stay in $a until first use, but >1 reads
+        require a save because every prior expression may have
+        clobbered $a (any `inc`, `addi`, deref, builtin etc)."""
+        if not isinstance(node, tuple) or len(node) == 0:
+            return 0
+        kind = node[0]
+        if kind == 'var':
+            return 1 if node[1] == name else 0
+        if kind == 'assign':
+            op, left, right = node[1], node[2], node[3]
+            n = self._count_reads(right, name)
+            if op != '=':
+                n += self._count_reads(left, name)
+            if left[0] == 'index':
+                n += self._count_reads(left, name)
+            return n
+        if kind == 'postinc' or kind == 'postdec':
+            return self._count_reads(node[1], name)
+        if kind == 'block':
+            return sum(self._count_reads(s, name) for s in node[1])
+        if kind == 'local':
+            return self._count_reads(node[2], name) if node[2] else 0
+        n = 0
+        for child in node[1:]:
+            if isinstance(child, tuple):
+                n += self._count_reads(child, name)
+            elif isinstance(child, list):
+                for item in child:
+                    if isinstance(item, tuple):
+                        n += self._count_reads(item, name)
+        return n
+
     BUILTINS = {'out', 'halt', 'nop', 'exw', 'exr', 'exrw', 'clr_irq0', 'clr_irq1',
                 'irq0', 'irq1', 'exr_port_a', 'exr_port_b', 'exr_port_c',
                 'via_read_porta', 'via_read_portb',
@@ -8174,18 +8211,46 @@ class MK1CodeGen:
             has_calls = self._has_calls(body)
             has_d_clobber_calls = self._body_calls_any(
                 body, getattr(self, '_d_clobber_funcs', set()))
+            # Param 0 stays in $a only if it's read at most once. A second
+            # read sees a clobbered $a (e.g. `buf[0]=x+1; buf[1]=x+2;` —
+            # the `inc` for the first expression turns A from x into x+1,
+            # so the second `addi 2,$a` produces x+3 instead of x+2). Force
+            # a save in that case so subsequent reads can reload from D or
+            # the stack.
+            param0_reads = (self._count_reads(body, params[0])
+                            if len(params) >= 1 else 0)
+            param1_reads = (self._count_reads(body, params[1])
+                            if len(params) >= 2 else 0)
+            # Param 0 stays in $a only if it's read at most once. A second
+            # read sees a clobbered $a (e.g. `buf[0]=x+1; buf[1]=x+2;` —
+            # the `inc` for the first expression turns A from x into x+1,
+            # so the second `addi 2,$a` produces x+3 instead of x+2). Force
+            # a save in that case so subsequent reads can reload from D or
+            # the stack.
             needs_save = (len(params) >= 1
                           and params[0] in self.read_vars
                           and self.reg_d_var is None
                           and (has_locals or len(params) > 2
-                               or has_calls))
+                               or has_calls
+                               or param0_reads > 1))
             # Save to $d only if no call in the body clobbers $d.
             save_a_to_d = needs_save and not has_d_clobber_calls
             # If $d is unavailable OR a $d-clobbering call exists, save to stack.
             save_a_to_stack = (not save_a_to_d
                                and len(params) >= 1
                                and params[0] in self.read_vars
-                               and (has_locals or has_calls))
+                               and (has_locals or has_calls
+                                    or param0_reads > 1))
+            # Param 1 (in $b) has the same multi-read hazard: B gets
+            # clobbered by `ldi $b, N` for array indexing, by mov $b
+            # in argument shuffles, etc. Save to stack if read more
+            # than once. ($d is not used for param 1 because it may
+            # already be holding param 0's save, and because the
+            # save-to-D path needs the precise d-clobber analysis the
+            # existing code only does for param 0.)
+            save_b_to_stack = (len(params) >= 2
+                               and params[1] in self.read_vars
+                               and param1_reads > 1)
             for i, pname in enumerate(params):
                 if i == 0:
                     if save_a_to_d:
@@ -8200,7 +8265,16 @@ class MK1CodeGen:
                     else:
                         self.locals[pname] = ('regparam', 'a')
                 elif i == 1:
-                    self.locals[pname] = ('regparam', 'b')
+                    if save_b_to_stack:
+                        # Track as a local so gen_expr emits ldsp loads
+                        # from the saved stack slot. push $b is emitted
+                        # in the entry preamble below, after the optional
+                        # push $a so offsets line up with _sp_offset's
+                        # `local_count - idx` formula.
+                        self.local_count += 1
+                        self.locals[pname] = ('local', self.local_count - 1)
+                    else:
+                        self.locals[pname] = ('regparam', 'b')
                 else:
                     self.locals[pname] = ('param', i - 2)
         else:
@@ -8221,6 +8295,16 @@ class MK1CodeGen:
                 # save_a_to_stack path: emit the push HERE, after the label,
                 # so dead-code elimination can't strip it.
                 self.emit('\tpush $a')
+        if self.regcall and len(params) >= 2:
+            loc = self.locals[params[1]]
+            if loc[0] == 'local':
+                # save_b_to_stack path: param 1 in $b is multi-read, so
+                # save it before any expression clobbers B (e.g. `ldi
+                # $b, N` for array indexing). The push goes AFTER push
+                # $a (if any) so _sp_offset's `local_count - idx`
+                # ordering matches the runtime stack: param 0 deeper,
+                # param 1 on top.
+                self.emit('\tpush $b')
 
         self.compile_stmt(body)
 
