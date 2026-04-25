@@ -9868,6 +9868,7 @@ class MK1CodeGen:
                 if not hasattr(self, '_lcd_helpers'):
                     self._lcd_helpers = set()
                 self._lcd_helpers.add('__lcd_cmd')
+                self._lcd_helpers.add('__lcd_send_raw')  # __lcd_cmd falls through to __lcd_send_raw — co-locate
                 self._lcd_helpers.add('__i2c_sb')
                 self.emit('\tldi $a,1')        # A = cmd byte (Clear) — __lcd_cmd reads caller's $a
                 self.emit('\tjal __lcd_cmd')
