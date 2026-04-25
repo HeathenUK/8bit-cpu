@@ -3283,6 +3283,7 @@ class MK1CodeGen:
             self.emit('\tmov $a,$b')       # B = shifted
             self.emit_ddrb(0x00)   # SCL HIGH
             self.emit('\texrw 0')          # A = port B
+            self.emit('\texrw 0')          # A = port B
             self.emit('\ttst 0x01')        # test SDA
             self.emit(f'\tjz {lbl_rz}')
             self.emit('\tmov $b,$a')       # A = accumulated
@@ -3350,8 +3351,9 @@ class MK1CodeGen:
             # Send register byte (recover from D)
             self.emit('\tmov $d,$a')
             self.emit('\tjal __i2c_sb')
-            # Repeated START + 0xD1 (read address) + read byte + NACK + STOP
-            self.emit('\tjal __i2c_rs')
+            # STOP + START (no RS) + 0xD1 (read address) + read byte + NACK + STOP
+            self.emit('\tjal __i2c_sp')
+            self.emit('\tjal __i2c_st_only')
             self.emit('\tldi $a,0xD1')
             self.emit('\tjal __i2c_sb')
             self.emit('\tjal __i2c_rb')
@@ -5875,6 +5877,38 @@ class MK1CodeGen:
                         target = s.split()[1]
                         if is_init_only(target) or target in INIT_COMPAT_HELPERS:
                             is_init = True
+                            # If no MORE init-compatible jals are coming, end
+                            # init phase AFTER this one. Without this look-
+                            # ahead, init-prefix-matching lines after the
+                            # last init jal (e.g. an `exrw 2; ddrb 0x01;
+                            # ddrb 0x03` START sequence prefixing a runtime
+                            # rtc_read_temp transaction) get pulled into
+                            # init, leaving the rest of the runtime
+                            # transaction (`ldi $a, 0xD0; jal __i2c_sb`)
+                            # without a START. Empirically: `lcd_init();
+                            # rtc_read_temp(); printf(...)` produced 0
+                            # output because the START went to init and the
+                            # address byte went to runtime, so the bus had
+                            # no START before the address — slave didn't
+                            # respond. Terminating init phase right after
+                            # the last init-jal sends the runtime START to
+                            # runtime where it belongs.
+                            has_more_init_jal = False
+                            for fli in range(mi + 1, len(main_lines)):
+                                fs = main_lines[fli].strip()
+                                if fs.startswith('jal '):
+                                    ft = fs.split()[1]
+                                    if is_init_only(ft) or ft in INIT_COMPAT_HELPERS:
+                                        has_more_init_jal = True
+                                    # any jal (init or not) terminates the
+                                    # look-ahead — first jal decides
+                                    break
+                            if not has_more_init_jal:
+                                init_extracted.append(line)
+                                in_init_phase = False
+                                if _iidbg:
+                                    print(f"  [init-dbg] LAST-INIT-JAL: {s!r}", file=sys.stderr)
+                                continue
                         else:
                             # Any non-init jal ends the init phase
                             in_init_phase = False
@@ -10263,14 +10297,15 @@ class MK1CodeGen:
 
             if name == 'rtc_read_seconds':
                 # Read DS3231 seconds register (0x00), returns BCD in A.
-                # Uses repeated START between register-pointer write and
-                # data read — keeps bus owned across the two phases, more
-                # robust than STOP+START and saves ~6B.
+                # Uses STOP + START between register-pointer write and
+                # data read — matching the proven sequence in main.cpp's
+                # readDS3231Temp() for maximum hardware reliability.
                 if not hasattr(self, '_lcd_helpers'):
                     self._lcd_helpers = set()
                 self._lcd_helpers.add('__i2c_sb')
                 self._lcd_helpers.add('__i2c_rb')
-                self._lcd_helpers.add('__i2c_rs')
+                self._lcd_helpers.add('__i2c_sp')
+                self._lcd_helpers.add('__i2c_st_only')
                 # Set register pointer: START + 0xD0 + 0x00
                 self.emit('\texrw 2')
                 self.emit_ddrb(0x01)
@@ -10279,8 +10314,9 @@ class MK1CodeGen:
                 self.emit('\tjal __i2c_sb')
                 self.emit('\tclr $a')
                 self.emit('\tjal __i2c_sb')
-                # Repeated START (no STOP) + 0xD1 + read byte + NACK + STOP
-                self.emit('\tjal __i2c_rs')
+                # STOP + START (no RS) + 0xD1 + read byte + NACK + STOP
+                self.emit('\tjal __i2c_sp')
+                self.emit('\tjal __i2c_st_only')
                 self.emit('\tldi $a,0xD1')
                 self.emit('\tjal __i2c_sb')
                 self.emit('\tjal __i2c_rb')
@@ -10295,7 +10331,16 @@ class MK1CodeGen:
 
             if name == 'rtc_read_temp':
                 # Read DS3231 temperature MSB (register 0x11), returns signed °C in A.
-                # Uses repeated START between register-pointer write and data read.
+                # Uses REPEATED-START (jal __i2c_rs) between register-pointer
+                # write and data read — same as rtc_read_seconds and the new
+                # rtc_read_reg. STOP+START would release the bus, and the
+                # DS3231 loses the register pointer on STOP, so a subsequent
+                # START would return whatever the auto-incremented internal
+                # pointer points at (typically register 0/1, giving wildly
+                # wrong "temperature" values like 8 or 11 instead of 24).
+                # Empirically: STOP+START version produced wrong values when
+                # called after lcd_init (which leaves the DS3231 in a
+                # different internal state than i2c_init alone).
                 if not hasattr(self, '_lcd_helpers'):
                     self._lcd_helpers = set()
                 self._lcd_helpers.add('__i2c_sb')

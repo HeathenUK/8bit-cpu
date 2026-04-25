@@ -8,7 +8,6 @@ void main() {
     i2c_init();
     lcd_init();
     unsigned char temp = rtc_read_temp();
-    i2c_bus_reset();
     printf("%d\xDFC", temp);
     out(temp);
     halt();
