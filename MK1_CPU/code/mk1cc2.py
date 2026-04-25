@@ -4018,7 +4018,18 @@ class MK1CodeGen:
         # out causes kernel growth that overflows i2c_scan_lcd etc.
         INIT_ONLY_NAMES = {
             '__lcd_init',
-            '__i2c_st', '__i2c_sp',  # START/STOP inlined in __lcd_chr at runtime
+            # __i2c_st is genuinely init-only — runtime LCD sends use
+            # __i2c_st_only (no slave-address byte). __i2c_sp is included
+            # because the legacy LCD driver inlined STOP in __lcd_chr;
+            # the post-2026-04-24 driver calls __i2c_sp via jal from
+            # __lcd_send_raw, but that's reconciled later by the
+            # `_needs_runtime_i2c` no-overlay path which keeps __i2c_sp
+            # resident anyway. Leaving __i2c_sp here keeps the init
+            # path unchanged for programs that DON'T use the LCD —
+            # they don't need __i2c_sp resident. (Removing it from
+            # this set would force __i2c_sp into the overlay tier for
+            # those programs, which is wasteful.)
+            '__i2c_st', '__i2c_sp',
         }
         # __delay_cal is normally NOT init-only: it becomes an overlay in the
         # overlay system, freeing ~57B of init space. A compile-time placement
