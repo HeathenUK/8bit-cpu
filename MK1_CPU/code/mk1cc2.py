@@ -2801,9 +2801,15 @@ class MK1CodeGen:
         Sets self._needs_runtime_i2c and self._dynamic_no_overlay."""
         helpers = getattr(self, '_lcd_helpers', set())
 
-        # Runtime I2C: needed if program uses LCD output or EEPROM reads at runtime
-        # (not just init-time operations like delay_cal or lcd_init).
+        # Runtime I2C: needed if program uses LCD output, RGB backlight,
+        # or EEPROM reads at runtime (not just init-time operations like
+        # delay_cal or lcd_init).
+        # __lcd_rgb (added when the driver was rewritten for AiP31068L +
+        # PCA9633) drives the backlight via runtime I2C transactions and
+        # therefore needs the same `__i2c_st_only` / `__i2c_sb` / `__i2c_sp`
+        # primitives kept resident as the char/cmd path does.
         runtime_i2c_markers = {'__lcd_chr', '__lcd_cmd', '__lcd_send', '__lcd_print',
+                               '__lcd_rgb',
                                '__eeprom_r2c_loop', '__eeprom_dispatch', '__eeprom_load'}
         self._needs_runtime_i2c = bool(helpers & runtime_i2c_markers)
 
