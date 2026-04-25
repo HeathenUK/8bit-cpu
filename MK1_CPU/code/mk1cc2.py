@@ -4253,6 +4253,7 @@ class MK1CodeGen:
             # Loop until no new missing helpers are found.
             any_missing = True
             rename_map = {}
+            _prev_missing = None
             while any_missing:
                 init_jal_targets = set()
                 for line in init_inline + init_helper_lines:
@@ -4265,6 +4266,24 @@ class MK1CodeGen:
                     if s.endswith(':') and s.startswith('__'):
                         init_helper_names.add(s[:-1])
                 missing = init_jal_targets - init_helper_names
+                # Termination guard: if this iteration's `missing` set is
+                # identical to the previous iteration's, the inner copy
+                # loop made no progress (the missing helpers don't exist
+                # in runtime_helper_lines either). Without this guard the
+                # outer `while any_missing:` loop spins forever — observed
+                # on test_i2c_ack_diag.c where __i2c_st_only was referenced
+                # by __lcd_init but never registered (now fixed above; this
+                # is the safety net so a similar registration miss in
+                # future doesn't hang the compiler).
+                if missing == _prev_missing:
+                    raise Exception(
+                        f"init-helper resolver: cannot satisfy jal targets "
+                        f"{sorted(missing)} — these are referenced by init code "
+                        f"but no definition exists in either init or runtime "
+                        f"helper sections. Likely a missing _lcd_helpers.add() "
+                        f"in a builtin emitter."
+                    )
+                _prev_missing = set(missing)
                 any_missing = bool(missing)
                 if not missing: break
                 # Copy needed helpers from runtime to init, renaming to avoid
@@ -9732,6 +9751,18 @@ class MK1CodeGen:
                     self._lcd_helpers = set()
                 self._lcd_helpers.add('__lcd_init')
                 self._lcd_helpers.add('__i2c_sb')
+                # __lcd_init's body (data-driven walker emitted at
+                # mk1cc2.py:~3326) issues `jal __i2c_st_only` for START
+                # sentinels, `jal __i2c_sp` for STOP sentinels, and
+                # `jal __i2c_sb` for plain bytes. All three must be
+                # registered as helpers so they get emitted; without these,
+                # programs that call lcd_init() but no other LCD primitive
+                # (e.g. test_i2c_ack_diag.c, which uses only lcd_init() +
+                # raw i2c_send_byte) leave dangling jal targets and the
+                # init-helper dependency resolver in _overlay_partition
+                # loops forever trying to satisfy them.
+                self._lcd_helpers.add('__i2c_st_only')
+                self._lcd_helpers.add('__i2c_sp')
                 # __i2c_rb NOT needed: LCD init data pre-populated in data page
                 self.emit('\tjal __lcd_init')
                 # The init data sequence we emit includes Clear Display
