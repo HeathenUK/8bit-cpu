@@ -963,6 +963,7 @@ class MK1CodeGen:
 
     I2C_CALLS = {'i2c_start', 'i2c_stop', 'i2c_send_byte', 'i2c_read_byte',
                  'i2c_nack', 'i2c_ack', 'i2c_bus_reset', 'i2c_stream',
+                 'i2c_repeated_start',
                  'rtc_read_temp', 'rtc_read_seconds', 'eeprom_read_byte',
                  'eeprom_read', 'eeprom_write_byte', 'eeprom_write'}
     LCD_CALLS = {'lcd_cmd', 'lcd_char', 'lcd_print', 'delay', 'tone', 'silence'}
@@ -9792,6 +9793,18 @@ class MK1CodeGen:
                 self.emit_ddrb(0x03)   # both LOW
                 self.emit_ddrb(0x01)   # SDA LOW, SCL HIGH
                 self.emit_ddrb(0x00)   # both HIGH (idle)
+                return
+
+            if name == 'i2c_repeated_start':
+                # Repeated START via shared __i2c_rs helper. Lets user code
+                # write `i2c_repeated_start()` between a register-pointer
+                # write and a data read instead of `i2c_stop(); i2c_start();`
+                # (saves ~5-9 B per call site by sharing the rs helper and
+                # skipping the intermediate STOP).
+                if not hasattr(self, '_lcd_helpers'):
+                    self._lcd_helpers = set()
+                self._lcd_helpers.add('__i2c_rs')
+                self.emit('\tjal __i2c_rs')
                 return
 
             if name == 'i2c_send_byte':
