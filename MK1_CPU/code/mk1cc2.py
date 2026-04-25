@@ -844,6 +844,7 @@ class MK1CodeGen:
         'lcd_init',        # data-driven, iterates via $d
         'rtc_read_temp',   # uses __i2c_rb (bit counter in $d)
         'rtc_read_seconds',
+        'rtc_read_reg',    # uses __i2c_rb / __i2c_sb (both clobber $d)
         'i2c_read_byte',   # __i2c_rb directly
         'eeprom_read_byte',
         'eeprom_read',
@@ -964,8 +965,15 @@ class MK1CodeGen:
     I2C_CALLS = {'i2c_start', 'i2c_stop', 'i2c_send_byte', 'i2c_read_byte',
                  'i2c_nack', 'i2c_ack', 'i2c_bus_reset', 'i2c_stream',
                  'i2c_repeated_start',
-                 'rtc_read_temp', 'rtc_read_seconds', 'eeprom_read_byte',
+                 'rtc_read_temp', 'rtc_read_seconds',
+                 'eeprom_read_byte',
                  'eeprom_read', 'eeprom_write_byte', 'eeprom_write'}
+    # NOTE: rtc_read_reg is intentionally NOT in I2C_CALLS. It lowers to a
+    # callable shared helper rather than inlining the I2C transaction, so
+    # call sites are tiny (4 B) and don't justify a domain split. Putting
+    # it in I2C_CALLS triggered phase-splitter behaviour on
+    # overlay_dashboard.c that created a 74 B _main_p1 wrap instead of
+    # fitting the (smaller) post-alias main into a single overlay.
     LCD_CALLS = {'lcd_cmd', 'lcd_char', 'lcd_print', 'delay', 'tone', 'silence'}
 
     def _stmt_domain(self, stmt):
@@ -1498,14 +1506,79 @@ class MK1CodeGen:
         return (body_s.count("('call', 'exw', [('num', 0), ('num', 2), ('num', 0)])") >= 2
                 and body_s.count("('call', 'exw', [('num', 64), ('num', 2), ('num', 0)])") >= 2)
 
+    def _is_rtc_read_reg_alias(self, name, params, body, ret_type):
+        """Recognize a user-defined DS3231 register-read function whose body
+        is structurally identical to the compiler's `rtc_read_reg(reg)`
+        builtin.
+
+        Pattern (`overlay_dashboard.c`'s rtc_reg, others may vary):
+          unsigned char NAME(unsigned char reg) {
+              i2c_start();
+              i2c_send_byte(0xD0);
+              i2c_send_byte(reg);
+              [i2c_stop(); i2c_start(); | i2c_repeated_start();]
+              i2c_send_byte(0xD1);
+              unsigned char v;
+              v = i2c_read_byte();
+              i2c_nack();
+              i2c_stop();
+              return v;
+          }
+
+        When matched, the function is dropped from the program and every
+        `('call', name, [arg])` in the rest of the corpus is rewritten to
+        `('call', 'rtc_read_reg', [arg])`. The compiler's rtc_read_reg
+        emitter then takes over (callable shared helper, smaller per-call
+        cost than user's bespoke function-overlay).
+        """
+        if len(params) != 1 or body[0] != 'block':
+            return False
+        p_name = params[0][0] if isinstance(params[0], tuple) else params[0]
+        body_s = str(body)
+        # Required tokens: device address writes, reg-byte send via param,
+        # read of D1 + i2c_read_byte + nack + stop + return v.
+        required = [
+            "('call', 'i2c_start',",
+            "('call', 'i2c_send_byte', [('num', 208)])",     # 0xD0 device write addr
+            f"('call', 'i2c_send_byte', [('var', '{p_name}')])",  # reg
+            "('call', 'i2c_send_byte', [('num', 209)])",     # 0xD1 device read addr
+            "('call', 'i2c_read_byte', [])",
+            "('call', 'i2c_nack', [])",
+            "('call', 'i2c_stop',",
+            "('return',",
+        ]
+        return all(tok in body_s for tok in required)
+
     def _alias_builtin_compatible_functions(self, functions):
         aliases = set()
+        # name -> builtin name to redirect calls to (when builtin name differs
+        # from user name, e.g. user's rtc_reg → rtc_read_reg builtin).
+        rename_map = {}
         kept = []
         for name, params, body, ret_type in functions:
             if self._is_builtin_i2c_send_byte_alias(name, params, body, ret_type):
                 aliases.add(name)
                 continue
+            if self._is_rtc_read_reg_alias(name, params, body, ret_type):
+                aliases.add(name)
+                rename_map[name] = 'rtc_read_reg'
+                continue
             kept.append((name, params, body, ret_type))
+        if rename_map:
+            # Rename calls in all kept function bodies. This is the critical
+            # step — without it, calls to the dropped function dangle.
+            def _rename_calls(node):
+                if isinstance(node, tuple):
+                    if (len(node) >= 2 and node[0] == 'call'
+                            and node[1] in rename_map):
+                        new_name = rename_map[node[1]]
+                        return ('call', new_name,
+                                [_rename_calls(a) for a in node[2]])
+                    return tuple(_rename_calls(c) for c in node)
+                if isinstance(node, list):
+                    return [_rename_calls(c) for c in node]
+                return node
+            kept = [(n, p, _rename_calls(b), r) for (n, p, b, r) in kept]
         if aliases:
             for name in aliases:
                 self.func_params.pop(name, None)
@@ -3250,6 +3323,41 @@ class MK1CodeGen:
             self.emit('\tjal __i2c_rb')
             self.emit('\tmov $d,$a')       # A = read byte
             # NACK + STOP
+            self.emit_ddrb(0x00)
+            self.emit_ddrb(0x02)
+            self.emit_ddrb(0x03)
+            self.emit_ddrb(0x01)
+            self.emit_ddrb(0x00)
+            self.emit('\tret')
+
+        # __rtc_read_reg: read DS3231 register byte specified in $a.
+        # Generic parameterized RTC read with repeated START. Caller passes
+        # the register address in $a; returns the byte read in $a.
+        # Saves bytes vs inlining for programs that read multiple registers
+        # (e.g. overlay_dashboard.c reads 4 different registers in main()).
+        # Same I2C sequence as rtc_read_seconds/rtc_read_temp but with the
+        # register byte parameterized — shared body costs ~32 B once instead
+        # of ~31 B per inline call site.
+        if '__rtc_read_reg' in helpers:
+            self.emit('__rtc_read_reg:')
+            self.emit('\tmov $a,$d')         # save reg byte to D
+            # START + 0xD0 (DS3231 write address)
+            self.emit('\texrw 2')
+            self.emit_ddrb(0x01)
+            self.emit_ddrb(0x03)
+            self.emit('\tldi $a,0xD0')
+            self.emit('\tjal __i2c_sb')
+            # Send register byte (recover from D)
+            self.emit('\tmov $d,$a')
+            self.emit('\tjal __i2c_sb')
+            # Repeated START + 0xD1 (read address) + read byte + NACK + STOP
+            self.emit('\tjal __i2c_rs')
+            self.emit('\tldi $a,0xD1')
+            self.emit('\tjal __i2c_sb')
+            self.emit('\tjal __i2c_rb')
+            self.emit('\tmov $d,$a')         # A = read byte (returned)
+            # NACK + STOP (merged via the trailing 6 ddrb writes)
+            self.emit_ddrb(0x02)
             self.emit_ddrb(0x00)
             self.emit_ddrb(0x02)
             self.emit_ddrb(0x03)
@@ -10178,6 +10286,33 @@ class MK1CodeGen:
                 self.emit_ddrb(0x03)
                 self.emit_ddrb(0x01)
                 self.emit_ddrb(0x00)
+                return
+
+            if name == 'rtc_read_reg':
+                # Read DS3231 register N (passed in args[0]). Generic
+                # parameterized version of rtc_read_seconds (reg=0x00) and
+                # rtc_read_temp (reg=0x11). Lowers to a callable shared
+                # `__rtc_read_reg` helper rather than inlining the I2C
+                # transaction per call site — for programs that read multiple
+                # registers (overlay_dashboard.c reads 4: hours, minutes,
+                # seconds, temp) this saves 3× the bytes vs inlining.
+                if not args:
+                    self.gen_error("rtc_read_reg() requires 1 argument: register byte")
+                    return
+                if not hasattr(self, '_lcd_helpers'):
+                    self._lcd_helpers = set()
+                self._lcd_helpers.add('__rtc_read_reg')
+                self._lcd_helpers.add('__i2c_sb')
+                self._lcd_helpers.add('__i2c_rb')
+                self._lcd_helpers.add('__i2c_rs')
+                # Pass reg byte in $a — helper preserves it through the
+                # device-address write and uses it as the register pointer.
+                c = self._const_eval(args[0])
+                if c is not None:
+                    self.emit(f'\tldi $a,{c & 0xFF}')
+                else:
+                    self.gen_expr(args[0])
+                self.emit('\tjal __rtc_read_reg')
                 return
 
             if name == 'i2c_ack':
