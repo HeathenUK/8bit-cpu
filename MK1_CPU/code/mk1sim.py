@@ -188,22 +188,28 @@ class MK1:
             return (a_val | e_val) & 0xFF, False
         elif mode == 0b110:  # AND (= SUB|OR)
             return (a_val & e_val) & 0xFF, False
-        elif mode == 0b001:  # SHF (shift left)
+        elif mode == 0b001:  # SHF (shift left/right)
+            # HARDWARE NOTE: the shifter's bit-shifted-out is NOT wired to
+            # the CF flop on this hardware. Microcode declares `SHF|FI` but
+            # the FI signal latches an unconnected input — CF stays at
+            # whatever the previous ALU op left. Empirically verified by
+            # hardware probe (see WORKLOG Round 10). Return carry=False so
+            # sim matches silicon: code that relies on CF after sll/slr
+            # fails sim immediately rather than passing sim and breaking
+            # on hardware.
             rgt = bool(mode_bits & RGT)
             if rgt:
-                carry = bool(a_val & 1)
-                return (a_val >> 1) & 0xFF, carry
+                return (a_val >> 1) & 0xFF, False
             else:
-                carry = bool(a_val & 0x80)
-                return (a_val << 1) & 0xFF, carry
+                return (a_val << 1) & 0xFF, False
         elif mode == 0b101:  # ROT (rotate)
+            # Same wiring caveat as SHF — ROT uses the same shifter
+            # carry-out path. Return carry=False to match hardware.
             rgt = bool(mode_bits & RGT)
             if rgt:
-                carry = bool(a_val & 1)
-                return ((a_val >> 1) | ((a_val & 1) << 7)) & 0xFF, carry
+                return ((a_val >> 1) | ((a_val & 1) << 7)) & 0xFF, False
             else:
-                carry = bool(a_val & 0x80)
-                return ((a_val << 1) | ((a_val >> 7) & 1)) & 0xFF, carry
+                return ((a_val << 1) | ((a_val >> 7) & 1)) & 0xFF, False
         elif mode == 0b111:  # NOT
             return (e_val ^ 0xFF) & 0xFF, False
         else:
