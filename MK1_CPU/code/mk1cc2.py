@@ -2044,16 +2044,10 @@ class MK1CodeGen:
         # Must be AFTER all tone()/silence() calls are compiled (so note table is complete)
         # and BEFORE dead function elimination.
         #
-        # FLAT MODE ONLY. Enabling precompute in overlay mode exposes
-        # a separate overlay-layout/stack interaction that makes user
-        # functions calling tone() return early after a couple of
-        # tones or hang in a single note. Root cause not yet pinned
-        # down; until it is, overlay-mode programs keep the
-        # pre-precompute behavior (frequency/duration independent of
-        # __delay_cal, tuned for ~100 kHz reference) — imperfect but
-        # non-hanging. Tracked as a separate issue; do not re-enable
-        # this path in overlay mode without first understanding the
-        # failure observed in `one_phrase.c`/`twinkle_v3.c`.
+        # Flat-mode precompute is inserted inline because there is no overlay
+        # loader. EEPROM mode emits __tone_precompute below and calls it after
+        # delay_calibrate(), so it sees the calibrated page3[240] value without
+        # growing the permanent runtime kernel.
         if (getattr(self, '_needs_tone_init', False) and
             hasattr(self, '_note_table') and self._note_table and
             not getattr(self, 'eeprom_mode', False)):
@@ -2093,6 +2087,67 @@ class MK1CodeGen:
                     ]
                     self.code[insert_at:insert_at] = precomp
                     break
+
+        if (getattr(self, '_needs_tone_init', False) and
+            hasattr(self, '_note_table') and self._note_table and
+            getattr(self, 'eeprom_mode', False)):
+            note_base = self._note_table[0][0]
+            note_end = self._note_table[-1][0] + 3
+            precomp_call_inserted = False
+            for mi, ml in enumerate(self.code):
+                if ml.strip() == '_main:':
+                    insert_at = mi + 1
+                    for j in range(mi + 1, min(mi + 40, len(self.code))):
+                        if self.code[j].strip() == 'jal __delay_cal':
+                            insert_at = j + 1
+                    self.code.insert(insert_at, '\tjal __tone_precompute')
+                    precomp_call_inserted = True
+                    break
+            if precomp_call_inserted:
+                self.code.extend([
+                    '__tone_precompute:',
+                    # Idempotency guard: the precompute converts each note
+                    # table entry's first byte from `ratio` to `half_period`
+                    # IN PLACE. Without this guard, a second `_main` run
+                    # after RESET (without re-upload) would call __tone_setup
+                    # on already-precomputed half_periods, cascading into
+                    # garbage values — empirically observed as twinkle
+                    # playing low/slow on the 2nd run and completely wrong
+                    # on the 3rd. page3[241] is zero on upload (only [240]
+                    # is touched by __delay_cal, [242] by __eeprom_r2c_loop)
+                    # and persists across MK1 resets, making it a safe
+                    # one-shot latch.
+                    '\tldi $a,241',
+                    '\tderefp3',
+                    '\ttst 0xFF',
+                    '\tjnz .__tpc_already',
+                    f'\tldi $a,{note_base}',
+                    '\tmov $a,$d',
+                    '.__tpc_loop:',
+                    '\tmov $d,$a',
+                    '\tderef',
+                    '\ttst 0xFF',
+                    '\tjz .__tpc_skip',
+                    '\tmov $d,$b',
+                    '\tpush_b',
+                    '\tmov $a,$b',
+                    '\tjal __tone_setup',
+                    '\tpop_b',
+                    '\tmov $c,$a',
+                    '\tideref',
+                    '\tmov $b,$d',
+                    '.__tpc_skip:',
+                    '\tincd',
+                    '\tincd',
+                    '\tincd',
+                    f'\tcmpi {note_end}',
+                    '\tjnz .__tpc_loop',
+                    '\tldi $a,1',
+                    '\tldi $b,241',
+                    '\tiderefp3',
+                    '.__tpc_already:',
+                    '\tret',
+                ])
 
         # Dead function elimination
         self._eliminate_dead_functions()
@@ -2440,15 +2495,19 @@ class MK1CodeGen:
 
         # I2C byte-level helpers: resident if called from runtime code.
         # __i2c_sb and __i2c_rb are called from overlays + resident LCD code.
-        # __i2c_st and __i2c_sp are init-only: __lcd_chr inlines the START,
-        # and STOP is inlined in __lcd_send. Only the init sentinel loop
-        # calls them as standalone functions.
+        # __i2c_st is init-only: runtime LCD sends use __i2c_st_only.
+        # __i2c_sp must stay resident when runtime LCD output is present:
+        # __lcd_send_raw calls it after each command/character transaction.
         if '__i2c_sb' in helpers:
             no_ov.add('__i2c_sb:')
         if '__i2c_rb' in helpers:
             no_ov.add('__i2c_rb:')
         if '__i2c_rs' in helpers:
             no_ov.add('__i2c_rs:')
+        if '__i2c_st_only' in helpers and self._needs_runtime_i2c:
+            no_ov.add('__i2c_st_only:')
+        if '__i2c_sp' in helpers and self._needs_runtime_i2c:
+            no_ov.add('__i2c_sp:')
         # __eeprom_rd: resident only if user code accesses eeprom arrays at
         # runtime. In --eeprom overlay mode it's called only by the init-time
         # preload (before self-copy), so it stays init-only.
@@ -3202,7 +3261,7 @@ class MK1CodeGen:
             self.emit_ddrb(0x01)   # SDA LOW, SCL HIGH
             self.emit_ddrb(0x00)   # both HIGH (idle)
             # Clear DDRA so PA0 reads SQW. Routed through emit_ddra so any
-            # active port-A claim (e.g. tone's PA1) keeps its bits driven.
+            # active port-A claim keeps its bits driven.
             self.emit_ddra(0x00)
             # Sync: wait LOW then HIGH (rising edge)
             self.emit(f'{lbl_s1}:')
@@ -3315,13 +3374,13 @@ class MK1CodeGen:
             self.emit('\tsll')
             self.emit('\tsll')             # A = D << 4
             self.emit('\tadd $c,$a')       # A = (D<<4) + (A>>4) = (blocks*ratio)/16
-            # Subtract 1 to compensate for the ~27 MK1 cycles of per-tone-cycle
-            # overhead (ora_imm, mov $c,$a, mov $b,$a, dec, mov $a,$b, jnz) that
-            # the `(blocks × ratio) / 16` formula ignores. Without this the
-            # formula over-estimates half_period by ~1 iter and every tone
-            # plays ~10–15% too long. Verified empirically across freq 500/
-            # 1000/2000 Hz at 165.5 kHz MK1 clock; also stays correct at
-            # 100 kHz and 500 kHz per model.
+            # Subtract 2 to compensate for the per-tone-cycle overhead that
+            # the `(blocks × ratio) / 16` formula ignores. With the duty-cycle
+            # pad (3 nop + 1 tst, 14 cyc) added below, the per-period
+            # overhead is 52 cycles ≈ 2.89 inner-loop iters; rounded with
+            # the same +1 empirical bias the original `-1` carried over its
+            # analytical -2.11 (overhead 38 pre-pad), the right value is -2.
+            self.emit('\tdec')
             self.emit('\tdec')
             self.emit('\tmov $a,$c')       # C = half_period
             self.emit('\tret')
@@ -3329,21 +3388,30 @@ class MK1CodeGen:
         # __tone: play square wave on PA1.
         # C = half_period (dec+jnz iterations per half-cycle).
         # D:B = 16-bit cycle count (D=high, B=low).
-        # DDRA must already be 0x02.
+        # DDRA PA1 must already be configured as output by runtime main.
         if '__tone' in helpers:
             lbl_loop = self.label('ttl')
             lbl_hi = self.label('thi')
             lbl_lo = self.label('tlo')
             lbl_done = self.label('tdn')
             self.emit('__tone:')
-            self.emit_ddra(0x02)   # PA1 = output (only during tone)
             self.emit(f'{lbl_loop}:')
-            self.emit_ora(0x02)    # PA1 HIGH
+            self.emit('\tldi $a,0x02')
+            self.emit('\texw 0 1')         # PA1 HIGH
             self.emit('\tmov $c,$a')       # A = half_period
             self.emit(f'{lbl_hi}:')
             self.emit('\tdec')
             self.emit(f'\tjnz {lbl_hi}')
-            self.emit_ora(0x00)    # PA1 LOW
+            # Duty-cycle pad: 14 cycles (3 nop + tst 0) to balance the
+            # LOW-side outer-tail overhead. Constant — independent of
+            # MK1 clock and target frequency. None of these clobber $a.
+            # __tone_setup's compensation absorbs the period growth.
+            self.emit('\tnop')
+            self.emit('\tnop')
+            self.emit('\tnop')
+            self.emit('\ttst 0')
+            self.emit('\tclr $a')
+            self.emit('\texw 0 1')         # PA1 LOW
             self.emit('\tmov $c,$a')
             self.emit(f'{lbl_lo}:')
             self.emit('\tdec')
@@ -3362,8 +3430,6 @@ class MK1CodeGen:
             self.emit('\tdecd')
             self.emit(f'\tj {lbl_loop}')
             self.emit(f'{lbl_done}:')
-            self.emit_ora(0x00)    # PA1 LOW before disabling
-            self.emit_ddra(0x00)   # PA1 = input (stop driving bus)
             self.emit('\tret')
 
         # __eeprom_r2c_loop: sequential I2C read → code page via istc.
@@ -4273,12 +4339,16 @@ class MK1CodeGen:
         overlay_asm_blocks = []  # (entry_name, combined_lines, slot_size)
         overlay_meta = []        # (idx, entry_name, slot_size)
         func_to_overlay_idx = {}
+        func_to_overlay_offset = {}
 
         for idx, (slot_funcs, slot_size) in enumerate(overlay_slots):
             combined_lines = []
+            slot_off = 0
             for name, start, end, fsize in slot_funcs:
+                func_to_overlay_offset[name] = slot_off
                 combined_lines.extend(self.code[start:end])
                 func_to_overlay_idx[name] = idx
+                slot_off += fsize
             overlay_asm_blocks.append((slot_funcs[0][0], combined_lines, slot_size))
             overlay_meta.append((idx, slot_funcs[0][0], slot_size))
 
@@ -4397,7 +4467,18 @@ class MK1CodeGen:
                     hs, he = helper_ranges[hname2]
                     cond_res_ranges.update(range(hs, he))
 
+            # Tone-runtime helpers must stay resident even when only called
+            # from user-function overlays. Bundling them inside an overlay
+            # has been observed to hang programs that play tone() from a
+            # single user function (e.g. twinkle.c's `p1`); the
+            # multi-callsite case works because the knapsack already keeps
+            # them resident there. Root cause of the bundled-mode failure
+            # is not yet pinned down; until it is, force-resident.
+            _force_resident_helpers = {'__tone', '__play_note', '__delay_Nms'}
+
             for hname in list(cond_res):
+                if hname in _force_resident_helpers:
+                    continue   # leave in _NO_OVERLAY → stays resident
                 called_from_resident = False
                 for ci, cline in enumerate(new_resident):
                     # Skip other conditionally-resident helper bodies
@@ -5197,6 +5278,12 @@ class MK1CodeGen:
                 '\tddrb_imm 0x00',   # SCL high, SDA high (STOP/idle)
             ])
             main_lines = ['_main:'] + preamble + runtime_main
+            if getattr(self, '_needs_tone_init', False):
+                tone_ddra = self._port_shadow_mask('DDRA') | 0x02
+                for _mi, _ml in enumerate(main_lines):
+                    if _ml.strip() == 'jal __tone_precompute':
+                        main_lines.insert(_mi + 1, f'\tddra_imm 0x{tone_ddra:02X}')
+                        break
 
             # ── Step 11: Generate kernel assembly (overlay_load function) ──
             # This is the runtime overlay loader that lives in the code page.
@@ -5464,10 +5551,15 @@ class MK1CodeGen:
             shared_helper_size = measure_lines(shared_helpers_ov)
 
             # ── Cross-section procedure abstraction ──
-            # Scan runtime_resident_helpers + every overlay body for instruction
+            # Scan runtime_resident_helpers + main for instruction
             # sequences that repeat ≥2 times across different sections. Extract
             # profitable ones as kernel-resident thunks (placed at the tail of
             # runtime_resident_helpers) and rewrite all call sites to `jal`.
+            #
+            # Do not extract from overlay bodies. Hardware testing with tone
+            # overlays showed cross-section thunks/tail-merges in overlay code
+            # can return into the wrong stream or otherwise corrupt subsequent
+            # overlay execution even when the byte accounting is correct.
             #
             # Savings model: sequence of S bytes occurring K times across sections
             # Cost:    thunk body S + ret(1) = S+1 bytes added to kernel
@@ -5525,8 +5617,7 @@ class MK1CodeGen:
                 units = {}   # unit_id → list of (global_idx, text)
                 units['kernel'] = list(_t2_strip_section_tokens(runtime_resident_helpers))
                 units['main'] = list(_t2_strip_section_tokens(main_lines))
-                for oi, (oname, olines, _ofsize) in enumerate(overlay_asm_blocks):
-                    units[f'ov{oi}'] = list(_t2_strip_section_tokens(olines))
+                # Overlay units deliberately omitted; see safety note above.
                 # Stage-1 init code runs AFTER mini-copy but BEFORE self-copy.
                 # Mini-copy places every runtime_resident_helper at its kernel
                 # address, so init code can call kernel-resident thunks freely.
@@ -6369,15 +6460,13 @@ class MK1CodeGen:
             p2_code_offset = 0
             # Page 2 needs SP init (3B) which increases init code. Estimate if
             # init code can afford it (must stay ≤ 250B including selfcopy).
-            # If the program has LCD init (heavy init helpers), init is ~240B
-            # without SP init. Adding 3B pushes to 243B + selfcopy 14B = 257B > 250.
-            # In that case, disable page 2 to avoid the SP init overhead.
-            # Page 2 always available for overlays: 196B at low addresses
-            # (stack grows down from 0xFF into the top ~60B). The 3B SP init
-            # is emitted when has_p2 is True and is tiny compared to unlocking
-            # 196B of fast SRAM. Previously disabled for LCD programs due to
-            # a stale fit-calculation heuristic that is now obsolete.
-            p2_capacity = 196
+            # Page 2 = stack page. Using it for overlay storage was observed
+            # to produce hangs on tone-playing programs (e.g. twinkle.c),
+            # likely because the overlay source bytes in page 2 are liable
+            # to be corrupted by stack pushes/pops if the overlay is ever
+            # reloaded during runtime. Disabled until the mechanism is
+            # understood; overlays flow to page 1 and page 3 instead.
+            p2_capacity = 0
 
             p3_overlays = []
             p1_overlays = []
@@ -6669,6 +6758,22 @@ class MK1CodeGen:
         KERNEL_SIZE = loader_size + main_size + runtime_helper_size
         OVERLAY_REGION = KERNEL_SIZE + shared_helper_size
 
+        def _resolve_overlay_jal_targets(lines):
+            """Overlay body labels live in storage sections, whose assembler
+            label addresses are page offsets. Resident code must call the
+            runtime address the loader copies the body to instead."""
+            out = []
+            for line in lines:
+                s = line.strip()
+                if s.startswith('jal '):
+                    target = s.split()[1]
+                    off = func_to_overlay_offset.get(target)
+                    if off is not None:
+                        out.append(f'\tjal {OVERLAY_REGION + off}')
+                        continue
+                out.append(line)
+            return out
+
         # Fix p3 overlay offsets if meta_base changed from estimate.
         # IMPORTANT: only shift REGULAR p3 overlays, not EEPROM-backed ones.
         # EEPROM overlays are placed at page3[0..] and don't move with meta_base
@@ -6729,6 +6834,9 @@ class MK1CodeGen:
         loader_size = measure_lines(loader)
         KERNEL_SIZE = RESET_STUB + loader_size + actual_main_size + runtime_helper_size
         OVERLAY_REGION = KERNEL_SIZE + shared_helper_size
+        main_lines = _resolve_overlay_jal_targets(main_lines)
+        runtime_main_lines = main_lines
+        runtime_resident_helpers = _resolve_overlay_jal_targets(runtime_resident_helpers)
         # Verify kernel sizing
         actual_total = RESET_STUB + measure_lines(loader + runtime_resident_helpers + runtime_main_lines)
         if actual_total != KERNEL_SIZE:
@@ -7470,9 +7578,9 @@ class MK1CodeGen:
         if init_only_funcs:
             assembled.append('__init_done:')
 
-        # DDRA for tone: now set inside __tone itself (bracket with ddra_imm 0x02
-        # before toggle loop, ddra_imm 0x00 after). Persistent DDRA=0x02 breaks
-        # delay loops due to VIA bus coupling (confirmed in stopwatch testing).
+        # DDRA for tone is configured once in runtime main after calibration.
+        # __tone only toggles ORA/PA1; repeatedly bracketing DDRA around each
+        # note was hardware-unstable.
 
         # Note table precomputation: convert ratio → half_period during init.
         # After delay_cal stores ipm to page3[240], iterate over note entries
@@ -9616,16 +9724,11 @@ class MK1CodeGen:
                 # tone(freq_hz, duration_ms) — play square wave on PA1.
                 # Both args MUST be compile-time constants.
                 # Stores [ratio, cyc_lo, cyc_hi] in data page note table.
-                # Emits: ddra_imm 0x02 (once) + ldi $a, offset; jal __play_note.
-                # DDRA bit 1 must be set for PA1 output (i2c_init clears DDRA).
-                # DDRA is now set inside __tone itself (bracketed), not here.
-                # Persistent DDRA=0x02 breaks delay loops via VIA bus coupling.
+                # Emits ldi $a, offset; jal __play_note. Runtime main configures
+                # DDRA/PA1 after delay calibration; __tone only toggles ORA.
                 if not hasattr(self, '_tone_ddra_emitted'):
                     self._tone_ddra_emitted = True
                     self._needs_tone_init = True
-                    # __tone brackets PA1 itself. A persistent DDRA claim keeps
-                    # PA1 driven during delay calibration and after playback,
-                    # which has been observed to disturb timing-sensitive VIA use.
                 if len(args) < 2:
                     raise Exception("tone() requires 2 arguments: freq_hz, duration_ms")
                 freq = self._const_eval(args[0])

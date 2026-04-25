@@ -28,21 +28,16 @@ void p4(void) {
     tone(392, 250); tone(392, 250);
     tone(349, 250); tone(349, 250);
     tone(330, 250); tone(330, 250);
-}
-
-void p5(void) {
     tone(294, 500);
 }
 
 void main(void) {
     i2c_init();
     delay_calibrate();
-    ddra_imm(0x02);
+    out(1);
 
     p1(); p2(); p3();
-    p4(); p5();
-    p4(); p5();
-    p1(); p2(); p3();
+    p4();
 
     out(0xDD);
     halt();

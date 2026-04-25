@@ -57,6 +57,11 @@ static void autoSaveSource(const String& source);
 static void startOIMonitor();
 static void stopOIMonitor();
 static int readDS3231Temp();
+static int readDS3231Reg(uint8_t reg);
+static bool updateBootLCD(int tempC, bool rtcSet, uint8_t hourBcd, uint8_t minBcd);
+static void loadAsmResultForUpload(const AsmResult& r);
+static int runUploadedUntilFirstOut(int maxCycles);
+static bool runUploadedUntilHalt(int maxCycles);
 static void writeEepromData(const uint8_t* data, int size);
 static inline uint8_t IRAM_ATTR decodeBus(uint32_t gpio);
 
@@ -625,6 +630,12 @@ static void stopOIMonitor() {
     oiMonitorActive = false;
 }
 
+static void detachOIMonitorForManualRun() {
+    if (!oiMonitorActive) return;
+    detachInterrupt(digitalPinToInterrupt(PIN_OI));
+    oiMonitorActive = false;
+}
+
 // POST /upload_and_wait?timeout=10 — upload program, then immediately spin-poll for OI.
 // Combines upload + capture in one request so we don't miss fast programs.
 static void handleUploadAndWait() {
@@ -775,9 +786,7 @@ static void handleRunCycles() {
 
     stopCustomClock();
     // Detach OI interrupt — we'll poll OI directly in the clock loop
-    if (oiMonitorActive) {
-        detachInterrupt(digitalPinToInterrupt(PIN_OI));
-    }
+    detachOIMonitorForManualRun();
     // Reset OI capture state
     outputCaptured = false;
     oiCount = 0;
@@ -924,7 +933,7 @@ static int runI2CScanAddr(uint8_t addr) {
     // Returns 1 if ACK (device found), 0 if NACK, -1 on error.
     uint8_t writeAddr = addr << 1;  // 7-bit addr → 8-bit write addr
     char asmBuf[2048];
-    snprintf(asmBuf, sizeof(asmBuf),
+    int asmLen = snprintf(asmBuf, sizeof(asmBuf),
         "; I2C scan address 0x%02X\n"
         "    ldi $d, 0\n"
         ".dly:\n"
@@ -1006,6 +1015,11 @@ static int runI2CScanAddr(uint8_t addr) {
         addr, writeAddr
     );
 
+    if (asmLen < 0 || asmLen >= (int)sizeof(asmBuf)) {
+        Serial.printf("I2C scan address 0x%02X program truncated\n", addr);
+        return -1;
+    }
+
     assembler.assemble(asmBuf);
     const AsmResult& r = assembler.result;
     if (r.error_count != 0) return -1;
@@ -1020,7 +1034,7 @@ static int runI2CScanAddr(uint8_t addr) {
     enableCU();
 
     stopCustomClock();
-    if (oiMonitorActive) detachInterrupt(digitalPinToInterrupt(PIN_OI));
+    detachOIMonitorForManualRun();
     outputCaptured = false;
     oiCount = 0;
 
@@ -1038,6 +1052,7 @@ static int runI2CScanAddr(uint8_t addr) {
 
     int result = -1;
     for (int i = 0; i < 20000; i++) {
+        if ((i & 0x3FFF) == 0) yield();
         GPIO.out_w1ts = clkMask;
         delayMicroseconds(1);
         uint32_t g1 = GPIO.in;
@@ -1077,6 +1092,127 @@ static void handleI2CScan() {
     }
     json += "]}";
     server.send(200, "application/json", json);
+}
+
+static void loadAsmResultForUpload(const AsmResult& r) {
+    int dataBytes = r.data_size < DATA_SIZE ? r.data_size : DATA_SIZE;
+    int stackBytes = r.stack_size < DATA_SIZE ? r.stack_size : DATA_SIZE;
+    int p3Bytes = r.page3_size < DATA_SIZE ? r.page3_size : DATA_SIZE;
+
+    memset(uploadBuf, 0, sizeof(uploadBuf));
+    memcpy(uploadBuf, r.code, CODE_SIZE);
+    uploadSize = CODE_SIZE;
+
+    if (dataBytes > 0 || stackBytes > 0 || p3Bytes > 0) {
+        memcpy(uploadBuf + CODE_SIZE, r.data, dataBytes);
+        uploadSize = CODE_SIZE + DATA_SIZE;
+    }
+    if (stackBytes > 0 || p3Bytes > 0) {
+        memcpy(uploadBuf + CODE_SIZE + DATA_SIZE, r.stack, stackBytes);
+        uploadSize = CODE_SIZE + DATA_SIZE + DATA_SIZE;
+    }
+    if (p3Bytes > 0) {
+        memcpy(uploadBuf + CODE_SIZE + DATA_SIZE + DATA_SIZE, r.page3, p3Bytes);
+        uploadSize = CODE_SIZE + DATA_SIZE + DATA_SIZE + DATA_SIZE;
+    }
+}
+
+static int runUploadedUntilFirstOut(int maxCycles) {
+    disableClock();
+    resetPulse();
+    enableCU();
+
+    stopCustomClock();
+    detachOIMonitorForManualRun();
+    outputCaptured = false;
+    oiCount = 0;
+
+    int oiGpio = digitalPinToGPIONumber(PIN_OI);
+    if (oiGpio < 0) oiGpio = PIN_OI;
+    uint32_t oiMask = 1 << oiGpio;
+
+    busSetInput();
+    disableOutput();
+    digitalWrite(PIN_DIR, LOW);
+    enableOutput();
+
+    int clkGpio = digitalPinToGPIONumber(PIN_CLK);
+    uint32_t clkMask = 1 << clkGpio;
+    pinMode(PIN_CLK, OUTPUT);
+    digitalWrite(PIN_CLK, LOW);
+
+    int result = -1;
+    for (int i = 0; i < maxCycles; i++) {
+        if ((i & 0x3FFF) == 0) yield();
+        GPIO.out_w1ts = clkMask;
+        delayMicroseconds(1);
+        uint32_t g1 = GPIO.in;
+        if (g1 & oiMask) {
+            result = decodeBus(g1);
+            GPIO.out_w1tc = clkMask;
+            break;
+        }
+        GPIO.out_w1tc = clkMask;
+        delayMicroseconds(1);
+        uint32_t g2 = GPIO.in;
+        if (g2 & oiMask) {
+            result = decodeBus(g2);
+            break;
+        }
+    }
+
+    pinMode(PIN_CLK, INPUT);
+    disableOutput();
+    digitalWrite(PIN_DIR, HIGH);
+    busSetOutput();
+    enableOutput();
+    return result;
+}
+
+static bool runUploadedUntilHalt(int maxCycles) {
+    disableClock();
+    resetPulse();
+    enableCU();
+
+    stopCustomClock();
+    detachOIMonitorForManualRun();
+
+    busSetInput();
+    disableOutput();
+    digitalWrite(PIN_DIR, LOW);
+    enableOutput();
+
+    int clkGpio = digitalPinToGPIONumber(PIN_CLK);
+    uint32_t clkMask = 1 << clkGpio;
+    pinMode(PIN_CLK, OUTPUT);
+    digitalWrite(PIN_CLK, LOW);
+
+    bool halted = false;
+    for (int i = 0; i < maxCycles; i++) {
+        if ((i & 0x3FFF) == 0) yield();
+        GPIO.out_w1ts = clkMask;
+        delayMicroseconds(1);
+        uint32_t g1 = GPIO.in;
+        if (i > 4 && hltOpcodeObserved(g1)) {
+            halted = true;
+            GPIO.out_w1tc = clkMask;
+            break;
+        }
+        GPIO.out_w1tc = clkMask;
+        delayMicroseconds(1);
+        uint32_t g2 = GPIO.in;
+        if (i > 4 && hltOpcodeObserved(g2)) {
+            halted = true;
+            break;
+        }
+    }
+
+    pinMode(PIN_CLK, INPUT);
+    disableOutput();
+    digitalWrite(PIN_DIR, HIGH);
+    busSetOutput();
+    enableOutput();
+    return halted;
 }
 
 // ── Web handlers ─────────────────────────────────────────────────────
@@ -1724,7 +1860,7 @@ static void handleSerialCommand(const String& line) {
         if (nops > 10000) nops = 10000;
 
         stopCustomClock();
-        if (oiMonitorActive) detachInterrupt(digitalPinToInterrupt(PIN_OI));
+        detachOIMonitorForManualRun();
         outputCaptured = false;
         oiCount = 0;
 
@@ -1818,7 +1954,7 @@ static void handleSerialCommand(const String& line) {
         if (maxoi < 0) maxoi = 0;
 
         stopCustomClock();
-        if (oiMonitorActive) detachInterrupt(digitalPinToInterrupt(PIN_OI));
+        detachOIMonitorForManualRun();
         outputCaptured = false;
         oiCount = 0;
 
@@ -1930,6 +2066,55 @@ static void handleSerialCommand(const String& line) {
             Serial.println("{\"ok\":false,\"error\":\"temp read failed\"}");
         }
     }
+    else if (line.startsWith("RTCREG")) {
+        int reg = 0x0F;
+        int sp = line.indexOf(' ');
+        if (sp >= 0) reg = strtol(line.substring(sp + 1).c_str(), nullptr, 0);
+        Serial.printf("RTCREG: reading 0x%02X\n", reg & 0xFF);
+        Serial.flush();
+        int val = readDS3231Reg((uint8_t)reg);
+        Serial.printf("{\"ok\":%s,\"reg\":%d,\"val\":%d}\n",
+            val >= 0 ? "true" : "false", reg & 0xFF, val);
+    }
+    else if (line == "BOOTLCD") {
+        Serial.println("BOOTLCD: scan");
+        Serial.flush();
+        bool lcdFound = (runI2CScanAddr(0x3E) == 1);
+        Serial.printf("BOOTLCD: lcd_found=%s\n", lcdFound ? "true" : "false");
+        Serial.flush();
+        int rtcStatus = -1;
+        int rtcHour = -1;
+        int rtcMin = -1;
+        if (lcdFound) {
+            Serial.println("BOOTLCD: rtc_status");
+            Serial.flush();
+            rtcStatus = readDS3231Reg(0x0F);
+            if (rtcStatus >= 0 && (rtcStatus & 0x80) == 0) {
+                Serial.println("BOOTLCD: rtc_time");
+                Serial.flush();
+                rtcHour = readDS3231Reg(0x02);
+                rtcMin = readDS3231Reg(0x01);
+            }
+        }
+        Serial.println("BOOTLCD: temp");
+        Serial.flush();
+        int tempC = readDS3231Temp();
+        bool rtcSet = rtcStatus >= 0 && (rtcStatus & 0x80) == 0 &&
+                      rtcHour >= 0 && rtcMin >= 0;
+        bool lcdOk = false;
+        if (tempC >= 0 && lcdFound) {
+            Serial.println("BOOTLCD: lcd_update");
+            Serial.flush();
+            lcdOk = updateBootLCD(tempC, rtcSet, (uint8_t)rtcHour, (uint8_t)rtcMin);
+            readDS3231Temp();  // restore visible out() after LCD completion marker
+        }
+        Serial.printf("{\"ok\":%s,\"lcd_found\":%s,\"lcd_ok\":%s,\"rtc_set\":%s,\"temp\":%d,\"rtc_status\":%d,\"hour\":%d,\"minute\":%d}\n",
+            (tempC >= 0 && (!lcdFound || lcdOk)) ? "true" : "false",
+            lcdFound ? "true" : "false",
+            lcdOk ? "true" : "false",
+            rtcSet ? "true" : "false",
+            tempC, rtcStatus, rtcHour, rtcMin);
+    }
     else if (line == "NTPSYNC") {
         // Force NTP resync + RTC set + temperature display
         if (!staMode) {
@@ -2040,7 +2225,7 @@ static void handleSerialCommand(const String& line) {
                     uploadToMK1(uploadBuf, uploadSize);
                     // Run RTC set
                     stopCustomClock();
-                    if (oiMonitorActive) detachInterrupt(digitalPinToInterrupt(PIN_OI));
+                    detachOIMonitorForManualRun();
                     int clkGpio = digitalPinToGPIONumber(PIN_CLK);
                     uint32_t clkMask = 1 << clkGpio;
                     int oiGpio = digitalPinToGPIONumber(PIN_OI);
@@ -2123,7 +2308,7 @@ static void handleSerialCommand(const String& line) {
         if (us < 0) us = 0;
 
         stopCustomClock();
-        if (oiMonitorActive) detachInterrupt(digitalPinToInterrupt(PIN_OI));
+        detachOIMonitorForManualRun();
         outputCaptured = false;
         oiCount = 0;
 
@@ -2370,10 +2555,7 @@ static void writeEepromData(const uint8_t* data, int size) {
         // Run shim — replicate serial RUN handler exactly
         stopCustomClock();
         // Detach OI ISR only (don't call stopOIMonitor which reconfigures bus)
-        if (oiMonitorActive) {
-            detachInterrupt(digitalPinToInterrupt(PIN_OI));
-            oiMonitorActive = false;
-        }
+        detachOIMonitorForManualRun();
 
         busSetInput();
         disableOutput();
@@ -2524,7 +2706,7 @@ static int readDS3231Temp() {
 
     // RUN (same as serial RUN handler — stop on first OI)
     stopCustomClock();
-    if (oiMonitorActive) detachInterrupt(digitalPinToInterrupt(PIN_OI));
+    detachOIMonitorForManualRun();
     outputCaptured = false;
     oiCount = 0;
 
@@ -2544,6 +2726,7 @@ static int readDS3231Temp() {
 
     int tempVal = -1;
     for (int i = 0; i < 50000; i++) {
+        if ((i & 0x3FFF) == 0) yield();
         GPIO.out_w1ts = clkMask;
         delayMicroseconds(1);
         uint32_t gpio1 = GPIO.in;
@@ -2565,6 +2748,540 @@ static int readDS3231Temp() {
     busSetOutput(); enableOutput();
 
     return tempVal;
+}
+
+static int readDS3231Reg(uint8_t reg) {
+    char asmBuf[4096];
+    int asmLen = snprintf(asmBuf, sizeof(asmBuf),
+        "; DS3231 register read 0x%02X (auto-generated)\n"
+        "    ldi $d, 0\n"
+        ".dly:\n"
+        "    dec\n"
+        "    jnz .dly\n"
+        "    clr $a\n"
+        "    exw 0 0\n"
+        "    ddrb_imm 0x00\n"
+        "    clr $a\n"
+        "    exw 0 3\n"
+        "    ddrb_imm 0x03\n"
+        "    ddrb_imm 0x01\n"
+        "    ddrb_imm 0x00\n"
+        "    jal __i2c_st\n"
+        "    ldi $a, 0xD0\n"
+        "    jal __i2c_sb\n"
+        "    ldi $a, 0x%02X\n"
+        "    jal __i2c_sb\n"
+        "    jal __i2c_sp\n"
+        "    jal __i2c_st\n"
+        "    ldi $a, 0xD1\n"
+        "    jal __i2c_sb\n"
+        "    jal __i2c_rb\n"
+        "    ddrb_imm 0x02\n"
+        "    ddrb_imm 0x00\n"
+        "    ddrb_imm 0x03\n"
+        "    ddrb_imm 0x01\n"
+        "    ddrb_imm 0x00\n"
+        "    mov $d, $a\n"
+        "    out\n"
+        "    hlt\n"
+        "__i2c_st:\n"
+        "    exrw 2\n"
+        "    ddrb_imm 0x01\n"
+        "    ddrb_imm 0x03\n"
+        "    ret\n"
+        "__i2c_sp:\n"
+        "    ddrb_imm 0x03\n"
+        "    ddrb_imm 0x01\n"
+        "    ddrb_imm 0x00\n"
+        "    ret\n"
+        "__i2c_sb:\n"
+        "    mov $a, $b\n"
+        "    ldi $a, 8\n"
+        "    mov $a, $c\n"
+        ".isb:\n"
+        "    mov $b, $a\n"
+        "    tst 0x80\n"
+        "    jnz .isbh\n"
+        "    ddrb_imm 0x03\n"
+        "    ddrb_imm 0x01\n"
+        "    ddrb_imm 0x03\n"
+        "    j .isbn\n"
+        ".isbh:\n"
+        "    ddrb_imm 0x02\n"
+        "    ddrb_imm 0x00\n"
+        "    ddrb_imm 0x02\n"
+        ".isbn:\n"
+        "    mov $b, $a\n"
+        "    sll\n"
+        "    mov $a, $b\n"
+        "    mov $c, $a\n"
+        "    dec\n"
+        "    mov $a, $c\n"
+        "    jnz .isb\n"
+        "    ddrb_imm 0x02\n"
+        "    ddrb_imm 0x00\n"
+        "    exrw 0\n"
+        "    ddrb_imm 0x02\n"
+        "    ret\n"
+        "__i2c_rb:\n"
+        "    ldi $b, 0\n"
+        "    ldi $d, 8\n"
+        ".rb:\n"
+        "    mov $b, $a\n"
+        "    sll\n"
+        "    mov $a, $b\n"
+        "    ddrb_imm 0x00\n"
+        "    exrw 0\n"
+        "    tst 0x01\n"
+        "    jz .rz\n"
+        "    mov $b, $a\n"
+        "    ori 0x01, $a\n"
+        "    mov $a, $b\n"
+        ".rz:\n"
+        "    ddrb_imm 0x02\n"
+        "    mov $d, $a\n"
+        "    dec\n"
+        "    mov $a, $d\n"
+        "    jnz .rb\n"
+        "    mov $b, $d\n"
+        "    ret\n",
+        reg, reg
+    );
+
+    if (asmLen < 0 || asmLen >= (int)sizeof(asmBuf)) {
+        Serial.printf("RTC register 0x%02X program truncated\n", reg);
+        return -1;
+    }
+
+    assembler.assemble(asmBuf);
+    const AsmResult& r = assembler.result;
+    if (r.error_count != 0) {
+        Serial.printf("RTC register 0x%02X program assembly failed\n", reg);
+        return -1;
+    }
+    if (r.code_size > CODE_SIZE || r.data_size > DATA_SIZE ||
+        r.stack_size > DATA_SIZE || r.page3_size > DATA_SIZE) {
+        Serial.printf("RTC register 0x%02X program too large: code=%d data=%d stack=%d page3=%d\n",
+            reg, r.code_size, r.data_size, r.stack_size, r.page3_size);
+        return -1;
+    }
+
+    loadAsmResultForUpload(r);
+    uploadToMK1(uploadBuf, uploadSize);
+    return runUploadedUntilFirstOut(50000);
+}
+
+static bool bcdByteValid(uint8_t v, uint8_t maxVal) {
+    uint8_t tens = (v >> 4) & 0x0F;
+    uint8_t ones = v & 0x0F;
+    if (tens > 9 || ones > 9) return false;
+    return (uint8_t)(tens * 10 + ones) <= maxVal;
+}
+
+// Boot LCD update is decomposed into a sequence of small, self-contained MK1
+// programs ("snippets"). Each snippet sets up the VIA, performs a few I2C
+// transactions to the DFRobot RGB V2.0 module, then emits 0xDD and halts so
+// the ESP32 has a per-step ack. This avoids the overlay/dual-section regime
+// that the compiler uses to pack large LCD programs into 256 bytes — the
+// boot path has no competing user code, so each snippet fits flat in page 0.
+//
+// The I2C primitives below mirror the proven sequence in readDS3231Temp().
+
+#define BOOT_LCD_I2C_HELPERS_ASM \
+    "__i2c_st:\n" \
+    "    exrw 2\n" \
+    "    ddrb_imm 0x01\n" \
+    "    ddrb_imm 0x03\n" \
+    "    ret\n" \
+    "__i2c_sp:\n" \
+    "    ddrb_imm 0x03\n" \
+    "    ddrb_imm 0x01\n" \
+    "    ddrb_imm 0x00\n" \
+    "    ret\n" \
+    "__i2c_sb:\n" \
+    "    mov $a, $b\n" \
+    "    ldi $a, 8\n" \
+    "    mov $a, $c\n" \
+    ".isb:\n" \
+    "    mov $b, $a\n" \
+    "    tst 0x80\n" \
+    "    jnz .isbh\n" \
+    "    ddrb_imm 0x03\n" \
+    "    ddrb_imm 0x01\n" \
+    "    ddrb_imm 0x03\n" \
+    "    j .isbn\n" \
+    ".isbh:\n" \
+    "    ddrb_imm 0x02\n" \
+    "    ddrb_imm 0x00\n" \
+    "    ddrb_imm 0x02\n" \
+    ".isbn:\n" \
+    "    mov $b, $a\n" \
+    "    sll\n" \
+    "    mov $a, $b\n" \
+    "    mov $c, $a\n" \
+    "    dec\n" \
+    "    mov $a, $c\n" \
+    "    jnz .isb\n" \
+    "    ddrb_imm 0x02\n" \
+    "    ddrb_imm 0x00\n" \
+    "    exrw 0\n" \
+    "    ddrb_imm 0x02\n" \
+    "    ret\n"
+
+#define BOOT_LCD_VIA_PROLOGUE_ASM \
+    "    ldi $d, 0\n" \
+    ".dly:\n" \
+    "    dec\n" \
+    "    jnz .dly\n" \
+    "    clr $a\n" \
+    "    exw 0 0\n" \
+    "    ddrb_imm 0x00\n" \
+    "    clr $a\n" \
+    "    exw 0 3\n" \
+    "    ddrb_imm 0x03\n" \
+    "    ddrb_imm 0x01\n" \
+    "    ddrb_imm 0x00\n"
+
+// Generic snippet runner: returns the first out() value (0..255) or -1 on
+// assembly/upload/timeout failure. Use this when the snippet emits a value
+// the caller wants to inspect (e.g. calibration). For ack-style snippets
+// that emit 0xDD on success, prefer runBootLCDSnippet().
+static int runBootSnippet(const char* asmSrc, const char* tag, int maxCycles) {
+    assembler.assemble(asmSrc);
+    const AsmResult& r = assembler.result;
+    if (r.error_count != 0) {
+        Serial.printf("Boot %s: assembly failed (%d errors)\n", tag, r.error_count);
+        return -1;
+    }
+    if (r.code_size > CODE_SIZE) {
+        Serial.printf("Boot %s: code too large (%d > %d)\n",
+                      tag, r.code_size, CODE_SIZE);
+        return -1;
+    }
+    loadAsmResultForUpload(r);
+    uploadToMK1(uploadBuf, uploadSize);
+    return runUploadedUntilFirstOut(maxCycles);
+}
+
+static bool runBootLCDSnippet(const char* asmSrc, const char* tag, int maxCycles) {
+    int result = runBootSnippet(asmSrc, tag, maxCycles);
+    if (result != 0xDD) {
+        Serial.printf("Boot %s: ack mismatch (expected 0xDD, got %d)\n", tag, result);
+        return false;
+    }
+    return true;
+}
+
+// Cached MK1 clock calibration (blocks = MK1_clock / 4608). Set on first
+// successful runBootCalibSnippet(). Stable across the session because the
+// MK1 clock source doesn't change at runtime; if it ever does, callers can
+// re-run with forceRecalibrate=true.
+static int g_calibBlocks = 0;
+
+// Run __delay_cal: configure DS3231 SQW=1Hz, sync to a rising edge, count
+// 256-iter (dec+jnz) blocks during the 500ms HIGH phase. Emits the block
+// count via out() and halts. Mirrors mk1cc2.py:__delay_cal exactly so the
+// runtime cycle math (9 cycles per inner iter, blocks = F/4608) holds.
+static int runBootCalibSnippet(bool forceRecalibrate = false) {
+    if (g_calibBlocks > 0 && !forceRecalibrate) return g_calibBlocks;
+
+    static const char* CALIB_ASM =
+        "; Boot calibration (DS3231 SQW 1Hz HIGH-phase block count)\n"
+        BOOT_LCD_VIA_PROLOGUE_ASM
+        // DS3231 register 0x0E = 0x00 → SQW out, 1 Hz.
+        "    jal __i2c_st\n"
+        "    ldi $a, 0xD0\n    jal __i2c_sb\n"
+        "    ldi $a, 0x0E\n    jal __i2c_sb\n"
+        "    clr $a\n          jal __i2c_sb\n"
+        "    jal __i2c_sp\n"
+        // PA0 reads SQW.
+        "    ddra_imm 0x00\n"
+        // Sync: wait for LOW (.s1) then rising edge (.s2 → HIGH).
+        ".s1:\n"
+        "    exrw 1\n"
+        "    tst 0x01\n"
+        "    jz .s2\n"
+        "    j .s1\n"
+        ".s2:\n"
+        "    exrw 1\n"
+        "    tst 0x01\n"
+        "    jnz .cal\n"
+        "    j .s2\n"
+        // Calibrate: count 256-iter (dec+jnz) blocks while SQW is HIGH.
+        ".cal:\n"
+        "    ldi $b, 0\n"
+        "    clr $a\n"
+        ".chi:\n"
+        "    dec\n"
+        "    jnz .chi\n"
+        "    mov $b, $a\n"      // A = B (current block count)
+        "    inc\n"               // A = B + 1
+        "    mov $a, $b\n"      // B = A
+        "    exrw 1\n"
+        "    tst 0x01\n"
+        "    jz .cdn\n"
+        "    clr $a\n"
+        "    j .chi\n"
+        ".cdn:\n"
+        "    mov $b, $a\n"      // A = B (final blocks)
+        "    out\n"
+        "    hlt\n"
+        BOOT_LCD_I2C_HELPERS_ASM;
+
+    // Up to ~600ms of MK1 cycles for the SQW sync + 500ms HIGH phase + I2C
+    // setup. At ~500kHz (max realistic) that's ~300k cycles; budget 4M.
+    int result = runBootSnippet(CALIB_ASM, "calib", 4000000);
+    if (result <= 0 || result > 255) {
+        Serial.printf("Boot calib: invalid blocks (%d) — DS3231 SQW unreachable?\n",
+                      result);
+        return -1;
+    }
+    Serial.printf("Boot calib: blocks=%d (≈%d Hz MK1 clock)\n",
+                  result, result * 4608);
+    g_calibBlocks = result;
+    return result;
+}
+
+static bool runBootLCDInitSnippet(uint8_t r, uint8_t g, uint8_t b) {
+    static char asmBuf[6000];
+    int n = snprintf(asmBuf, sizeof(asmBuf),
+        "; Boot LCD init snippet (DFRobot RGB V2.0: AiP31068L 0x3E + PCA9633 0x2D)\n"
+        BOOT_LCD_VIA_PROLOGUE_ASM
+        // Power-on settle ~30ms (30 * 256 inner dec/jnz iterations).
+        "    ldi $c, 30\n"
+        ".po_o:\n"
+        "    ldi $a, 0\n"
+        ".po_i:\n"
+        "    dec\n"
+        "    jnz .po_i\n"
+        "    decc\n"
+        "    jnz .po_o\n"
+        // Function Set 0x38: 8-bit, 2-line, 5x8 dots
+        "    jal __i2c_st\n"
+        "    ldi $a, 0x7C\n    jal __i2c_sb\n"
+        "    ldi $a, 0x80\n    jal __i2c_sb\n"
+        "    ldi $a, 0x38\n    jal __i2c_sb\n"
+        "    jal __i2c_sp\n"
+        // Display ON 0x0C: display on, cursor off, blink off
+        "    jal __i2c_st\n"
+        "    ldi $a, 0x7C\n    jal __i2c_sb\n"
+        "    ldi $a, 0x80\n    jal __i2c_sb\n"
+        "    ldi $a, 0x0C\n    jal __i2c_sb\n"
+        "    jal __i2c_sp\n"
+        // Clear Display 0x01
+        "    jal __i2c_st\n"
+        "    ldi $a, 0x7C\n    jal __i2c_sb\n"
+        "    ldi $a, 0x80\n    jal __i2c_sb\n"
+        "    ldi $a, 0x01\n    jal __i2c_sb\n"
+        "    jal __i2c_sp\n"
+        // Post-clear settle ~3ms
+        "    ldi $c, 5\n"
+        ".cl_o:\n"
+        "    ldi $a, 0\n"
+        ".cl_i:\n"
+        "    dec\n"
+        "    jnz .cl_i\n"
+        "    decc\n"
+        "    jnz .cl_o\n"
+        // Entry Mode 0x06: increment, no shift
+        "    jal __i2c_st\n"
+        "    ldi $a, 0x7C\n    jal __i2c_sb\n"
+        "    ldi $a, 0x80\n    jal __i2c_sb\n"
+        "    ldi $a, 0x06\n    jal __i2c_sb\n"
+        "    jal __i2c_sp\n"
+        // PCA9633 V2.0 @ 0x2D: R=0x01, G=0x02, B=0x03
+        "    jal __i2c_st\n"
+        "    ldi $a, 0x5A\n    jal __i2c_sb\n"
+        "    ldi $a, 0x01\n    jal __i2c_sb\n"
+        "    ldi $a, %u\n      jal __i2c_sb\n"
+        "    jal __i2c_sp\n"
+        "    jal __i2c_st\n"
+        "    ldi $a, 0x5A\n    jal __i2c_sb\n"
+        "    ldi $a, 0x02\n    jal __i2c_sb\n"
+        "    ldi $a, %u\n      jal __i2c_sb\n"
+        "    jal __i2c_sp\n"
+        "    jal __i2c_st\n"
+        "    ldi $a, 0x5A\n    jal __i2c_sb\n"
+        "    ldi $a, 0x03\n    jal __i2c_sb\n"
+        "    ldi $a, %u\n      jal __i2c_sb\n"
+        "    jal __i2c_sp\n"
+        "    out_imm 0xDD\n"
+        "    hlt\n"
+        BOOT_LCD_I2C_HELPERS_ASM,
+        r, g, b);
+    if (n < 0 || n >= (int)sizeof(asmBuf)) {
+        Serial.println("Boot LCD init: snippet truncated");
+        return false;
+    }
+    return runBootLCDSnippet(asmBuf, "init", 1500000);
+}
+
+static bool runBootLCDLineSnippet(uint8_t setAddrCmd, const uint8_t* chars,
+                                  int count, const char* tag) {
+    if (count < 1 || count > 16) return false;
+
+    static char asmBuf[6000];
+    int written = snprintf(asmBuf, sizeof(asmBuf),
+        "; Boot LCD line snippet (set DDRAM addr cmd 0x%02X then %d chars)\n"
+        BOOT_LCD_VIA_PROLOGUE_ASM
+        // Set DDRAM address (cmd byte): write LCD command 0x80 | addr
+        "    jal __i2c_st\n"
+        "    ldi $a, 0x7C\n    jal __i2c_sb\n"
+        "    ldi $a, 0x80\n    jal __i2c_sb\n"
+        "    ldi $a, %u\n      jal __i2c_sb\n"
+        "    jal __i2c_sp\n",
+        setAddrCmd, count, setAddrCmd);
+    if (written < 0 || written >= (int)sizeof(asmBuf)) return false;
+    char* p = asmBuf + written;
+    int remain = (int)sizeof(asmBuf) - written;
+
+    for (int i = 0; i < count; i++) {
+        int wr = snprintf(p, remain,
+            "    jal __i2c_st\n"
+            "    ldi $a, 0x7C\n    jal __i2c_sb\n"
+            "    ldi $a, 0x40\n    jal __i2c_sb\n"
+            "    ldi $a, %u\n      jal __i2c_sb\n"
+            "    jal __i2c_sp\n",
+            chars[i]);
+        if (wr < 0 || wr >= remain) return false;
+        p += wr; remain -= wr;
+    }
+
+    int wr = snprintf(p, remain,
+        "    out_imm 0xDD\n"
+        "    hlt\n"
+        BOOT_LCD_I2C_HELPERS_ASM);
+    if (wr < 0 || wr >= remain) {
+        Serial.printf("Boot LCD %s: snippet truncated\n", tag);
+        return false;
+    }
+
+    return runBootLCDSnippet(asmBuf, tag, 1000000);
+}
+
+// Boot beep: play a square wave on PA1 via the same primitive as Twinkle's
+// __tone. Self-calibrating — uses runBootCalibSnippet() to obtain blocks
+// (= MK1_clock / 4608), then derives the per-half-period inner-loop count
+// from the cycle math. Best-effort — failure does not fail updateBootLCD
+// because the LCD content is already written.
+//
+// Duty cycle: __tone's outer-loop tail (16-bit period decrement, 15 cycles)
+// runs while PA1 is LOW, making the LOW half 14 cycles longer than HIGH:
+//
+//   HIGH half =  1 (exw rest) + 3 (mov)  + 9*N + 5 (clr) + 3 (exw setup) = 12 + 9N
+//   LOW  half =  1            + 3        + 9*N + 15 (tail) + 4 (ldi) + 3 = 26 + 9N
+//
+// To restore 50% duty we pad HIGH with exactly 14 cycles of A-preserving
+// instructions (`nop nop nop tst 0` = 3+3+3+5). Pad size is constant — it
+// matches the structural LOW-side overhead and is independent of clock and
+// frequency. Per-period cost becomes 18*innerCount + 52.
+//
+// Solving for innerCount given target freqHz and clock F:
+//   period_cycles = F / freqHz = 18*innerCount + 52
+//   innerCount    = (F/freqHz - 52) / 18
+//
+// Substituting F = blocks * 4608:
+//   innerCount    = (blocks * 4608/freqHz - 52) / 18
+//                 = blocks * 256 / freqHz  -  52/18
+//                 ≈ blocks * 256 / freqHz  -  3
+static bool runBootBeepSnippet(int freqHz, int durationMs) {
+    if (freqHz <= 0 || durationMs <= 0) return false;
+
+    int blocks = runBootCalibSnippet();
+    if (blocks <= 0) {
+        Serial.println("Boot beep: skipped (calibration failed)");
+        return false;
+    }
+
+    int innerCount = (blocks * 256 + freqHz / 2) / freqHz - 3;
+    if (innerCount < 1)   innerCount = 1;
+    if (innerCount > 255) innerCount = 255;
+
+    // totalPeriods = freq * duration_ms / 1000  (clock-independent)
+    int totalPeriods = (durationMs * freqHz + 500) / 1000;
+    if (totalPeriods < 1)     totalPeriods = 1;
+    if (totalPeriods > 65535) totalPeriods = 65535;
+    int periodsLow  = totalPeriods & 0xFF;
+    int periodsHigh = (totalPeriods >> 8) & 0xFF;
+
+    static char asmBuf[3000];
+    int n = snprintf(asmBuf, sizeof(asmBuf),
+        "; Boot beep (PA1 square wave, %d Hz / %d ms; blocks=%d innerCount=%d periods=%d)\n"
+        BOOT_LCD_VIA_PROLOGUE_ASM
+        "    ddra_imm 0x02\n"
+        "    ldi $a, %u\n    mov $a, $c\n"
+        "    ldi $a, %u\n    mov $a, $b\n"
+        "    ldi $a, %u\n    mov $a, $d\n"
+        "    jal __tone\n"
+        "    out_imm 0xDD\n"
+        "    hlt\n"
+        "__tone:\n"
+        ".tloop:\n"
+        "    ldi $a, 0x02\n"
+        "    exw 0 1\n"
+        "    mov $c, $a\n"
+        ".thi:\n"
+        "    dec\n"
+        "    jnz .thi\n"
+        "    nop\n"             // duty-cycle pad: 14 cycles to balance the
+        "    nop\n"             // LOW-side outer-tail. Constant — independent
+        "    nop\n"             // of MK1 clock and target frequency. None of
+        "    tst 0\n"           // these instructions clobber $a.
+        "    clr $a\n"
+        "    exw 0 1\n"
+        "    mov $c, $a\n"
+        ".tlo:\n"
+        "    dec\n"
+        "    jnz .tlo\n"
+        "    mov $b, $a\n"
+        "    dec\n"
+        "    mov $a, $b\n"
+        "    jnz .tloop\n"
+        "    mov $d, $a\n"
+        "    tst 0xFF\n"
+        "    jz .tdn\n"
+        "    decd\n"
+        "    j .tloop\n"
+        ".tdn:\n"
+        "    ret\n",
+        freqHz, durationMs, blocks, innerCount, totalPeriods,
+        innerCount, periodsLow, periodsHigh);
+    if (n < 0 || n >= (int)sizeof(asmBuf)) {
+        Serial.println("Boot beep: snippet truncated");
+        return false;
+    }
+
+    int toneCycles = totalPeriods * (18 * innerCount + 52);
+    int maxCycles  = toneCycles + 5000;
+    if (maxCycles > 5000000) maxCycles = 5000000;
+
+    return runBootLCDSnippet(asmBuf, "beep", maxCycles);
+}
+
+static bool updateBootLCD(int tempC, bool rtcSet, uint8_t hourBcd, uint8_t minBcd) {
+    uint8_t timeChars[5] = {' ', ' ', ' ', ' ', ' '};
+    if (rtcSet && bcdByteValid(hourBcd, 23) && bcdByteValid(minBcd, 59)) {
+        timeChars[0] = '0' + ((hourBcd >> 4) & 0x0F);
+        timeChars[1] = '0' + (hourBcd & 0x0F);
+        timeChars[2] = ':';
+        timeChars[3] = '0' + ((minBcd >> 4) & 0x0F);
+        timeChars[4] = '0' + (minBcd & 0x0F);
+    }
+
+    uint8_t tempChars[4] = {'?', '?', 0xDF, 'C'};
+    if (tempC >= 0 && tempC <= 99) {
+        tempChars[0] = tempC >= 10 ? ('0' + (tempC / 10)) : ' ';
+        tempChars[1] = '0' + (tempC % 10);
+    } else if (tempC < 0 && tempC >= -9) {
+        tempChars[0] = '-';
+        tempChars[1] = '0' + (-tempC);
+    }
+
+    if (!runBootLCDInitSnippet(0xFF, 0xFF, 0xFF)) return false;
+    if (!runBootLCDLineSnippet(0x80, timeChars, 5, "time")) return false;
+    if (!runBootLCDLineSnippet(0x8C, tempChars, 4, "temp")) return false;
+    runBootBeepSnippet(896, 200);  // best-effort PC-style boot beep
+    return true;
 }
 
 // ── Setup & Loop ─────────────────────────────────────────────────────
@@ -2753,7 +3470,7 @@ void setup() {
 
                 // Run at 500kHz (us=1) — enough cycles for VIA init + I2C write
                 stopCustomClock();
-                if (oiMonitorActive) detachInterrupt(digitalPinToInterrupt(PIN_OI));
+                detachOIMonitorForManualRun();
                 outputCaptured = false;
                 oiCount = 0;
 
@@ -2805,11 +3522,38 @@ void setup() {
         }
     }
 
-    // ── Always read DS3231 temperature on boot ───────────────────────
+    // ── Boot status display ──────────────────────────────────────────
     {
+        bool lcdFound = (runI2CScanAddr(0x3E) == 1);
+        int rtcStatus = -1;
+        int rtcHour = -1;
+        int rtcMin = -1;
+
+        if (lcdFound) {
+            rtcStatus = readDS3231Reg(0x0F);  // DS3231 OSF bit marks unset/lost time
+            if (rtcStatus >= 0 && (rtcStatus & 0x80) == 0) {
+                rtcHour = readDS3231Reg(0x02);
+                rtcMin = readDS3231Reg(0x01);
+            }
+        }
+
+        // Keep this after the probe/register reads: those use out() for the
+        // ESP32 harness, and the boot-visible out() value should remain temp.
         int tempC = readDS3231Temp();
         if (tempC >= 0) {
             Serial.printf("DS3231 temperature: %d°C (on 7-seg)\n", tempC);
+            if (lcdFound) {
+                bool rtcSet = rtcStatus >= 0 && (rtcStatus & 0x80) == 0 &&
+                              rtcHour >= 0 && rtcMin >= 0;
+                bool lcdOk = updateBootLCD(tempC, rtcSet,
+                                           (uint8_t)rtcHour, (uint8_t)rtcMin);
+                readDS3231Temp();  // restore visible out() after LCD completion marker
+                Serial.printf("Boot LCD status: %s%s\n",
+                    lcdOk ? "OK" : "FAIL",
+                    rtcSet ? "" : " (RTC time unset)");
+            } else {
+                Serial.println("Boot LCD status: not found at 0x3E");
+            }
         } else {
             Serial.println("DS3231 temperature read failed");
         }
