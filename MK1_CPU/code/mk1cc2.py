@@ -28,6 +28,43 @@ if os.environ.get('PYTHONHASHSEED') != '0':
     os.execvpe(sys.executable, [sys.executable, __file__] + sys.argv[1:], env)
 
 import re, argparse
+from collections import namedtuple
+
+# ── Kernel-state allocator ───────────────────────────────────────────
+# Single source of truth for memory offsets used by runtime helpers
+# (calibration constants, one-shot guards, kernel counters). Replaces
+# the previous pattern of hardcoding magic numbers like `240`, `241`,
+# `242` in multiple emission sites and assuming non-collision by
+# inspection.
+#
+# To add a new entry: pick a free offset on the chosen page, register
+# it here with `owner` and `description` set, then reference it via
+# the convenience alias below. The matching C header for the ESP32
+# firmware lives at `mk1_esp32_uploader/src/kernel_state.h` — keep
+# the two in sync (only three entries today; trivial to maintain).
+
+KSlot = namedtuple('KSlot', ['page', 'offset', 'size', 'owner', 'description'])
+
+KERNEL_STATE = {
+    'calib_blocks': KSlot(
+        page=3, offset=240, size=1, owner='__delay_cal',
+        description='F/4608 — DS3231 SQW HIGH-phase block count, '
+                    'consumed by __delay_Nms and __tone_setup'),
+    'tone_precomp_done': KSlot(
+        page=3, offset=241, size=1, owner='__tone_precompute',
+        description='one-shot guard: non-zero means the note table '
+                    'has been converted from ratios to half_periods '
+                    'and a second precompute would corrupt it'),
+    'overlay_r2c_count': KSlot(
+        page=3, offset=242, size=1, owner='__eeprom_r2c_loop',
+        description='remaining-bytes counter for sequential I2C → '
+                    'code page reads (EEPROM overlay loader)'),
+}
+
+# Convenience aliases for f-string emission sites.
+K_CALIB_BLOCKS      = KERNEL_STATE['calib_blocks'].offset
+K_TONE_PRECOMP_DONE = KERNEL_STATE['tone_precomp_done'].offset
+K_OVERLAY_R2C_COUNT = KERNEL_STATE['overlay_r2c_count'].offset
 
 # ── Tokenizer (from mk1cc.py) ────────────────────────────────────────
 
@@ -2113,11 +2150,10 @@ class MK1CodeGen:
                     # on already-precomputed half_periods, cascading into
                     # garbage values — empirically observed as twinkle
                     # playing low/slow on the 2nd run and completely wrong
-                    # on the 3rd. page3[241] is zero on upload (only [240]
-                    # is touched by __delay_cal, [242] by __eeprom_r2c_loop)
+                    # on the 3rd. The kernel-state slot is zero on upload
                     # and persists across MK1 resets, making it a safe
                     # one-shot latch.
-                    '\tldi $a,241',
+                    f'\tldi $a,{K_TONE_PRECOMP_DONE}',
                     '\tderefp3',
                     '\ttst 0xFF',
                     '\tjnz .__tpc_already',
@@ -2143,7 +2179,7 @@ class MK1CodeGen:
                     f'\tcmpi {note_end}',
                     '\tjnz .__tpc_loop',
                     '\tldi $a,1',
-                    '\tldi $b,241',
+                    f'\tldi $b,{K_TONE_PRECOMP_DONE}',
                     '\tiderefp3',
                     '.__tpc_already:',
                     '\tret',
@@ -3294,8 +3330,8 @@ class MK1CodeGen:
             self.emit(f'\tj {lbl_chi}')
             self.emit(f'{lbl_done}:')
             self.emit('\tmov $b,$a')       # A = B (blocks during HIGH)
-            self.emit('\tldi $b,240')
-            self.emit('\tiderefp3')        # page3[240] = raw block count
+            self.emit(f'\tldi $b,{K_CALIB_BLOCKS}')
+            self.emit(f'\tiderefp3')       # page3[{K_CALIB_BLOCKS}] = raw block count
             # SQW left enabled — no coupling issue, saves ~20B
             self.emit('\tret')
 
@@ -3313,8 +3349,8 @@ class MK1CodeGen:
             lbl_outer = self.label('dms_o')
             lbl_inner = self.label('dms_i')
             self.emit('__delay_Nms:')
-            self.emit('\tldi $a,240')
-            self.emit('\tderefp3')         # A = raw blocks from page3[240]
+            self.emit(f'\tldi $a,{K_CALIB_BLOCKS}')
+            self.emit(f'\tderefp3')        # A = raw blocks from page3[{K_CALIB_BLOCKS}]
             # Scale: blocks is F/4608 (per 500 ms HIGH). We want the
             # inner loop's iters per ms to satisfy 9 × iters + 14 ≈ F/1000
             # where 14 is the outer-loop overhead per ms. That solves to
@@ -3341,8 +3377,8 @@ class MK1CodeGen:
             lbl_mul = self.label('tsmul')
             lbl_noc = self.label('tsnoc')
             self.emit('__tone_setup:')
-            self.emit('\tldi $a,240')
-            self.emit('\tderefp3')         # A = ipm from page3[240]
+            self.emit(f'\tldi $a,{K_CALIB_BLOCKS}')
+            self.emit(f'\tderefp3')        # A = ipm from page3[{K_CALIB_BLOCKS}]
             self.emit('\tmov $a,$c')       # C = ipm
             self.emit('\tldi $d,0')        # D = product high
             self.emit('\tclr $a')          # A = product low
@@ -3440,7 +3476,7 @@ class MK1CodeGen:
         if '__eeprom_r2c_loop' in helpers:
             lbl_loop = self.label('r2c')
             lbl_last = self.label('r2cl')
-            P3_COUNT = 242   # overlay byte count (page 3 kernel state)
+            P3_COUNT = K_OVERLAY_R2C_COUNT   # alias for local readability
             self.emit('__eeprom_r2c_loop:')
             # Entry: B = code dest, stack = [ret_addr, count, ...]
             # Save B (dest), store count to page3, restore B.
