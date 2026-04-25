@@ -591,15 +591,24 @@ TESTS = [
         interval_tolerance_pct=10,
     ),
     Test(
+        # Exercises BOTH paths through the LCD driver: the PCA9633
+        # backlight register-write (lcd_rgb) and the AiP31068L DDRAM
+        # path (printf → __lcd_print → __lcd_chr). printf compiles
+        # against the string-literal pool + repeated lcd_chr emission,
+        # so this test also gates the printf lowering. Visual
+        # confirmation is "MK1" at top-left with magenta backlight;
+        # the regression gate is the out(42) byte capture.
         'rgb lcd smoke test',
         '''void main(void) {
             i2c_init();
             lcd_init();
             lcd_rgb(255, 0, 255);
+            lcd_cmd(0x80);
+            printf("MK1");
             out(42);
             halt();
         }''',
-        [42], eeprom=True, cycles=200_000,
+        [42], eeprom=True, cycles=500_000,
     ),
     Test(
         # Issue #1: regparam in $a was elided (no save) for functions

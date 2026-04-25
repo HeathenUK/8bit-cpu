@@ -1562,20 +1562,20 @@ class MK1CodeGen:
                     out_stmts.append(rewrite_stmt(stmts[i + 8]))
                     i += 9
                     continue
-                if (i + 2 < len(stmts)
-                        and self._is_call_stmt(stmts[i], 'i2c_stop')
-                        and self._is_call_stmt(stmts[i + 1], 'i2c_start')
-                        and self._is_call_stmt(stmts[i + 2], 'i2c_send_byte')
-                        and 'i2c_stop' not in self.func_params
-                        and 'i2c_start' not in self.func_params
-                        and 'i2c_send_byte' not in self.func_params):
-                    addr = self._const_eval(stmts[i + 2][1][2][0]) if stmts[i + 2][1][2] else None
-                    if addr is not None and (addr & 1):
-                        # STOP + START + read-address can be a repeated START.
-                        # This matches the compiler's own RTC/EEPROM read
-                        # builtins and saves the STOP sequence.
-                        i += 1
-                        continue
+                # NOTE: a previous peephole here elided `i2c_stop(); i2c_start();
+                # i2c_send_byte(read_addr);` to just `i2c_start(); i2c_send_byte;`
+                # claiming this matched the compiler builtins' repeated-START
+                # behaviour. It didn't — the compiler's `i2c_start` emits
+                # `ddrb_imm 0x01` (SDA LOW, SCL HIGH) which expects the bus in
+                # idle state (both HIGH). Coming out of `__i2c_sb` the bus is
+                # `SDA released, SCL LOW`, so the simultaneous SCL-rise and
+                # SDA-fall in that ddrb write is not a clean START — slaves
+                # often miss it. The proven `readDS3231Temp` ESP32 program
+                # does keep the STOP. Removed; the savings (3 ddrb writes)
+                # don't justify the silent-miscompile risk on RTC/EEPROM
+                # reads. Surfaced by overlay_dashboard.c which explicitly
+                # codes `i2c_stop(); i2c_start();` and was producing
+                # garbage byte reads (consistent 0xFE) at run time.
                 s = stmts[i]
                 if s[0] != 'local' or s[2] is not None:
                     out_stmts.append(rewrite_stmt(s))
@@ -2382,11 +2382,17 @@ class MK1CodeGen:
                 self.emit(f'\tbyte {b}')
             self.emit('\tsection code')
 
-        # Emit lcd_print string data in page 3
+        # Emit lcd_print string data in page 1 (data section). Each
+        # string carries its own symbolic label `__str_N`; the
+        # assembler resolves it to the data-page offset where the
+        # bytes physically land. Storing in page 1 avoids the page-3
+        # kernel-image collision that the previous implementation
+        # silently produced.
         if hasattr(self, '_lcd_print_strings') and not getattr(self, '_init_extraction_done', False):
-            self.emit('\tsection page3')
-            for p3_off, s in self._lcd_print_strings:
-                self.emit(f'; string at page3 offset {p3_off}')
+            self.emit('\tsection data')
+            for label, s, d_off in self._lcd_print_strings:
+                self.emit(f'; string at data offset {d_off}')
+                self.emit(f'{label}:')
                 for ch in s:
                     self.emit(f'\tbyte {ord(ch)}')
                 self.emit('\tbyte 0')  # null terminator
@@ -2459,10 +2465,21 @@ class MK1CodeGen:
         # is generated later in _overlay_partition and isn't visible here).
         if getattr(self, 'eeprom_mode', False):
             refs.add('__i2c_sb')
-        # __lcd_send is reached via fall-through from __lcd_cmd — keep alive
-        # when __lcd_cmd is referenced (merge may make it a sub-label)
-        if '__lcd_cmd' in refs:
-            refs.add('__lcd_send')
+        # __lcd_send_raw is reached via fall-through from __lcd_cmd (and
+        # via `j __lcd_send_raw` from __lcd_chr) — keep alive when either
+        # is referenced. The 2026-04-24 LCD driver rewrite renamed the
+        # helper from `__lcd_send` to `__lcd_send_raw` but this dead-
+        # function-elimination guard wasn't updated, so the eliminator
+        # silently stripped the helper out of the final asm whenever
+        # __lcd_cmd / __lcd_chr lacked a direct call site (e.g. when
+        # the call goes through a fall-through path the scanner doesn't
+        # see). Symptom: lcd_cmd / lcd_char hung indefinitely on
+        # hardware because the resident __lcd_cmd body fell through into
+        # whatever code happened to be emitted next (typically `_main`,
+        # which then reset the stack pointer and recursed). Surfaced by
+        # rgb_lcd_smoke when expanded with lcd_cmd(0x80); printf("MK1").
+        if '__lcd_cmd' in refs or '__lcd_chr' in refs:
+            refs.add('__lcd_send_raw')
 
         # Identify function body ranges (global label to next global label)
         funcs = []  # (start, end, name)
@@ -2570,10 +2587,14 @@ class MK1CodeGen:
             return tuple(out)
 
         # Skip entry points and helpers reached by fall-through (not just jal).
-        # __lcd_send is reached via fall-through from __lcd_cmd, so merging its
+        # __lcd_send_raw is reached via fall-through from __lcd_cmd (and via
+        # an explicit `j __lcd_send_raw` from __lcd_chr), so merging its
         # body with another function would break the fall-through linkage.
+        # NB: stale name `__lcd_send` (pre-2026-04-24 driver rewrite) was
+        # left here too; both have been seen referenced in the codebase
+        # while the active emission target is `__lcd_send_raw`.
         SKIP = {'_main', '_overlay_load', '_overlay_load_p1',
-                '__lcd_send'}
+                '__lcd_send_raw'}
         body_by_sig = {}  # normalized body → canonical name
         rename_map = {}   # duplicate name → canonical name
         for name, start, end in funcs:
@@ -2808,7 +2829,7 @@ class MK1CodeGen:
         # PCA9633) drives the backlight via runtime I2C transactions and
         # therefore needs the same `__i2c_st_only` / `__i2c_sb` / `__i2c_sp`
         # primitives kept resident as the char/cmd path does.
-        runtime_i2c_markers = {'__lcd_chr', '__lcd_cmd', '__lcd_send', '__lcd_print',
+        runtime_i2c_markers = {'__lcd_chr', '__lcd_cmd', '__lcd_send_raw', '__lcd_print',
                                '__lcd_rgb',
                                '__eeprom_r2c_loop', '__eeprom_dispatch', '__eeprom_load'}
         self._needs_runtime_i2c = bool(helpers & runtime_i2c_markers)
@@ -2823,7 +2844,13 @@ class MK1CodeGen:
             for h in ('__lcd_chr', '__lcd_cmd', '__lcd_print'):
                 if h in helpers:
                     no_ov.add(f'{h}:')
-                    no_ov.add('__lcd_send:')  # shared by chr and cmd
+                    # __lcd_send_raw (renamed from __lcd_send during the
+                    # 2026-04-24 LCD driver rewrite) is reached via fall-
+                    # through from __lcd_cmd and an explicit jump from
+                    # __lcd_chr; if the partitioner treated it as
+                    # overlay-eligible the call site would jump into
+                    # whatever overlay happens to be loaded.
+                    no_ov.add('__lcd_send_raw:')
 
         # I2C byte-level helpers: resident if called from runtime code.
         # __i2c_sb and __i2c_rb are called from overlays + resident LCD code.
@@ -2880,8 +2907,8 @@ class MK1CodeGen:
         # __i2c_rb and __eeprom_rd are init-only (emitted in stage 1).
         if getattr(self, 'eeprom_mode', False):
             unconditional.add('__i2c_sb')
-        # __lcd_send's residency is handled by step 8b propagation (scans
-        # resident __lcd_cmd body for 'j __lcd_send' reference)
+        # __lcd_send_raw's residency is handled by step 8b propagation
+        # (scans resident __lcd_cmd body for 'j __lcd_send_raw' reference)
         for label in no_ov:
             name = label.rstrip(':')
             if name.startswith('__') and name not in unconditional:
@@ -3370,7 +3397,9 @@ class MK1CodeGen:
 
 
         if '__lcd_print' in helpers:
-            # Print null-terminated string from page 3. A = page3 offset.
+            # Print null-terminated string from page 1. A = page-1
+            # offset (resolved from a `__str_N` label by the assembler;
+            # the compiler never bakes a numeric offset).
             lbl_lp = self.label('lp_lp')
             lbl_dn = self.label('lp_dn')
             self.emit('__lcd_print:')
@@ -3378,7 +3407,7 @@ class MK1CodeGen:
             self.emit(f'{lbl_lp}:')
             self.emit('\tmov $d,$a')         # A = pointer
             self.emit('\tpush $a')           # save pointer
-            self.emit('\tderefp3')           # A = page3[pointer]
+            self.emit('\tderef')             # A = data[pointer]
             self.emit('\tcmp 0')             # null terminator?
             self.emit(f'\tjz {lbl_dn}')
             self.emit('\tmov $a,$d')         # D = char (for __lcd_chr)
@@ -4459,9 +4488,14 @@ class MK1CodeGen:
 
             # LCD init data — no emission needed here (stored in EEPROM)
             if hasattr(self, '_lcd_print_strings'):
-                if not any('section page3' in l for l in new_code[-5:]):
-                    new_code.append('\tsection page3')
-                for p3_off, s in self._lcd_print_strings:
+                # Strings live in page 1 with a per-string symbolic
+                # label (`__str_N`). See the codegen path in gen_expr's
+                # 'string' case for the rationale on why this isn't
+                # page 3 anymore.
+                if not any('section data' in l for l in new_code[-5:]):
+                    new_code.append('\tsection data')
+                for label, s, d_off in self._lcd_print_strings:
+                    new_code.append(f'{label}:')
                     for ch in s:
                         new_code.append(f'\tbyte {ord(ch)}')
                     new_code.append('\tbyte 0')  # null terminator
@@ -5185,7 +5219,8 @@ class MK1CodeGen:
                 suffix = f'_ov{oi}'
 
                 # Collect ALL __ labels defined in bundled helper bodies (including
-                # internal labels from fall-through merging, e.g., __lcd_send inside __lcd_cmd)
+                # internal labels from fall-through merging, e.g., __lcd_send_raw
+                # inside __lcd_cmd)
                 all_bundled_labels = set(all_needed)
                 for hname in sorted_for_ov:
                     hstart_b, _, hlines_b = helper_bodies[hname]
@@ -9134,21 +9169,35 @@ class MK1CodeGen:
                 self.emit(f'\tldi $a,{expr[1] & 0xFF}')
 
         elif kind == 'string':
-            # General string-literal codegen: emit the string into page 3 (null-
-            # terminated), return its page-3 offset in $a. Strings are deduped
-            # by content, and lcd_print's special-case path reuses this.
+            # General string-literal codegen: emit the string into page 1
+            # (data) null-terminated, return its page-1 offset in $a.
+            # Strings are deduped by content. The address is referenced
+            # by a symbolic label (`__str_N`) — the assembler resolves
+            # it at link time, so the compiler never bakes a magic
+            # numeric offset into `ldi $a, ...`.
+            #
+            # Why page 1 and not page 3: page 3's [0..KERNEL_SIZE-1]
+            # range is reserved for the kernel image (which gets
+            # self-copied to page 0 at boot). The original code
+            # allocated string offsets via `page3_alloc` starting at 0,
+            # which collided with the kernel image and corrupted the
+            # first 4 bytes of page 0 after self-copy. Page 1 has no
+            # such reserved area; data_alloc grows sequentially from 0
+            # alongside app globals / note table / lcd-init blocks.
             s = expr[1]
             if not hasattr(self, '_lcd_print_strings'):
                 self._lcd_print_strings = []
-            # dedupe: if the same string is already stored, reuse its offset
-            for off, existing in self._lcd_print_strings:
+            # Dedupe by content — reuse an existing label if the same
+            # string was already stored.
+            for label, existing, _off in self._lcd_print_strings:
                 if existing == s:
-                    self.emit(f'\tldi $a,{off}')
+                    self.emit(f'\tldi $a,{label}')
                     return
-            p3_off = self.page3_alloc
-            self._lcd_print_strings.append((p3_off, s))
-            self.page3_alloc += len(s) + 1
-            self.emit(f'\tldi $a,{p3_off}')
+            d_off = self.data_alloc
+            label = f'__str_{len(self._lcd_print_strings)}'
+            self._lcd_print_strings.append((label, s, d_off))
+            self.data_alloc += len(s) + 1
+            self.emit(f'\tldi $a,{label}')
 
         elif kind == 'var':
             name = expr[1]
@@ -9657,9 +9706,9 @@ class MK1CodeGen:
                 return
 
             if name == 'lcd_clear':
-                # HD44780 Clear Display (0x01) via __lcd_cmd (shares __lcd_send
-                # with __lcd_chr so almost free). Inline ~3ms delay avoids
-                # pulling in __delay_Nms/__delay_cal infrastructure.
+                # HD44780 Clear Display (0x01) via __lcd_cmd (shares
+                # __lcd_send_raw with __lcd_chr so almost free). Inline
+                # ~3ms delay avoids pulling in __delay_Nms / __delay_cal.
                 if not hasattr(self, '_lcd_helpers'):
                     self._lcd_helpers = set()
                 self._lcd_helpers.add('__lcd_cmd')
@@ -11694,6 +11743,7 @@ def main():
     code_bytes = 0
     data_bytes = 0
     p3_bytes = 0
+    stack_bytes = 0   # page 2 (stack page) — Phase 5 manifest + stack_code overlays
     eeprom_bytes = 0
     section = 'code'
     two_byte_set = {'ldsp','stsp','push_imm','jal','jc','jz','jnc','jnz','j','ldi',
@@ -11710,6 +11760,7 @@ def main():
         elif 'section eeprom' in s: section = 'eeprom'; continue
         elif 'section data_code' in s: section = 'data'; continue
         elif 'section stack_code' in s: section = 'stack'; continue
+        elif 'section stack' in s: section = 'stack'; continue
         elif 'section data' in s: section = 'data'; continue
         elif 'section code' in s: section = 'code'; continue
         if not s or s.endswith(':') or s.startswith(';'): continue
@@ -11729,6 +11780,7 @@ def main():
             b = 1
         if section == 'code': code_bytes += b
         elif section == 'data': data_bytes += b
+        elif section == 'stack': stack_bytes += b
         elif section in ('page3', 'page3_data'): p3_bytes += b
         elif section == 'eeprom': eeprom_bytes += b
 
@@ -11851,10 +11903,35 @@ def main():
     data_desc = f"{n_globals} globals" if n_globals else "allocated"
     print(f"  Page 1:     {data_runtime}B {data_desc}, {256 - data_runtime}B free  (data page)", file=sys.stderr)
 
-    print(f"  Page 2:     stack (grows down from 0xFF)", file=sys.stderr)
+    # Page 2 layout per the kernel-state allocator + page-2 partition
+    # refactor: bottom = page-2 overlay storage (data_size bytes for any
+    # `section stack_code` overlays placed there; 0 if all overlays
+    # fit in pages 1/3); kstate region 0x80..0xAF holds the kernel-
+    # state slots from KERNEL_STATE plus the overlay manifest+pages
+    # array; guard band 0xB0..0xBF; reserved stack 0xC0..0xFF (SP grows
+    # down from 0xFF; static analysis enforces depth ≤ 64 B). The
+    # `stack_size` field reported by the assembler covers everything
+    # written, so for a typical program it is `manifest_end` (= about
+    # 0x90 + meta_size bytes).
+    if overlay_mode:
+        # Distinguish whether anything actually lives at the page-2
+        # overlay slot vs only the manifest/kstate.
+        p2_overlay_present = stack_bytes > 0xB0  # anything past guard band would be unusual
+        p2_desc = "manifest + kstate" if stack_bytes else "stack only"
+        if p2_overlay_present and stack_bytes >= P2_OVERLAY_BYTES:
+            p2_desc = "overlays + manifest + kstate"
+        print(f"  Page 2:     {stack_bytes}B used ({p2_desc}); stack reserved at 0xC0..0xFF",
+              file=sys.stderr)
+    else:
+        print(f"  Page 2:     stack (grows down from 0xFF)", file=sys.stderr)
 
     if overlay_mode:
-        print(f"  Page 3:     {p3_bytes}B / 256B  (kernel + shared + manifest)", file=sys.stderr)
+        # Phase 5 moved manifest+pages off page 3 into the page-2
+        # kstate region, so post-init page 3 is just the freed kernel
+        # image area + shared helpers + page-3 overlay storage.
+        print(f"  Page 3:     {p3_bytes}B / 256B  "
+              f"(kernel image transient; shared helpers + page-3 overlays persist)",
+              file=sys.stderr)
     elif init_extraction:
         p3_free = 256 - kernel_bytes
         print(f"  Page 3:     {kernel_bytes}B kernel image, {p3_free}B free", file=sys.stderr)
