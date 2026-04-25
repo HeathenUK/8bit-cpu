@@ -1,22 +1,15 @@
-/* Display RTC temperature on LCD as "NN°C".
- * Uses inline digit extraction (not printf) because this single-number
- * display would pay ~60B for __print_u8_dec just for one call. */
+/* Display RTC temperature on LCD as "N°C" or "NN°C".
+ * The compiler lowers `printf("%d\xDFC", t)` to `lcd_temp_u8(t)`,
+ * a compact helper (~33 B shared) emitting decimal + degree + 'C'.
+ * Note: printf's %d is "minimum digits", so a temp of 5 prints as
+ * "5°C" not "05°C". For RTC temps (always >=10 in normal operation)
+ * this matches the prior hand-rolled output. */
 void main() {
     i2c_init();
     lcd_init();
-    unsigned char temp;
-    temp = rtc_read_temp();
+    unsigned char temp = rtc_read_temp();
     i2c_bus_reset();
-    unsigned char tens;
-    tens = 0;
-    while (temp >= 10) {
-        temp = temp - 10;
-        tens = tens + 1;
-    }
-    lcd_char(tens + 48);
-    lcd_char(temp + 48);
-    lcd_char(0xDF);
-    lcd_char('C');
+    printf("%d\xDFC", temp);
     out(temp);
     halt();
 }

@@ -5194,33 +5194,68 @@ class MK1CodeGen:
             # Save original ranges before merging (for correct removal later)
             helper_original_ranges = {h: (s, e) for h, (s, e, _) in helper_bodies.items()}
 
-            # Detect fall-through: if a helper body doesn't end with a terminator,
-            # it falls through to the next label. Merge it with that label's body
-            # so bundling preserves the fall-through semantics.
+            # Detect fall-through OR tail-jump-to-helper: if a helper body
+            # ends with `j __OTHER` where __OTHER is another bundleable
+            # helper, the two MUST be co-located in any overlay that
+            # bundles the first — otherwise the bundled body's `j __OTHER`
+            # references a target that's neither resident nor in the
+            # overlay (the validator at the end of step 9 catches this and
+            # raises). Merge them the same way as a literal fall-through.
+            #
+            # Without this: __lcd_chr (whose body ends with
+            # `j __lcd_send_raw`) gets bundled standalone and the
+            # `j __lcd_send_raw` target dangles — affects every program
+            # that calls lcd_*_u8 / printf_temp_u8 via overlay
+            # (lcd_temp_overlay.c, lcd_temp.c after the printf refactor,
+            # overlay_dashboard.c, etc.).
             terminators = {'ret', 'hlt'}
             helper_order = sorted(helper_bodies.keys(),
                                   key=lambda h: helper_bodies[h][0])
+            helper_label_set = {f'{h}' for h in helper_bodies}
             for idx_h, hname in enumerate(helper_order):
                 hstart, hend, hlines = helper_bodies[hname]
-                # Find last real instruction
+                # Find last real instruction (and its operand if any)
                 last_instr = ''
+                last_operand = None
                 for hl in reversed(hlines):
                     stripped = hl.strip()
                     if stripped and not stripped.endswith(':') and not stripped.startswith(';'):
-                        last_instr = stripped.split()[0]
+                        parts = stripped.split()
+                        last_instr = parts[0]
+                        last_operand = parts[1] if len(parts) > 1 else None
                         break
-                is_terminator = (last_instr in terminators or
-                                 last_instr == 'j' or
-                                 (last_instr.startswith('j') and not last_instr.startswith('jal')))
-                if not is_terminator and idx_h + 1 < len(helper_order):
-                    # Falls through to next helper — merge bodies
+                is_ret_or_hlt = last_instr in terminators
+                # Tail-jump to another helper: `j __X` where __X is in
+                # helper_bodies. This needs the same co-location handling
+                # as fall-through.
+                tail_jumps_to = None
+                if last_instr == 'j' and last_operand and last_operand in helper_label_set:
+                    tail_jumps_to = last_operand
+                # is_jump_terminator: any j-prefixed (not jal) that is NOT
+                # a tail-jump to a co-bundleable helper.
+                is_jump_term = (last_instr.startswith('j') and
+                                not last_instr.startswith('jal') and
+                                tail_jumps_to is None)
+                is_terminator = is_ret_or_hlt or is_jump_term
+                # Case 1: literal fall-through (no terminator) — merge with
+                # next helper in source order.
+                if not is_terminator and tail_jumps_to is None and idx_h + 1 < len(helper_order):
                     next_name = helper_order[idx_h + 1]
                     ns, ne, nlines = helper_bodies[next_name]
-                    # Extend current helper to include next helper's label + body
                     merged_lines = hlines + [new_resident[ns]] + nlines
                     helper_bodies[hname] = (hstart, ne, merged_lines)
-                    # Don't remove the next helper from helper_bodies — it can
-                    # still be bundled independently by overlays that call it directly
+                # Case 2: tail-jump to a specific bundleable helper — merge
+                # with THAT helper (not necessarily the next in source).
+                elif tail_jumps_to is not None and tail_jumps_to in helper_bodies:
+                    ts, te, tlines = helper_bodies[tail_jumps_to]
+                    # Insert target's label + body after our body. The
+                    # `j __X` already there acts as a no-op fall-through
+                    # since __X's label is now immediately following.
+                    merged_lines = hlines + [new_resident[ts]] + tlines
+                    helper_bodies[hname] = (hstart, te, merged_lines)
+                # Don't remove the merged-in helper from helper_bodies — it
+                # can still be bundled independently by overlays that call
+                # it directly.
 
             # Identify which helpers can be bundled (not in _NO_OVERLAY, not called
             # from non-helper resident code).
