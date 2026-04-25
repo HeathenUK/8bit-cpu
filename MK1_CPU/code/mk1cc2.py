@@ -6693,15 +6693,22 @@ class MK1CodeGen:
             p1_code_offset = self.data_alloc
             p1_capacity = 256 - self.data_alloc
             p2_code_offset = 0
-            # Page 2 needs SP init (3B) which increases init code. Estimate if
-            # init code can afford it (must stay ≤ 250B including selfcopy).
-            # Page 2 = stack page. Using it for overlay storage was observed
-            # to produce hangs on tone-playing programs (e.g. twinkle.c),
-            # likely because the overlay source bytes in page 2 are liable
-            # to be corrupted by stack pushes/pops if the overlay is ever
-            # reloaded during runtime. Disabled until the mechanism is
-            # understood; overlays flow to page 1 and page 3 instead.
-            p2_capacity = 0
+            # Page 2 = stack page. Phase 4 of the kernel-state allocator
+            # refactor (see WORKLOG.md) re-enabled overlay storage here
+            # at offsets 0x00..(P2_OVERLAY_HI), with the page-2 partition
+            # ensuring stack and overlays cannot overlap:
+            #   0x00..0x7F  overlay storage   (this region)
+            #   0x80..0xAF  kernel state      (KERNEL_STATE entries)
+            #   0xB0..0xBF  guard band
+            #   0xC0..0xFF  reserved stack
+            # The previous defensive `p2_capacity = 0` was for a suspected
+            # corruption of overlay bytes by stack pushes; the partition
+            # now makes that impossible by construction (stack-depth gate
+            # in `_analyze_stack_depth` enforces depth ≤ 64 B which keeps
+            # SP at or above 0xC0, with the 16-byte guard band catching
+            # any near-overflow before kernel state — let alone overlays
+            # — could be touched).
+            p2_capacity = P2_OVERLAY_BYTES
 
             p3_overlays = []
             p1_overlays = []
