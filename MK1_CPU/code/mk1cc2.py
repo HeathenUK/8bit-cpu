@@ -1925,6 +1925,29 @@ class MK1CodeGen:
             out = []
             i = 0
             while i < len(stmts):
+                # Merged-init form: after merge_local_init_runs collapses
+                #   local tens; local ones; tens=0; ones=expr;
+                # into
+                #   local tens=0; local ones=expr;
+                # the prefix-scanning branch below cannot match (its boundary
+                # check requires uninit locals + bare assigns). Recognise the
+                # merged shape directly: 7 stmts = 2 init-locals + 5 print
+                # tail (loop, optional-tens, ones_print, deg, cchar).
+                if i + 6 < len(stmts):
+                    d0, d1 = stmts[i], stmts[i + 1]
+                    if (d0[0] == 'local' and d0[2] == ('num', 0)
+                            and d1[0] == 'local' and d1[2] is not None):
+                        loop, ifs, ones_print, deg, cchar = stmts[i+2:i+7]
+                        vars_ = decimal_loop_vars(loop)
+                        if (vars_ == (d0[1], d1[1])
+                                and is_optional_tens_print(ifs, d0[1])
+                                and is_lcd_char_digit(ones_print, d1[1])
+                                and is_lcd_char_const(deg, 0xDF)
+                                and is_lcd_char_const(cchar, ord('C'))):
+                            out.append(('expr_stmt',
+                                        ('call', 'lcd_temp_u8', [d1[2]])))
+                            i += 7
+                            continue
                 if i + 7 < len(stmts):
                     d0, d1 = stmts[i], stmts[i + 1]
                     if d0[0] == 'local' and d0[2] is None \
