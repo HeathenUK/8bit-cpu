@@ -47,16 +47,16 @@ KSlot = namedtuple('KSlot', ['page', 'offset', 'size', 'owner', 'description'])
 
 KERNEL_STATE = {
     'calib_blocks': KSlot(
-        page=2, offset=0x80, size=1, owner='__delay_cal',
+        page=2, offset=0xB0, size=1, owner='__delay_cal',
         description='F/4608 — DS3231 SQW HIGH-phase block count, '
                     'consumed by __delay_Nms and __tone_setup'),
     'tone_precomp_done': KSlot(
-        page=2, offset=0x81, size=1, owner='__tone_precompute',
+        page=2, offset=0xB1, size=1, owner='__tone_precompute',
         description='one-shot guard: non-zero means the note table '
                     'has been converted from ratios to half_periods '
                     'and a second precompute would corrupt it'),
     'overlay_r2c_count': KSlot(
-        page=2, offset=0x82, size=1, owner='__eeprom_r2c_loop',
+        page=2, offset=0xB2, size=1, owner='__eeprom_r2c_loop',
         description='remaining-bytes counter for sequential I2C → '
                     'code page reads (EEPROM overlay loader)'),
 }
@@ -68,37 +68,38 @@ KERNEL_STATE = {
 # and offset; helper methods fan out the correct opcode pair.
 
 # ── Page-2 partition ─────────────────────────────────────────────────
-# Plan-of-record memory layout for page 2. Phase 2 defined the regions
-# and added stack-depth assertion. Phase 3 migrated KERNEL_STATE slots
-# from page 3 into the kstate region (see `KERNEL_STATE['*'].page`).
-# Phase 4 will activate the overlay slot. Stack still grows down from
-# 0xFF; the reserved range is guarded by static analysis and a 16-byte
-# guard band before kstate begins.
+# Plan-of-record memory layout for page 2. The corpus stack-depth
+# analysis (Phase 2) showed the deepest observed depth is 9 B, so the
+# Phase-2 64-byte stack reservation was very generous; the layout was
+# refactored on 2026-04-25 to give the freed 48 B back to the page-2
+# overlay slot, raising it from 128 B to 176 B (more storage room
+# for the partitioner's page-2 overlay tier).
 #
 # Page-2 byte layout (low to high):
-#   0x00 .. 0x7F   overlay slot     (128 B; Phase 4 activates)
-#   0x80 .. 0xAF   kernel state     ( 48 B; Phase 3 migrates from p3)
-#   0xB0 .. 0xBF   guard band       ( 16 B; unused — overflow buffer)
-#   0xC0 .. 0xFF   stack reserved   ( 64 B; SP grows down from 0xFF)
+#   0x00 .. 0xAF   overlay slot     (176 B; storage for page-2 overlays)
+#   0xB0 .. 0xDF   kernel state     ( 48 B; KERNEL_STATE entries +
+#                                          manifest+pages from 0xC0)
+#   0xE0 .. 0xEF   guard band       ( 16 B; unused — overflow buffer)
+#   0xF0 .. 0xFF   stack reserved   ( 16 B; SP grows down from 0xFF)
 #
 # Sizing rationale:
-#   - 64B stack: empirical observation that the existing corpus uses
-#     well under this; Phase 2 confirms via static analysis below.
+#   - 16B stack: corpus peak observed depth = 9 B (overlay_dashboard).
+#     Static analysis enforces depth ≤ 16 B; deeper programs hard-
+#     fail compile (mirrors the overlay-placement guard).
 #   - 16B guard: catches a runaway stack before it corrupts kernel
 #     state; small enough that the budget loss is trivial.
-#   - 48B kstate: 3 entries today, room for ~45 more without
-#     refactoring. Includes future home for the overlay manifest.
-#   - 128B overlay: matches the typical overlay slot size in the
-#     existing partitioner; gives us a useful third tier alongside
-#     page-1 (data_code) and page-3 (page3_code).
+#   - 48B kstate: 3 fixed slots at 0xB0..0xB2 + manifest+pages at
+#     0xC0..0xDF (~5 overlays at 3 B each before overflow into guard).
+#   - 176B overlay: 48 B more than the original 128; gives the
+#     partitioner's page-2 storage tier substantially more room.
 
 P2_OVERLAY_LO        = 0x00
-P2_OVERLAY_HI        = 0x7F
-P2_KSTATE_LO         = 0x80
-P2_KSTATE_HI         = 0xAF
-P2_GUARD_LO          = 0xB0
-P2_GUARD_HI          = 0xBF
-P2_STACK_LO          = 0xC0   # stack must not descend below this
+P2_OVERLAY_HI        = 0xAF
+P2_KSTATE_LO         = 0xB0
+P2_KSTATE_HI         = 0xDF
+P2_GUARD_LO          = 0xE0
+P2_GUARD_HI          = 0xEF
+P2_STACK_LO          = 0xF0   # stack must not descend below this
 P2_STACK_HI          = 0xFF   # SP starts here
 
 P2_OVERLAY_BYTES     = P2_OVERLAY_HI - P2_OVERLAY_LO + 1   # 128
@@ -110,10 +111,10 @@ P2_STACK_BUDGET      = P2_STACK_HI   - P2_STACK_LO   + 1   #  64
 # them out of `section page3_code` (where they squatted at the tail of
 # the kernel image, occupying 15-30 B of page-3 post-init) into the
 # structured page-2 kstate area. KERNEL_STATE fixed slots fill from
-# 0x80 upward; the manifest+pages variable region fills from 0x90
-# upward. Leaves 13 bytes (0x83..0x8F) for future fixed-slot growth
-# before the manifest start would need to move.
-P2_MANIFEST_BASE     = 0x90
+# P2_KSTATE_LO upward; the manifest+pages variable region fills from
+# P2_MANIFEST_BASE upward. The gap between fixed-slot top and manifest
+# base is reserved for future fixed-slot growth.
+P2_MANIFEST_BASE     = 0xC0
 
 # ── Tokenizer (from mk1cc.py) ────────────────────────────────────────
 
