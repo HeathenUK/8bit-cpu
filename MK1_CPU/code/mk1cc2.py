@@ -1728,12 +1728,22 @@ class MK1CodeGen:
             i = 0
             while i < len(stmts):
                 if i + 3 < len(stmts):
-                    count_decl, addr_decl, loop, sentinel = stmts[i:i+4]
-                    if not (count_decl[0] == 'local'
-                            and count_decl[2] == ('num', 0)
-                            and addr_decl[0] == 'local'
-                            and addr_decl[2] is None
-                            and loop[0] == 'for'):
+                    s0, s1, loop, sentinel = stmts[i:i+4]
+                    # Accept either local ordering: count first (init=0)
+                    # then addr (uninit), or addr first then count. The
+                    # natural source `unsigned char addr; unsigned char
+                    # count; count = 0; for(addr...)` defeats
+                    # merge_local_init_runs and leaves both uninit, so
+                    # the original count_decl-must-be-init guard wouldn't
+                    # match. Accept both shapes.
+                    count_decl = addr_decl = None
+                    if (s0[0] == 'local' and s0[2] == ('num', 0)
+                            and s1[0] == 'local' and s1[2] is None):
+                        count_decl, addr_decl = s0, s1
+                    elif (s1[0] == 'local' and s1[2] == ('num', 0)
+                            and s0[0] == 'local' and s0[2] is None):
+                        count_decl, addr_decl = s1, s0
+                    if not (count_decl is not None and loop[0] == 'for'):
                         out.append(stmts[i]); i += 1; continue
                     count_name = count_decl[1]
                     addr_name = addr_decl[1]
@@ -1825,10 +1835,17 @@ class MK1CodeGen:
             i = 0
             while i < len(stmts):
                 if i + 3 < len(stmts):
-                    idx_decl, count_decl, loop, out_stmt = stmts[i:i+4]
-                    if not (idx_decl[0] == 'local' and idx_decl[2] is None
-                            and count_decl[0] == 'local'
-                            and count_decl[2] == ('num', 0)
+                    s0, s1, loop, out_stmt = stmts[i:i+4]
+                    # Accept either local ordering (idx-first or count-first).
+                    # See compact_i2c_scan for the same brittleness rationale.
+                    idx_decl = count_decl = None
+                    if (s0[0] == 'local' and s0[2] is None
+                            and s1[0] == 'local' and s1[2] == ('num', 0)):
+                        idx_decl, count_decl = s0, s1
+                    elif (s1[0] == 'local' and s1[2] is None
+                            and s0[0] == 'local' and s0[2] == ('num', 0)):
+                        idx_decl, count_decl = s1, s0
+                    if not (idx_decl is not None
                             and loop[0] == 'for'
                             and self._is_call_stmt(out_stmt, 'out')
                             and out_stmt[1][2] == [('var', count_decl[1])]):
@@ -2015,8 +2032,32 @@ class MK1CodeGen:
                 return (kind, stmt[1], stmt[2], stmt[3], rewrite_stmt(stmt[4]))
             return stmt
 
+        # Auto-detect compiler-injected calls: any AST-rewrite matcher
+        # that lowers a user pattern into a call to a different builtin
+        # name introduces a call name that wasn't in the user's source.
+        # Capture pre vs post call-name set per function; the delta is
+        # the set of "matcher fires" for that function. Future matchers
+        # that synthesize new call nodes get tracked automatically — no
+        # per-matcher instrumentation. Output via --metrics-out so a
+        # corpus regression baseline can detect "matchers that used to
+        # fire on program X but stopped firing" without humans having
+        # to remember which matchers exist.
+        def _collect_call_names(node, acc):
+            if isinstance(node, tuple):
+                if len(node) >= 2 and node[0] == 'call':
+                    acc.add(node[1])
+                for c in node:
+                    _collect_call_names(c, acc)
+            elif isinstance(node, list):
+                for c in node:
+                    _collect_call_names(c, acc)
+
+        if not hasattr(self, '_matcher_fires'):
+            self._matcher_fires = {}  # fn -> set of injected call names
         out = []
         for name, params, body, ret_type in functions:
+            pre_calls = set()
+            _collect_call_names(body, pre_calls)
             if body[0] == 'block':
                 body = simplify_block(body)
                 stmts = body[1]
@@ -2030,6 +2071,13 @@ class MK1CodeGen:
                         and stmts[2][1] == ('var', stmts[0][1])
                         and stmts[0][2] is None):
                     body = ('block', [('return', stmts[1][1][3])])
+                    self._matcher_fires.setdefault(name, set()).add(
+                        '<trivial-return-wrapper>')
+            post_calls = set()
+            _collect_call_names(body, post_calls)
+            injected = post_calls - pre_calls
+            if injected:
+                self._matcher_fires.setdefault(name, set()).update(injected)
             out.append((name, params, body, ret_type))
         return out
 
@@ -9921,6 +9969,7 @@ class MK1CodeGen:
                 if not hasattr(self, '_lcd_helpers'):
                     self._lcd_helpers = set()
                 self._lcd_helpers.add('__lcd_chr')
+                self._lcd_helpers.add('__lcd_send_raw')  # __lcd_chr tail-jumps to __lcd_send_raw — co-locate
                 self._lcd_helpers.add('__print_u8_hex')
                 self._lcd_helpers.add(helper)
                 if not hasattr(self, '_lcd_hex_result_helpers'):
@@ -10431,6 +10480,7 @@ class MK1CodeGen:
                         self._lcd_helpers = set()
                     self._lcd_helpers.add('__lcd_print')
                     self._lcd_helpers.add('__lcd_chr')
+                    self._lcd_helpers.add('__lcd_send_raw')  # __lcd_chr tail-jumps to __lcd_send_raw — co-locate
                     self.emit('\tjal __lcd_print')
                 return
 
@@ -10441,6 +10491,7 @@ class MK1CodeGen:
                     self._lcd_helpers = set()
                 self._lcd_helpers.add('__lcd_temp_u8')
                 self._lcd_helpers.add('__lcd_chr')
+                self._lcd_helpers.add('__lcd_send_raw')  # __lcd_chr tail-jumps to __lcd_send_raw — co-locate
                 self.emit('\tjal __lcd_temp_u8')
                 return
 
@@ -10451,6 +10502,7 @@ class MK1CodeGen:
                     self._lcd_helpers = set()
                 self._lcd_helpers.add('__print_u8_hex')
                 self._lcd_helpers.add('__lcd_chr')
+                self._lcd_helpers.add('__lcd_send_raw')  # __lcd_chr tail-jumps to __lcd_send_raw — co-locate
                 self.emit('\tjal __print_u8_hex')
                 return
 
@@ -10461,6 +10513,7 @@ class MK1CodeGen:
                     self._lcd_helpers = set()
                 self._lcd_helpers.add('__lcd_bcd_u8')
                 self._lcd_helpers.add('__lcd_chr')
+                self._lcd_helpers.add('__lcd_send_raw')  # __lcd_chr tail-jumps to __lcd_send_raw — co-locate
                 self.emit('\tjal __lcd_bcd_u8')
                 return
 
@@ -10477,6 +10530,7 @@ class MK1CodeGen:
                 if not hasattr(self, '_lcd_helpers'):
                     self._lcd_helpers = set()
                 self._lcd_helpers.add('__lcd_chr')
+                self._lcd_helpers.add('__lcd_send_raw')  # __lcd_chr tail-jumps to __lcd_send_raw — co-locate
                 fmt = args[0][1]
                 temp_marker = '%d\xDFC'
                 if (len(args) >= 2 and fmt.count('%') == 1
@@ -10496,6 +10550,7 @@ class MK1CodeGen:
                     self.gen_expr(args[1])
                     self._lcd_helpers.add('__lcd_temp_u8')
                     self._lcd_helpers.add('__lcd_chr')
+                    self._lcd_helpers.add('__lcd_send_raw')  # __lcd_chr tail-jumps to __lcd_send_raw — co-locate
                     self.emit('\tjal __lcd_temp_u8')
                     _emit_lit(suffix)
                     if len(args) > 2:
@@ -11756,6 +11811,10 @@ def main():
 
     def _prepare_compile(prefer_delay_cal_init=False, capture_log=False):
         gen = MK1CodeGen(optimize=args.optimize)
+        # Stash the in-flight gen so the exception handler can recover
+        # `_matcher_fires` even on compile failure (populated during
+        # _simplify_function_bodies, before _overlay_partition can throw).
+        _prepare_compile._last_gen = gen
         gen._prefer_delay_cal_init = prefer_delay_cal_init
         if hasattr(args, 'eeprom') and args.eeprom:
             gen.eeprom_mode = True
@@ -11862,8 +11921,30 @@ def main():
         init_limit_local = 254 if (init_extraction_local or overlay_mode_local) else 250
         return gen, asm, lines, code_bytes_local, init_limit_local, compile_log
 
-    gen, asm, lines, _code_bytes_try, _init_limit_try, _compile_log = _prepare_compile(
-        prefer_delay_cal_init=True, capture_log=True)
+    def _emit_partial_metrics(g, exc_msg):
+        """Emit metrics with `compile_ok=False` + matcher_fires when compile
+        fails. Keeps the corpus audit / regression baseline complete: programs
+        that wrap-fail at partition still record which matchers fired so
+        future regressions stay detectable."""
+        if not args.metrics_out:
+            return
+        import json as _json
+        partial = {'compile_ok': False, 'compile_error': exc_msg}
+        _fires = getattr(g, '_matcher_fires', {}) if g else {}
+        if _fires:
+            partial['matcher_fires'] = {fn: sorted(s) for fn, s in sorted(_fires.items())}
+        try:
+            with open(args.metrics_out, 'w') as _mf:
+                _json.dump(partial, _mf, indent=2)
+        except Exception:
+            pass
+
+    try:
+        gen, asm, lines, _code_bytes_try, _init_limit_try, _compile_log = _prepare_compile(
+            prefer_delay_cal_init=True, capture_log=True)
+    except Exception as _e:
+        _emit_partial_metrics(getattr(_prepare_compile, '_last_gen', None), str(_e))
+        raise
     if (_code_bytes_try > _init_limit_try and
             getattr(gen, '_prefer_delay_cal_init', False)):
         import sys as _retry_sys
@@ -12150,6 +12231,16 @@ def main():
         _why = getattr(gen, '_why_breakdown', None)
         if _why is not None:
             metrics['breakdown'] = _why
+        # Matcher-fire telemetry: which compiler-injected calls each user
+        # function picked up. Auto-derived from pre/post call-name diff
+        # in _simplify_function_bodies. Output as sorted lists for
+        # deterministic JSON. Future matchers that synthesize new call
+        # nodes show up here automatically.
+        _fires = getattr(gen, '_matcher_fires', {})
+        if _fires:
+            metrics['matcher_fires'] = {
+                fn: sorted(s) for fn, s in sorted(_fires.items())
+            }
         with open(args.metrics_out, 'w') as _mf:
             _json.dump(metrics, _mf, indent=2)
 
