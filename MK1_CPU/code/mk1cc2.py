@@ -2347,6 +2347,47 @@ class MK1CodeGen:
         # they land at the offsets the allocator assigned.
         self._page1_globals_cache = [(n, i) for n, i, s in globals_ if n in self.globals]
 
+        # ── Helper-registration validator ──
+        # Every `jal __X` must resolve to a `__X:` definition somewhere in
+        # `self.code`. If a builtin emitter registers helper A but A's body
+        # internally jumps to helper B which wasn't separately registered,
+        # B never gets emitted and we end up with a dangling jal target.
+        # Two recent bugs of this exact shape:
+        #   - lcd_init() registered __lcd_init but not __i2c_st_only / __i2c_sp
+        #     (which __lcd_init's body jal's to). Latent for typical LCD
+        #     programs; surfaced as a 3:46 init-helper-resolver hang on
+        #     test_i2c_ack_diag.c.
+        #   - silence() registered __play_note but not __tone (which
+        #     __play_note's body always jal's). Silence-only programs
+        #     emitted a dangling jal __tone; caught only at assembly time.
+        #
+        # Catch this class at compile time, before partitioning, with a
+        # clear error naming the unresolved target(s).
+        _defined_labels = set()
+        _jal_targets = set()
+        for _l in self.code:
+            _s = _l.strip()
+            if _s.endswith(':') and not _s.startswith('.') and not _s.startswith(';'):
+                _defined_labels.add(_s[:-1])
+            for _prefix in ('jal ', 'j ', 'ocall '):
+                if _s.startswith(_prefix):
+                    _tgt = _s[len(_prefix):].split()[0].split(';')[0].strip()
+                    # Only check helper-style targets (start with __); user
+                    # function targets and numeric targets are resolved by
+                    # the partitioner / assembler.
+                    if _tgt.startswith('__') and not _tgt[0].isdigit():
+                        _jal_targets.add(_tgt)
+        _unresolved = _jal_targets - _defined_labels
+        if _unresolved:
+            raise Exception(
+                f"Helper registration miss: jal target(s) {sorted(_unresolved)} "
+                f"are referenced but never emitted. Likely a builtin emitter "
+                f"registered a helper without registering its transitive "
+                f"dependencies. Check `_lcd_helpers.add(...)` in the relevant "
+                f"`if name == '...':' block; the helper body emitted in "
+                f"`_emit_i2c_helpers` is the source of truth for required deps."
+            )
+
         # Two-stage boot overlay partitioning
         self._overlay_partition()
 
@@ -10302,6 +10343,13 @@ class MK1CodeGen:
                     self._lcd_helpers = set()
                 self._lcd_helpers.add('__play_note')
                 self._lcd_helpers.add('__delay_Nms')
+                # __play_note's body unconditionally issues `jal __tone`
+                # (mk1cc2.py:~3892) regardless of which note-table entry
+                # is being played. silence()-only programs (no tone() call)
+                # would otherwise emit a dangling jal target. Same family
+                # as the lcd_init / __i2c_st_only registration miss fixed
+                # earlier this session.
+                self._lcd_helpers.add('__tone')
                 self.emit(f'\tldi $a,{p1_off}')
                 self.emit('\tjal __play_note')
                 return
