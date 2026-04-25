@@ -381,6 +381,7 @@ private:
     void emitBank(uint8_t byte, bool pass1, int bank) {
         if (bank == 4) emitEeprom(byte, pass1);
         else if (bank == 3) emitPage3(byte, pass1);
+        else if (bank == 2) emitStack(byte, pass1);  // Phase 5: section stack
         else if (bank == 1) emitData(byte, pass1);
         else emitCode(byte, pass1);
     }
@@ -458,6 +459,11 @@ private:
                     codeEmitTarget = 4;  // emit assembled bytes to EEPROM buffer
                 } else if (strstr(lp, "page3")) {
                     bank = 3;  // raw data in page 3
+                    codeEmitTarget = 0;
+                } else if (strstr(lp, "stack")) {
+                    bank = 2;  // raw data in page 2 (stack page; used by Phase 5
+                               // for the overlay manifest and pages array, plus
+                               // any future page-2 globals)
                     codeEmitTarget = 0;
                 } else if (strstr(lp, "data")) {
                     bank = 1;
@@ -541,20 +547,56 @@ private:
                 continue;
             }
             if (startsWith(lp, "org ") || startsWith(lp, "org\t")) {
-                // .org N: set code PC to address N. Pads with HLT if advancing.
+                // org N: set the active bank's PC to address N.
+                //   Forward (target > current): pad with bank-appropriate
+                //     filler so emitted bytes don't overlap unset addresses.
+                //     Code: 0x7F (HLT) — prevents runaway execution past
+                //     emitted code. All other banks: 0x00 — neutral default
+                //     for static data (matches the upload-buffer memset
+                //     contract — page-2/3 unset bytes are 0).
+                //   Backward / same (target <= current): just set the PC.
+                //     Used by overlay code that follows resident emission
+                //     (the overlay's runtime address is lower than the
+                //     end-of-resident PC).
                 const char* p = lp + 4;
                 skipWs(p);
                 char tok[32]; parseToken(p, tok, sizeof(tok));
                 int target = resolveValue(tok, lineNum, pass1);
-                int current = result.code_size;
-                if (target > current) {
-                    // Forward: pad with HLT
-                    while (result.code_size < target) {
-                        emitCode(0x7F, pass1);
+                if (bank == 0) {
+                    int current = result.code_size;
+                    if (target > current) {
+                        while (result.code_size < target) emitCode(0x7F, pass1);
+                    } else {
+                        result.code_size = target;
                     }
-                } else {
-                    // Backward or same: just set PC (for overlay code that follows resident)
-                    result.code_size = target;
+                } else if (bank == 1) {
+                    int current = result.data_size;
+                    if (target > current) {
+                        while (result.data_size < target) emitData(0x00, pass1);
+                    } else {
+                        result.data_size = target;
+                    }
+                } else if (bank == 2) {
+                    int current = result.stack_size;
+                    if (target > current) {
+                        while (result.stack_size < target) emitStack(0x00, pass1);
+                    } else {
+                        result.stack_size = target;
+                    }
+                } else if (bank == 3) {
+                    int current = result.page3_size;
+                    if (target > current) {
+                        while (result.page3_size < target) emitPage3(0x00, pass1);
+                    } else {
+                        result.page3_size = target;
+                    }
+                } else if (bank == 4) {
+                    int current = result.eeprom_size;
+                    if (target > current) {
+                        while (result.eeprom_size < target) emitEeprom(0x00, pass1);
+                    } else {
+                        result.eeprom_size = target;
+                    }
                 }
                 continue;
             }
@@ -599,7 +641,10 @@ private:
                     labelName[li] = 0;
 
                     uint16_t addr = (bank == 1) ? result.data_size :
-                                    (bank == 3) ? result.page3_size : result.code_size;
+                                    (bank == 2) ? result.stack_size :
+                                    (bank == 3) ? result.page3_size :
+                                    (bank == 4) ? result.eeprom_size :
+                                    result.code_size;
                     if (pass1) addLabel(labelName, addr, bank != 0);
                     if (labelName[0] != '.') {
                         strncpy(lastGlobalLabel, labelName, sizeof(lastGlobalLabel) - 1);

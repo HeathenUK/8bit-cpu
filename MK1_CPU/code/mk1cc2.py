@@ -106,6 +106,15 @@ P2_KSTATE_BYTES      = P2_KSTATE_HI  - P2_KSTATE_LO  + 1   #  48
 P2_GUARD_BYTES       = P2_GUARD_HI   - P2_GUARD_LO   + 1   #  16
 P2_STACK_BUDGET      = P2_STACK_HI   - P2_STACK_LO   + 1   #  64
 
+# Manifest + pages array base within the kstate region. Phase 5 moved
+# them out of `section page3_code` (where they squatted at the tail of
+# the kernel image, occupying 15-30 B of page-3 post-init) into the
+# structured page-2 kstate area. KERNEL_STATE fixed slots fill from
+# 0x80 upward; the manifest+pages variable region fills from 0x90
+# upward. Leaves 13 bytes (0x83..0x8F) for future fixed-slot growth
+# before the manifest start would need to move.
+P2_MANIFEST_BASE     = 0x90
+
 # ── Tokenizer (from mk1cc.py) ────────────────────────────────────────
 
 TOKEN_PATTERNS = [
@@ -2383,6 +2392,12 @@ class MK1CodeGen:
         # to a hard error before re-enabling page-2 overlay storage.
         self._analyze_stack_depth()
 
+        # Phase 5: post-self-copy page-3 layout report. Confirms what
+        # categories of bytes live in page 3 after the kernel has been
+        # copied to page 0, so we can see how much of page 3 is truly
+        # "overlay storage" vs static kernel-state residue.
+        self._report_page3_post_init_layout()
+
         return '\n'.join(self.code)
 
     def _eliminate_dead_functions(self):
@@ -2711,6 +2726,38 @@ class MK1CodeGen:
                 f'({depth}B > {P2_STACK_BUDGET}B). Page-2 overlay '
                 f'storage cannot be safely activated for this program '
                 f'until the stack is bounded below {P2_STACK_LO:#x}.\n')
+
+    def _report_page3_post_init_layout(self):
+        """Phase 5: report what occupies page 3 after `__selfcopy`.
+
+        After the bootloader copies page3[0..OVERLAY_REGION-1] into page 0,
+        page 3 still holds:
+          - Original kernel image at [0..KERNEL_SIZE-1] (transient: overwritten
+            by overlay storage as overlays load on top of it).
+          - Shared helpers at [KERNEL_SIZE..OVERLAY_REGION-1] (NOT overlaid;
+            these survive and are used at runtime via dual-residency).
+          - Manifest + pages array at [OVERLAY_REGION..OVERLAY_REGION+meta-1]
+            (read every overlay load; persists indefinitely).
+          - Overlay storage at [OVERLAY_REGION+meta..] (the actual reason for
+            page 3 being overlay-tier in the first place).
+
+        Goal of the larger refactor: page 3 should ideally be 100% overlay
+        storage post-init. Phase 5 (deferred) will move the manifest+pages
+        out, leaving only kernel-image-residue + shared helpers + overlays.
+        Today's report tells us how much each category contributes.
+        """
+        kernel_size  = getattr(self, '_overlay_kernel_size', None)
+        overlay_reg  = getattr(self, '_overlay_region', None)
+        if kernel_size is None or overlay_reg is None:
+            return  # flat mode (no overlays / no self-copy) — nothing to report.
+        meta_size = 0
+        if hasattr(self, '_overlay_meta_size'):
+            meta_size = self._overlay_meta_size
+        shared_size = max(0, overlay_reg - kernel_size)
+        sys.stderr.write(
+            f'page-3 layout: kernel-image={kernel_size}B (transient), '
+            f'shared-helpers={shared_size}B, manifest+pages={meta_size}B, '
+            f'overlay-storage at {overlay_reg + meta_size}+\n')
 
     def _classify_helpers(self):
         """Classify helpers into resident vs overlay-eligible categories.
@@ -5563,6 +5610,8 @@ class MK1CodeGen:
                   __manifest: [offset0, size0, offset1, size1, ...]  (2B each)
                   __pages:    [page0, page1, ...]                     (1B each)
                 Page values: 3=derefp3, 1=deref, 2=deref2
+                Phase 5: __manifest and __pages live in page-2 kstate
+                at P2_MANIFEST_BASE; loader reads via deref2.
                 EEPROM-backed overlays are preloaded into freed page3 space during init,
                 so the runtime loader only needs SRAM copy paths.
                 """
@@ -5588,13 +5637,13 @@ class MK1CodeGen:
                     '\tmov $c,$a',                  # A = index (from $c)
                     '\tsll',                        # A = index * 2
                     '\taddi __manifest,$a',          # A = __manifest + index*2
-                    # Read manifest entry [offset, size]
+                    # Read manifest entry [offset, size] from page-2 kstate
                     '\tmov $a,$d',                  # D = manifest addr
-                    '\tderefp3',                    # A = src_offset
+                    '\tderef2',                     # A = src_offset
                     '\tmov $a,$c',                  # C = src offset
                     '\tmov $d,$a',                  # A = manifest addr
                     '\tinc',                        # A = manifest addr + 1
-                    '\tderefp3',                    # A = size
+                    '\tderef2',                     # A = size
                     f'\taddi {overlay_region},$a',  # A = overlay_region + size = end
                     '\tmov $a,$d',                  # D = end addr
                     f'\tldi $b,{overlay_region}',   # B = dest start
@@ -5615,18 +5664,18 @@ class MK1CodeGen:
                         # Compute __pages[index] once, stash on stack.
                         '\tmov $c,$a',                  # A = index
                         '\taddi __pages,$a',
-                        '\tderefp3',                    # A = page number (1,2,3)
+                        '\tderef2',                     # A = page number (1,2,3) from p2 kstate
                         '\tpush $a',                    # stash page number
-                        # Manifest lookup
+                        # Manifest lookup from page-2 kstate
                         '\tmov $c,$a',                  # A = index
                         '\tsll',                        # A = index * 2
                         '\taddi __manifest,$a',
                         '\tmov $a,$d',                  # D = manifest addr
-                        '\tderefp3',                    # A = src_offset
+                        '\tderef2',                     # A = src_offset
                         '\tmov $a,$c',                  # C = src offset
                         '\tmov $d,$a',                  # A = manifest addr
                         '\tinc',
-                        '\tderefp3',                    # A = size
+                        '\tderef2',                     # A = size
                         f'\taddi {overlay_region},$a',
                         '\tmov $a,$d',                  # D = end addr
                         f'\tldi $b,{overlay_region}',   # B = dest start
@@ -7285,14 +7334,17 @@ class MK1CodeGen:
         # During init, a mini-copy bootstraps them from page3 to code page.
         assembled.extend(shared_helpers_ov)
 
-        # Phase 2: Manifest — stay in page3_code (same section as kernel).
-        # 'byte' in page3_code goes through emitCode→emitPage3, keeping
-        # code_size and page3_size in sync. The loader's meta_base (from
-        # code_size) then matches the actual page3 data position.
-        # (DO NOT switch to 'section page3' — that desynchs them.)
-
-        # Emit 2-byte manifest entries: [src_offset, size]
-        # Label prevents peephole dead-code elimination (manifest follows kernel's hlt)
+        # Phase 5: Manifest + pages array live at P2_MANIFEST_BASE in
+        # the page-2 kstate region. The C++ assembler in this commit
+        # has been extended to honour `org` in raw-data sections so
+        # the manifest bytes land at the right offset; the overlay
+        # loader was updated in lockstep to use `deref2` for manifest
+        # and pages reads. Moving them off page-3 frees the bytes
+        # they used to squat in at the tail of the kernel image
+        # (15-30 B per program), letting page-3 overlay storage start
+        # earlier and giving the partitioner more room.
+        assembled.append('\tsection stack')
+        assembled.append(f'\torg {P2_MANIFEST_BASE}')
         assembled.append('__manifest:')
         # Overlays ordered: page3 first (includes EEPROM-backed), then page1, then page2.
         # EEPROM-backed overlays were already merged into p3_overlays above.
