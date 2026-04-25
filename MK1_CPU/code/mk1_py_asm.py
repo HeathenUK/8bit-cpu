@@ -291,7 +291,17 @@ _TWO_BYTE_MNS = {'move imm, $a', 'move imm, $b', 'move imm, $c', 'move imm, $d',
                  'stor $a, [imm]', 'stor $b, [imm]', 'stor $c, [imm]',
                  'stor $d, [imm]', 'stor $pc, [imm]', 'stor $sp, [imm]',
                  'load $a, [imm]', 'load $b, [imm]', 'load $c, [imm]',
-                 'load $d, [imm]', 'load $pc, [imm]', 'load $sp, [imm]'}
+                 'load $d, [imm]', 'load $pc, [imm]', 'load $sp, [imm]',
+                 # Conditional jumps that take an address operand. Per
+                 # microcode (jnc=0xCA, jnz=0xCE), both have the third
+                 # tuple element `True` indicating they take an immediate
+                 # byte. They were missing from this set, so the Python
+                 # assembler silently emitted them as 1-byte opcodes with
+                 # the operand dropped — programs using jnc/jnz via
+                 # mk1_py_asm assembled wrong. The C++ assembler (isa.h)
+                 # has them as ARGS_IMM correctly, so sim_regression has
+                 # been fine (it routes through ESP32-side assembly).
+                 'jnc', 'jnz'}
 
 
 def _instr_size(canon_mn):
