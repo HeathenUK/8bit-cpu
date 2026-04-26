@@ -3109,23 +3109,6 @@ class MK1CodeGen:
                 if h in helpers:
                     no_ov.add(f'{h}:')
 
-        # Keypad scan must be resident in programs that ALSO use I2C/LCD.
-        # Reason: overlay_load's bus-recovery sequence (9 SCL clocks +
-        # STOP, intended to flush a stuck PCF8574 backpack after the
-        # copy loop's phantom SCL pulses) confuses the DFRobot V2.0 LCD
-        # module (AiP31068L + PCA9633) into a state where keypad
-        # column reads stay at 0xF0 regardless of presses. Keeping
-        # __keypad_scan resident eliminates the per-call overlay_load
-        # and its bus activity, so the LCD stays in a clean state.
-        # Removing the 9-clock recovery globally would fix this but
-        # breaks `tone duration timing` and `rgb lcd smoke test` —
-        # tone+lcd programs DO need the longer flush. So we leave the
-        # recovery alone and pay ~80B of kernel residency for keypad.
-        # See 2026-04-26 keypad_lcd debugging.
-        if '__keypad_scan' in helpers and self._needs_runtime_i2c:
-            no_ov.add('__keypad_scan:')
-            no_ov.add('__ovthunk_0_0:')
-
         self._dynamic_no_overlay = no_ov
 
         # Conditionally resident: helpers that are marked _NO_OVERLAY now but
