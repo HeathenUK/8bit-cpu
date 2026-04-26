@@ -2058,6 +2058,125 @@ static void handleSerialCommand(const String& line) {
         }
         Serial.printf("]%s}\n", aborted ? ",\"aborted\":true" : "");
     }
+    else if (line.startsWith("RUNHZ:")) {
+        // RUNHZ:cycles,hz[,maxoi] — like RUNNB but with arbitrary
+        // target frequency in Hz, computed via ESP32 cycle counter.
+        // Firmware subtracts a measured ~530 ns/half overhead so the
+        // actual rate is close to the requested one. Safe range is
+        // roughly 50 kHz to 400 kHz; above ~430 kHz the firmware
+        // spuriously detects HLT on bus noise.
+        int comma1 = line.indexOf(',', 6);
+        int comma2 = comma1 > 0 ? line.indexOf(',', comma1 + 1) : -1;
+        int n = line.substring(6, comma1 > 0 ? comma1 : line.length()).toInt();
+        int hz = comma1 > 0 ? line.substring(comma1 + 1, comma2 > 0 ? comma2 : line.length()).toInt() : 145000;
+        int maxoi = comma2 > 0 ? line.substring(comma2 + 1).toInt() : 0;
+        if (n <= 0) n = 5000000;
+        if (n > 100000000) n = 100000000;
+        if (hz < 1) hz = 1;
+        if (hz > 1000000) hz = 1000000;   // firmware can't really exceed this
+        if (maxoi < 0) maxoi = 0;
+
+        // half_period_ns = 1e9 / (2 * hz). Then subtract ~530 ns of
+        // firmware overhead per half (GPIO writes + OI/HLT checks)
+        // so the wait we actually impose is just the *gap* needed
+        // beyond what the firmware itself takes.
+        uint32_t half_period_ns = 1000000000UL / (2UL * (uint32_t)hz);
+        const uint32_t FW_OVERHEAD_NS = 530;
+        uint32_t wait_ns = (half_period_ns > FW_OVERHEAD_NS)
+            ? (half_period_ns - FW_OVERHEAD_NS) : 0;
+        // ESP32 runs at 240 MHz → 1 CCOUNT cycle ≈ 4.167 ns.
+        uint32_t target_cycles = (wait_ns * 240) / 1000;
+
+        stopCustomClock();
+        detachOIMonitorForManualRun();
+        outputCaptured = false;
+        oiCount = 0;
+
+        int oiGpio = digitalPinToGPIONumber(PIN_OI);
+        if (oiGpio < 0) oiGpio = PIN_OI;
+        uint32_t oiMask = 1 << oiGpio;
+        busSetInput(); disableOutput();
+        digitalWrite(PIN_DIR, LOW); enableOutput();
+        int clkGpio = digitalPinToGPIONumber(PIN_CLK);
+        uint32_t clkMask = 1 << clkGpio;
+        pinMode(PIN_CLK, OUTPUT);
+        digitalWrite(PIN_CLK, LOW);
+
+        int actualCycles = 0;
+        bool aborted = false;
+        bool halted = false;
+        // Edge-detect OI: count one event per low→high transition,
+        // not per sample where OI=1. Without this, each `out`
+        // instruction registers twice (once when CLK is high, once
+        // when CLK is low) and small `maxoi` budgets fire on
+        // transitional bus glitches before the program completes.
+        bool prevOI = false;
+        unsigned long t0_us = micros();
+        for (int i = 0; i < n; i++) {
+            if ((i & 0x1FFFF) == 0x1FFFF) {
+                if (Serial.available()) { aborted = true; break; }
+                if ((i & 0x7FFFF) == 0x7FFFF) {
+                    Serial.printf("{\"hb\":%d,\"oi\":%d}\n", i, oiCount);
+                }
+            }
+            actualCycles++;
+            GPIO.out_w1ts = clkMask;
+            if (target_cycles > 0) {
+                uint32_t start = ESP.getCycleCount();
+                while ((ESP.getCycleCount() - start) < target_cycles) ;
+            }
+            uint32_t gpio1 = GPIO.in;
+            bool curOI1 = (gpio1 & oiMask) != 0;
+            if (curOI1 && !prevOI) {
+                uint8_t val = decodeBus(gpio1);
+                oiHistory[oiCount & 0xFF] = val; oiTimes[oiCount & 0xFF] = actualCycles;
+                oiCount++;
+                lastOutputVal = val;
+                outputCaptured = true;
+                if (maxoi > 0 && (int)oiCount >= maxoi) { prevOI = curOI1; actualCycles++; break; }
+            }
+            prevOI = curOI1;
+            if (i > 4 && hltOpcodeObserved(gpio1)) { halted = true; GPIO.out_w1tc = clkMask; break; }
+            GPIO.out_w1tc = clkMask;
+            if (target_cycles > 0) {
+                uint32_t start = ESP.getCycleCount();
+                while ((ESP.getCycleCount() - start) < target_cycles) ;
+            }
+            uint32_t gpio2 = GPIO.in;
+            bool curOI2 = (gpio2 & oiMask) != 0;
+            if (curOI2 && !prevOI) {
+                uint8_t val = decodeBus(gpio2);
+                oiHistory[oiCount & 0xFF] = val; oiTimes[oiCount & 0xFF] = actualCycles;
+                oiCount++;
+                lastOutputVal = val;
+                outputCaptured = true;
+                if (maxoi > 0 && (int)oiCount >= maxoi) { prevOI = curOI2; break; }
+            }
+            prevOI = curOI2;
+            if (i > 4 && hltOpcodeObserved(gpio2)) { halted = true; break; }
+        }
+        unsigned long elapsed_us = micros() - t0_us;
+        pinMode(PIN_CLK, INPUT);
+        disableOutput(); digitalWrite(PIN_DIR, HIGH);
+        busSetOutput(); enableOutput();
+
+        float actual_khz = (actualCycles > 100 && elapsed_us > 100)
+            ? (float)actualCycles / elapsed_us * 1000.0f : 0;
+        Serial.printf("{\"cyc\":%d,\"cnt\":%d,\"halted\":%s,\"khz\":%.1f,\"hist\":[",
+            actualCycles, oiCount, halted ? "true" : "false", actual_khz);
+        uint32_t stored = oiHistStored();
+        uint32_t start_idx = (oiCount > 32) ? (stored - 32) : 0;
+        for (uint32_t i = start_idx; i < stored; i++) {
+            if (i > start_idx) Serial.print(',');
+            Serial.print(oiHistAt(i));
+        }
+        Serial.print("],\"ts\":[");
+        for (uint32_t i = start_idx; i < stored; i++) {
+            if (i > start_idx) Serial.print(',');
+            Serial.print(oiTimeAt(i));
+        }
+        Serial.printf("]%s}\n", aborted ? ",\"aborted\":true" : "");
+    }
     else if (line == "OI") {
         // Report the NEWEST non-spurious value. That's the program's last
         // meaningful out() — typically the result you care about when
