@@ -3715,7 +3715,17 @@ class MK1CodeGen:
             self.emit('\tcmpi 10')
             self.emit(f'\tjnc {lbl_done}')   # A < 10
             self.emit('\tsubi 10,$a')        # ones -= 10
-            self.emit('\tincc')              # tens++
+            # `incc` clobbers $a as a side effect (microcode: BO|AI ... AO|CI
+            # — the ALU runs through A, leaving A=new C). Without saving A
+            # around the increment, the next iteration's `cmpi 10` compares
+            # the tens count (e.g. 1) instead of the running ones value, and
+            # the loop terminates after one iteration regardless of the
+            # input. For input 22 this produced "11°C" on the LCD instead
+            # of "22°C". `__print_u8_dec` already wraps incc with push/pop
+            # for the same reason; this matches that pattern.
+            self.emit('\tpush $a')
+            self.emit('\tincc')              # tens++ (clobbers A)
+            self.emit('\tpop $a')            # restore ones
             self.emit(f'\tj {lbl_loop}')
             self.emit(f'{lbl_done}:')
             self.emit('\tpush $a')           # save ones across optional tens char
