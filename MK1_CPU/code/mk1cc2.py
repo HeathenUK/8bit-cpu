@@ -726,6 +726,68 @@ class MK1CodeGen:
         self.emit('\texrw 0')            # sample ACK (discarded)
         self.emit_ddrb(0x02)             # SCL LOW
 
+    def _oled_ensure_init(self):
+        """Idempotent: allocate the SSD1327 init data in the data
+        section (once), register the `__oled_init` walker plus its
+        I²C dependencies, and emit `jal __oled_init` (once). Any of
+        the oled_init/oled_fill/oled_clear builtins can call this on
+        every invocation — subsequent calls are no-ops.
+
+        The init transaction is one I²C burst with DISPLAYOFF, the
+        full chip config, CMDLOCK unlock and DISPLAYON in that order
+        — matches the Adafruit driver. Followed by SETCONTRAST=0x2F
+        and a full-screen address window (0,0..63,127 in 2-pixel
+        column units / pixel rows). Total init payload is ~75 bytes
+        in the data section.
+        """
+        if not hasattr(self, '_oled_init_data'):
+            OSTART, OSTOP, OEND, ODELAY = 0xF1, 0xF2, 0xF0, 0xF3
+            OLED = 0x7A           # SSD1327 7-bit addr 0x3D shifted for write
+            CMD_STREAM = 0x00
+            init = (
+                [ODELAY] * 5 +    # ~25 ms power-on settle
+                [OSTART, OLED, CMD_STREAM,
+                 0xAE,             # DISPLAYOFF
+                 0x81, 0x80,        # SETCONTRAST (overridden below)
+                 0xA0, 0x51,        # SEGREMAP
+                 0xA1, 0x00,        # SETSTARTLINE
+                 0xA2, 0x00,        # SETDISPLAYOFFSET
+                 0xA4,             # NORMALDISPLAY (resume from RAM)
+                 0xA8, 0x7F,        # SETMULTIPLEX = 1/128
+                 0xB1, 0x11,        # PHASELEN
+                 0xB3, 0x00,        # DCLK
+                 0xAB, 0x01,        # REGULATOR on
+                 0xB6, 0x04,        # PRECHARGE2
+                 0xBE, 0x0F,        # SETVCOM
+                 0xBC, 0x08,        # PRECHARGE1
+                 0xD5, 0x62,        # FUNCSELB
+                 0xFD, 0x12,        # CMDLOCK unlock
+                 0xAF,             # DISPLAYON (in same transaction)
+                 OSTOP] +
+                [ODELAY] * 20 +   # ~100 ms after init
+                [OSTART, OLED, CMD_STREAM, 0x81, 0x2F, OSTOP] +
+                # Full-screen address window:
+                #   0x15 col_start col_end (cols are 2-px units, 0..63)
+                #   0x75 row_start row_end (rows are pixels, 0..127)
+                [OSTART, OLED, CMD_STREAM,
+                 0x15, 0x00, 0x3F,
+                 0x75, 0x00, 0x7F,
+                 OSTOP] +
+                [OEND]
+            )
+            data_base = self.data_alloc
+            self.data_alloc += len(init)
+            self._oled_init_data = (data_base, init)
+        if not hasattr(self, '_lcd_helpers'):
+            self._lcd_helpers = set()
+        self._lcd_helpers.add('__oled_init')
+        self._lcd_helpers.add('__i2c_sb')
+        self._lcd_helpers.add('__i2c_st_only')
+        self._lcd_helpers.add('__i2c_sp')
+        if not getattr(self, '_oled_init_emitted', False):
+            self.emit('\tjal __oled_init')
+            self._oled_init_emitted = True
+
     def emit_unrolled_i2c_fill_const(self, val, count):
         """Emit a tight asm loop that sends `val` over I²C `count`
         times, using the unrolled byte-send body. Uses $c as the
@@ -3174,9 +3236,20 @@ class MK1CodeGen:
             no_ov.add('__i2c_rb:')
         if '__i2c_rs' in helpers:
             no_ov.add('__i2c_rs:')
-        if '__i2c_st_only' in helpers and self._needs_runtime_i2c:
+        # OLED helpers are runtime callers of __i2c_st_only / __i2c_sp:
+        # __oled_init walker dispatches to them on START/STOP sentinels,
+        # and each __oled_fill_<K> wraps its 8 KB stream in a START/STOP
+        # transaction. Treat them like LCD runtime helpers and force the
+        # I²C primitives resident whenever an OLED helper is in use.
+        oled_runtime = {'__oled_init'} | {
+            h for h in helpers if h.startswith('__oled_fill_')}
+        if helpers & oled_runtime:
+            for h in oled_runtime:
+                if h in helpers:
+                    no_ov.add(f'{h}:')
+        if '__i2c_st_only' in helpers and (self._needs_runtime_i2c or (helpers & oled_runtime)):
             no_ov.add('__i2c_st_only:')
-        if '__i2c_sp' in helpers and self._needs_runtime_i2c:
+        if '__i2c_sp' in helpers and (self._needs_runtime_i2c or (helpers & oled_runtime)):
             no_ov.add('__i2c_sp:')
         # __eeprom_rd: resident only if user code accesses eeprom arrays at
         # runtime. In --eeprom overlay mode it's called only by the init-time
@@ -3680,32 +3753,23 @@ class MK1CodeGen:
             self.emit(f'{lbl_done}:')
             self.emit('\tret')
 
-        if '__oled_fill' in helpers:
+        if '__oled_init' in helpers:
             # Walker mirroring __lcd_init's shape, with non-conflicting
             # sentinels (SSD1327 uses 0xFD/0xFE/0xFC as real commands).
-            # After the data sentinel 0xF0 (END), fall through to a
-            # tight 8192-byte fill loop that streams the user-supplied
-            # fill byte via __i2c_sb.
+            # Reads init data from the data section byte-by-byte and
+            # dispatches START/STOP/DELAY/byte to the right I²C helper.
+            # Returns when OEND is seen.
             data_base, init_bytes = self._oled_init_data
-            fill_val = getattr(self, '_oled_fill_value', 0xFF) & 0xFF
             OSTART, OSTOP, OEND, ODELAY = 0xF1, 0xF2, 0xF0, 0xF3
-            lp = self.label('ow_lp')
-            ns = self.label('ow_ns')
-            nd = self.label('ow_nd')
-            sd = self.label('ow_sd')
-            av = self.label('ow_av')
-            dn = self.label('ow_dn')
+            lp = self.label('oi_lp')
+            ns = self.label('oi_ns')
+            nd = self.label('oi_nd')
+            sd = self.label('oi_sd')
+            av = self.label('oi_av')
+            dn = self.label('oi_dn')
 
-            self.emit('__oled_fill:')
-            self.emit('\tout_imm 0x10')        # DEBUG: entered helper
-            # NOTE: bus-recovery (9 SCL + STOP) was tried here for
-            # power-cycle-free self-recovery, but it empirically caused
-            # the fill loop to hang on hardware (sim was fine). Until
-            # we understand the mechanism, depend on i2c_init's runtime
-            # stub for whatever recovery it provides — the user may
-            # need to power-cycle the OLED between runs after a
-            # botched transaction. TODO: root-cause the bus-reset
-            # interaction.
+            self.emit('__oled_init:')
+            self.emit('\tout_imm 0x10')        # DEBUG: entered init walker
             self.emit(f'\tldi $d,{data_base}')
             self.emit(f'{lp}:')
             self.emit('\tmov $d,$a')
@@ -3726,8 +3790,8 @@ class MK1CodeGen:
             self.emit(f'\tcmp {ODELAY}')
             self.emit(f'\tjnz {sd}')
             # ~5 ms delay (uncalibrated, identical shape to __lcd_init's).
-            do = self.label('ow_do')
-            di = self.label('ow_di')
+            do = self.label('oi_do')
+            di = self.label('oi_di')
             self.emit('\tldi $c,5')
             self.emit(f'{do}:')
             self.emit('\tldi $a,0')
@@ -3748,32 +3812,29 @@ class MK1CodeGen:
             self.emit('\tmov $a,$d')
             self.emit(f'\tj {lp}')
             self.emit(f'{dn}:')
-            self.emit('\tout_imm 0x20')        # DEBUG: walker done
-            # ── Fill phase: stream 8192 × fill_val as one I2C transaction ──
-            # START, addr (write), control byte 0x40 (= data stream),
-            # then 8192 data bytes, then STOP. SSD1327's GDDRAM
-            # auto-increments inside the address window we set during
-            # the walker phase, so there's no per-byte addressing.
-            #
-            # Counter register: $c. __i2c_sb clobbers $a, $b (its bit
-            # counter), and $d (the byte storage), so $b can't hold our
-            # outer count. $c is preserved across __i2c_sb (the helper
-            # never touches it). Outer count goes on the stack across
-            # the inner loop because both loops want $c.
+            self.emit('\tout_imm 0x20')        # DEBUG: init walker done
+            self.emit('\tret')
+
+        # Per-K specialized fill helpers. Each emits the
+        # 8192-byte fill transaction with the unrolled byte-send
+        # body for that specific K. Multiple distinct K values in
+        # one program produce multiple helpers (one per K) but each
+        # is reused if `oled_fill(K)` is called multiple times with
+        # the same K. ~80B per helper.
+        for k in sorted(getattr(self, '_oled_fill_ks', set())):
+            helper_name = f'__oled_fill_{k:02X}'
+            if helper_name not in helpers:
+                continue
+            self.emit(f'{helper_name}:')
             self.emit('\tjal __i2c_st_only')
-            self.emit('\tldi $a,0x7A')        # OLED write addr
+            self.emit('\tldi $a,0x7A')         # OLED write addr
             self.emit('\tjal __i2c_sb')
-            self.emit('\tldi $a,0x40')        # control: data stream
+            self.emit('\tldi $a,0x40')         # control: data stream
             self.emit('\tjal __i2c_sb')
-            # 8192-byte fill via the shared unrolled-fill helper —
-            # same code that backs the `i2c_fill_const(K, N)` builtin.
-            # Emits 32 outer × 256 inner with $c saved on the stack.
-            self.emit_unrolled_i2c_fill_const(fill_val, 8192)
+            # 8192-byte fill via the shared unrolled helper.
+            self.emit_unrolled_i2c_fill_const(k, 8192)
             self.emit('\tout_imm 0x30')        # DEBUG: fill loop complete
             self.emit('\tjal __i2c_sp')
-            # No final DISPLAYON — display has been on since the very
-            # first command of init, so the user sees the fill happen
-            # in real time. Return to caller.
             self.emit('\tret')
 
         # Updated __lcd_chr / __lcd_cmd for AiP31068L
@@ -10587,98 +10648,58 @@ class MK1CodeGen:
                 self._lcd_init_just_emitted = True
                 return
 
-            if name == 'oled_fill':
-                # One-shot SSD1327 128x128 OLED test: init the chip and
-                # fill the entire 8 KB GDDRAM with the user-supplied
-                # byte value (0x00 = black, 0xFF = white, intermediate
-                # = mid grey since each byte holds two 4 bpp pixels).
-                # Same data-driven walker shape as __lcd_init plus a
-                # trailing 8192-byte fill loop. Reuses the existing
-                # __i2c_st_only / __i2c_sb / __i2c_sp primitives —
-                # no new I2C bit-banging.
+            if name in ('oled_init', 'oled_fill', 'oled_clear'):
+                # SSD1327 128x128 4bpp OLED driver — Phase 2.
                 #
-                # Argument: 1 compile-time-constant byte. The constant
-                # is baked into a `ldi $a, VAL` in the fill loop, so
-                # `oled_fill(0xFF)` produces byte-identical asm to the
-                # earlier `oled_white()` builtin.
+                # Three builtins share an init walker (`__oled_init`,
+                # one per program) and per-K specialized fill helpers
+                # (`__oled_fill_<K>`, one per distinct fill byte):
                 #
-                # Sentinel choice: SSD1327 uses 0xFD (CMDLOCK) and other
-                # F-range bytes as real commands, so we can't reuse the
-                # LCD walker's 0xFB..0xFE sentinels. 0xF0..0xF3 are
-                # unused by SSD1327 commands and don't appear as args
-                # in the init sequence we send.
-                if len(args) != 1:
-                    raise Exception(
-                        f"oled_fill(byte) takes exactly 1 argument, got {len(args)}")
-                fill_val = self._const_eval(args[0])
-                if fill_val is None:
-                    raise Exception(
-                        "oled_fill() argument must be a compile-time constant")
-                fill_val &= 0xFF
-                prev = getattr(self, '_oled_fill_value', None)
-                if prev is not None and prev != fill_val:
-                    raise Exception(
-                        f"oled_fill() called with conflicting fill values "
-                        f"(0x{prev:02X} vs 0x{fill_val:02X}) — only one fill "
-                        f"value is supported per program")
-                self._oled_fill_value = fill_val
+                #   oled_init()    — emit init transaction (DISPLAYOFF,
+                #                    config, CMDLOCK, DISPLAYON,
+                #                    contrast, full-screen window).
+                #                    Idempotent: subsequent calls are
+                #                    no-ops.
+                #   oled_fill(K)   — fill GDDRAM with constant byte K.
+                #                    Lazy-inits if oled_init() wasn't
+                #                    called explicitly. Multiple
+                #                    distinct K values per program are
+                #                    allowed; each gets its own ~80B
+                #                    helper.
+                #   oled_clear()   — convenience for oled_fill(0x00).
+                #
+                # Sentinel choice for the init walker: SSD1327 uses
+                # 0xFD/FE/FC as real commands, so we use 0xF0..0xF3 for
+                # END/START/STOP/DELAY (none appear in init payload).
+                if name == 'oled_init':
+                    if len(args) != 0:
+                        raise Exception(
+                            f"oled_init() takes no arguments, got {len(args)}")
+                    self._oled_ensure_init()
+                    return
 
-                if not hasattr(self, '_lcd_helpers'):
-                    self._lcd_helpers = set()
-                self._lcd_helpers.add('__oled_fill')
-                self._lcd_helpers.add('__i2c_sb')
-                self._lcd_helpers.add('__i2c_st_only')
-                self._lcd_helpers.add('__i2c_sp')
+                if name == 'oled_fill':
+                    if len(args) != 1:
+                        raise Exception(
+                            f"oled_fill(byte) takes exactly 1 argument, got {len(args)}")
+                    fill_val = self._const_eval(args[0])
+                    if fill_val is None:
+                        raise Exception(
+                            "oled_fill() argument must be a compile-time constant")
+                    fill_val &= 0xFF
+                else:  # oled_clear
+                    if len(args) != 0:
+                        raise Exception(
+                            f"oled_clear() takes no arguments, got {len(args)}")
+                    fill_val = 0x00
 
-                OSTART, OSTOP, OEND, ODELAY = 0xF1, 0xF2, 0xF0, 0xF3
-                OLED = 0x7A   # SSD1327 7-bit addr 0x3D shifted for write
-                CMD_STREAM = 0x00
-                # DEBUG: 0xAF (DISPLAYON) included in init for now so
-                # the user can watch the fill happen. Production code
-                # should send 0xAF *after* fill for a clean black-to-
-                # white transition.
-                # Reverting to the exact init that worked earlier in
-                # this session: ONE transaction with DISPLAYOFF, full
-                # config, CMDLOCK, DISPLAYON. No diagnostic A5, no
-                # split DISPLAYON transaction. This is the
-                # configuration the user confirmed produced "filling
-                # in slowly - well done!" before later experiments
-                # broke things.
-                init = (
-                    [ODELAY] * 5 +    # ~25 ms power-on settle
-                    [OSTART, OLED, CMD_STREAM,
-                     0xAE,             # DISPLAYOFF
-                     0x81, 0x80,        # SETCONTRAST
-                     0xA0, 0x51,        # SEGREMAP
-                     0xA1, 0x00,        # SETSTARTLINE
-                     0xA2, 0x00,        # SETDISPLAYOFFSET
-                     0xA4,             # NORMALDISPLAY (resume from RAM)
-                     0xA8, 0x7F,        # SETMULTIPLEX = 1/128
-                     0xB1, 0x11,        # PHASELEN
-                     0xB3, 0x00,        # DCLK
-                     0xAB, 0x01,        # REGULATOR on
-                     0xB6, 0x04,        # PRECHARGE2
-                     0xBE, 0x0F,        # SETVCOM
-                     0xBC, 0x08,        # PRECHARGE1
-                     0xD5, 0x62,        # FUNCSELB
-                     0xFD, 0x12,        # CMDLOCK unlock
-                     0xAF,             # DISPLAYON (in same transaction)
-                     OSTOP] +
-                    [ODELAY] * 20 +   # ~100 ms after init
-                    [OSTART, OLED, CMD_STREAM, 0x81, 0x2F, OSTOP] +
-                    # Set full-screen address window:
-                    #   0x15 col_start col_end (cols are 2-px units, 0..63)
-                    #   0x75 row_start row_end (rows are pixels, 0..127)
-                    [OSTART, OLED, CMD_STREAM,
-                     0x15, 0x00, 0x3F,
-                     0x75, 0x00, 0x7F,
-                     OSTOP] +
-                    [OEND]
-                )
-                data_base = self.data_alloc
-                self.data_alloc += len(init)
-                self._oled_init_data = (data_base, init)
-                self.emit('\tjal __oled_fill')
+                self._oled_ensure_init()
+                if not hasattr(self, '_oled_fill_ks'):
+                    self._oled_fill_ks = set()
+                self._oled_fill_ks.add(fill_val)
+                helper_name = f'__oled_fill_{fill_val:02X}'
+                self._lcd_helpers.add(helper_name)
+                self.emit(f'\tjal {helper_name}')
                 return
 
             if name == 'lcd_clear':
