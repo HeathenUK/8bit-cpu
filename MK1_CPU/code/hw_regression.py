@@ -551,9 +551,17 @@ TESTS = [
             halt();
         }''',
         [1, 2, 3, 4], eeprom=True,
-        # Budget: calibrate ≈ 500ms × 166kHz = 83k + delays 200ms × 166 = 33k
-        # + overhead ~10k = ~130k. 200k gives ~50% headroom.
-        cycles=200_000,
+        # Budget: delay_calibrate() WAITS for the next SQW rising edge,
+        # which is 0..1000 ms depending on where in the 1Hz cycle we
+        # start. Worst case: ~1000 ms × 166 kHz = ~166k cycles, NOT
+        # ~500ms × 166kHz as an earlier comment claimed. Plus 200 ms
+        # of delays (~33k), plus overhead (~10k) = ~210k worst-case.
+        # The previous 200k budget under-shot worst case by ~10k —
+        # whenever calibration landed in the unlucky half of the SQW
+        # cycle, the run hit the cycle cap right after out(1) and the
+        # capture was [sentinel, 1] with the rest of the test cut off.
+        # 300k gives comfortable headroom over the true worst case.
+        cycles=300_000,
         expected_intervals_ms=[50.0, 100.0, 50.0],
         interval_tolerance_pct=5,
     ),
