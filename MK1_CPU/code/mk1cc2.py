@@ -681,6 +681,20 @@ class MK1CodeGen:
             line += f'\t; (0x{value:02X} widened by shadow 0x{shadow:02X})'
         self.emit(line)
 
+    def _i2c_ddrb_str(self, low_bits):
+        """Build a `\\tddrb_imm 0xNN` string for an I2C bit-bang DDRB
+        write. low_bits in {0,1,2,3} sets PB0/PB1; bits 2-7 follow the
+        port shadow so a device that has claimed any DDRB[2-7] bit
+        keeps it set across I2C operations. With no DDRB[2-7] claimers
+        (the only state of the codebase as of 2026-04-26), this is
+        byte-identical to the old raw `\\tddrb_imm 0x0X`.
+
+        Use this for helper-emit functions that build asm as a list of
+        strings (loader = []; loader.append(...)) where `emit_ddrb` is
+        the wrong shape because they don't write directly to self.code."""
+        shadow_high = self._port_shadow_mask('DDRB') & 0xFC
+        return f'\tddrb_imm 0x{(low_bits & 0x03) | shadow_high:02X}'
+
     def emit_ddra(self, value, comment=None):
         shadow = self._port_shadow_mask('DDRA')
         augmented = (value | shadow) & 0xFF
@@ -6162,9 +6176,9 @@ class MK1CodeGen:
             if getattr(self, '_ee_preload_bytes', 0) > 0:
                 preamble.append('\tjal __eeprom_preload')
             preamble.extend([
-                '\tddrb_imm 0x03',   # bus recovery: SCL low, SDA low
-                '\tddrb_imm 0x01',   # SCL high, SDA low
-                '\tddrb_imm 0x00',   # SCL high, SDA high (STOP/idle)
+                self._i2c_ddrb_str(0x03) + '\t; bus recovery: SCL low, SDA low',
+                self._i2c_ddrb_str(0x01) + '\t; SCL high, SDA low',
+                self._i2c_ddrb_str(0x00) + '\t; SCL high, SDA high (STOP/idle)',
             ])
             main_lines = ['_main:'] + preamble + runtime_main
             if getattr(self, '_needs_tone_init', False):
@@ -6370,12 +6384,12 @@ class MK1CodeGen:
                 loader.append('.ov_done:')
                 loader.append('\tldi $a,9')
                 loader.append('.ov_br:')
-                loader.append('\tddrb_imm 0x02')   # SCL LOW, SDA released
-                loader.append('\tddrb_imm 0x00')   # SCL HIGH, SDA released
+                loader.append(self._i2c_ddrb_str(0x02))   # SCL LOW, SDA released
+                loader.append(self._i2c_ddrb_str(0x00))   # SCL HIGH, SDA released
                 loader.append('\tdec')
                 loader.append('\tjnz .ov_br')
-                loader.append('\tddrb_imm 0x01')   # SDA LOW, SCL HIGH (STOP prep)
-                loader.append('\tddrb_imm 0x00')   # SDA HIGH = STOP
+                loader.append(self._i2c_ddrb_str(0x01))   # SDA LOW, SCL HIGH (STOP prep)
+                loader.append(self._i2c_ddrb_str(0x00))   # SDA HIGH = STOP
                 # Restore caller's arg1/arg2 and return. The caller enters the
                 # requested function in the loaded overlay slot.
                 loader.append('\tpop $a')          # restore caller's arg1
@@ -7809,8 +7823,8 @@ class MK1CodeGen:
             self_copy.extend([
                 '; ── EEPROM preload (inline sequential read) ──',
                 '\texrw 2',
-                '\tddrb_imm 0x01',
-                '\tddrb_imm 0x03',
+                self._i2c_ddrb_str(0x01),
+                self._i2c_ddrb_str(0x03),
                 '\tldi $a,0xAE',
                 '\tjal __i2c_sb',
                 f'\tldi $a,{ee_hi_byte}',
@@ -7821,10 +7835,10 @@ class MK1CodeGen:
                 # Saves 3B in stage-1 — enough to fit test_eeprom_overlay
                 # cleanly. Same edge sequence as __i2c_rs helper without
                 # the jal/ret + needing the helper resident.
-                '\tddrb_imm 0x02',        # SCL LOW, SDA released
-                '\tddrb_imm 0x00',        # SCL rises → idle
-                '\tddrb_imm 0x01',        # SDA falls with SCL HIGH → REP START
-                '\tddrb_imm 0x03',        # SCL falls → ready for address byte
+                self._i2c_ddrb_str(0x02),        # SCL LOW, SDA released
+                self._i2c_ddrb_str(0x00),        # SCL rises → idle
+                self._i2c_ddrb_str(0x01),        # SDA falls with SCL HIGH → REP START
+                self._i2c_ddrb_str(0x03),        # SCL falls → ready for address byte
                 '\tldi $a,0xAF',
                 '\tjal __i2c_sb',
                 f'\tldi $d,{ee_preload_bytes}',
@@ -7844,7 +7858,7 @@ class MK1CodeGen:
                 '\tsll',                  # A = B << 1, CF = old bit 7
                 '\tmov $a,$b',            # B = shifted
                 '\tjc .ee_byte_end',      # sentinel shifted out → 8 bits done
-                '\tddrb_imm 0x00',        # SCL HIGH (release, slave drives SDA)
+                self._i2c_ddrb_str(0x00),        # SCL HIGH (release, slave drives SDA)
                 '\texrw 0',               # A = port B (bit 0 = SDA)
                 '\ttst 0x01',
                 '\tjz .ee_bz',
@@ -7852,7 +7866,7 @@ class MK1CodeGen:
                 '\tori 0x01,$a',          # B |= 1
                 '\tmov $a,$b',
                 '.ee_bz:',
-                '\tddrb_imm 0x02',        # SCL LOW
+                self._i2c_ddrb_str(0x02),        # SCL LOW
                 '\tj .ee_bit',
                 '.ee_byte_end:',
                 # B=read_byte (from sentinel loop), C=address counter.
@@ -7862,17 +7876,17 @@ class MK1CodeGen:
                 '\tmov $b,$a',            # A = B (byte)
                 '\tmov $c,$b',            # B = C (address)
                 '\tiderefp3',             # page3[B=addr] = A=byte
-                '\tddrb_imm 0x03',
-                '\tddrb_imm 0x01',
-                '\tddrb_imm 0x03',
+                self._i2c_ddrb_str(0x03),
+                self._i2c_ddrb_str(0x01),
+                self._i2c_ddrb_str(0x03),
                 # Pre-collapsed to `incc` / `decd` (would also be caught by
                 # the section-aware final peephole on this `code` section).
                 '\tincc',
                 '\tdecd',
                 '\tjnz .ee_byte',
-                '\tddrb_imm 0x03',
-                '\tddrb_imm 0x01',
-                '\tddrb_imm 0x00',
+                self._i2c_ddrb_str(0x03),
+                self._i2c_ddrb_str(0x01),
+                self._i2c_ddrb_str(0x00),
             ])
         self._ee_preload_bytes = 0  # disable kernel-side preload emission
         self_copy.append('\tj 0')                        # jump to kernel at code[0]
@@ -7903,20 +7917,20 @@ class MK1CodeGen:
                 '\tout_imm 250',   # DEBUG: preload entered
                 # Setup: START + write-addr + hi + lo, STOP, RESTART + read-addr
                 '\texrw 2',
-                '\tddrb_imm 0x01',
-                '\tddrb_imm 0x03',
+                self._i2c_ddrb_str(0x01),
+                self._i2c_ddrb_str(0x03),
                 '\tldi $a,0xAE',
                 '\tjal __i2c_sb',
                 f'\tldi $a,{_ee_hi_byte}',
                 '\tjal __i2c_sb',
                 '\tclr $a',
                 '\tjal __i2c_sb',
-                '\tddrb_imm 0x03',
-                '\tddrb_imm 0x01',
-                '\tddrb_imm 0x00',
+                self._i2c_ddrb_str(0x03),
+                self._i2c_ddrb_str(0x01),
+                self._i2c_ddrb_str(0x00),
                 '\texrw 2',
-                '\tddrb_imm 0x01',
-                '\tddrb_imm 0x03',
+                self._i2c_ddrb_str(0x01),
+                self._i2c_ddrb_str(0x03),
                 '\tldi $a,0xAF',
                 '\tjal __i2c_sb',
                 # Outer: init byte counter + page3 offset
@@ -7930,7 +7944,7 @@ class MK1CodeGen:
                 '\tmov $b,$a',
                 '\tsll',
                 '\tmov $a,$b',
-                '\tddrb_imm 0x00',
+                self._i2c_ddrb_str(0x00),
                 '\texrw 0',
                 '\ttst 0x01',
                 '\tjz .eepl_bz',
@@ -7938,7 +7952,7 @@ class MK1CodeGen:
                 '\tori 0x01,$a',
                 '\tmov $a,$b',
                 '.eepl_bz:',
-                '\tddrb_imm 0x02',
+                self._i2c_ddrb_str(0x02),
                 '\tpop $a',
                 '\tdec',
                 '\tpush $a',
@@ -7952,9 +7966,9 @@ class MK1CodeGen:
                 '\tpop $a',
                 '\tiderefp3',
                 # ACK pulse
-                '\tddrb_imm 0x03',
-                '\tddrb_imm 0x01',
-                '\tddrb_imm 0x03',
+                self._i2c_ddrb_str(0x03),
+                self._i2c_ddrb_str(0x01),
+                self._i2c_ddrb_str(0x03),
                 # C++
                 '\tmov $c,$a',
                 '\tinc',
@@ -7965,9 +7979,9 @@ class MK1CodeGen:
                 '\tmov $a,$d',
                 '\tjnz .eepl_byte',
                 # Final STOP
-                '\tddrb_imm 0x03',
-                '\tddrb_imm 0x01',
-                '\tddrb_imm 0x00',
+                self._i2c_ddrb_str(0x03),
+                self._i2c_ddrb_str(0x01),
+                self._i2c_ddrb_str(0x00),
                 '\tret',
             ])
         assembled.extend(runtime_main_lines)
