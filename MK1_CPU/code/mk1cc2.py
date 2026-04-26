@@ -5985,10 +5985,37 @@ class MK1CodeGen:
             main_lines = ['_main:'] + preamble + runtime_main
             if getattr(self, '_needs_tone_init', False):
                 tone_ddra = self._port_shadow_mask('DDRA') | 0x02
+                # DDRA-setup must land AFTER the precompute (which calls
+                # __tone_setup overlay and that path may temporarily clobber
+                # DDRA) and BEFORE any user-code path that calls __play_note
+                # / __tone. Two precompute forms exist in compiler output:
+                #   (a) `jal __tone_precompute` — eeprom-mode, function call
+                #   (b) inline `.__precomp:` loop with trailing `jnz .__precomp`
+                #       — non-eeprom mode (tone_isolation.c et al)
+                # Pre-2026-04-26 only form (a) was matched, so form (b)
+                # programs ran with DDRA=0 (whatever __delay_cal left it),
+                # PA1 stayed INPUT, no audio reached the piezo. Match both.
+                _inserted = False
                 for _mi, _ml in enumerate(main_lines):
                     if _ml.strip() == 'jal __tone_precompute':
                         main_lines.insert(_mi + 1, f'\tddra_imm 0x{tone_ddra:02X}')
+                        _inserted = True
                         break
+                if not _inserted:
+                    # Form (b): find last `jnz .__precomp` (precompute loop
+                    # back-edge) and insert immediately after.
+                    for _mi in range(len(main_lines) - 1, -1, -1):
+                        _ml_s = main_lines[_mi].strip()
+                        if _ml_s.startswith('jnz') and '.__precomp' in _ml_s:
+                            main_lines.insert(_mi + 1, f'\tddra_imm 0x{tone_ddra:02X}')
+                            _inserted = True
+                            break
+                if not _inserted:
+                    # Fallback: insert at top of runtime_main (after preamble).
+                    # This covers any future precompute form. Costs nothing
+                    # for programs that already had a match.
+                    main_lines.insert(len(['_main:'] + preamble),
+                                      f'\tddra_imm 0x{tone_ddra:02X}')
 
             # ── Step 11: Generate kernel assembly (overlay_load function) ──
             # This is the runtime overlay loader that lives in the code page.
