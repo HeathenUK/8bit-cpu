@@ -10763,6 +10763,49 @@ class MK1CodeGen:
                 self.emit('\tjal __i2c_sb')
                 return
 
+            if name == 'i2c_send_const':
+                # Send a compile-time-constant byte over I²C, fully
+                # unrolled at the call site. ~3.4× faster than
+                # i2c_send_byte() (the per-bit test/shift/branch chain
+                # in __i2c_sb is folded at emit time) but ~10× larger:
+                # ~52B per call vs ~5B for `ldi $a,K; jal __i2c_sb`.
+                # Use only in hot loops where the bus byte is known at
+                # compile time (bulk fills, EEPROM clears, etc.). For
+                # one-shot byte sends, prefer i2c_send_byte().
+                if len(args) != 1:
+                    raise Exception(
+                        f"i2c_send_const(byte) takes exactly 1 argument, got {len(args)}")
+                val = self._const_eval(args[0])
+                if val is None:
+                    raise Exception(
+                        "i2c_send_const() argument must be a compile-time constant")
+                self.emit_unrolled_i2c_send_const(val)
+                return
+
+            if name == 'i2c_fill_const':
+                # Send a compile-time-constant byte over I²C `count`
+                # times in a tight asm loop using the unrolled body.
+                # Counts in [1, 256] use a single inner loop; counts
+                # > 256 must be a multiple of 256 and use an outer/
+                # inner pair (max 65536). Both arguments must be
+                # compile-time constants. Backs the OLED fill helper
+                # and is intended for any bulk-write context (EEPROM
+                # erase, framebuffer clear, byte stream of known
+                # length).
+                if len(args) != 2:
+                    raise Exception(
+                        f"i2c_fill_const(byte, count) takes 2 arguments, got {len(args)}")
+                val = self._const_eval(args[0])
+                count = self._const_eval(args[1])
+                if val is None:
+                    raise Exception(
+                        "i2c_fill_const() byte argument must be a compile-time constant")
+                if count is None:
+                    raise Exception(
+                        "i2c_fill_const() count argument must be a compile-time constant")
+                self.emit_unrolled_i2c_fill_const(val, count)
+                return
+
             if name == 'i2c_scan_results':
                 vals = [self._const_eval(a) for a in (args or [])]
                 if len(vals) != 4 or any(v is None for v in vals):
