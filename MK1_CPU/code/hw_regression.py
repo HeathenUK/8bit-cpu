@@ -560,8 +560,13 @@ TESTS = [
         # whenever calibration landed in the unlucky half of the SQW
         # cycle, the run hit the cycle cap right after out(1) and the
         # capture was [sentinel, 1] with the rest of the test cut off.
-        # 300k gives comfortable headroom over the true worst case.
-        cycles=300_000,
+        # 500k gives ~2.4× headroom over worst case AND lets the
+        # halt-retry path (HLT_GRACE_CYCLES) emit at least one
+        # complete extra iteration after the first halt, which the
+        # find_sequence() any-occurrence matcher prefers because the
+        # second iteration tends to have cleaner OI capture (no
+        # startup transients). At ~330 kHz read rate this is ~3 sec.
+        cycles=500_000,
         expected_intervals_ms=[50.0, 100.0, 50.0],
         interval_tolerance_pct=5,
     ),
