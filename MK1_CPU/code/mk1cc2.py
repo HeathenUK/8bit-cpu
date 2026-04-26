@@ -4184,6 +4184,45 @@ class MK1CodeGen:
             self.emit('\tldi $a,0x02')
             self.emit('\tret')
 
+        # __keypad_wait: block until a stable key press is observed,
+        # then block until release, then return the 0-15 key index.
+        #
+        # Algorithm:
+        #   loop:
+        #     k1 = scan(); if k1 == 0xFF: continue   ; spin until something
+        #     delay 5 ms                              ; settle
+        #     k2 = scan()
+        #     if k2 != k1: continue                  ; bounce / glitch — restart
+        #     while scan() != 0xFF: spin             ; wait for release
+        #     return k1
+        #
+        # Debounce is 5 ms based on the typical membrane-keypad bounce
+        # window of 1-3 ms. ~26 B body. Depends on __keypad_scan and
+        # __delay_Nms (the latter requires __delay_cal calibration to
+        # have populated kstate calib_blocks).
+        if '__keypad_wait' in helpers:
+            kw_poll = self.label('kw_poll')
+            kw_release = self.label('kw_release')
+            self.emit('__keypad_wait:')
+            self.emit(f'{kw_poll}:')
+            self.emit('\tjal __keypad_scan')
+            self.emit('\tcmpi 0xFF')
+            self.emit(f'\tjz {kw_poll}')      # no key, keep polling
+            self.emit('\tpush $a')             # save first-scan key
+            self.emit('\tldi $b,5')            # 5 ms debounce
+            self.emit('\tjal __delay_Nms')
+            self.emit('\tjal __keypad_scan')   # second sample
+            self.emit('\tpop_b')               # B = first-scan key
+            self.emit('\tcmp $b')              # ZF = (A == B)
+            self.emit(f'\tjnz {kw_poll}')      # values differ → bounce, restart
+            self.emit('\tpush $a')             # save stable key index
+            self.emit(f'{kw_release}:')
+            self.emit('\tjal __keypad_scan')
+            self.emit('\tcmpi 0xFF')
+            self.emit(f'\tjnz {kw_release}')   # not released yet
+            self.emit('\tpop $a')              # A = stable key index
+            self.emit('\tret')
+
         # __play_note: A = data page offset into note table.
         # Reads [half_period, cyc_lo, cyc_hi] from data page (page 1) via deref.
         # Note: ratio→half_period precomputation happens during init when
@@ -10203,6 +10242,27 @@ class MK1CodeGen:
                     self._lcd_helpers = set()
                 self._lcd_helpers.add('__keypad_scan')
                 self.emit('\tjal __keypad_scan')
+                return
+
+            if name == 'keypad_wait':
+                # Phase 3 — block until a key is pressed and released,
+                # return the 0-15 key index. Two-sample debounce ~5 ms
+                # apart via the calibrated `__delay_Nms`. Requires
+                # `keypad_init()` (port claims) and an eventual
+                # `delay_calibrate()` (we set `_needs_delay_calibrate`
+                # to auto-insert one if absent — same pattern as
+                # `delay()`).
+                if not getattr(self, '_keypad_init_called', False):
+                    raise Exception(
+                        "keypad_wait() called without prior keypad_init(). "
+                        "Call keypad_init() before any keypad_wait()/keypad_scan().")
+                if not hasattr(self, '_lcd_helpers'):
+                    self._lcd_helpers = set()
+                self._lcd_helpers.add('__keypad_wait')
+                self._lcd_helpers.add('__keypad_scan')   # called from body
+                self._lcd_helpers.add('__delay_Nms')     # debounce
+                self._needs_delay_calibrate = True
+                self.emit('\tjal __keypad_wait')
                 return
 
             if name == 'lcd_init':
