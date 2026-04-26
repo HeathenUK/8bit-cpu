@@ -636,6 +636,20 @@ class MK1CodeGen:
             total |= m
         return total
 
+    def _port_shadow_mask_excluding(self, reg, device):
+        """OR of all bits claimed on `reg` EXCEPT those by `device`.
+
+        Used by emitters that drive their own claimed bits explicitly
+        (e.g. the keypad scanner pulls one row LOW per row-slot — it
+        owns bits 4-7 of ORA but its scan code can't OR those bits in
+        from its own claim, otherwise it could never drive any of its
+        rows LOW). Other devices' bits still need preserving."""
+        total = 0
+        for d, m in self._port_claims[reg].items():
+            if d != device:
+                total |= m
+        return total
+
     def label(self, prefix='L'):
         self.label_id += 1
         return f'.{prefix}{self.label_id}'
@@ -4080,6 +4094,94 @@ class MK1CodeGen:
             self.emit_ddrb(0x03)     # SDA LOW
             self.emit_ddrb(0x01)     # SCL HIGH
             self.emit_ddrb(0x00)     # STOP
+            self.emit('\tret')
+
+        # __keypad_scan: 4x4 matrix scanner for the keypad on PA4-7 (rows)
+        # / PB4-7 (cols). Returns 0-15 (row*4 + col) or 0xFF if no key.
+        # Drives one row LOW per slot, reads ORB & 0xF0; if any col bit
+        # is LOW, decodes which one and combines with the row index.
+        # Restores ORA to the all-rows-HIGH idle state before returning.
+        # Resident (called per-poll); ~95B body, acceptable kernel cost.
+        if '__keypad_scan' in helpers:
+            # Other-device contributions to the ORA shadow — bits the
+            # scan must preserve when driving its own row bits. Excludes
+            # keypad's own 0xF0 claim (which would otherwise force every
+            # row HIGH and make the whole scan a no-op).
+            excl = self._port_shadow_mask_excluding('ORA', 'keypad')
+            row_masks = [
+                excl | 0xE0,   # row 0: PA4 LOW, PA5-7 HIGH
+                excl | 0xD0,   # row 1: PA5 LOW
+                excl | 0xB0,   # row 2: PA6 LOW
+                excl | 0x70,   # row 3: PA7 LOW
+            ]
+            idle_ora = excl | 0xF0   # all rows HIGH (= full shadow)
+
+            ks_p = [self.label('ks_p') for _ in range(4)]
+            ks_common = self.label('ks_common')
+            ks_decode = self.label('ks_decode')
+            ks_d0 = self.label('ks_d0')
+            ks_d1 = self.label('ks_d1')
+            ks_d2 = self.label('ks_d2')
+
+            self.emit('__keypad_scan:')
+            for row in range(4):
+                self.emit(f'\tldi $a,0x{row_masks[row]:02X}')
+                self.emit('\texw 0 1')           # ORA = row mask
+                self.emit('\tnop')               # settle (column lines)
+                self.emit('\texrw 0')            # A = ORB
+                self.emit('\tandi 0xF0,$a')      # mask col bits
+                self.emit('\tcmpi 0xF0')         # all 1s = no key in row
+                self.emit(f'\tjnz {ks_p[row]}')
+
+            # Fall-through: no key in any row → restore idle, return 0xFF.
+            self.emit(f'\tldi $a,0x{idle_ora:02X}')
+            self.emit('\texw 0 1')
+            self.emit('\tldi $a,0xFF')
+            self.emit('\tret')
+
+            # Pressed handlers: load row*4 into $b, jump to common.
+            # Last one falls through to the common block, saving 2B.
+            for row in range(3):
+                self.emit(f'{ks_p[row]}:')
+                self.emit(f'\tldi $b,0x{(row * 4):02X}')
+                self.emit(f'\tj {ks_common}')
+            self.emit(f'{ks_p[3]}:')
+            self.emit('\tldi $b,0x0C')           # row 3 → b = 12
+
+            # Common: A has the col pattern (e.g. 0xE0 if COL0 is the
+            # pressed col in the active row). Decode to col 0-3, add
+            # the row*4 in $b for the final 0-15 key index, restore
+            # ORA to idle, return.
+            self.emit(f'{ks_common}:')
+            self.emit(f'\tjal {ks_decode}')      # A = col 0-3
+            self.emit('\tadd $b,$a')             # A = col + row*4 = key index
+            self.emit('\tpush $a')               # save key across ORA write
+            self.emit(f'\tldi $a,0x{idle_ora:02X}')
+            self.emit('\texw 0 1')               # ORA back to all-rows-HIGH
+            self.emit('\tpop $a')                # A = key index
+            self.emit('\tret')
+
+            # Decoder: A in {0xE0, 0xD0, 0xB0, 0x70} → col 0-3.
+            # Three explicit cmpi / jz checks; default falls through
+            # to col 3 (= 0x70). Cheaper than a shift-loop because
+            # incb / incd clobber A and the push/pop dance dominates.
+            self.emit(f'{ks_decode}:')
+            self.emit('\tcmpi 0xE0')
+            self.emit(f'\tjz {ks_d0}')
+            self.emit('\tcmpi 0xD0')
+            self.emit(f'\tjz {ks_d1}')
+            self.emit('\tcmpi 0xB0')
+            self.emit(f'\tjz {ks_d2}')
+            self.emit('\tldi $a,0x03')
+            self.emit('\tret')
+            self.emit(f'{ks_d0}:')
+            self.emit('\tclr $a')
+            self.emit('\tret')
+            self.emit(f'{ks_d1}:')
+            self.emit('\tldi $a,0x01')
+            self.emit('\tret')
+            self.emit(f'{ks_d2}:')
+            self.emit('\tldi $a,0x02')
             self.emit('\tret')
 
         # __play_note: A = data page offset into note table.
@@ -10081,6 +10183,26 @@ class MK1CodeGen:
                 # something else claims them; the conflict check above
                 # rejects that. I2C's dynamic DDRB toggling (0x03/0x01/
                 # 0x00) only touches bits 0-1 so col bits stay at 0.
+                return
+
+            if name == 'keypad_scan':
+                # Phase 2 — scan helper returns 0-15 (key index, where
+                # row 0 col 0 = 0, row 3 col 3 = 15) or 0xFF if no key
+                # is pressed. Body emitted in `_emit_i2c_helpers`.
+                # Caller must have called `keypad_init()` first;
+                # without it the port shadow mask wouldn't include
+                # the keypad row claims and the scan would emit ORA
+                # writes that fail to preserve row direction.
+                if not getattr(self, '_keypad_init_called', False):
+                    raise Exception(
+                        "keypad_scan() called without prior keypad_init(). "
+                        "keypad_init() registers the PA4-7 / ORA shadow "
+                        "claims that the scan helper relies on; without "
+                        "it the scan would emit incorrect ORA values.")
+                if not hasattr(self, '_lcd_helpers'):
+                    self._lcd_helpers = set()
+                self._lcd_helpers.add('__keypad_scan')
+                self.emit('\tjal __keypad_scan')
                 return
 
             if name == 'lcd_init':
