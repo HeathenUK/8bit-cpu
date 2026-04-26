@@ -331,6 +331,11 @@ class Parser:
         # Typedef alias in statement position: behave like a local declaration.
         if t.type == 'IDENT' and t.value in self.typedefs: return self.parse_local_decl()
         if t.value == '{': return self.parse_block()
+        # Empty statement (`;` alone). Permits idioms like `while (1);`
+        # for spin-forever loops without forcing a useless block.
+        if t.value == ';':
+            self.advance()
+            return ('block', [])
         e = self.parse_expr(); self.expect(';'); return ('expr_stmt', e)
 
     def parse_do_while(self):

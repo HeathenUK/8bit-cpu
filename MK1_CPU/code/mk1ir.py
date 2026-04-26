@@ -455,6 +455,14 @@ def branch_thread(prog: Program, cond_mnemonics=None) -> int:
             if len(first_parts) != 2 or first_parts[0] != 'j':
                 continue
             final_target = first_parts[1].strip()
+            # No-op rewrite: if the threaded target is identical to the
+            # current target (e.g. self-loop `while(1){}` → `.L: j .L`,
+            # where threading through `.L`'s `j .L` produces `j .L`
+            # again), the line doesn't change. Counting it still as a
+            # rewrite makes the outer fixed-point loop spin forever
+            # because every iteration reports "progress made". Skip.
+            if final_target == target:
+                continue
             # Rewrite: same conditional, new target
             indent = item.raw[:len(item.raw) - len(item.raw.lstrip())]
             new_raw = indent + f'{item.mnemonic} {final_target}'
