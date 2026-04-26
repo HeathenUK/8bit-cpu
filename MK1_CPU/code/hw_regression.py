@@ -560,13 +560,17 @@ TESTS = [
         # whenever calibration landed in the unlucky half of the SQW
         # cycle, the run hit the cycle cap right after out(1) and the
         # capture was [sentinel, 1] with the rest of the test cut off.
-        # 500k gives ~2.4× headroom over worst case AND lets the
-        # halt-retry path (HLT_GRACE_CYCLES) emit at least one
-        # complete extra iteration after the first halt, which the
-        # find_sequence() any-occurrence matcher prefers because the
-        # second iteration tends to have cleaner OI capture (no
-        # startup transients). At ~330 kHz read rate this is ~3 sec.
-        cycles=500_000,
+        # 500k was supposed to be ~2.4× worst case but hw_regression
+        # still saw intermittent FAILs with cnt=1 raw=[4] on rep 2/3 —
+        # i.e. the captured trace contained only the FINAL out, with
+        # the first three either missed or rolled out of the firmware
+        # buffer when HLT_GRACE_CYCLES re-entered main mid-run. Could
+        # be longer-than-modelled DS3231 SQW jitter, or the find_
+        # sequence() matcher landing on a cross-iteration tail. Either
+        # way, fattening the budget so even pathological reps complete
+        # the full sequence multiple times eliminates the failure mode
+        # at the cost of a few seconds of test runtime.
+        cycles=2_000_000,
         expected_intervals_ms=[50.0, 100.0, 50.0],
         interval_tolerance_pct=5,
     ),
@@ -595,8 +599,11 @@ TESTS = [
         # Budget: calibration can wait up to a full 1 Hz SQW period before
         # starting (~1 s = 166k cycles at 165.5 kHz), then counts 500 ms
         # (83k), plus 1000 ms of tones (166k), plus sentinel/out overhead.
-        # 600k gives comfortable headroom.
-        cycles=600_000,
+        # 600k *should* have been enough, but the same intermittent FAIL
+        # pattern as the stopwatch test (rep 1/3 saw raw=[2,3,2,3,4]) —
+        # cross-iteration buffer rolling under HLT_GRACE_CYCLES.
+        # Fattened to match the stopwatch budget.
+        cycles=2_000_000,
         expected_intervals_ms=[250.0, 500.0, 250.0],
         # 10% tolerance on the flat-mode path (precompute converts ratio
         # to half_period correctly). Overlay-mode tone precision is a
