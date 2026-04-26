@@ -10030,6 +10030,59 @@ class MK1CodeGen:
                 self.emit_ddrb(0x00)   # SDA rises = STOP
                 return
 
+            if name == 'keypad_init':
+                # 4x4 matrix keypad on PA4-7 (rows, output) + PB4-7
+                # (cols, input with external 8K pull-ups to VCC).
+                # Hardware-validated 2026-04-26 with `keypad_smoke.c` and
+                # `keypad_scan_test.c`; per-key map captured in worklog.
+                #
+                # Phase 1: register pin claims so any other emitter
+                # (tone, lcd, i2c) that goes through emit_ddra / emit_ora
+                # automatically preserves these bits. No scan helper
+                # yet — `keypad_scan()` builtin is Phase 2.
+                #
+                # Why each claim:
+                #   DDRA bits 4-7 = 1   rows must stay outputs
+                #   ORA  bits 4-7 = 1   rows IDLE state is HIGH (pulled
+                #                       low only during the active row's
+                #                       scan slot, which the scan helper
+                #                       will manage explicitly in Phase 2)
+                # Cols (PB4-7) are inputs — DDR bit = 0. The current
+                # claim model only tracks always-output bits, so we
+                # can't "claim PB4-7 as input" via the registry. We
+                # ASSERT no other device has claimed DDRB[4-7] as
+                # output instead — if a future device does, this
+                # raises at compile time. Symmetric assertion on
+                # ORB[4-7] would be redundant (an input pin's ORB
+                # latch is don't-care since it doesn't drive).
+                ddrb_existing = self._port_shadow_mask('DDRB')
+                if ddrb_existing & 0xF0:
+                    raise Exception(
+                        "keypad_init(): DDRB bits 4-7 (column input "
+                        f"pins PB4-7) are claimed as output by another "
+                        f"device (DDRB shadow=0x{ddrb_existing:02X}, "
+                        f"conflict=0x{ddrb_existing & 0xF0:02X}). "
+                        "Keypad columns need PB4-7 as inputs."
+                    )
+                self._claim_port_bits('DDRA', 0xF0, 'keypad')
+                self._claim_port_bits('ORA',  0xF0, 'keypad')
+                # Mark for downstream: the scan helper (Phase 2) will
+                # check this flag rather than rebuilding the inference.
+                self._keypad_init_called = True
+                # Emit runtime port setup at the call site. emit_ddra /
+                # emit_ora apply the now-updated shadow mask, so the
+                # actual byte we write is `(0xF0 | other_devices_bits)`
+                # — preserves PA1 (tone) etc. if those have also been
+                # claimed already.
+                self.emit_ddra(0xF0, comment='keypad rows PA4-7 output')
+                self.emit_ora(0xF0,  comment='keypad rows idle HIGH')
+                # DDRB / ORB intentionally untouched. PB4-7 default to
+                # input (DDR=0) post-reset and stay that way unless
+                # something else claims them; the conflict check above
+                # rejects that. I2C's dynamic DDRB toggling (0x03/0x01/
+                # 0x00) only touches bits 0-1 so col bits stay at 0.
+                return
+
             if name == 'lcd_init':
                 # Complete LCD init sequence as one jal call.
                 # LCD init data is pre-populated in data page (no EEPROM read needed).
