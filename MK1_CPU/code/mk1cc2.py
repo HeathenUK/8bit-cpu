@@ -3096,13 +3096,18 @@ class MK1CodeGen:
                     no_ov.add(f'{h}:')
 
         # Keypad scan must be resident in programs that ALSO use I2C/LCD.
-        # Reason: every overlay_load call generates phantom SCL pulses
-        # (the copy loop's `deref` toggles SCL, plus an explicit 9-clock
-        # bus-recovery sequence at the end). On the DFRobot AiP31068L LCD
-        # this confuses the slave into a state where keypad scan reads
-        # stop reflecting key presses (col bits stuck at 0xF0). Keeping
-        # __keypad_scan resident eliminates the per-call overlay_load and
-        # its bus activity. See 2026-04-26 keypad_lcd_iso debugging.
+        # Reason: overlay_load's bus-recovery sequence (9 SCL clocks +
+        # STOP, intended to flush a stuck PCF8574 backpack after the
+        # copy loop's phantom SCL pulses) confuses the DFRobot V2.0 LCD
+        # module (AiP31068L + PCA9633) into a state where keypad
+        # column reads stay at 0xF0 regardless of presses. Keeping
+        # __keypad_scan resident eliminates the per-call overlay_load
+        # and its bus activity, so the LCD stays in a clean state.
+        # Removing the 9-clock recovery globally would fix this but
+        # breaks `tone duration timing` and `rgb lcd smoke test` —
+        # tone+lcd programs DO need the longer flush. So we leave the
+        # recovery alone and pay ~80B of kernel residency for keypad.
+        # See 2026-04-26 keypad_lcd debugging.
         if '__keypad_scan' in helpers and self._needs_runtime_i2c:
             no_ov.add('__keypad_scan:')
             no_ov.add('__ovthunk_0_0:')
@@ -6354,6 +6359,14 @@ class MK1CodeGen:
                 # is in a confused mid-transaction state. Flush it with
                 # 9 SCL clocks (loop, not inline — saves ~27B vs the
                 # unrolled version) + STOP.
+                # NOTE: a 2026-04-26 attempt to remove the 9-clock loop
+                # (in the hope it was the root cause of keypad scan
+                # failures on the DFRobot AiP31068L LCD) regressed
+                # `tone duration timing` and `rgb lcd smoke test` in
+                # hw_regression. The recovery is genuinely load-bearing
+                # for tone+lcd programs. The keypad fix is handled
+                # separately by keeping __keypad_scan resident in I2C
+                # programs.
                 loader.append('.ov_done:')
                 loader.append('\tldi $a,9')
                 loader.append('.ov_br:')
