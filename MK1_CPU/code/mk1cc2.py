@@ -2542,13 +2542,20 @@ class MK1CodeGen:
                     self.code.insert(mi + 2, '\tmov $b,$sp')
                     break
 
-        # Emit page 1 globals ONLY if overlay partitioning didn't inline them.
-        # Overlay mode emits them inside the data section before overlay bodies;
-        # skip the separate emission here to avoid double-defining the labels.
+        # Emit page 1 globals UNLESS the overlay partitioner already inlined
+        # them (overlay mode emits globals inside the data section before
+        # overlay bodies — that path sets _overlay_kernel_size). Init-
+        # extraction mode does NOT emit globals separately, so we still
+        # need to emit them here even when _init_extraction_done is True;
+        # otherwise data[0..globals_size-1] is left empty and any compile-
+        # time data_base computed AFTER globals (e.g. lcd_init) lands at
+        # the wrong runtime offset (lcd_init expects keymap to occupy
+        # data[0..15], so its data sits at data[16..]). Without this
+        # emission, the data section opens with lcd_init bytes at offset 0
+        # and `keymap[k]` deref reads garbage.
         page1_vars = self._page1_globals_cache
         overlays_handled_globals = getattr(self, '_overlay_kernel_size', None) is not None
-        if (page1_vars and not getattr(self, '_init_extraction_done', False)
-                and not overlays_handled_globals):
+        if page1_vars and not overlays_handled_globals:
             self.emit('\tsection data')
             for name, init in page1_vars:
                 self.emit(f'_{name}:')
@@ -3087,6 +3094,18 @@ class MK1CodeGen:
             for h in tone_runtime:
                 if h in helpers:
                     no_ov.add(f'{h}:')
+
+        # Keypad scan must be resident in programs that ALSO use I2C/LCD.
+        # Reason: every overlay_load call generates phantom SCL pulses
+        # (the copy loop's `deref` toggles SCL, plus an explicit 9-clock
+        # bus-recovery sequence at the end). On the DFRobot AiP31068L LCD
+        # this confuses the slave into a state where keypad scan reads
+        # stop reflecting key presses (col bits stuck at 0xF0). Keeping
+        # __keypad_scan resident eliminates the per-call overlay_load and
+        # its bus activity. See 2026-04-26 keypad_lcd_iso debugging.
+        if '__keypad_scan' in helpers and self._needs_runtime_i2c:
+            no_ov.add('__keypad_scan:')
+            no_ov.add('__ovthunk_0_0:')
 
         self._dynamic_no_overlay = no_ov
 
@@ -4119,9 +4138,6 @@ class MK1CodeGen:
             ks_p = [self.label('ks_p') for _ in range(4)]
             ks_common = self.label('ks_common')
             ks_decode = self.label('ks_decode')
-            ks_d0 = self.label('ks_d0')
-            ks_d1 = self.label('ks_d1')
-            ks_d2 = self.label('ks_d2')
 
             self.emit('__keypad_scan:')
             for row in range(4):
@@ -4133,14 +4149,16 @@ class MK1CodeGen:
                 self.emit('\tcmpi 0xF0')         # all 1s = no key in row
                 self.emit(f'\tjnz {ks_p[row]}')
 
-            # Fall-through: no key in any row → restore idle, return 0xFF.
-            self.emit(f'\tldi $a,0x{idle_ora:02X}')
-            self.emit('\texw 0 1')
-            self.emit('\tldi $a,0xFF')
-            self.emit('\tret')
+            # No-key fall-through and pressed paths converge on a
+            # single ORA-idle-restore + ret block, saving the
+            # duplicated `ldi IDLE / exw 0 1` between them.
+            ks_finish = self.label('ks_finish')
+
+            self.emit('\tldi $a,0xFF')           # no-key sentinel
+            self.emit(f'\tj {ks_finish}')
 
             # Pressed handlers: load row*4 into $b, jump to common.
-            # Last one falls through to the common block, saving 2B.
+            # Last one falls through to common, saving 2B.
             for row in range(3):
                 self.emit(f'{ks_p[row]}:')
                 self.emit(f'\tldi $b,0x{(row * 4):02X}')
@@ -4150,38 +4168,47 @@ class MK1CodeGen:
 
             # Common: A has the col pattern (e.g. 0xE0 if COL0 is the
             # pressed col in the active row). Decode to col 0-3, add
-            # the row*4 in $b for the final 0-15 key index, restore
-            # ORA to idle, return.
+            # row*4 in $b for the 0-15 key index, fall through to
+            # finish (which restores ORA to idle and returns A).
             self.emit(f'{ks_common}:')
             self.emit(f'\tjal {ks_decode}')      # A = col 0-3
-            self.emit('\tadd $b,$a')             # A = col + row*4 = key index
-            self.emit('\tpush $a')               # save key across ORA write
+            self.emit('\tadd $b,$a')             # A = col + row*4
+
+            # Shared idle-restore + return. Reached from the no-key
+            # fall-through (A = 0xFF) and from the pressed common
+            # path (A = key index 0-15). The push/pop preserves A
+            # across the ORA write.
+            self.emit(f'{ks_finish}:')
+            self.emit('\tpush $a')
             self.emit(f'\tldi $a,0x{idle_ora:02X}')
-            self.emit('\texw 0 1')               # ORA back to all-rows-HIGH
-            self.emit('\tpop $a')                # A = key index
+            self.emit('\texw 0 1')
+            self.emit('\tpop $a')
             self.emit('\tret')
 
             # Decoder: A in {0xE0, 0xD0, 0xB0, 0x70} → col 0-3.
-            # Three explicit cmpi / jz checks; default falls through
-            # to col 3 (= 0x70). Cheaper than a shift-loop because
-            # incb / incd clobber A and the push/pop dance dominates.
+            # Shift right 4 to align high nibble in bits 0-3, then
+            # count trailing 1-bits via tst+slr loop, returning the
+            # count in A. Counter lives in $d, NOT $b — the caller
+            # (ks_common) holds the row*4 offset in $b and adds it
+            # after we return, so we MUST preserve $b.
+            ks_dec_loop = self.label('ks_dl')
+            ks_dec_done = self.label('ks_dd')
             self.emit(f'{ks_decode}:')
-            self.emit('\tcmpi 0xE0')
-            self.emit(f'\tjz {ks_d0}')
-            self.emit('\tcmpi 0xD0')
-            self.emit(f'\tjz {ks_d1}')
-            self.emit('\tcmpi 0xB0')
-            self.emit(f'\tjz {ks_d2}')
-            self.emit('\tldi $a,0x03')
-            self.emit('\tret')
-            self.emit(f'{ks_d0}:')
-            self.emit('\tclr $a')
-            self.emit('\tret')
-            self.emit(f'{ks_d1}:')
-            self.emit('\tldi $a,0x01')
-            self.emit('\tret')
-            self.emit(f'{ks_d2}:')
-            self.emit('\tldi $a,0x02')
+            self.emit('\tslr')
+            self.emit('\tslr')
+            self.emit('\tslr')
+            self.emit('\tslr')                   # A = high nibble
+            self.emit('\tldi $d,0x00')           # col counter ($d, not $b)
+            self.emit(f'{ks_dec_loop}:')
+            self.emit('\ttst 0x01')
+            self.emit(f'\tjz {ks_dec_done}')
+            self.emit('\tslr')
+            self.emit('\tpush $a')
+            self.emit('\tincd')                  # incd clobbers $a
+            self.emit('\tpop $a')
+            self.emit(f'\tj {ks_dec_loop}')
+            self.emit(f'{ks_dec_done}:')
+            self.emit('\tmov $d,$a')             # A = col index
             self.emit('\tret')
 
         # __keypad_wait: block until a stable key press is observed,
@@ -5979,11 +6006,22 @@ class MK1CodeGen:
             # (DDR setup) — previously these ended the init phase and caused
             # subsequent lcd_init() calls to stay in runtime_main while their
             # body was placed stage-1-only (section-mismatch error).
-            INIT_PREFIXES = ('ddrb_imm', 'exrw 2', 'exw ', 'ldi $d,', 'ddra_imm', 'push_imm')
+            INIT_PREFIXES = ('ddrb_imm', 'exrw 2', 'exw ', 'ldi $d,', 'ddra_imm', 'ora_imm', 'push_imm')
             # Helpers that are safe to call during init (don't end init phase)
+            # __delay_cal included even though it's NOT always init-only (the
+            # `_prefer_delay_cal_init` retry can demote it to overlay) — when
+            # it's an overlay, the call still appears in init-compatible
+            # context because programs typically order
+            # `i2c_init(); delay_calibrate(); lcd_init();` and the calibrate
+            # call must not end the init phase or `jal __lcd_init` ends up
+            # stuck in runtime while __lcd_init body lives in stage 1
+            # (section-mismatch error). The overlay-loaded form is still
+            # safe in init phase because overlay_load doesn't itself need
+            # any post-init kernel state.
             INIT_COMPAT_HELPERS = {'__i2c_stream', '__i2c_st', '__i2c_sp',
                                    '__i2c_rs',
-                                   '__lcd_init', '__tone_setup'}
+                                   '__lcd_init', '__tone_setup',
+                                   '__delay_cal'}
 
             # Pre-scan: find overlay_load call sequences
             overlay_call_lines = set()
@@ -8271,6 +8309,27 @@ class MK1CodeGen:
             else:
                 _post_mc_helpers = list(init_only_funcs)
 
+            # Order matters: emit `j __init_after_mc` BEFORE pre-mc
+            # helpers, not after. Two reasons:
+            # (1) The CPU falls through from the mini-copy loop's
+            #     `jnz` — without an unconditional jump first, it
+            #     would execute the helpers' first instructions.
+            # (2) If the j were emitted after the helpers (whose
+            #     bodies end with `ret`), the peephole's dead-code-
+            #     elim pass (which drops anything between a
+            #     terminator and the next label) would strip it.
+            #     Pre-fix symptom: lcd_init runs in init phase, but
+            #     after the mini-copy loop the CPU falls into
+            #     __i2c_st_only's bytes, then __i2c_sp's, then
+            #     pops a return address from the stack — pure UB.
+            _cur_addr = _measure_code_section(assembled)
+            if _cur_addr < _mc_end:
+                _pad_needed = _mc_end - _cur_addr
+                print(f"  Init-code placement: jumping over mini-copy target "
+                      f"({_cur_addr}->{_mc_end}) before init code",
+                      file=sys.stderr)
+                assembled.append('\tj __init_after_mc')
+
             if _pre_mc_helpers:
                 print(f"  Init-helper pre-mini-copy placement: {len(_pre_mc_helpers)} "
                       f"helper(s) ({sum(h[3] for h in _pre_mc_helpers)}B) fit in "
@@ -8280,24 +8339,16 @@ class MK1CodeGen:
                     body = _rename_shared_refs(self.code[start:end])
                     assembled.extend(body)
 
-            # The mini-copy has already overwritten
-            # [helper_start.._mc_end) with runtime helper bytes. Init code
-            # executes after that copy, so it must not occupy the overwritten
-            # interval. Pre-mc helpers are safe because they are only jumped
-            # to by label; skip over the copied runtime-helper target before
-            # emitting linear init code.
+            # Pad up to mc_end so __init_after_mc lands at the
+            # correct address (just past the mini-copy target).
+            # Always emit the label — j __init_after_mc above needs it.
             _cur_addr = _measure_code_section(assembled)
             if _cur_addr < _mc_end:
                 _pad_needed = _mc_end - _cur_addr
-                print(f"  Init-code placement: jumping over mini-copy target "
-                      f"({_cur_addr}->{_mc_end}) before init code",
-                      file=sys.stderr)
-                assembled.append('\tj __init_after_mc')
-                if _pad_needed > 2:
-                    assembled.append('__init_mc_pad:')
-                    for _ in range(_pad_needed - 2):
-                        assembled.append('\tnop')
-                assembled.append('__init_after_mc:')
+                assembled.append('__init_mc_pad:')
+                for _ in range(_pad_needed):
+                    assembled.append('\tnop')
+            assembled.append('__init_after_mc:')
 
             # Emit init code after the mini-copy target. It may call pre-mc
             # helper bodies by label, but it will not be overwritten before
