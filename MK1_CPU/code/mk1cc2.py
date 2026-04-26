@@ -102,10 +102,10 @@ P2_GUARD_HI          = 0xEF
 P2_STACK_LO          = 0xF0   # stack must not descend below this
 P2_STACK_HI          = 0xFF   # SP starts here
 
-P2_OVERLAY_BYTES     = P2_OVERLAY_HI - P2_OVERLAY_LO + 1   # 128
+P2_OVERLAY_BYTES     = P2_OVERLAY_HI - P2_OVERLAY_LO + 1   # 176
 P2_KSTATE_BYTES      = P2_KSTATE_HI  - P2_KSTATE_LO  + 1   #  48
 P2_GUARD_BYTES       = P2_GUARD_HI   - P2_GUARD_LO   + 1   #  16
-P2_STACK_BUDGET      = P2_STACK_HI   - P2_STACK_LO   + 1   #  64
+P2_STACK_BUDGET      = P2_STACK_HI   - P2_STACK_LO   + 1   #  16
 
 # Manifest + pages array base within the kstate region. Phase 5 moved
 # them out of `section page3_code` (where they squatted at the tail of
@@ -3986,10 +3986,21 @@ class MK1CodeGen:
             lbl_hi = self.label('thi')
             lbl_lo = self.label('tlo')
             lbl_done = self.label('tdn')
+            # Apply ORA shadow mask so other PA pins claimed by other
+            # devices keep their driven bits across the tone toggle.
+            # PA1 (bit 1) is tone's owned output. For programs without
+            # any other ORA claim, shadow=0 → byte-identical to the
+            # pre-shadow raw `ldi 0x02 / clr $a` sequence (which is
+            # what the duty-cycle pad below was calibrated against).
+            # Precomputed values keep the opcode/cycle counts stable;
+            # we don't switch to `ora_imm` because that would change
+            # the pad math (ora_imm is fewer cycles than ldi + exw).
+            ora_hi = self._port_shadow_mask('ORA') | 0x02
+            ora_lo = self._port_shadow_mask('ORA') & ~0x02 & 0xFF
             self.emit('__tone:')
             self.emit(f'{lbl_loop}:')
-            self.emit('\tldi $a,0x02')
-            self.emit('\texw 0 1')         # PA1 HIGH
+            self.emit(f'\tldi $a,0x{ora_hi:02X}')
+            self.emit('\texw 0 1')         # PA1 HIGH (shadow preserved)
             self.emit('\tmov $c,$a')       # A = half_period
             self.emit(f'{lbl_hi}:')
             self.emit('\tdec')
@@ -4002,8 +4013,11 @@ class MK1CodeGen:
             self.emit('\tnop')
             self.emit('\tnop')
             self.emit('\ttst 0')
-            self.emit('\tclr $a')
-            self.emit('\texw 0 1')         # PA1 LOW
+            if ora_lo == 0:
+                self.emit('\tclr $a')          # 1 B (was the unshadowed path)
+            else:
+                self.emit(f'\tldi $a,0x{ora_lo:02X}')  # 2 B; LOW path 1 B longer
+            self.emit('\texw 0 1')         # PA1 LOW (shadow preserved)
             self.emit('\tmov $c,$a')
             self.emit(f'{lbl_lo}:')
             self.emit('\tdec')
@@ -9941,7 +9955,15 @@ class MK1CodeGen:
                 # Removing this causes overlay_dashboard to stop extracting
                 # init code at the wrong boundary (+63B kernel regression).
                 self.emit("\tclr $a")
-                self.emit('\texw 0 0')         # ORB = 0 (A=0)
+                # ORB latch = 0 (will drive PB low when DDRB later goes
+                # output for I2C). Shadow OR'd so any other PB-claimed
+                # bits (e.g. a future keypad row pull-down) keep their
+                # latch state. For programs without other ORB claims,
+                # shadow=0 → byte-identical to raw `exw 0 0`.
+                _orb_init = self._port_shadow_mask('ORB')
+                if _orb_init != 0:
+                    self.emit(f'\tldi $a,0x{_orb_init:02X}')  # +1B per other ORB user
+                self.emit('\texw 0 0')         # ORB = A (shadow preserved)
                 self.emit_ddrb(0x00)   # DDRB = 0 (both lines idle/HIGH)
                 # Full 9-clock bus recovery + STOP. Replaces the older
                 # 4-ddrb_imm STOP sequence (which only handled idle bus).
