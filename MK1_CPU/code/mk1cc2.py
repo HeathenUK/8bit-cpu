@@ -700,6 +700,81 @@ class MK1CodeGen:
         shadow_high = self._port_shadow_mask('DDRB') & 0xFC
         return f'\tddrb_imm 0x{(low_bits & 0x03) | shadow_high:02X}'
 
+    def emit_unrolled_i2c_send_const(self, val):
+        """Emit the unrolled __i2c_sb body for a compile-time-constant
+        byte: 24 ddrb_imm bus pulses (3 per bit, MSB-first) plus a
+        4-pulse ACK clock with `exrw 0` to sample/discard ACK. ~3.4×
+        faster than `jal __i2c_sb` (127 vs 437 cyc/byte) because every
+        per-bit test/shift/branch is folded at emit time. Costs ~52B
+        of inline code; only worth the trade in hot loops. Shared
+        between the `i2c_send_const(K)` builtin and `__oled_fill`'s
+        inner loop body — keep the two call sites in sync via this
+        method."""
+        val &= 0xFF
+        for shift in range(7, -1, -1):
+            if (val >> shift) & 1:
+                self.emit_ddrb(0x02)
+                self.emit_ddrb(0x00)
+                self.emit_ddrb(0x02)
+            else:
+                self.emit_ddrb(0x03)
+                self.emit_ddrb(0x01)
+                self.emit_ddrb(0x03)
+        # ACK clock — same shape as __i2c_sb's tail
+        self.emit_ddrb(0x02)             # SCL LOW, SDA released
+        self.emit_ddrb(0x00)             # SCL HIGH (read ACK)
+        self.emit('\texrw 0')            # sample ACK (discarded)
+        self.emit_ddrb(0x02)             # SCL LOW
+
+    def emit_unrolled_i2c_fill_const(self, val, count):
+        """Emit a tight asm loop that sends `val` over I²C `count`
+        times, using the unrolled byte-send body. Uses $c as the
+        counter (preserved across the unrolled body since none of its
+        ddrb_imm/exrw instructions touch $c).
+
+        Supported counts: 1 ≤ count ≤ 65536. count > 256 must be a
+        multiple of 256 (uses an outer/inner pair with $c saved on
+        the stack). For non-multiple counts > 256 the user should
+        split the work themselves — keeps the builtin simple and the
+        emitted code predictable.
+
+        Code-size: ~52B for the unrolled body + ~6B loop bookkeeping
+        (single loop) or ~14B (nested). Fast: ~127 cyc/byte at the
+        bus, dominated by the 28 ddrb_imm pulses themselves."""
+        if not (1 <= count <= 65536):
+            raise Exception(
+                f"i2c_fill_const count must be in [1, 65536], got {count}")
+        val &= 0xFF
+        if count <= 256:
+            lbl = self.label('ifc_lp')
+            # ldi $c, N where N=256 wraps to 0 and decc decrements 256
+            # iterations (0→255→...→1, jnz exits when $c hits 0).
+            self.emit(f'\tldi $c,{count & 0xFF}')
+            self.emit(f'{lbl}:')
+            self.emit_unrolled_i2c_send_const(val)
+            self.emit('\tdecc')
+            self.emit(f'\tjnz {lbl}')
+        else:
+            if count % 256 != 0:
+                raise Exception(
+                    f"i2c_fill_const count > 256 must be a multiple of 256, "
+                    f"got {count}. Split into a {count // 256 * 256}-byte "
+                    f"fill plus a {count % 256}-byte fill.")
+            outer = count // 256
+            outer_lbl = self.label('ifc_o')
+            inner_lbl = self.label('ifc_i')
+            self.emit(f'\tldi $c,{outer & 0xFF}')   # outer count
+            self.emit(f'{outer_lbl}:')
+            self.emit('\tpush $c')                  # save outer
+            self.emit('\tldi $c,0')                 # inner = 256 via wrap
+            self.emit(f'{inner_lbl}:')
+            self.emit_unrolled_i2c_send_const(val)
+            self.emit('\tdecc')
+            self.emit(f'\tjnz {inner_lbl}')
+            self.emit('\tpop $c')                   # restore outer
+            self.emit('\tdecc')
+            self.emit(f'\tjnz {outer_lbl}')
+
     def emit_ddra(self, value, comment=None):
         shadow = self._port_shadow_mask('DDRA')
         augmented = (value | shadow) & 0xFF
@@ -2609,6 +2684,15 @@ class MK1CodeGen:
                 self.emit(f'\tbyte {b}')
             self.emit('\tsection code')
 
+        # OLED init data (same shape as LCD init data, different sentinels).
+        if hasattr(self, '_oled_init_data') and not getattr(self, '_oled_init_already_emitted', False):
+            data_base, oled_bytes = self._oled_init_data
+            self.emit('\tsection data')
+            self.emit(f'; OLED (SSD1327) init data at data[{data_base}..{data_base+len(oled_bytes)-1}]')
+            for b in oled_bytes:
+                self.emit(f'\tbyte {b}')
+            self.emit('\tsection code')
+
         # Emit lcd_print string data in page 1 (data section). Each
         # string carries its own symbolic label `__str_N`; the
         # assembler resolves it to the data-page offset where the
@@ -3594,6 +3678,102 @@ class MK1CodeGen:
             self.emit('\tmov $a,$d')
             self.emit(f'\tj {lbl_loop}')
             self.emit(f'{lbl_done}:')
+            self.emit('\tret')
+
+        if '__oled_fill' in helpers:
+            # Walker mirroring __lcd_init's shape, with non-conflicting
+            # sentinels (SSD1327 uses 0xFD/0xFE/0xFC as real commands).
+            # After the data sentinel 0xF0 (END), fall through to a
+            # tight 8192-byte fill loop that streams the user-supplied
+            # fill byte via __i2c_sb.
+            data_base, init_bytes = self._oled_init_data
+            fill_val = getattr(self, '_oled_fill_value', 0xFF) & 0xFF
+            OSTART, OSTOP, OEND, ODELAY = 0xF1, 0xF2, 0xF0, 0xF3
+            lp = self.label('ow_lp')
+            ns = self.label('ow_ns')
+            nd = self.label('ow_nd')
+            sd = self.label('ow_sd')
+            av = self.label('ow_av')
+            dn = self.label('ow_dn')
+
+            self.emit('__oled_fill:')
+            self.emit('\tout_imm 0x10')        # DEBUG: entered helper
+            # NOTE: bus-recovery (9 SCL + STOP) was tried here for
+            # power-cycle-free self-recovery, but it empirically caused
+            # the fill loop to hang on hardware (sim was fine). Until
+            # we understand the mechanism, depend on i2c_init's runtime
+            # stub for whatever recovery it provides — the user may
+            # need to power-cycle the OLED between runs after a
+            # botched transaction. TODO: root-cause the bus-reset
+            # interaction.
+            self.emit(f'\tldi $d,{data_base}')
+            self.emit(f'{lp}:')
+            self.emit('\tmov $d,$a')
+            self.emit('\tderef')
+            self.emit(f'\tcmp {OEND}')
+            self.emit(f'\tjz {dn}')
+            self.emit('\tpush $d')
+            self.emit(f'\tcmp {OSTART}')
+            self.emit(f'\tjnz {ns}')
+            self.emit('\tjal __i2c_st_only')
+            self.emit(f'\tj {av}')
+            self.emit(f'{ns}:')
+            self.emit(f'\tcmp {OSTOP}')
+            self.emit(f'\tjnz {nd}')
+            self.emit('\tjal __i2c_sp')
+            self.emit(f'\tj {av}')
+            self.emit(f'{nd}:')
+            self.emit(f'\tcmp {ODELAY}')
+            self.emit(f'\tjnz {sd}')
+            # ~5 ms delay (uncalibrated, identical shape to __lcd_init's).
+            do = self.label('ow_do')
+            di = self.label('ow_di')
+            self.emit('\tldi $c,5')
+            self.emit(f'{do}:')
+            self.emit('\tldi $a,0')
+            self.emit(f'{di}:')
+            self.emit('\tdec')
+            self.emit(f'\tjnz {di}')
+            self.emit('\tmov $c,$a')
+            self.emit('\tdec')
+            self.emit('\tmov $a,$c')
+            self.emit(f'\tjnz {do}')
+            self.emit(f'\tj {av}')
+            self.emit(f'{sd}:')
+            self.emit('\tjal __i2c_sb')
+            self.emit(f'{av}:')
+            self.emit('\tpop $d')
+            self.emit('\tmov $d,$a')
+            self.emit('\tinc')
+            self.emit('\tmov $a,$d')
+            self.emit(f'\tj {lp}')
+            self.emit(f'{dn}:')
+            self.emit('\tout_imm 0x20')        # DEBUG: walker done
+            # ── Fill phase: stream 8192 × fill_val as one I2C transaction ──
+            # START, addr (write), control byte 0x40 (= data stream),
+            # then 8192 data bytes, then STOP. SSD1327's GDDRAM
+            # auto-increments inside the address window we set during
+            # the walker phase, so there's no per-byte addressing.
+            #
+            # Counter register: $c. __i2c_sb clobbers $a, $b (its bit
+            # counter), and $d (the byte storage), so $b can't hold our
+            # outer count. $c is preserved across __i2c_sb (the helper
+            # never touches it). Outer count goes on the stack across
+            # the inner loop because both loops want $c.
+            self.emit('\tjal __i2c_st_only')
+            self.emit('\tldi $a,0x7A')        # OLED write addr
+            self.emit('\tjal __i2c_sb')
+            self.emit('\tldi $a,0x40')        # control: data stream
+            self.emit('\tjal __i2c_sb')
+            # 8192-byte fill via the shared unrolled-fill helper —
+            # same code that backs the `i2c_fill_const(K, N)` builtin.
+            # Emits 32 outer × 256 inner with $c saved on the stack.
+            self.emit_unrolled_i2c_fill_const(fill_val, 8192)
+            self.emit('\tout_imm 0x30')        # DEBUG: fill loop complete
+            self.emit('\tjal __i2c_sp')
+            # No final DISPLAYON — display has been on since the very
+            # first command of init, so the user sees the fill happen
+            # in real time. Return to caller.
             self.emit('\tret')
 
         # Updated __lcd_chr / __lcd_cmd for AiP31068L
@@ -8117,6 +8297,15 @@ class MK1CodeGen:
                 # Mark that we've already emitted LCD init data here, so the
                 # later emission in compile() can skip.
                 self._lcd_init_already_emitted = True
+            oled_init_info = getattr(self, '_oled_init_data', None)
+            if oled_init_info is not None:
+                oled_base, oled_bytes = oled_init_info
+                emit_allocated_until(oled_base)
+                assembled.append(f'; OLED (SSD1327) init data at data[{oled_base}..{oled_base+len(oled_bytes)-1}]')
+                for b in oled_bytes:
+                    assembled.append(f'\tbyte {b}')
+                    emitted += 1
+                self._oled_init_already_emitted = True
             # Any remaining slots → zero-fill
             emit_allocated_until(self.data_alloc)
             if note_entries:
@@ -10396,6 +10585,100 @@ class MK1CodeGen:
                 # `lcd_clear()` immediately after `lcd_init()` is redundant.
                 # Mark the flag so the lcd_cmd builtin can elide such a call.
                 self._lcd_init_just_emitted = True
+                return
+
+            if name == 'oled_fill':
+                # One-shot SSD1327 128x128 OLED test: init the chip and
+                # fill the entire 8 KB GDDRAM with the user-supplied
+                # byte value (0x00 = black, 0xFF = white, intermediate
+                # = mid grey since each byte holds two 4 bpp pixels).
+                # Same data-driven walker shape as __lcd_init plus a
+                # trailing 8192-byte fill loop. Reuses the existing
+                # __i2c_st_only / __i2c_sb / __i2c_sp primitives —
+                # no new I2C bit-banging.
+                #
+                # Argument: 1 compile-time-constant byte. The constant
+                # is baked into a `ldi $a, VAL` in the fill loop, so
+                # `oled_fill(0xFF)` produces byte-identical asm to the
+                # earlier `oled_white()` builtin.
+                #
+                # Sentinel choice: SSD1327 uses 0xFD (CMDLOCK) and other
+                # F-range bytes as real commands, so we can't reuse the
+                # LCD walker's 0xFB..0xFE sentinels. 0xF0..0xF3 are
+                # unused by SSD1327 commands and don't appear as args
+                # in the init sequence we send.
+                if len(args) != 1:
+                    raise Exception(
+                        f"oled_fill(byte) takes exactly 1 argument, got {len(args)}")
+                fill_val = self._const_eval(args[0])
+                if fill_val is None:
+                    raise Exception(
+                        "oled_fill() argument must be a compile-time constant")
+                fill_val &= 0xFF
+                prev = getattr(self, '_oled_fill_value', None)
+                if prev is not None and prev != fill_val:
+                    raise Exception(
+                        f"oled_fill() called with conflicting fill values "
+                        f"(0x{prev:02X} vs 0x{fill_val:02X}) — only one fill "
+                        f"value is supported per program")
+                self._oled_fill_value = fill_val
+
+                if not hasattr(self, '_lcd_helpers'):
+                    self._lcd_helpers = set()
+                self._lcd_helpers.add('__oled_fill')
+                self._lcd_helpers.add('__i2c_sb')
+                self._lcd_helpers.add('__i2c_st_only')
+                self._lcd_helpers.add('__i2c_sp')
+
+                OSTART, OSTOP, OEND, ODELAY = 0xF1, 0xF2, 0xF0, 0xF3
+                OLED = 0x7A   # SSD1327 7-bit addr 0x3D shifted for write
+                CMD_STREAM = 0x00
+                # DEBUG: 0xAF (DISPLAYON) included in init for now so
+                # the user can watch the fill happen. Production code
+                # should send 0xAF *after* fill for a clean black-to-
+                # white transition.
+                # Reverting to the exact init that worked earlier in
+                # this session: ONE transaction with DISPLAYOFF, full
+                # config, CMDLOCK, DISPLAYON. No diagnostic A5, no
+                # split DISPLAYON transaction. This is the
+                # configuration the user confirmed produced "filling
+                # in slowly - well done!" before later experiments
+                # broke things.
+                init = (
+                    [ODELAY] * 5 +    # ~25 ms power-on settle
+                    [OSTART, OLED, CMD_STREAM,
+                     0xAE,             # DISPLAYOFF
+                     0x81, 0x80,        # SETCONTRAST
+                     0xA0, 0x51,        # SEGREMAP
+                     0xA1, 0x00,        # SETSTARTLINE
+                     0xA2, 0x00,        # SETDISPLAYOFFSET
+                     0xA4,             # NORMALDISPLAY (resume from RAM)
+                     0xA8, 0x7F,        # SETMULTIPLEX = 1/128
+                     0xB1, 0x11,        # PHASELEN
+                     0xB3, 0x00,        # DCLK
+                     0xAB, 0x01,        # REGULATOR on
+                     0xB6, 0x04,        # PRECHARGE2
+                     0xBE, 0x0F,        # SETVCOM
+                     0xBC, 0x08,        # PRECHARGE1
+                     0xD5, 0x62,        # FUNCSELB
+                     0xFD, 0x12,        # CMDLOCK unlock
+                     0xAF,             # DISPLAYON (in same transaction)
+                     OSTOP] +
+                    [ODELAY] * 20 +   # ~100 ms after init
+                    [OSTART, OLED, CMD_STREAM, 0x81, 0x2F, OSTOP] +
+                    # Set full-screen address window:
+                    #   0x15 col_start col_end (cols are 2-px units, 0..63)
+                    #   0x75 row_start row_end (rows are pixels, 0..127)
+                    [OSTART, OLED, CMD_STREAM,
+                     0x15, 0x00, 0x3F,
+                     0x75, 0x00, 0x7F,
+                     OSTOP] +
+                    [OEND]
+                )
+                data_base = self.data_alloc
+                self.data_alloc += len(init)
+                self._oled_init_data = (data_base, init)
+                self.emit('\tjal __oled_fill')
                 return
 
             if name == 'lcd_clear':
