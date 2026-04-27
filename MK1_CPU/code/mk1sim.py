@@ -134,6 +134,33 @@ class MK1:
         self.halted = False
         self.cycle = 0
 
+        # ── W65C22S VIA register state ──────────────────────────────────
+        # Selected via E0 (write) or E0+E1 (read) with U-bits encoding
+        # which register: U=0 → ORB, U0 → ORA, U1 → DDRB, U0+U1 → DDRA.
+        # Hardware quirk: the chip-select asymmetry means writes only
+        # need E0; reads need both E0 and E1.
+        self.via_orb = 0
+        self.via_ora = 0
+        self.via_ddrb = 0
+        self.via_ddra = 0
+
+        # ── Keypad matrix model ─────────────────────────────────────────
+        # 4x4 matrix wired to PA4-7 (rows) and PB4-7 (cols). Each pressed
+        # key shorts its row→col when the row is driven LOW (the row line
+        # has DDRA bit set + ORA bit clear). Cols are normally pulled HIGH
+        # by 8K resistors.
+        # `pressed_keys` is a set of (row, col) tuples currently held down.
+        # `keypad_events` is an optional list of timed events:
+        # [(cycle_at_or_after, set/clear, row, col), ...] applied in order
+        # to schedule presses/releases over the run.
+        self.pressed_keys = set()
+        self.keypad_events = []   # list of (cycle, action, row, col)
+        self._next_kp_event = 0
+
+        # ── PA0-3 input pins (DS3231 SQW etc.) ──────────────────────────
+        # Default 0x0F (all high — pull-ups). User can override.
+        self.pa_inputs_low = 0x0F
+
         # Memory: 4 pages of 256 bytes
         # Page 0: code, Page 1: data, Page 2: stack, Page 3: extended data
         self.mem = [bytearray(256) for _ in range(4)]
@@ -232,12 +259,86 @@ class MK1:
             return result
         return None
 
+    def _apply_keypad_events(self):
+        """Drain pending keypad events whose cycle threshold is reached."""
+        while self._next_kp_event < len(self.keypad_events):
+            ev = self.keypad_events[self._next_kp_event]
+            if self.cycle < ev[0]:
+                break
+            _, action, row, col = ev
+            if action == 'press':
+                self.pressed_keys.add((row, col))
+            elif action == 'release':
+                self.pressed_keys.discard((row, col))
+            self._next_kp_event += 1
+
+    def _via_read(self, u_bits):
+        """Compute the value the VIA drives onto the bus when XI+E0+E1 is
+        asserted with the given U-bits selector.
+            u=0 → ORB (PB pin state)
+            u=1 → ORA (PA pin state)
+            u=2 → DDRB
+            u=3 → DDRA
+        For PA/PB reads, output bits show the latched OR_ value; input
+        bits show the external pin state computed from the keypad matrix
+        (and pull-ups).
+        """
+        if u_bits == 2:
+            return self.via_ddrb
+        if u_bits == 3:
+            return self.via_ddra
+        if u_bits == 1:  # ORA / IRA
+            val = 0
+            for bit in range(8):
+                mask = 1 << bit
+                if self.via_ddra & mask:
+                    val |= self.via_ora & mask  # output: read latched
+                else:
+                    val |= self.pa_inputs_low & mask  # input pin
+            return val & 0xFF
+        # u_bits == 0 → ORB / IRB
+        val = 0
+        for bit in range(8):
+            mask = 1 << bit
+            if self.via_ddrb & mask:
+                val |= self.via_orb & mask  # output: read latched
+            else:
+                # Input: default pulled HIGH by 8K resistors.
+                val |= mask
+                # Keypad columns on PB4-7: any pressed key whose row
+                # is driven LOW shorts the column to ground.
+                if 4 <= bit <= 7:
+                    col = bit - 4
+                    for (kr, kc) in self.pressed_keys:
+                        if kc != col:
+                            continue
+                        row_pin = 4 + kr
+                        row_mask = 1 << row_pin
+                        # Row driven LOW iff DDRA bit set AND ORA bit clear
+                        if (self.via_ddra & row_mask) and not (self.via_ora & row_mask):
+                            val &= ~mask  # pull this col LOW
+                            break
+        return val & 0xFF
+
+    def _via_write(self, u_bits, value):
+        """Latch `value` into the VIA register selected by u_bits when
+        E0 is asserted (without XI). Symmetric encoding to _via_read."""
+        if u_bits == 0:
+            self.via_orb = value & 0xFF
+        elif u_bits == 1:
+            self.via_ora = value & 0xFF
+        elif u_bits == 2:
+            self.via_ddrb = value & 0xFF
+        elif u_bits == 3:
+            self.via_ddra = value & 0xFF
+
     def tick(self):
         """Execute one clock cycle. Returns False if halted."""
         if self.halted:
             return False
 
         self.cycle += 1
+        self._apply_keypad_events()
 
         # Get current microcode step
         flags_irq = (0 << 3) | (0 << 2) | (self.ZF << 1) | self.CF  # IRQ0=0, IRQ1=0
@@ -275,11 +376,26 @@ class MK1:
             result, _ = self._alu_compute(self.A, self.E, mode_bits)
             bus = result
 
+        # External-bus read: when XI + E0 + E1 are asserted, the VIA
+        # drives the bus with the selected register's value (ORB/ORA/
+        # DDRB/DDRA, encoded by U-bits).
+        if (ctrl & XI) and (ctrl & E0) and (ctrl & E1):
+            u_bits = (1 if ctrl & U0 else 0) + (2 if ctrl & U1 else 0)
+            bus = self._via_read(u_bits)
+
         # If nothing drives the bus, it floats (we use 0 as default)
         if bus is None:
             bus = 0
 
         bus = bus & 0xFF
+
+        # External-bus write to VIA: E0 set, E1 clear, XI clear. The
+        # E0/E1 split distinguishes VIA writes from 82C55-PPI writes
+        # (which use E1, sometimes with E0 also asserted). We only model
+        # the VIA here; 82C55 writes are silently ignored.
+        if (ctrl & E0) and not (ctrl & E1) and not (ctrl & XI):
+            u_bits = (1 if ctrl & U0 else 0) + (2 if ctrl & U1 else 0)
+            self._via_write(u_bits, bus)
 
         # Register inputs (active on clock edge)
         reg_in_code = (ctrl & _REG_IN_MASK) >> _REG_IN_SHIFT
