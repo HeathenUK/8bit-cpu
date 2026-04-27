@@ -6067,6 +6067,20 @@ class MK1CodeGen:
             _force_resident_helpers = {
                 '__tone', '__play_note', '__delay_Nms',
             }
+            # When OLED runtime helpers are present, force the I²C
+            # primitives `__i2c_st_only` / `__i2c_sp` resident. Init code
+            # (`__oled_init`) calls them at stage 1, AND runtime OLED
+            # helpers call them in their bundled overlay copies. Keeping
+            # one resident copy is cheaper than (a) bundling into each
+            # overlay path that needs them PLUS (b) emitting a renamed
+            # `_init` copy in stage 1 — the latter pushes stage 1 over
+            # the 254 B limit on programs like `keypad_oled.c`.
+            _helpers_used = getattr(self, '_lcd_helpers', set())
+            _oled_runtime_used = bool(_helpers_used & {
+                '__oled_putc_xfer', '__oled_stream_chars', '__oled_set_window'
+            } | {h for h in _helpers_used if h.startswith('__oled_fill_')})
+            if _oled_runtime_used:
+                _force_resident_helpers |= {'__i2c_st_only', '__i2c_sp'}
             # OLED helpers (__oled_stream_chars, __oled_set_window) used to be
             # in this set to prevent the partitioner from duplicating them
             # into each user-function overlay. Empirically, with the streaming
@@ -6256,7 +6270,17 @@ class MK1CodeGen:
                         hlines_t.pop()
                         hlines = hlines_t
                     merged_lines = hlines + [new_resident[ts]] + tlines
-                    helper_bodies[hname] = (hstart, te, merged_lines)
+                    # Preserve the SOURCE helper's original (hstart, hend) so
+                    # downstream "is this index inside helper X's body" checks
+                    # correctly identify lines in `new_resident[hstart..hend]`
+                    # as belonging to this helper. Earlier code stored the
+                    # tail-target's end here, which produced an empty range
+                    # for source helpers whose tail target lived elsewhere
+                    # in `new_resident` — causing the bundleable filter to
+                    # falsely classify deeper helpers (e.g. `__i2c_st_only`
+                    # called from inside `__oled_set_window`'s body) as
+                    # called from resident code.
+                    helper_bodies[hname] = (hstart, hend, merged_lines)
                 # Don't remove the merged-in helper from helper_bodies — it
                 # can still be bundled independently by overlays that call
                 # it directly.
@@ -6288,6 +6312,7 @@ class MK1CodeGen:
                         break
                 if not called_from_resident:
                     bundleable_helpers.append(hname)
+
 
             # Build dependency graph for transitive closure.
             deps = {h: set() for h in bundleable_helpers}
@@ -6394,9 +6419,11 @@ class MK1CodeGen:
                                 needed_helpers |= transitive_deps(target)
                     bundled_size = ofsize + sum(
                         measure_lines(helper_bodies[h][2]) + 1 for h in needed_helpers
-                        if h in helper_bodies and h not in keep_resident)
+                        if h in helper_bodies and h not in keep_resident
+                        and h not in keep_standalone)
                     if bundled_size > est_overlay_avail:
-                        wrapping_overlays.append((oi, oname, bundled_size, needed_helpers - keep_resident))
+                        wrapping_overlays.append((oi, oname, bundled_size,
+                            needed_helpers - keep_resident - keep_standalone))
                 if not wrapping_overlays:
                     break
                 # Find the bundled helper that, if promoted, would reduce the most wrapping
@@ -6410,6 +6437,36 @@ class MK1CodeGen:
                     break
                 best = max(helper_impact, key=helper_impact.get)
                 best_size = measure_lines(helper_bodies[best][2]) + 1
+                # For LARGE helpers (≥ 32 B), prefer cold-helper extraction
+                # over promotion-to-resident. Promotion grows the kernel by
+                # the helper's full body; extraction grows it by ~9 B per
+                # (caller, helper) edge. The reload thunk path was built for
+                # exactly this trade and works for any helper that's
+                # called from a single user-fn overlay (cycle cost
+                # acceptable on cold paths). Phase 6 wrap-aware promotion
+                # used to greedily resident-promote any helper that fit
+                # under the 230 B kernel cap, which over-bloated kernels
+                # for OLED-heavy programs and prevented later cold-helper
+                # extraction from helping (helpers were already resident).
+                if best_size >= 32:
+                    if best in keep_standalone:
+                        # Already extracted; nothing more to do for this helper.
+                        # Force exit so we don't loop forever on the same one.
+                        break
+                    keep_standalone.add(best)
+                    # Estimate one thunk per caller of this helper.
+                    n_callers = sum(
+                        1 for _, ol2, _ in overlay_asm_blocks
+                        if any(line2.strip() == f'jal {best}' for line2 in ol2)
+                    )
+                    thunk_cost = max(1, n_callers) * 9
+                    est_kernel_growth += thunk_cost
+                    est_overlay_avail = 250 - (est_kernel_base + est_kernel_growth)
+                    import sys
+                    print(f"  Phase 6: extracting {best} ({best_size}B) to own "
+                          f"overlay (thunk cost ~{thunk_cost}B for {n_callers} "
+                          f"caller(s))", file=sys.stderr)
+                    continue  # re-evaluate wrapping with the extraction applied
                 # Check that promoting this helper doesn't make kernel too large
                 new_kernel = est_kernel_base + est_kernel_growth + best_size
                 if new_kernel > 230:  # leave at least 20B overlay region
@@ -6607,59 +6664,119 @@ class MK1CodeGen:
                     new_resident[ri] = ''
 
             # ── Step 9c: Standalone-helper overlay emission ──
-            # Phase 6 wrap-aware promotion may have flagged some helpers for
-            # extraction to their OWN overlay rather than promotion to kernel.
-            # Emit each as a new overlay_asm_blocks entry; the helper's bare
-            # label stays un-suffixed (so the reload thunk's `jal helper` works);
-            # any merged-in tail-target labels are suffixed with the new
-            # overlay's own _ovK to avoid collision with bundled copies in
-            # other overlays.
+            # The wrap-recovery path may have flagged helpers for extraction
+            # to their OWN overlay rather than promotion to kernel. Each
+            # gets a new overlay block with:
+            #   - the helper's body (primary label kept BARE so the
+            #     reload thunk's `jal helper` resolves correctly)
+            #   - any non-resident bundleable deps bundled in (transitively)
+            # Bundling deps into the standalone overlay (rather than
+            # force-resident them) avoids kernel growth, which prevents the
+            # cascade where extracting one helper forces deps resident →
+            # slot shrinks → another overlay starts wrapping → another
+            # extraction. For `keypad_oled.c` specifically: extracting
+            # `__oled_stream_chars` while bundling its `__i2c_st_only`
+            # dep into the standalone overlay keeps slot at 116 B
+            # (instead of dropping to 101 B), so `_poll_once` (104 B) fits
+            # without needing to also extract the HOT `__keypad_scan`.
             if keep_standalone:
                 import re as _re_sa
                 for h in sorted(keep_standalone):
                     if h not in helper_bodies:
                         continue
                     hstart, _, hlines = helper_bodies[h]
-                    # Also remove the standalone helper's body from new_resident.
+                    # Remove the standalone helper's body from new_resident.
                     s_orig_start, s_orig_end = helper_original_ranges.get(h, (0, 0))
                     for ri in range(s_orig_start, s_orig_end):
                         if ri < len(new_resident):
                             new_resident[ri] = ''
                     new_oi = len(overlay_asm_blocks)
                     suffix = f'_ov{new_oi}'
-                    # Collect internal __ labels that should be suffixed (to avoid
-                    # collision with copies bundled in other overlays). The helper's
-                    # OWN primary label stays bare so the reload thunk can `jal h`.
-                    internal_labels = set()
+                    # Collect non-resident bundleable deps transitively. A
+                    # dep is bundled into THIS standalone overlay if:
+                    #   - its body is in helper_bodies
+                    #   - it's NOT already kernel-resident (in _NO_OVERLAY)
+                    #   - it's NOT already merged into the helper's body
+                    #     (tail-jump merge produces inline copy)
+                    #   - it's NOT another standalone helper (which has
+                    #     its own overlay; cross-call would need its own
+                    #     reload thunk — not handled here)
+                    merged_in = set()
                     for hl in hlines:
                         s2 = hl.strip()
                         if s2.endswith(':') and s2.startswith('__') and not s2.startswith('.'):
-                            lbl = s2[:-1]
-                            if lbl != h:
-                                internal_labels.add(lbl)
-                    renamed = [new_resident[hstart] if hstart < len(new_resident) else f'{h}:']
-                    # If new_resident[hstart] was just blanked out by us above,
-                    # use the bare label form.
-                    if not renamed[0].strip():
-                        renamed[0] = f'{h}:'
-                    for hl in hlines:
-                        l = hl
-                        for lbl in internal_labels:
-                            l = l.replace(f'{lbl}:', f'{lbl}{suffix}:')
-                            l = l.replace(f'jal {lbl}', f'jal {lbl}{suffix}')
-                            if f'j {lbl}' in l and f'jal {lbl}' not in l:
+                            merged_in.add(s2[:-1])
+                    needed_deps = []  # ordered (topo-sortish via insertion order)
+                    seen_dep = {h} | merged_in
+                    frontier = [h]
+                    while frontier:
+                        cur = frontier.pop()
+                        _, _, cur_lines = helper_bodies.get(cur, (0, 0, []))
+                        for hl in cur_lines:
+                            s_c = hl.strip()
+                            if not s_c.startswith('jal '):
+                                continue
+                            tgt = s_c.split()[1]
+                            if not tgt.startswith('__'):
+                                continue
+                            if tgt not in helper_bodies:
+                                continue
+                            if tgt in seen_dep:
+                                continue
+                            if f'{tgt}:' in _NO_OVERLAY:
+                                continue
+                            if tgt in keep_standalone:
+                                continue
+                            seen_dep.add(tgt)
+                            needed_deps.append(tgt)
+                            frontier.append(tgt)
+                    # Build the all-bundled-labels set so renaming covers
+                    # every non-primary label that appears in our overlay.
+                    all_bundled_labels = set()
+                    for dep in [h] + needed_deps:
+                        _, _, dep_lines = helper_bodies[dep]
+                        for dl in dep_lines:
+                            s_dl = dl.strip()
+                            if s_dl.endswith(':') and s_dl.startswith('__') and not s_dl.startswith('.'):
+                                lbl_ = s_dl[:-1]
+                                if lbl_ != h:
+                                    all_bundled_labels.add(lbl_)
+                    # Helper for renaming a single line.
+                    def _rename_line(line, scope_lines):
+                        result = line
+                        for lbl in all_bundled_labels:
+                            result = result.replace(f'{lbl}:', f'{lbl}{suffix}:')
+                            result = result.replace(f'jal {lbl}', f'jal {lbl}{suffix}')
+                            if f'j {lbl}' in result and f'jal {lbl}' not in result:
                                 for jtype in ('jnz', 'jz', 'jc', 'jnc'):
-                                    if f'{jtype} {lbl}' in l:
+                                    if f'{jtype} {lbl}' in result:
                                         break
                                 else:
-                                    l = l.replace(f'j {lbl}', f'j {lbl}{suffix}')
-                        # Suffix-rename .local labels too so they don't collide
-                        # with the same helper bundled in another overlay.
-                        for m in _re_sa.finditer(r'\.([\w]+)', l):
+                                    result = result.replace(f'j {lbl}', f'j {lbl}{suffix}')
+                        for m in _re_sa.finditer(r'\.([\w]+)', result):
                             ref = '.' + m.group(1)
-                            if any(ref + ':' in h2.strip() for h2 in hlines):
-                                l = l.replace(ref, ref + suffix)
-                        renamed.append(l)
+                            if any(ref + ':' in h2.strip() for h2 in scope_lines):
+                                result = result.replace(ref, ref + suffix)
+                        return result
+                    # Emit primary label (BARE — for reload-thunk lookup).
+                    renamed = [f'{h}:']
+                    # Emit helper body (renamed).
+                    for hl in hlines:
+                        renamed.append(_rename_line(hl, hlines))
+                    # Emit each bundled dep's body (renamed). Use the same
+                    # label-emit dedup as Fix #2 (skip if a top-level
+                    # `__name_ovK:` label has already been emitted).
+                    seen_emit = {h}
+                    for lbl in all_bundled_labels:
+                        # already-emitted from helper body (its own merged labels)
+                        seen_emit.add(lbl + suffix)
+                    for dep in needed_deps:
+                        _, _, dep_lines = helper_bodies[dep]
+                        dep_label_orig = f'{dep}:'
+                        # Emit the dep's primary label (renamed).
+                        renamed.append(_rename_line(dep_label_orig, dep_lines))
+                        for dl in dep_lines:
+                            renamed.append(_rename_line(dl, dep_lines))
                     block_size = measure_lines(renamed)
                     overlay_asm_blocks.append((h, renamed, block_size))
                     func_to_overlay_idx[h] = new_oi
@@ -8576,53 +8693,17 @@ class MK1CodeGen:
                           file=sys.stderr)
                     keep_standalone.add(h)
                     bundleable_helpers = [hh for hh in bundleable_helpers if hh != h]
-                    # Resolve the standalone helper's transitive deps. For each:
-                    #   - already resident (in _NO_OVERLAY): use as-is
-                    #   - else: must be reachable from the standalone overlay.
-                    # We force resident only the deps that AREN'T already going
-                    # to be in some bundled overlay or merged into the helper's
-                    # body. The Step 9c emission code copies the helper's body
-                    # lines verbatim including any merged tail-targets, so
-                    # those don't need force-resident either.
-                    _, _, _hlines_extr = helper_bodies.get(h, (0, 0, []))
-                    _merged_in_body = set()
-                    for _hl in _hlines_extr:
-                        _s2 = _hl.strip()
-                        if _s2.endswith(':') and _s2.startswith('__') and not _s2.startswith('.'):
-                            _merged_in_body.add(_s2[:-1])
-                    _force_set = set()
-                    _frontier = [h]
-                    _seen_walk = {h}
-                    while _frontier:
-                        _cur = _frontier.pop()
-                        _, _, _cur_lines = helper_bodies.get(_cur, (0, 0, []))
-                        for _hl in _cur_lines:
-                            _s = _hl.strip()
-                            if _s.startswith('jal '):
-                                _tgt = _s.split()[1]
-                                if not _tgt.startswith('__'):
-                                    continue
-                                if _tgt not in helper_bodies:
-                                    continue
-                                if _tgt == h or _tgt in keep_standalone:
-                                    continue
-                                if _tgt in _merged_in_body:
-                                    continue  # body inlined into the helper
-                                if f'{_tgt}:' in _NO_OVERLAY:
-                                    continue  # already resident
-                                if _tgt in _seen_walk:
-                                    continue
-                                _seen_walk.add(_tgt)
-                                _force_set.add(_tgt)
-                                _frontier.append(_tgt)
-                    for _tgt in _force_set:
-                        _NO_OVERLAY.add(f'{_tgt}:')
-                    bundleable_helpers = [hh for hh in bundleable_helpers
-                                           if hh not in _force_set]
-                    if _force_set:
-                        print(f"    forced resident (deps of {h}): "
-                              f"{sorted(_force_set)}",
-                              file=sys.stderr)
+                    # Note: the helper's bundleable deps (e.g. __i2c_st_only)
+                    # do NOT get force-resident here. Step 9c bundles them
+                    # into the standalone overlay alongside the helper body,
+                    # avoiding kernel growth. This prevents the cascade where
+                    # forcing one dep resident shrinks the slot enough that
+                    # another (unrelated) overlay starts wrapping and a hot
+                    # helper has to be extracted to compensate. Trade-off:
+                    # small dep ends up in two overlays (the standalone +
+                    # whichever original overlay still calls it via another
+                    # bundled helper); 6-12 B duplication beats 6 B kernel
+                    # growth when slot is the binding constraint.
                     _placement_retries += 1
                     _retry_bundling = True
                     continue
