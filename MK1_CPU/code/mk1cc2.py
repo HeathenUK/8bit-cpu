@@ -726,6 +726,75 @@ class MK1CodeGen:
         self.emit('\texrw 0')            # sample ACK (discarded)
         self.emit_ddrb(0x02)             # SCL LOW
 
+    # 5x5 font for SSD1327 oled_putc(). Each glyph is 5 row bytes; bits
+    # 4..0 = leftmost..rightmost pixel. Add chars as needed; the
+    # builtin errors out on unsupported chars rather than guessing.
+    _OLED_FONT_5X5 = {
+        ' ': [0x00, 0x00, 0x00, 0x00, 0x00],
+        '.': [0x00, 0x00, 0x00, 0x00, 0x04],
+        '-': [0x00, 0x00, 0x1F, 0x00, 0x00],
+        '!': [0x04, 0x04, 0x04, 0x00, 0x04],
+        '?': [0x0E, 0x11, 0x02, 0x00, 0x04],
+        ':': [0x00, 0x04, 0x00, 0x04, 0x00],
+        'A': [0x0E, 0x11, 0x1F, 0x11, 0x11],
+        'B': [0x1E, 0x11, 0x1E, 0x11, 0x1E],
+        'C': [0x0F, 0x10, 0x10, 0x10, 0x0F],
+        'D': [0x1E, 0x11, 0x11, 0x11, 0x1E],
+        'E': [0x1F, 0x10, 0x1E, 0x10, 0x1F],
+        'F': [0x1F, 0x10, 0x1E, 0x10, 0x10],
+        'G': [0x0F, 0x10, 0x13, 0x11, 0x0F],
+        'H': [0x11, 0x11, 0x1F, 0x11, 0x11],
+        'I': [0x1F, 0x04, 0x04, 0x04, 0x1F],
+        'J': [0x1F, 0x04, 0x04, 0x14, 0x08],
+        'K': [0x11, 0x12, 0x1C, 0x12, 0x11],
+        'L': [0x10, 0x10, 0x10, 0x10, 0x1F],
+        'M': [0x11, 0x1B, 0x15, 0x11, 0x11],
+        'N': [0x11, 0x19, 0x15, 0x13, 0x11],
+        'O': [0x0E, 0x11, 0x11, 0x11, 0x0E],
+        'P': [0x1E, 0x11, 0x1E, 0x10, 0x10],
+        'Q': [0x0E, 0x11, 0x15, 0x12, 0x0D],
+        'R': [0x1E, 0x11, 0x1E, 0x12, 0x11],
+        'S': [0x0F, 0x10, 0x0E, 0x01, 0x1E],
+        'T': [0x1F, 0x04, 0x04, 0x04, 0x04],
+        'U': [0x11, 0x11, 0x11, 0x11, 0x0E],
+        'V': [0x11, 0x11, 0x11, 0x0A, 0x04],
+        'W': [0x11, 0x11, 0x15, 0x15, 0x0A],
+        'X': [0x11, 0x0A, 0x04, 0x0A, 0x11],
+        'Y': [0x11, 0x0A, 0x04, 0x04, 0x04],
+        'Z': [0x1F, 0x02, 0x04, 0x08, 0x1F],
+        '0': [0x0E, 0x13, 0x15, 0x19, 0x0E],
+        '1': [0x04, 0x0C, 0x04, 0x04, 0x0E],
+        '2': [0x1E, 0x01, 0x0E, 0x10, 0x1F],
+        '3': [0x1E, 0x01, 0x06, 0x01, 0x1E],
+        '4': [0x12, 0x12, 0x1F, 0x02, 0x02],
+        '5': [0x1F, 0x10, 0x1E, 0x01, 0x1E],
+        '6': [0x0E, 0x10, 0x1E, 0x11, 0x0E],
+        '7': [0x1F, 0x01, 0x02, 0x04, 0x04],
+        '8': [0x0E, 0x11, 0x0E, 0x11, 0x0E],
+        '9': [0x0E, 0x11, 0x0F, 0x01, 0x0E],
+    }
+
+    def _oled_render_5x5_to_4bpp(self, glyph):
+        """Convert a 5-byte 5x5 glyph to the 21 4bpp bytes streamed to
+        SSD1327 GDDRAM for one 6x7 cell. Foreground is bright (nibble
+        0xF), background dark (0x0). 7 rows = 5 glyph + 1 descender +
+        1 line gap; the right margin (col 5) is always dark.
+
+        Layout per row: 3 bytes covering 6 pixels, high nibble = even
+        col (left), low nibble = odd col (right)."""
+        rows = list(glyph) + [0x00, 0x00]   # 2 blank rows after the glyph
+        out = []
+        for r in rows:
+            b4 = (r >> 4) & 1
+            b3 = (r >> 3) & 1
+            b2 = (r >> 2) & 1
+            b1 = (r >> 1) & 1
+            b0 = r & 1
+            out.append((0xF0 if b4 else 0) | (0x0F if b3 else 0))
+            out.append((0xF0 if b2 else 0) | (0x0F if b1 else 0))
+            out.append(0xF0 if b0 else 0)   # right margin always dark
+        return out
+
     def _oled_ensure_init(self):
         """Idempotent: allocate the SSD1327 init data in the data
         section (once), register the `__oled_init` walker plus its
@@ -2755,6 +2824,16 @@ class MK1CodeGen:
                 self.emit(f'\tbyte {b}')
             self.emit('\tsection code')
 
+        # OLED putc per-call data tables (6 window bytes + 21 pixel bytes
+        # each). The runtime helper `__oled_putc_xfer` walks one of these
+        # tables to do a single character render.
+        for tbl_base, table, ch, xv, yv in getattr(self, '_oled_putc_tables', []):
+            self.emit('\tsection data')
+            self.emit(f'; oled_putc {ch!r} at ({xv},{yv}) table @ data[{tbl_base}..{tbl_base+len(table)-1}]')
+            for b in table:
+                self.emit(f'\tbyte {b}')
+            self.emit('\tsection code')
+
         # Emit lcd_print string data in page 1 (data section). Each
         # string carries its own symbolic label `__str_N`; the
         # assembler resolves it to the data-page offset where the
@@ -3241,7 +3320,7 @@ class MK1CodeGen:
         # and each __oled_fill_<K> wraps its 8 KB stream in a START/STOP
         # transaction. Treat them like LCD runtime helpers and force the
         # I²C primitives resident whenever an OLED helper is in use.
-        oled_runtime = {'__oled_init'} | {
+        oled_runtime = {'__oled_init', '__oled_putc_xfer'} | {
             h for h in helpers if h.startswith('__oled_fill_')}
         if helpers & oled_runtime:
             for h in oled_runtime:
@@ -3835,6 +3914,77 @@ class MK1CodeGen:
             self.emit_unrolled_i2c_fill_const(k, 8192)
             self.emit('\tout_imm 0x30')        # DEBUG: fill loop complete
             self.emit('\tjal __i2c_sp')
+            self.emit('\tret')
+
+        if '__oled_putc_xfer' in helpers:
+            # Streams a 27-byte putc table across two I²C transactions.
+            # Caller passes table base in $d. Table layout:
+            #   bytes 0..5: 0x15, col_s, col_e, 0x75, row_s, row_e
+            #              (6-byte window-set payload, sent after
+            #              addr+CMD_STREAM)
+            #   bytes 6..26: 21 4bpp pixel bytes
+            #              (sent after addr+DATA_STREAM)
+            # `$c` holds the per-section byte count, `$d` walks the
+            # table. `__i2c_sb` clobbers $a/$b/$d — we save $d and
+            # the loop counter on the stack across each send.
+            wlp = self.label('puxw')
+            dlp = self.label('puxd')
+            self.emit('__oled_putc_xfer:')
+            # The `out_imm` markers below were the diff between
+            # "MK1 stair-steps diagonally" and "MK1 renders side-by-
+            # side correctly" on hardware. Adding them inadvertently
+            # fixed the rendering bug; removing them re-introduced
+            # it (visual confirmation pending on next hardware run).
+            # The byte→STOP hold-time hypothesis was checked against
+            # the SSD1327 datasheet (Table 13-6) and ruled out: tHD
+            # = 300 ns, tSSTOP = 0.6 µs, tIDLE = 1.3 µs are all
+            # easily met (we have ~50 µs gaps everywhere). True
+            # cause is still unknown; markers are kept as a
+            # known-good workaround until root-caused. See WORKLOG
+            # 2026-04-27 for the open TODO.
+            self.emit('\tout_imm 0x40')             # entry pad
+            self.emit('\tpush $d')                  # save table base
+            self.emit('\tjal __i2c_st_only')
+            self.emit('\tldi $a,0x7A')              # OLED write addr
+            self.emit('\tjal __i2c_sb')
+            self.emit('\tldi $a,0x00')              # CMD_STREAM
+            self.emit('\tjal __i2c_sb')
+            self.emit('\tpop $d')                   # restore table base
+            self.emit('\tldi $c,6')                 # 6 window bytes
+            self.emit(f'{wlp}:')
+            self.emit('\tpush $c')
+            self.emit('\tpush $d')
+            self.emit('\tmov $d,$a')                # $a = $d (table ptr)
+            self.emit('\tderef')                    # $a = data[$a]
+            self.emit('\tjal __i2c_sb')
+            self.emit('\tpop $d')
+            self.emit('\tincd')                     # advance ptr
+            self.emit('\tpop $c')
+            self.emit('\tdecc')
+            self.emit(f'\tjnz {wlp}')
+            self.emit('\tout_imm 0x50')             # window→data pad (see comment above)
+            self.emit('\tpush $d')                  # save ptr (now @ data section)
+            self.emit('\tjal __i2c_sp')
+            self.emit('\tjal __i2c_st_only')
+            self.emit('\tldi $a,0x7A')
+            self.emit('\tjal __i2c_sb')
+            self.emit('\tldi $a,0x40')              # DATA_STREAM
+            self.emit('\tjal __i2c_sb')
+            self.emit('\tpop $d')                   # ptr to first pixel byte
+            self.emit('\tldi $c,21')                # 21 pixel bytes
+            self.emit(f'{dlp}:')
+            self.emit('\tpush $c')
+            self.emit('\tpush $d')
+            self.emit('\tmov $d,$a')
+            self.emit('\tderef')
+            self.emit('\tjal __i2c_sb')
+            self.emit('\tpop $d')
+            self.emit('\tincd')
+            self.emit('\tpop $c')
+            self.emit('\tdecc')
+            self.emit(f'\tjnz {dlp}')
+            self.emit('\tjal __i2c_sp')
+            self.emit('\tout_imm 0x60')             # exit pad (see comment above)
             self.emit('\tret')
 
         # Updated __lcd_chr / __lcd_cmd for AiP31068L
@@ -8367,6 +8517,12 @@ class MK1CodeGen:
                     assembled.append(f'\tbyte {b}')
                     emitted += 1
                 self._oled_init_already_emitted = True
+            for tbl_base, table, ch, xv, yv in getattr(self, '_oled_putc_tables', []):
+                emit_allocated_until(tbl_base)
+                assembled.append(f'; oled_putc {ch!r} at ({xv},{yv}) table @ data[{tbl_base}..{tbl_base+len(table)-1}]')
+                for b in table:
+                    assembled.append(f'\tbyte {b}')
+                    emitted += 1
             # Any remaining slots → zero-fill
             emit_allocated_until(self.data_alloc)
             if note_entries:
@@ -10700,6 +10856,63 @@ class MK1CodeGen:
                 helper_name = f'__oled_fill_{fill_val:02X}'
                 self._lcd_helpers.add(helper_name)
                 self.emit(f'\tjal {helper_name}')
+                return
+
+            if name == 'oled_putc':
+                # Render a single 5x5 glyph at cell (x, y). All three
+                # arguments must be compile-time constants. The
+                # builtin allocates a 27-byte table in the data page
+                # (6 window bytes + 21 4bpp pixel bytes) and emits a
+                # short call to the shared `__oled_putc_xfer` runtime
+                # helper which streams the table across two I²C
+                # transactions (window-set + data-stream).
+                #
+                # Cost: ~5B per call site + 27B/call data + ~80B for
+                # the shared helper. ~21× smaller per-call than
+                # inlining all 32 byte-sends, so multi-letter strings
+                # actually fit page 0.
+                #
+                # Cell grid: 21 cols × 18 rows on a 128×128 OLED
+                # (6 px wide × 7 px tall cells). Cursor state and
+                # auto-advance are deferred.
+                if len(args) != 3:
+                    raise Exception(
+                        f"oled_putc(char, x, y) takes 3 arguments, got {len(args)}")
+                cv = self._const_eval(args[0])
+                xv = self._const_eval(args[1])
+                yv = self._const_eval(args[2])
+                if cv is None or xv is None or yv is None:
+                    raise Exception(
+                        "oled_putc() arguments must all be compile-time constants")
+                if not (0 <= xv <= 20):
+                    raise Exception(
+                        f"oled_putc() x must be in [0, 20], got {xv}")
+                if not (0 <= yv <= 17):
+                    raise Exception(
+                        f"oled_putc() y must be in [0, 17], got {yv}")
+                ch = chr(cv & 0xFF)
+                glyph = self._OLED_FONT_5X5.get(ch)
+                if glyph is None:
+                    raise Exception(
+                        f"oled_putc() char {ch!r} (0x{cv & 0xFF:02X}) is not in "
+                        f"the embedded 5x5 font. Supported: "
+                        f"{''.join(sorted(self._OLED_FONT_5X5.keys()))}")
+                self._oled_ensure_init()
+                col_s = xv * 3
+                col_e = col_s + 2
+                row_s = yv * 7
+                row_e = row_s + 6
+                # Per-call data table: 6 window bytes + 21 pixel bytes.
+                table = [0x15, col_s, col_e, 0x75, row_s, row_e] + \
+                    self._oled_render_5x5_to_4bpp(glyph)
+                tbl_base = self.data_alloc
+                self.data_alloc += len(table)
+                if not hasattr(self, '_oled_putc_tables'):
+                    self._oled_putc_tables = []
+                self._oled_putc_tables.append((tbl_base, table, ch, xv, yv))
+                self._lcd_helpers.add('__oled_putc_xfer')
+                self.emit(f'\tldi $d,{tbl_base}')
+                self.emit('\tjal __oled_putc_xfer')
                 return
 
             if name == 'lcd_clear':
