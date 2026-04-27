@@ -3029,11 +3029,16 @@ class MK1CodeGen:
         # Keep __tone_setup alive if notes exist (called by __play_note at runtime)
         if hasattr(self, '_note_table') and self._note_table:
             refs.add('__tone_setup')
-        # Keep I2C helpers alive when i2c_init() was called — they may be
-        # needed for EEPROM preload (generated later in _overlay_partition)
+        # Keep __i2c_sb alive when i2c_init() was called — needed for
+        # EEPROM preload (generated later in _overlay_partition) and used
+        # by virtually every program that calls i2c_init(). __i2c_rb
+        # used to also be force-kept here but the EEPROM preload is
+        # inline (no __i2c_rb dependency) and runtime read users
+        # (RTC, eeprom_read_byte, i2c_read_byte) add it themselves;
+        # keeping it unconditionally cost ~38 B resident on write-only
+        # programs (LCD/OLED/tone) for nothing.
         if getattr(self, '_i2c_init_called', False):
             refs.add('__i2c_sb')
-            refs.add('__i2c_rb')
         # In --eeprom mode, the inline preload calls __i2c_sb (the reference
         # is generated later in _overlay_partition and isn't visible here).
         if getattr(self, 'eeprom_mode', False):
@@ -10910,14 +10915,24 @@ class MK1CodeGen:
             # ── VIA I2C builtins (emit known-good assembly patterns) ──
 
             if name == 'i2c_init':
-                # Ensure I2C helpers are available (needed for EEPROM preload
-                # even if program doesn't explicitly use I2C send/read).
+                # Ensure I²C send-byte helper is available — required for the
+                # `--eeprom` mode preload, and a useful default for any
+                # program that calls i2c_init() (most do go on to send
+                # bytes via __i2c_sb directly or via __lcd_chr / __i2c_st_only
+                # which transitively call __i2c_sb).
+                #
+                # __i2c_rb (read byte) is NOT added here — it's only
+                # needed if the program actually reads from an I²C device
+                # at runtime (RTC reads, EEPROM array reads, i2c_read_byte
+                # builtin, eeprom_read_byte builtin). All those builtins
+                # add __i2c_rb themselves, so adding it here was dead
+                # weight (~38 B resident) for the many write-only programs
+                # (LCD-only, OLED-only, tone+keypad, etc.). The dead-code
+                # eliminator at line ~3030 was also patched in the same
+                # spirit.
                 if not hasattr(self, '_lcd_helpers'):
                     self._lcd_helpers = set()
                 self._lcd_helpers.add('__i2c_sb')
-                self._lcd_helpers.add('__i2c_rb')
-                # Mark that i2c_init was called — ensures I2C helpers are
-                # available for EEPROM preload (unconditionally resident).
                 self._i2c_init_called = True
                 # VIA init for I2C: delay for VIA ~RES settle (RC = 1ms),
                 # then set ORB=0, DDRB=0, DDRA=0, init SP.
