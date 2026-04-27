@@ -5179,6 +5179,11 @@ class MK1CodeGen:
         # __eeprom_seq_rd_to_p3 is always init-only — its sole caller is
         # the OLED font-cache load which runs once in oled_init.
         INIT_ONLY_NAMES.add('__eeprom_seq_rd_to_p3')
+        # __oled_init walker runs ONCE per program (gated by the
+        # _oled_init_emitted compile-time flag → only one `jal __oled_
+        # init` per program). Stage 1 placement frees ~78 B of stage-2
+        # kernel space.
+        INIT_ONLY_NAMES.add('__oled_init')
         # I2C helpers that are init-only when no runtime I2C is needed
         I2C_INIT_ONLY = {'__i2c_sb', '__i2c_sp', '__i2c_st', '__i2c_st_only', '__i2c_rb', '__i2c_rs'}
 
