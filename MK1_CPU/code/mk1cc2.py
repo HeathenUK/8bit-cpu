@@ -3447,7 +3447,7 @@ class MK1CodeGen:
         # transaction. Treat them like LCD runtime helpers and force the
         # I²C primitives resident whenever an OLED helper is in use.
         oled_runtime = {'__oled_init', '__oled_putc_xfer', '__oled_stream_chars',
-                        '__oled_set_window'} | {
+                        '__oled_set_window', '__oled_send_lut_byte'} | {
             h for h in helpers if h.startswith('__oled_fill_')}
         if helpers & oled_runtime:
             for h in oled_runtime:
@@ -4204,6 +4204,27 @@ class MK1CodeGen:
             self.emit('\tjal __i2c_sp')
             self.emit('\tret')
 
+        if '__oled_send_lut_byte' in helpers:
+            # Sub-helper for __oled_stream_chars: takes a 2-bit input
+            # value in $a (0..3), looks it up in the page-1 4bpp LUT,
+            # sends the resulting byte via __i2c_sb. Tail-calls
+            # __i2c_sb (no return overhead from this helper).
+            #
+            # Called 3× per glyph row × 5 rows = 15 times per char.
+            # Pulling these 4 instructions into a sub-helper cuts ~10B
+            # from the streaming helper at the cost of ~7B for this
+            # tiny one. Plus a `jal` per call site (3B each) replaces
+            # ~5B of inline code, net per-call savings ~2B × 3 bytes/
+            # row × 5 rows-looped = ~30B over 15 inline instances …
+            # except per-row code is in a loop, so the actual code
+            # savings are 3 byte-sends' worth of inline shrinkage = ~6B.
+            lut_off = self._oled_lut_base if hasattr(self, '_oled_lut_base') else 0
+            self.emit('__oled_send_lut_byte:')
+            if lut_off:
+                self.emit(f'\taddi {lut_off},$a')
+            self.emit('\tderef')                    # $a = LUT[v]
+            self.emit('\tj __i2c_sb')                # tail-call (no ret needed)
+
         if '__oled_stream_chars' in helpers:
             # Phase 4b' streaming text helper. Pumps expanded glyph
             # data for `count` characters through an already-open OLED
@@ -4261,33 +4282,28 @@ class MK1CodeGen:
             self.emit('\tldi $a,5')
             self.emit('\tpush $a')                  # row counter
             self.emit(f'{rl}:')
-            # Byte 0: bits[4:3] of row → LUT
+            # Each byte send pulls the row byte from page 3 fresh,
+            # extracts a 2-bit value, and tail-calls into the shared
+            # `__oled_send_lut_byte` (which adds the LUT base, defs
+            # the byte, and tail-jumps to __i2c_sb).
+            # Byte 0: bits[4:3] of row
             self.emit('\tmov $c,$a')
             self.emit('\tderefp3')                  # $a = row byte
             self.emit('\tsrl'); self.emit('\tsrl'); self.emit('\tsrl')   # >> 3
             self.emit('\tandi 0x03,$a')
-            if lut_off:
-                self.emit(f'\taddi {lut_off},$a')
-            self.emit('\tderef')                    # LUT[v]
-            self.emit('\tjal __i2c_sb')
-            # Byte 1: bits[2:1] → LUT
+            self.emit('\tjal __oled_send_lut_byte')
+            # Byte 1: bits[2:1]
             self.emit('\tmov $c,$a')
             self.emit('\tderefp3')
             self.emit('\tsrl')                      # >> 1
             self.emit('\tandi 0x03,$a')
-            if lut_off:
-                self.emit(f'\taddi {lut_off},$a')
-            self.emit('\tderef')
-            self.emit('\tjal __i2c_sb')
-            # Byte 2: bit[0] → LUT (right margin always 0)
+            self.emit('\tjal __oled_send_lut_byte')
+            # Byte 2: bit[0] (right margin always 0)
             self.emit('\tmov $c,$a')
             self.emit('\tderefp3')
             self.emit('\tandi 0x01,$a')
-            self.emit('\tsll')                      # bit0 → bit1 position
-            if lut_off:
-                self.emit(f'\taddi {lut_off},$a')
-            self.emit('\tderef')
-            self.emit('\tjal __i2c_sb')
+            self.emit('\tsll')                      # bit0 → bit1 position (0b00 or 0b10)
+            self.emit('\tjal __oled_send_lut_byte')
             self.emit('\tincc')                     # advance to next row's font byte
             # Row counter
             self.emit('\tpop $a'); self.emit('\taddi -1,$a'); self.emit('\tpush $a')
@@ -6016,6 +6032,7 @@ class MK1CodeGen:
             _force_resident_helpers = {
                 '__tone', '__play_note', '__delay_Nms',
                 '__oled_stream_chars', '__oled_set_window',
+                '__oled_send_lut_byte',
             }
 
             for hname in list(cond_res):
@@ -11364,6 +11381,7 @@ class MK1CodeGen:
                     self._lcd_helpers = set()
                 self._lcd_helpers.add('__oled_stream_chars')
                 self._lcd_helpers.add('__oled_set_window')
+                self._lcd_helpers.add('__oled_send_lut_byte')
                 # Translate chars to font indices and allocate page-1 buf
                 buf = []
                 for ch in s:
