@@ -59,15 +59,6 @@ KERNEL_STATE = {
         page=2, offset=0xB2, size=1, owner='__eeprom_r2c_loop',
         description='remaining-bytes counter for sequential I2C → '
                     'code page reads (EEPROM overlay loader)'),
-    'oled_cursor_x': KSlot(
-        page=2, offset=0xB3, size=1, owner='__oled_render_at_cursor',
-        description='SSD1327 putc cursor column (0..20). Advanced by '
-                    '__oled_render_at_cursor and read by oled_text/'
-                    'oled_printf. Set by oled_set_cursor() builtin.'),
-    'oled_cursor_y': KSlot(
-        page=2, offset=0xB4, size=1, owner='__oled_render_at_cursor',
-        description='SSD1327 putc cursor row (0..17). Advanced and '
-                    'wrapped alongside oled_cursor_x.'),
 }
 
 # Phase 1 introduced f-string aliases (`K_CALIB_BLOCKS`, etc.) for
@@ -804,37 +795,6 @@ class MK1CodeGen:
             out.append(0xF0 if b0 else 0)   # right margin always dark
         return out
 
-    def _oled_ensure_font_eeprom(self):
-        """Idempotent: allocate the compact 5x5 OLED font in EEPROM
-        (43 glyphs × 5 bytes = 215 B) and remember its base address
-        for the runtime render helper. Sets `_oled_font_eeprom_base`.
-        Called by builtins that need the runtime path
-        (oled_text/oled_printf in Phase 4b).
-
-        The font is stored sorted by ASCII char code so `glyph index =
-        char_to_index_map[ch]` matches the order. We expose a
-        `_oled_font_index_map` dict so the runtime-path builtins can
-        translate `chr → index` at emit time when arg is a literal
-        and the runtime helpers can be passed the index in `$a`.
-        """
-        if hasattr(self, '_oled_font_eeprom_base'):
-            return
-        # Stable ordering: sorted by char code so the index is
-        # predictable when reading by visual inspection.
-        chars = sorted(self._OLED_FONT_5X5.keys(), key=ord)
-        self._oled_font_index_map = {ch: i for i, ch in enumerate(chars)}
-        font_bytes = []
-        for ch in chars:
-            font_bytes.extend(self._OLED_FONT_5X5[ch])
-        # Allocate at the next free EEPROM offset using the same
-        # mechanism as `eeprom unsigned char foo[] = {...}` in C.
-        # The compiler's eeprom_alloc starts at 0x0010 (header).
-        addr = self.eeprom_alloc
-        self._oled_font_eeprom_base = addr
-        self.eeprom_globals['__oled_font'] = addr
-        self.eeprom_data.append((addr, font_bytes))
-        self.eeprom_alloc += len(font_bytes)
-
     def _emit_oled_putc(self, ch, xv, yv):
         """Emit one Phase-3-style oled_putc call for char `ch` at cell
         (xv, yv). Allocates a 27-byte glyph table in the data page,
@@ -933,30 +893,8 @@ class MK1CodeGen:
         self._lcd_helpers.add('__i2c_st_only')
         self._lcd_helpers.add('__i2c_sp')
         if not getattr(self, '_oled_init_emitted', False):
-            # Zero kstate cursor BEFORE the chip init runs. Page-2
-            # contents are not guaranteed to be zero on boot, and the
-            # runtime render helper assumes cursor in [0, 20] × [0, 17].
-            self.emit('\tldi $a,0')
-            for line in self._kstate_store_lines('oled_cursor_x'):
-                self.emit(line)
-            self.emit('\tldi $a,0')
-            for line in self._kstate_store_lines('oled_cursor_y'):
-                self.emit(line)
             self.emit('\tjal __oled_init')
             self._oled_init_emitted = True
-
-    def _oled_ensure_lut(self):
-        """Idempotent: allocate a 4-byte 4bpp expansion LUT in the
-        data page (page 1). Maps a 2-bit input value to one 4bpp
-        output byte: 0→0x00, 1→0x0F, 2→0xF0, 3→0xFF. Used by the
-        `__oled_render_at_cursor` runtime helper to expand each glyph
-        row's 5 source bits into the 3 4bpp output bytes per row,
-        without 30 conditional branches."""
-        if hasattr(self, '_oled_lut_base'):
-            return
-        self._oled_lut_base = self.data_alloc
-        self.data_alloc += 4
-        self._oled_lut_data = [0x00, 0x0F, 0xF0, 0xFF]
 
     def emit_unrolled_i2c_fill_const(self, val, count):
         """Emit a tight asm loop that sends `val` over I²C `count`
@@ -2935,16 +2873,6 @@ class MK1CodeGen:
                 self.emit(f'\tbyte {b}')
             self.emit('\tsection code')
 
-        # OLED 4bpp expansion LUT (4 bytes in page 1). Used by
-        # `__oled_render_at_cursor` to translate 2-bit glyph input to
-        # one 4bpp output byte (0→0x00, 1→0x0F, 2→0xF0, 3→0xFF).
-        if hasattr(self, '_oled_lut_base'):
-            self.emit('\tsection data')
-            self.emit(f'; OLED 4bpp expansion LUT at data[{self._oled_lut_base}..{self._oled_lut_base+3}]')
-            for b in self._oled_lut_data:
-                self.emit(f'\tbyte {b}')
-            self.emit('\tsection code')
-
         # Emit lcd_print string data in page 1 (data section). Each
         # string carries its own symbolic label `__str_N`; the
         # assembler resolves it to the data-page offset where the
@@ -3431,7 +3359,7 @@ class MK1CodeGen:
         # and each __oled_fill_<K> wraps its 8 KB stream in a START/STOP
         # transaction. Treat them like LCD runtime helpers and force the
         # I²C primitives resident whenever an OLED helper is in use.
-        oled_runtime = {'__oled_init', '__oled_putc_xfer', '__oled_render_at_cursor'} | {
+        oled_runtime = {'__oled_init', '__oled_putc_xfer'} | {
             h for h in helpers if h.startswith('__oled_fill_')}
         if helpers & oled_runtime:
             for h in oled_runtime:
@@ -3443,11 +3371,9 @@ class MK1CodeGen:
             no_ov.add('__i2c_sp:')
         # __eeprom_rd: resident only if user code accesses eeprom arrays at
         # runtime. In --eeprom overlay mode it's called only by the init-time
-        # preload (before self-copy), so it stays init-only. Also resident
-        # if the OLED render-at-cursor helper is in use (it reads font
-        # bytes from EEPROM at every render).
+        # preload (before self-copy), so it stays init-only.
         if '__eeprom_rd' in helpers:
-            if getattr(self, '_needs_runtime_eeprom_rd', False) or '__oled_render_at_cursor' in helpers:
+            if getattr(self, '_needs_runtime_eeprom_rd', False):
                 no_ov.add('__eeprom_rd:')
             # else: init-only, handled by init extraction (stage 1 code)
         if '__i2c_stream' in helpers:
@@ -4100,160 +4026,6 @@ class MK1CodeGen:
             self.emit('\tout_imm 0x60')             # exit pad (see comment above)
             self.emit('\tret')
 
-        if '__oled_render_at_cursor' in helpers:
-            # Phase 4b runtime render helper. Renders one glyph at the
-            # current kstate cursor and advances the cursor with wrap.
-            #
-            #   $a in: glyph index (0..N-1, where N = number of font
-            #          chars allocated in EEPROM at __oled_font).
-            #
-            # Font is in EEPROM (compact 5-bytes-per-glyph). Each row's
-            # 5 bits expand to 3 4bpp bytes via a 4-entry LUT in page 1.
-            # Followed by 6 zero bytes for the descender + line-gap rows.
-            #
-            # Register discipline:
-            #   $a, $b, $d are clobbered by __i2c_sb / __eeprom_rd.
-            #   $c is preserved across both, used for per-iter state.
-            #   Stack carries values that must survive multiple clobbers.
-            #
-            # The two `out_imm` markers below mirror the unexplained
-            # Phase 3 marker mystery; ~16µs pad before each STOP edge
-            # has been empirically required to avoid a stair-stepping
-            # bug. See WORKLOG 2026-04-27 — root cause still unknown.
-            font_lo = self._oled_font_eeprom_base & 0xFF
-            font_hi = (self._oled_font_eeprom_base >> 8) & 0xFF
-            lut_off = self._oled_lut_base
-            rl = self.label('orac_rl')        # row loop
-            xok = self.label('orac_xok')      # x didn't wrap
-            yok = self.label('orac_yok')      # y didn't wrap
-
-            self.emit('__oled_render_at_cursor:')
-            self.emit('\tpush $a')                  # save idx [stack: idx]
-
-            # ── Compute col_s = x*3, send window-set first half ──
-            for line in self._kstate_load_lines('oled_cursor_x'):
-                self.emit(line)
-            self.emit('\tmov $a,$b')               # $b = x
-            self.emit('\tadd $b,$a')               # 2x
-            self.emit('\tadd $b,$a')               # 3x = col_s
-            self.emit('\tmov $a,$c')               # $c = col_s
-
-            self.emit('\tjal __i2c_st_only')
-            self.emit('\tldi $a,0x7A'); self.emit('\tjal __i2c_sb')
-            self.emit('\tldi $a,0x00'); self.emit('\tjal __i2c_sb')   # CMD_STREAM
-            self.emit('\tldi $a,0x15'); self.emit('\tjal __i2c_sb')   # col cmd
-            self.emit('\tmov $c,$a'); self.emit('\tjal __i2c_sb')     # col_s
-            self.emit('\tmov $c,$a'); self.emit('\taddi 2,$a'); self.emit('\tjal __i2c_sb')  # col_e
-
-            # ── Compute row_s = y*7 = 8y - y, send window-set second half ──
-            for line in self._kstate_load_lines('oled_cursor_y'):
-                self.emit(line)
-            self.emit('\tmov $a,$b')               # $b = y
-            self.emit('\tsll')                      # 2y
-            self.emit('\tsll')                      # 4y
-            self.emit('\tsll')                      # 8y
-            self.emit('\tsub $b,$a')               # 7y = row_s
-            self.emit('\tmov $a,$c')               # $c = row_s
-
-            self.emit('\tldi $a,0x75'); self.emit('\tjal __i2c_sb')   # row cmd
-            self.emit('\tmov $c,$a'); self.emit('\tjal __i2c_sb')     # row_s
-            self.emit('\tmov $c,$a'); self.emit('\taddi 6,$a'); self.emit('\tjal __i2c_sb')  # row_e
-
-            self.emit('\tout_imm 0x70')            # window→stop pad
-            self.emit('\tjal __i2c_sp')
-
-            # ── Begin data-stream transaction ──
-            self.emit('\tjal __i2c_st_only')
-            self.emit('\tldi $a,0x7A'); self.emit('\tjal __i2c_sb')
-            self.emit('\tldi $a,0x40'); self.emit('\tjal __i2c_sb')   # DATA_STREAM
-
-            # Recover idx and compute eeprom byte offset = idx*5
-            self.emit('\tpop $a')                   # idx [stack: empty]
-            self.emit('\tpush $a')                  # save again for cursor advance later
-            self.emit('\tmov $a,$b')               # $b = idx
-            self.emit('\tsll')                      # 2x
-            self.emit('\tsll')                      # 4x
-            self.emit('\tadd $b,$a')               # 5x
-            # Font assumed to fit within first 256 B of EEPROM, so no
-            # carry handling needed inside the 5-byte read sequence.
-            if font_lo:
-                self.emit(f'\taddi {font_lo},$a')
-            self.emit('\tmov $a,$c')               # $c = current EEPROM addr lo
-
-            # ── Loop 5 rows: read EEPROM, expand 3 bytes via LUT, send ──
-            self.emit('\tldi $a,5')
-            self.emit('\tpush $a')                  # row counter [stack: idx, count]
-            self.emit(f'{rl}:')
-            self.emit('\tmov $c,$a')               # lo
-            self.emit(f'\tldi $b,{font_hi}')        # hi
-            self.emit('\tjal __eeprom_rd')          # $a = row byte; $c preserved
-            self.emit('\tincc')                     # advance EEPROM addr for next iter
-            self.emit('\tpush $a')                  # save row byte [stack: idx, count, row]
-
-            # Byte 0: bits[4:3] of row → LUT
-            self.emit('\tpop $a'); self.emit('\tpush $a')   # reload row
-            self.emit('\tsrl'); self.emit('\tsrl'); self.emit('\tsrl')  # >>3
-            self.emit('\tandi 0x03,$a')
-            self.emit(f'\taddi {lut_off},$a')
-            self.emit('\tderef')                    # $a = LUT[v]
-            self.emit('\tjal __i2c_sb')
-
-            # Byte 1: bits[2:1] → LUT
-            self.emit('\tpop $a'); self.emit('\tpush $a')
-            self.emit('\tsrl')                      # >>1
-            self.emit('\tandi 0x03,$a')
-            self.emit(f'\taddi {lut_off},$a')
-            self.emit('\tderef')
-            self.emit('\tjal __i2c_sb')
-
-            # Byte 2: bit[0] → LUT (right margin always 0)
-            self.emit('\tpop $a')                    # row (consumed) [stack: idx, count]
-            self.emit('\tandi 0x01,$a')
-            self.emit('\tsll')                      # bit0 to bit1 position
-            self.emit(f'\taddi {lut_off},$a')
-            self.emit('\tderef')
-            self.emit('\tjal __i2c_sb')
-
-            self.emit('\tpop $a')                    # counter
-            self.emit('\taddi -1,$a')
-            self.emit('\tpush $a')                   # restore [stack: idx, count']
-            self.emit('\tcmpi 0')
-            self.emit(f'\tjnz {rl}')
-            self.emit('\tpop $a')                    # discard counter [stack: idx]
-
-            # ── 6 blank bytes (descender + line-gap rows) ──
-            for _ in range(6):
-                self.emit('\tldi $a,0')
-                self.emit('\tjal __i2c_sb')
-
-            self.emit('\tout_imm 0x55')             # data→stop pad
-            self.emit('\tjal __i2c_sp')
-
-            # ── Cursor advance with wrap (col 21 → col 0, row++; row 18 → row 0) ──
-            self.emit('\tpop $a')                    # idx (now discarded) [stack: empty]
-            for line in self._kstate_load_lines('oled_cursor_x'):
-                self.emit(line)
-            self.emit('\tinc')                      # x++
-            self.emit('\tcmpi 21')
-            self.emit(f'\tjnc {xok}')                # x < 21? no wrap
-            self.emit('\tldi $a,0')
-            for line in self._kstate_store_lines('oled_cursor_x'):
-                self.emit(line)
-            for line in self._kstate_load_lines('oled_cursor_y'):
-                self.emit(line)
-            self.emit('\tinc')
-            self.emit('\tcmpi 18')
-            self.emit(f'\tjnc {yok}')
-            self.emit('\tldi $a,0')                 # y wrap
-            self.emit(f'{yok}:')
-            for line in self._kstate_store_lines('oled_cursor_y'):
-                self.emit(line)
-            self.emit('\tret')
-            self.emit(f'{xok}:')
-            for line in self._kstate_store_lines('oled_cursor_x'):
-                self.emit(line)
-            self.emit('\tret')
-
         # Updated __lcd_chr / __lcd_cmd for AiP31068L
         if '__lcd_chr' in helpers:
             self.emit('__lcd_chr:')
@@ -4397,87 +4169,6 @@ class MK1CodeGen:
             # --- ones ---
             self.emit('\taddi 48,$a')
             self.emit('\tjal __lcd_chr')
-            self.emit('\tret')
-
-        # __print_u8_dec_oled: same shape as __print_u8_dec but emits
-        # via __oled_render_at_cursor (font-index path). Compiler bakes
-        # in the font index of '0' so digit→idx is `digit + idx_zero`.
-        if '__print_u8_dec_oled' in helpers:
-            idx_zero = self._oled_font_index_map['0']
-            lbl_lt100 = self.label('pdo_lt100')
-            lbl_h = self.label('pdo_h')
-            lbl_hd = self.label('pdo_hd')
-            lbl_dotens = self.label('pdo_dotens')
-            lbl_lt10 = self.label('pdo_lt10')
-            lbl_t = self.label('pdo_t')
-            lbl_td = self.label('pdo_td')
-            self.emit('__print_u8_dec_oled:')
-            self.emit('\tcmpi 100')
-            self.emit(f'\tjnc {lbl_lt100}')
-            self.emit('\tldi $c,0')
-            self.emit(f'{lbl_h}:')
-            self.emit('\tcmpi 100')
-            self.emit(f'\tjnc {lbl_hd}')
-            self.emit('\tsubi 100,$a')
-            self.emit('\tpush $a'); self.emit('\tincc'); self.emit('\tpop $a')
-            self.emit(f'\tj {lbl_h}')
-            self.emit(f'{lbl_hd}:')
-            self.emit('\tpush $a')
-            self.emit('\tmov $c,$a')
-            self.emit(f'\taddi {idx_zero},$a')
-            self.emit('\tjal __oled_render_at_cursor')
-            self.emit('\tpop $a')
-            self.emit(f'\tj {lbl_dotens}')
-            self.emit(f'{lbl_lt100}:')
-            self.emit('\tcmpi 10')
-            self.emit(f'\tjnc {lbl_lt10}')
-            self.emit(f'{lbl_dotens}:')
-            self.emit('\tldi $c,0')
-            self.emit(f'{lbl_t}:')
-            self.emit('\tcmpi 10')
-            self.emit(f'\tjnc {lbl_td}')
-            self.emit('\tsubi 10,$a')
-            self.emit('\tpush $a'); self.emit('\tincc'); self.emit('\tpop $a')
-            self.emit(f'\tj {lbl_t}')
-            self.emit(f'{lbl_td}:')
-            self.emit('\tpush $a')
-            self.emit('\tmov $c,$a')
-            self.emit(f'\taddi {idx_zero},$a')
-            self.emit('\tjal __oled_render_at_cursor')
-            self.emit('\tpop $a')
-            self.emit(f'{lbl_lt10}:')
-            self.emit(f'\taddi {idx_zero},$a')
-            self.emit('\tjal __oled_render_at_cursor')
-            self.emit('\tret')
-
-        # __print_u8_hex_oled: 2-hex-digit print via __oled_render_at_cursor.
-        # idx for digits 0-9: idx_zero + digit. idx for A-F:
-        # idx_alpha_a + (digit-10). Unified: addi (idx_alpha_a-idx_zero-10)
-        # if digit >= 10, then addi idx_zero unconditionally.
-        if '__print_u8_hex_oled' in helpers:
-            idx_zero = self._oled_font_index_map['0']
-            idx_alpha_a = self._oled_font_index_map['A']
-            ab_offset = idx_alpha_a - idx_zero - 10   # offset to bridge 9→A
-            lbl_hd1 = self.label('pxo_hd1')
-            lbl_hd2 = self.label('pxo_hd2')
-            self.emit('__print_u8_hex_oled:')
-            self.emit('\tpush $a')
-            self.emit('\tslr'); self.emit('\tslr')
-            self.emit('\tslr'); self.emit('\tslr')
-            self.emit('\tcmpi 10')
-            self.emit(f'\tjnc {lbl_hd1}')
-            self.emit(f'\taddi {ab_offset},$a')
-            self.emit(f'{lbl_hd1}:')
-            self.emit(f'\taddi {idx_zero},$a')
-            self.emit('\tjal __oled_render_at_cursor')
-            self.emit('\tpop $a')
-            self.emit('\tandi 0x0F,$a')
-            self.emit('\tcmpi 10')
-            self.emit(f'\tjnc {lbl_hd2}')
-            self.emit(f'\taddi {ab_offset},$a')
-            self.emit(f'{lbl_hd2}:')
-            self.emit(f'\taddi {idx_zero},$a')
-            self.emit('\tjal __oled_render_at_cursor')
             self.emit('\tret')
 
         # __lcd_temp_u8: A = 0..99-ish temp, print decimal without leading
@@ -8871,12 +8562,6 @@ class MK1CodeGen:
                 for b in table:
                     assembled.append(f'\tbyte {b}')
                     emitted += 1
-            if hasattr(self, '_oled_lut_base'):
-                emit_allocated_until(self._oled_lut_base)
-                assembled.append(f'; OLED 4bpp expansion LUT at data[{self._oled_lut_base}..{self._oled_lut_base+3}]')
-                for b in self._oled_lut_data:
-                    assembled.append(f'\tbyte {b}')
-                    emitted += 1
             # Any remaining slots → zero-fill
             emit_allocated_until(self.data_alloc)
             if note_entries:
@@ -11242,11 +10927,11 @@ class MK1CodeGen:
                 return
 
             if name == 'oled_set_cursor':
-                # Phase 4b: writes the cursor to kstate at runtime
-                # (page 2 0xB3, 0xB4) so the runtime render helper
-                # picks it up. Both args must be compile-time
-                # constants — runtime cursor values are emitted as
-                # `ldi $a, K; <kstate_store>` pairs.
+                # Phase 4a: compile-time-only cursor. Updates the
+                # codegen's tracked cursor position (`_oled_cursor_x`,
+                # `_oled_cursor_y`) so that subsequent `oled_text(...)`
+                # calls render starting from the new cell. Both args
+                # must be compile-time constants. Emits no code.
                 if len(args) != 2:
                     raise Exception(
                         f"oled_set_cursor(x, y) takes 2 arguments, got {len(args)}")
@@ -11261,134 +10946,49 @@ class MK1CodeGen:
                 if not (0 <= yv <= 17):
                     raise Exception(
                         f"oled_set_cursor() y must be in [0, 17], got {yv}")
-                self._oled_ensure_init()
-                self.emit(f'\tldi $a,{xv}')
-                for line in self._kstate_store_lines('oled_cursor_x'):
-                    self.emit(line)
-                self.emit(f'\tldi $a,{yv}')
-                for line in self._kstate_store_lines('oled_cursor_y'):
-                    self.emit(line)
+                self._oled_cursor_x = xv
+                self._oled_cursor_y = yv
                 return
 
             if name == 'oled_text':
-                # Phase 4b: render a string literal at the runtime
-                # cursor (kstate), one font-index → render-helper
-                # call per char. The helper auto-advances the cursor
-                # with wrap. Per-char code cost is just
-                # `ldi $a, idx; jal __oled_render_at_cursor` (~5 B),
-                # so 21-char lines fit page 0 easily.
+                # Phase 4a: render a string literal at the current
+                # compiler-tracked cursor, advancing the cursor per
+                # char (wraps at col 21 → next row, row 18 → row 0).
+                # Each char compiles to one `oled_putc(c, x, y)`
+                # equivalent at known (x, y) — same code-size cost
+                # as a direct sequence of putc calls.
+                #
+                # The cursor lives only on the codegen object during
+                # compilation, so two `oled_text()` calls in the same
+                # program continue from where the previous one left
+                # off. Cross-function cursor flow is sound because
+                # the cursor is updated at *emit time*, not call
+                # time — calling order in the source is what counts.
+                #
+                # Phase 4b will replace this with a runtime cursor in
+                # kstate to support `oled_printf` (where digit count
+                # from `%d` varies at runtime).
                 if len(args) != 1 or args[0][0] != 'string':
                     raise Exception(
                         "oled_text() requires a string literal argument")
                 s = args[0][1]
-                self._oled_ensure_init()
-                self._oled_ensure_font_eeprom()
-                self._oled_ensure_lut()
-                if not hasattr(self, '_lcd_helpers'):
-                    self._lcd_helpers = set()
-                self._lcd_helpers.add('__oled_render_at_cursor')
-                self._lcd_helpers.add('__eeprom_rd')
-                self._lcd_helpers.add('__i2c_rb')
-                self._lcd_helpers.add('__i2c_rs')
-                self._needs_runtime_eeprom_rd = True
+                cur_x = getattr(self, '_oled_cursor_x', 0)
+                cur_y = getattr(self, '_oled_cursor_y', 0)
                 for ch in s:
-                    if ch not in self._oled_font_index_map:
+                    if ch not in self._OLED_FONT_5X5:
                         raise Exception(
                             f"oled_text(): char {ch!r} (0x{ord(ch):02X}) is not "
                             f"in the embedded 5x5 font. Supported: "
                             f"{''.join(sorted(self._OLED_FONT_5X5.keys()))}")
-                    idx = self._oled_font_index_map[ch]
-                    self.emit(f'\tldi $a,{idx}')
-                    self.emit('\tjal __oled_render_at_cursor')
-                return
-
-            if name == 'oled_printf':
-                # Phase 4b: format-string printf for the OLED, modeled
-                # on the LCD `printf` (mk1cc2.py:11656). Format string
-                # is parsed at compile time; literal chunks emit one
-                # render-helper call per char (like oled_text); `%d`
-                # / `%x` / `%c` / `%s` / `%%` resolve at emit time
-                # against the supplied args.
-                #
-                # Specifiers:
-                #   %d  — u8 in decimal via __print_u8_dec_oled
-                #   %x  — u8 in 2 hex digits via __print_u8_hex_oled
-                #   %s  — string literal arg
-                #   %c  — single char arg (compile-time const required;
-                #         runtime char→idx LUT not implemented yet)
-                #   %%  — literal '%'
-                if not args or args[0][0] != 'string':
-                    self.gen_error(
-                        "oled_printf requires a string literal as first argument")
-                    return
-                fmt = args[0][1]
-                self._oled_ensure_init()
-                self._oled_ensure_font_eeprom()
-                self._oled_ensure_lut()
-                if not hasattr(self, '_lcd_helpers'):
-                    self._lcd_helpers = set()
-                self._lcd_helpers.add('__oled_render_at_cursor')
-                self._lcd_helpers.add('__eeprom_rd')
-                self._lcd_helpers.add('__i2c_rb')
-                self._lcd_helpers.add('__i2c_rs')
-                self._needs_runtime_eeprom_rd = True
-
-                def _emit_lit_char(ch):
-                    if ch not in self._oled_font_index_map:
-                        raise Exception(
-                            f"oled_printf(): char {ch!r} (0x{ord(ch):02X}) "
-                            f"is not in the embedded 5x5 font. Supported: "
-                            f"{''.join(sorted(self._OLED_FONT_5X5.keys()))}")
-                    idx = self._oled_font_index_map[ch]
-                    self.emit(f'\tldi $a,{idx}')
-                    self.emit('\tjal __oled_render_at_cursor')
-
-                arg_idx = 1
-                i = 0
-                while i < len(fmt):
-                    ch = fmt[i]
-                    if ch != '%':
-                        _emit_lit_char(ch)
-                        i += 1
-                        continue
-                    i += 1
-                    if i >= len(fmt):
-                        self.gen_error("oled_printf: trailing '%' in format")
-                        return
-                    spec = fmt[i]; i += 1
-                    if spec == '%':
-                        _emit_lit_char('%') if '%' in self._oled_font_index_map \
-                            else self.gen_error("oled_printf: '%%' but '%' not in font")
-                        continue
-                    if arg_idx >= len(args):
-                        self.gen_error(f"oled_printf: not enough args for '%{spec}'")
-                        return
-                    arg = args[arg_idx]; arg_idx += 1
-                    if spec == 'd':
-                        self.gen_expr(arg)
-                        self._lcd_helpers.add('__print_u8_dec_oled')
-                        self.emit('\tjal __print_u8_dec_oled')
-                    elif spec == 'x':
-                        self.gen_expr(arg)
-                        self._lcd_helpers.add('__print_u8_hex_oled')
-                        self.emit('\tjal __print_u8_hex_oled')
-                    elif spec == 'c':
-                        c = self._const_eval(arg)
-                        if c is None:
-                            self.gen_error("oled_printf: %c arg must be compile-time const for now")
-                            return
-                        _emit_lit_char(chr(c & 0xFF))
-                    elif spec == 's':
-                        if arg[0] != 'string':
-                            self.gen_error("oled_printf: %s arg must be a string literal")
-                            return
-                        for sch in arg[1]:
-                            _emit_lit_char(sch)
-                    else:
-                        self.gen_error(f"oled_printf: unsupported specifier '%{spec}'")
-                        return
-                if arg_idx < len(args):
-                    self.emit(f'; oled_printf: {len(args) - arg_idx} extra arg(s) ignored')
+                    if cur_x > 20:
+                        cur_x = 0
+                        cur_y += 1
+                    if cur_y > 17:
+                        cur_y = 0
+                    self._emit_oled_putc(ch, cur_x, cur_y)
+                    cur_x += 1
+                self._oled_cursor_x = cur_x
+                self._oled_cursor_y = cur_y
                 return
 
             if name == 'lcd_clear':
