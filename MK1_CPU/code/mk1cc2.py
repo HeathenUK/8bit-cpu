@@ -795,6 +795,45 @@ class MK1CodeGen:
             out.append(0xF0 if b0 else 0)   # right margin always dark
         return out
 
+    def _emit_oled_putc(self, ch, xv, yv):
+        """Emit one Phase-3-style oled_putc call for char `ch` at cell
+        (xv, yv). Allocates a 27-byte glyph table in the data page,
+        registers the per-K helper if first time, and emits the
+        `ldi $d, addr; jal __oled_putc_xfer` call sequence.
+
+        Used by both the `oled_putc(c, x, y)` builtin (compile-time
+        const args) and the `oled_text(s)` builtin (compiler-tracked
+        cursor walking the string at emit time).
+        """
+        if not (0 <= xv <= 20):
+            raise Exception(
+                f"oled_putc emission: x must be in [0, 20], got {xv}")
+        if not (0 <= yv <= 17):
+            raise Exception(
+                f"oled_putc emission: y must be in [0, 17], got {yv}")
+        glyph = self._OLED_FONT_5X5.get(ch)
+        if glyph is None:
+            raise Exception(
+                f"oled_putc emission: char {ch!r} (0x{ord(ch):02X}) is not "
+                f"in the embedded 5x5 font. Supported: "
+                f"{''.join(sorted(self._OLED_FONT_5X5.keys()))}")
+        self._oled_ensure_init()
+        col_s = xv * 3
+        col_e = col_s + 2
+        row_s = yv * 7
+        row_e = row_s + 6
+        # Per-call data table: 6 window bytes + 21 pixel bytes.
+        table = [0x15, col_s, col_e, 0x75, row_s, row_e] + \
+            self._oled_render_5x5_to_4bpp(glyph)
+        tbl_base = self.data_alloc
+        self.data_alloc += len(table)
+        if not hasattr(self, '_oled_putc_tables'):
+            self._oled_putc_tables = []
+        self._oled_putc_tables.append((tbl_base, table, ch, xv, yv))
+        self._lcd_helpers.add('__oled_putc_xfer')
+        self.emit(f'\tldi $d,{tbl_base}')
+        self.emit('\tjal __oled_putc_xfer')
+
     def _oled_ensure_init(self):
         """Idempotent: allocate the SSD1327 init data in the data
         section (once), register the `__oled_init` walker plus its
@@ -10874,7 +10913,7 @@ class MK1CodeGen:
                 #
                 # Cell grid: 21 cols × 18 rows on a 128×128 OLED
                 # (6 px wide × 7 px tall cells). Cursor state and
-                # auto-advance are deferred.
+                # auto-advance are deferred to Phase 4b.
                 if len(args) != 3:
                     raise Exception(
                         f"oled_putc(char, x, y) takes 3 arguments, got {len(args)}")
@@ -10884,35 +10923,72 @@ class MK1CodeGen:
                 if cv is None or xv is None or yv is None:
                     raise Exception(
                         "oled_putc() arguments must all be compile-time constants")
+                self._emit_oled_putc(chr(cv & 0xFF), xv, yv)
+                return
+
+            if name == 'oled_set_cursor':
+                # Phase 4a: compile-time-only cursor. Updates the
+                # codegen's tracked cursor position (`_oled_cursor_x`,
+                # `_oled_cursor_y`) so that subsequent `oled_text(...)`
+                # calls render starting from the new cell. Both args
+                # must be compile-time constants. Emits no code.
+                if len(args) != 2:
+                    raise Exception(
+                        f"oled_set_cursor(x, y) takes 2 arguments, got {len(args)}")
+                xv = self._const_eval(args[0])
+                yv = self._const_eval(args[1])
+                if xv is None or yv is None:
+                    raise Exception(
+                        "oled_set_cursor() arguments must be compile-time constants")
                 if not (0 <= xv <= 20):
                     raise Exception(
-                        f"oled_putc() x must be in [0, 20], got {xv}")
+                        f"oled_set_cursor() x must be in [0, 20], got {xv}")
                 if not (0 <= yv <= 17):
                     raise Exception(
-                        f"oled_putc() y must be in [0, 17], got {yv}")
-                ch = chr(cv & 0xFF)
-                glyph = self._OLED_FONT_5X5.get(ch)
-                if glyph is None:
+                        f"oled_set_cursor() y must be in [0, 17], got {yv}")
+                self._oled_cursor_x = xv
+                self._oled_cursor_y = yv
+                return
+
+            if name == 'oled_text':
+                # Phase 4a: render a string literal at the current
+                # compiler-tracked cursor, advancing the cursor per
+                # char (wraps at col 21 → next row, row 18 → row 0).
+                # Each char compiles to one `oled_putc(c, x, y)`
+                # equivalent at known (x, y) — same code-size cost
+                # as a direct sequence of putc calls.
+                #
+                # The cursor lives only on the codegen object during
+                # compilation, so two `oled_text()` calls in the same
+                # program continue from where the previous one left
+                # off. Cross-function cursor flow is sound because
+                # the cursor is updated at *emit time*, not call
+                # time — calling order in the source is what counts.
+                #
+                # Phase 4b will replace this with a runtime cursor in
+                # kstate to support `oled_printf` (where digit count
+                # from `%d` varies at runtime).
+                if len(args) != 1 or args[0][0] != 'string':
                     raise Exception(
-                        f"oled_putc() char {ch!r} (0x{cv & 0xFF:02X}) is not in "
-                        f"the embedded 5x5 font. Supported: "
-                        f"{''.join(sorted(self._OLED_FONT_5X5.keys()))}")
-                self._oled_ensure_init()
-                col_s = xv * 3
-                col_e = col_s + 2
-                row_s = yv * 7
-                row_e = row_s + 6
-                # Per-call data table: 6 window bytes + 21 pixel bytes.
-                table = [0x15, col_s, col_e, 0x75, row_s, row_e] + \
-                    self._oled_render_5x5_to_4bpp(glyph)
-                tbl_base = self.data_alloc
-                self.data_alloc += len(table)
-                if not hasattr(self, '_oled_putc_tables'):
-                    self._oled_putc_tables = []
-                self._oled_putc_tables.append((tbl_base, table, ch, xv, yv))
-                self._lcd_helpers.add('__oled_putc_xfer')
-                self.emit(f'\tldi $d,{tbl_base}')
-                self.emit('\tjal __oled_putc_xfer')
+                        "oled_text() requires a string literal argument")
+                s = args[0][1]
+                cur_x = getattr(self, '_oled_cursor_x', 0)
+                cur_y = getattr(self, '_oled_cursor_y', 0)
+                for ch in s:
+                    if ch not in self._OLED_FONT_5X5:
+                        raise Exception(
+                            f"oled_text(): char {ch!r} (0x{ord(ch):02X}) is not "
+                            f"in the embedded 5x5 font. Supported: "
+                            f"{''.join(sorted(self._OLED_FONT_5X5.keys()))}")
+                    if cur_x > 20:
+                        cur_x = 0
+                        cur_y += 1
+                    if cur_y > 17:
+                        cur_y = 0
+                    self._emit_oled_putc(ch, cur_x, cur_y)
+                    cur_x += 1
+                self._oled_cursor_x = cur_x
+                self._oled_cursor_y = cur_y
                 return
 
             if name == 'lcd_clear':
