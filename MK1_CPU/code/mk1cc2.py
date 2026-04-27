@@ -5772,23 +5772,39 @@ class MK1CodeGen:
             if px != py:
                 parent[py] = px
         def _should_split_reload_edge(caller, callee):
+            # Library helpers (double-underscore) can't be reload-thunked
+            # because they're often called from many sites; bundling
+            # them with their callers is the right strategy.
             if caller.startswith('__') or callee.startswith('__'):
-                return False
-            if not caller.startswith('_main_p'):
                 return False
             cs = ov_by_name.get(caller, (0, 0, 0))[2]
             ds = ov_by_name.get(callee, (0, 0, 0))[2]
-            if ds < 24:
+            # The thunk costs ~11 B resident. We split if the savings
+            # (avoiding a merge that would balloon the bundle) clearly
+            # exceed that cost.
+            #
+            # The `_main_p`-only restriction (pre-2026-04-27) prevented
+            # all other user-fn → user-fn cross-overlay splits, forcing
+            # the SCC merger to pile every call chain into one overlay.
+            # That works for programs where the merged bundle fits the
+            # slot, but breaks (e.g. keypad_oled.c) when helpers bring
+            # the bundle over. Relaxed thresholds:
+            #
+            #   - callee ≥ 16 B: enough that the 11 B thunk + ~5 B per
+            #     extra call site is paid back by removing the callee
+            #     from the caller's overlay. Below 16 B, splitting
+            #     usually loses.
+            #   - cs + ds ≥ 30 B: filter out toy programs where the
+            #     entire bundle is small enough to fit anyway.
+            #
+            # No `_main_p` restriction; no call_count gate (a single
+            # call site can still benefit from the split when helpers
+            # would otherwise inflate the merged bundle past the slot).
+            if ds < 16:
                 return False
-            call_count = 0
-            start, end, _ = ov_by_name.get(caller, (0, 0, 0))
-            for line in self.code[start:end]:
-                if line.strip() == f'jal {callee}':
-                    call_count += 1
-            # One thunk per caller/callee edge costs about 11B resident. Split
-            # only when the avoided merge is clearly larger than that cost, and
-            # bias toward repeated calls where one thunk amortizes well.
-            return (cs + ds >= 60 and (call_count >= 2 or ds >= 40))
+            if cs + ds < 30:
+                return False
+            return True
 
         for ci, comp in enumerate(components):
             for name in comp:
