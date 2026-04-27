@@ -6897,8 +6897,12 @@ class MK1CodeGen:
 
             # Iterate: extract the best thunk, re-scan, repeat until no gains
             _thunk_counter = 0
+            import os as _dbg_p6
+            _phase6_disabled = _dbg_p6.environ.get('MK1_DISABLE_PHASE6') == '1'
             for oi, (oname, olines, ofsize) in enumerate(overlay_asm_blocks):
                 cur_lines = olines
+                if _phase6_disabled:
+                    continue
                 for _iter in range(4):  # up to 4 thunks per overlay
                     new_lines, added = _phase6_extract(cur_lines,
                                                         f'{oi}_{_thunk_counter}')
