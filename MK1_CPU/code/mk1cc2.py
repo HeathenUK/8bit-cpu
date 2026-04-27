@@ -3466,12 +3466,14 @@ class MK1CodeGen:
             no_ov.add('__i2c_rb:')
         if '__i2c_rs' in helpers:
             no_ov.add('__i2c_rs:')
-        # OLED helpers are runtime callers of __i2c_st_only / __i2c_sp:
-        # __oled_init walker dispatches to them on START/STOP sentinels,
-        # and each __oled_fill_<K> wraps its 8 KB stream in a START/STOP
-        # transaction. Treat them like LCD runtime helpers and force the
-        # I²C primitives resident whenever an OLED helper is in use.
-        oled_runtime = {'__oled_init', '__oled_putc_xfer', '__oled_stream_chars',
+        # OLED runtime helpers are runtime callers of __i2c_st_only /
+        # __i2c_sp. __oled_init is NOT in this set: it's init-only
+        # (one-shot, called from stage-1 oled_init() and never reached
+        # at runtime). Including it here added __oled_init: to
+        # _NO_OVERLAY upstream, which made it kernel-resident and
+        # bypassed the INIT_ONLY_NAMES classification (~51 B kernel
+        # bloat per program with OLED).
+        oled_runtime = {'__oled_putc_xfer', '__oled_stream_chars',
                         '__oled_set_window'} | {
             h for h in helpers if h.startswith('__oled_fill_')}
         if helpers & oled_runtime:
@@ -6220,9 +6222,19 @@ class MK1CodeGen:
                 # with THAT helper (not necessarily the next in source).
                 elif tail_jumps_to is not None and tail_jumps_to in helper_bodies:
                     ts, te, tlines = helper_bodies[tail_jumps_to]
-                    # Insert target's label + body after our body. The
-                    # `j __X` already there acts as a no-op fall-through
-                    # since __X's label is now immediately following.
+                    # Strip the trailing `j __X` since __X's label is now
+                    # immediately following — the jump is dead. Saves 1 B
+                    # per merged tail. Peephole would normally catch this
+                    # but is suppressed on overlay sections (manifest
+                    # offsets), so we elide it at merge time when sizes
+                    # are still mutable.
+                    hlines_t = list(hlines)
+                    while hlines_t and (not hlines_t[-1].strip() or
+                                         hlines_t[-1].strip().startswith(';')):
+                        hlines_t.pop()
+                    if hlines_t and hlines_t[-1].strip() == f'j {tail_jumps_to}':
+                        hlines_t.pop()
+                        hlines = hlines_t
                     merged_lines = hlines + [new_resident[ts]] + tlines
                     helper_bodies[hname] = (hstart, te, merged_lines)
                 # Don't remove the merged-in helper from helper_bodies — it
@@ -6505,13 +6517,22 @@ class MK1CodeGen:
                                 s_check = s_check.replace(f'j {lbl}', f'j {lbl}{suffix}')
                         new_olines[li] = s_check
 
-                # Append renamed helper bodies
+                # Append renamed helper bodies. Track top-level `__X_ovN:`
+                # labels we've already emitted in this overlay; if a
+                # subsequent helper's merged body would re-emit an
+                # already-seen label (because two bundled helpers
+                # tail-jumped to the same target and Case-2 merge
+                # inlined the body into both), truncate at the duplicate
+                # label and emit `j __X_ovN` to direct control flow to
+                # the first copy. Saves 4-9 B per duplicated tail.
+                seen_emitted_labels = set()
                 for hname in sorted_for_ov:
                     hstart, _, hlines = helper_bodies[hname]
                     helper_full = [new_resident[hstart]] + hlines
+                    # First, rename labels in each line (same logic as before)
+                    renamed = []
                     for hl in helper_full:
                         l = hl
-                        # Rename all bundled labels (definitions and references)
                         for lbl in all_bundled_labels:
                             l = l.replace(f'{lbl}:', f'{lbl}{suffix}:')
                             l = l.replace(f'jal {lbl}', f'jal {lbl}{suffix}')
@@ -6521,13 +6542,30 @@ class MK1CodeGen:
                                         break
                                 else:
                                     l = l.replace(f'j {lbl}', f'j {lbl}{suffix}')
-                        # Rename local labels to avoid conflicts between overlays
                         import re as _re
                         for m in _re.finditer(r'\.([\w]+)', l):
                             ref = '.' + m.group(1)
                             if any(ref + ':' in h2.strip() for h2 in [new_resident[hstart]] + hlines):
                                 l = l.replace(ref, ref + suffix)
+                        renamed.append(l)
+                    # Walk renamed; on first duplicate top-level label,
+                    # truncate and emit a forward jump.
+                    truncated = False
+                    for ri, l in enumerate(renamed):
+                        s = l.strip()
+                        if s.endswith(':') and s.startswith('__') and not s.startswith('.'):
+                            lbl_name = s[:-1]
+                            if lbl_name in seen_emitted_labels:
+                                # Duplicate. Replace this line and the rest of
+                                # `renamed` with a single `j lbl_name`.
+                                new_olines.append(f'\tj {lbl_name}')
+                                truncated = True
+                                break
+                            seen_emitted_labels.add(lbl_name)
                         new_olines.append(l)
+                    if not truncated:
+                        # No duplicate encountered; renamed[] fully appended above.
+                        pass
                 new_fsize = measure_lines(new_olines)
                 overlay_asm_blocks[oi] = (oname, new_olines, new_fsize)
 
@@ -8394,6 +8432,30 @@ class MK1CodeGen:
                 import os as _dbg_os
                 if _dbg_os.environ.get('MK1_DUMP_WRAPPING') == '1':
                     import sys as _dbg_sys
+                    _ldr_b = measure_lines(_loader_chk)
+                    print(f"[KDUMP] kernel total = {_kernel_chk}B "
+                          f"(loader={_ldr_b}B, main={main_size}B, helpers={runtime_helper_size}B)",
+                          file=_dbg_sys.stderr)
+                    print(f"[KDUMP] slot available = {_ov_avail}B (page_0 250B - kernel {_kernel_chk}B)",
+                          file=_dbg_sys.stderr)
+                    _kernel_helpers = []
+                    for _ke in _NO_OVERLAY:
+                        _hn = _ke[:-1] if _ke.endswith(':') else _ke
+                        if _hn in helper_bodies:
+                            _kernel_helpers.append((_hn, measure_lines(helper_bodies[_hn][2])))
+                    _kernel_helpers.sort(key=lambda x: -x[1])
+                    print(f"[KDUMP] kernel-resident helpers ({len(_kernel_helpers)} entries):",
+                          file=_dbg_sys.stderr)
+                    for _hn, _hb in _kernel_helpers:
+                        print(f"[KDUMP]   {_hn}: {_hb}B", file=_dbg_sys.stderr)
+                    if bundleable_helpers:
+                        _bun = []
+                        for _h in bundleable_helpers:
+                            _bun.append((_h, measure_lines(helper_bodies.get(_h, (0,0,[]))[2])))
+                        _bun.sort(key=lambda x: -x[1])
+                        print(f"[KDUMP] bundleable helpers (placed in overlays): "
+                              f"{', '.join(f'{n}={s}B' for n,s in _bun)}",
+                              file=_dbg_sys.stderr)
                     for _oi, (_on, _olines, _osz) in enumerate(overlay_asm_blocks):
                         print(f"[DUMP] overlay idx={_oi} name={_on} size={_osz}B",
                               file=_dbg_sys.stderr)
@@ -13424,6 +13486,42 @@ def peephole(lines):
         import sys
         print(f"  Peephole: shortened loop-local inc/dec stores "
               f"(saved {_loop_store_saved}B)", file=sys.stderr)
+
+    # ── Pass: elide `j X` immediately followed by `X:` ───────────────
+    # The merge step in _overlay_partition strips this pattern for
+    # bundleable helpers, but the equivalent at kernel/init level
+    # (e.g. __lcd_chr falling into __lcd_send_raw) survives because
+    # peephole sees a label between the two and historically had no
+    # rule for label-adjacency. 1B per occurrence; ~5 in the corpus
+    # at the kernel/flat level.
+    _dead_j_saved = 0
+    new_lines = []
+    i = 0
+    while i < len(lines):
+        cur = lines[i].strip()
+        if cur.startswith('j ') and not cur.startswith('jal') and \
+           not any(cur.startswith(jt + ' ') for jt in ('jnz', 'jz', 'jc', 'jnc')):
+            target = cur.split(None, 1)[1] if len(cur.split()) > 1 else ''
+            # Look ahead past blank/comment lines for the next label.
+            k = i + 1
+            while k < len(lines):
+                nxt = lines[k].strip()
+                if not nxt or nxt.startswith(';'):
+                    k += 1
+                    continue
+                break
+            if k < len(lines) and lines[k].strip() == f'{target}:':
+                _dead_j_saved += 1
+                i += 1
+                continue
+        new_lines.append(lines[i])
+        i += 1
+    lines = new_lines
+    if _dead_j_saved:
+        import sys
+        print(f"  Peephole: elided {_dead_j_saved} dead `j` jumps "
+              f"to immediate next label (saved {_dead_j_saved}B)",
+              file=sys.stderr)
 
     return lines
 

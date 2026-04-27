@@ -501,6 +501,48 @@ TESTS = [
         [21], eeprom=True, cycles=50_000,   # 10+10+1 = 21
     ),
     Test(
+        # Exercises _should_split_reload_edge for user-fn -> user-fn calls.
+        # leaf_a and leaf_b are sized so they cannot co-locate in one
+        # overlay slot; the partitioner emits __ovreload_leaf_a_leaf_b
+        # (load callee -> jal -> reload caller -> ret). The 0xB4 marker
+        # fires *after* leaf_b returns, so it can only print if the
+        # thunk's second _overlay_load correctly reloaded leaf_a's
+        # overlay before its tail. sibling() is a plain main->overlay
+        # call (no reload-thunk), demonstrating both paths coexist.
+        'overlay reload-thunk: user-fn -> user-fn cross-overlay call',
+        '''unsigned char tally[16];
+        unsigned char filler[8];
+        void leaf_b(void) {
+            out(0xC2);
+            tally[0]++; tally[1]++; tally[2]++; tally[3]++;
+            tally[4]++; tally[5]++; tally[6]++; tally[7]++;
+            tally[8]++; tally[9]++; tally[10]++; tally[11]++;
+            tally[12]++; tally[13]++; tally[14]++; tally[15]++;
+            out(0xC3);
+        }
+        void leaf_a(void) {
+            out(0xB1); leaf_b(); out(0xB4);
+            tally[0]++; tally[1]++; tally[2]++; tally[3]++;
+            tally[4]++; tally[5]++; tally[6]++; tally[7]++;
+            tally[8]++; tally[9]++; tally[10]++; tally[11]++;
+            tally[12]++; tally[13]++; tally[14]++; tally[15]++;
+        }
+        void sibling(void) {
+            out(0xF0);
+            filler[0]++; filler[1]++; filler[2]++; filler[3]++;
+            filler[4]++; filler[5]++; filler[6]++; filler[7]++;
+            filler[0]++; filler[1]++; filler[2]++; filler[3]++;
+            out(0xF1);
+        }
+        void main(void) {
+            out(0xA0); leaf_a(); out(0xA5);
+            sibling(); out(0xA6);
+            halt();
+        }''',
+        [0xA0, 0xB1, 0xC2, 0xC3, 0xB4, 0xA5, 0xF0, 0xF1, 0xA6],
+        cycles=50_000,
+    ),
+    Test(
         'xs-abstract init-touch: thunk extracted from init code',
         # With MIN_LEN=3, the 3-instr I2C STOP pattern (ddrb_imm 0x03/0x01/0x00)
         # extracts as a kernel thunk. The thunk occurrences span BOTH the

@@ -7,14 +7,16 @@ unsigned char keymap[16] = {
 unsigned char display[1];
 unsigned char prev_key;
 
+void show(unsigned char idx) {
+    display[0] = idx;
+    oled_print_buf(display, 1, 10, 12);
+}
+
 void poll_once(void) {
     unsigned char k;
     k = keypad_scan();
     if (k != prev_key) {
-        if (k != 0xFF) {
-            display[0] = keymap[k];
-            oled_print_buf(display, 1, 10, 12);
-        }
+        if (k != 0xFF) show(keymap[k]);
         prev_key = k;
     }
 }
