@@ -4058,27 +4058,25 @@ class MK1CodeGen:
             self.emit(f'{nd}:')
             self.emit(f'\tcmp {ODELAY}')
             self.emit(f'\tjnz {sd}')
-            # ~5 ms delay (uncalibrated, identical shape to __lcd_init's).
+            # ~5 ms delay (uncalibrated). Outer counter via decc
+            # directly instead of round-tripping through $a (was 3 ops:
+            # mov $c,$a; dec; mov $a,$c; jnz).
             do = self.label('oi_do')
             di = self.label('oi_di')
             self.emit('\tldi $c,5')
             self.emit(f'{do}:')
-            self.emit('\tldi $a,0')
+            self.emit('\tclr $a')                   # inner counter = 0 (-> 256 iters via dec/jnz)
             self.emit(f'{di}:')
             self.emit('\tdec')
             self.emit(f'\tjnz {di}')
-            self.emit('\tmov $c,$a')
-            self.emit('\tdec')
-            self.emit('\tmov $a,$c')
+            self.emit('\tdecc')                     # outer count-- (was mov/dec/mov)
             self.emit(f'\tjnz {do}')
             self.emit(f'\tj {av}')
             self.emit(f'{sd}:')
             self.emit('\tjal __i2c_sb')
             self.emit(f'{av}:')
             self.emit('\tpop $d')
-            self.emit('\tmov $d,$a')
-            self.emit('\tinc')
-            self.emit('\tmov $a,$d')
+            self.emit('\tincd')                     # advance walker ptr (was mov/inc/mov)
             self.emit(f'\tj {lp}')
             self.emit(f'{dn}:')
             self.emit('\tout_imm 0x20')        # DEBUG: init walker done
@@ -4193,7 +4191,7 @@ class MK1CodeGen:
             self.emit('\tpush $a')                 # col_s
             self.emit('\tjal __i2c_st_only')
             self.emit('\tldi $a,0x7A'); self.emit('\tjal __i2c_sb')
-            self.emit('\tldi $a,0x00'); self.emit('\tjal __i2c_sb')   # CMD_STREAM
+            self.emit('\tclr $a'); self.emit('\tjal __i2c_sb')        # CMD_STREAM (= 0x00)
             self.emit('\tldi $a,0x15'); self.emit('\tjal __i2c_sb')   # col cmd
             self.emit('\tpop $a'); self.emit('\tjal __i2c_sb')        # col_s
             self.emit('\tpop $a'); self.emit('\tjal __i2c_sb')        # col_e
@@ -4201,8 +4199,7 @@ class MK1CodeGen:
             self.emit('\tmov $c,$a'); self.emit('\tjal __i2c_sb')     # row_s
             self.emit('\tpop $a'); self.emit('\tjal __i2c_sb')        # row_e
             self.emit('\tout_imm 0x70')             # window→stop pad
-            self.emit('\tjal __i2c_sp')
-            self.emit('\tret')
+            self.emit('\tj __i2c_sp')                # tail-call (no ret needed)
 
         if '__oled_send_lut_byte' in helpers:
             # Sub-helper for __oled_stream_chars: takes a 2-bit input
@@ -4259,7 +4256,7 @@ class MK1CodeGen:
             self.emit('\tldi $a,0x7A'); self.emit('\tjal __i2c_sb')
             self.emit('\tldi $a,0x40'); self.emit('\tjal __i2c_sb')   # DATA_STREAM
             self.emit('\tpop $c')                   # count [.., buf]
-            self.emit('\tpop $a'); self.emit('\tmov $a,$d')   # buf [.., empty]
+            self.emit('\tpop $d')                   # buf ptr [.., empty]
 
             self.emit(f'{cl}:')                     # char loop
             self.emit('\tpush $c')                  # save outer count
@@ -4305,9 +4302,9 @@ class MK1CodeGen:
             self.emit('\tsll')                      # bit0 → bit1 position (0b00 or 0b10)
             self.emit('\tjal __oled_send_lut_byte')
             self.emit('\tincc')                     # advance to next row's font byte
-            # Row counter
-            self.emit('\tpop $a'); self.emit('\taddi -1,$a'); self.emit('\tpush $a')
-            self.emit('\tcmpi 0'); self.emit(f'\tjnz {rl}')
+            # Row counter — dec sets ZF, no separate cmpi 0 needed
+            self.emit('\tpop $a'); self.emit('\tdec'); self.emit('\tpush $a')
+            self.emit(f'\tjnz {rl}')
             self.emit('\tpop $a')                   # discard row counter
 
             # Char loop tail (no descender/line-gap rows — cells are
@@ -4321,8 +4318,7 @@ class MK1CodeGen:
             self.emit('\tdecc')
             self.emit(f'\tjnz {cl}')
             self.emit('\tout_imm 0x55')             # data→stop pad
-            self.emit('\tjal __i2c_sp')
-            self.emit('\tret')
+            self.emit('\tj __i2c_sp')                # tail-call (no ret needed)
 
         # Updated __lcd_chr / __lcd_cmd for AiP31068L
         if '__lcd_chr' in helpers:
@@ -11404,9 +11400,18 @@ class MK1CodeGen:
                 col_e = col_s + 3 * len(s) - 1   # inclusive
                 row_s = yv * 5
                 row_e = row_s + 4
-                self.emit(f'\tldi $a,{col_s}')
+                # `clr $X` (= sub $X,$X) is 1 B; `ldi $X, 0` is 2 B.
+                # Save a byte per zero arg at call sites that land at
+                # the origin.
+                if col_s == 0:
+                    self.emit('\tclr $a')
+                else:
+                    self.emit(f'\tldi $a,{col_s}')
                 self.emit(f'\tldi $b,{col_e}')
-                self.emit(f'\tldi $c,{row_s}')
+                if row_s == 0:
+                    self.emit('\tsub $c,$c')        # zero $c (clr only handles $a)
+                else:
+                    self.emit(f'\tldi $c,{row_s}')
                 self.emit(f'\tldi $d,{row_e}')
                 self.emit('\tjal __oled_set_window')
                 # Stream chars
