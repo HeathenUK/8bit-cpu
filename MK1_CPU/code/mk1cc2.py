@@ -59,6 +59,12 @@ KERNEL_STATE = {
         page=2, offset=0xB2, size=1, owner='__eeprom_r2c_loop',
         description='remaining-bytes counter for sequential I2C → '
                     'code page reads (EEPROM overlay loader)'),
+    'oled_font_loaded': KSlot(
+        page=2, offset=0xB3, size=1, owner='__oled_init',
+        description='one-shot guard: non-zero means the SSD1327 font '
+                    'has been copied from EEPROM to page 3 so a second '
+                    'oled_init() call skips the multi-byte sequential '
+                    'EEPROM read.'),
 }
 
 # Phase 1 introduced f-string aliases (`K_CALIB_BLOCKS`, etc.) for
@@ -794,6 +800,51 @@ class MK1CodeGen:
             out.append((0xF0 if b2 else 0) | (0x0F if b1 else 0))
             out.append(0xF0 if b0 else 0)   # right margin always dark
         return out
+
+    def _oled_ensure_font_p3(self):
+        """Idempotent: allocate the compact 5x5 OLED font directly in
+        page 3 (43 glyphs × 5 bytes = 215 B). The compiler emits the
+        font data inline into page 3 at compile time; the bytes are
+        uploaded with the program and stay resident in page 3 RAM
+        with no runtime EEPROM read.
+
+        This is simpler than the EEPROM + sequential-read-to-page-3
+        approach: zero runtime cost (the font is just there), no
+        sequential-read helper, no kstate guard, no init-time copy
+        latency. The cost is that the font occupies 215 B of page 3
+        permanently, but page 3 is otherwise unused in most current
+        programs.
+
+        Sets:
+          self._oled_font_p3_base   — page 3 base address (0)
+          self._oled_font_size      — count = N glyphs × 5
+          self._oled_font_index_map — char → index (0..N-1)
+        """
+        if hasattr(self, '_oled_font_p3_base'):
+            return
+        chars = sorted(self._OLED_FONT_5X5.keys(), key=ord)
+        self._oled_font_index_map = {ch: i for i, ch in enumerate(chars)}
+        font_bytes = []
+        for ch in chars:
+            font_bytes.extend(self._OLED_FONT_5X5[ch])
+        self._oled_font_p3_base = self.page3_alloc
+        self._oled_font_size = len(font_bytes)
+        self.page3_globals['__oled_font_p3'] = self._oled_font_p3_base
+        self._oled_font_p3_data = font_bytes
+        self.page3_alloc += self._oled_font_size
+
+    def _oled_ensure_lut(self):
+        """Idempotent: allocate a 4-byte 4bpp expansion LUT in the
+        data page (page 1). Maps a 2-bit input value to one 4bpp
+        output byte: 0→0x00, 1→0x0F, 2→0xF0, 3→0xFF. Used by the
+        runtime stream helper to expand each glyph row's 5 source
+        bits into 3 4bpp output bytes per row without 30 conditional
+        branches."""
+        if hasattr(self, '_oled_lut_base'):
+            return
+        self._oled_lut_base = self.data_alloc
+        self.data_alloc += 4
+        self._oled_lut_data = [0x00, 0x0F, 0xF0, 0xFF]
 
     def _emit_oled_putc(self, ch, xv, yv):
         """Emit one Phase-3-style oled_putc call for char `ch` at cell
@@ -2843,6 +2894,18 @@ class MK1CodeGen:
                     self.emit(f'\tbyte {init}')
             self.emit('\tsection code')
 
+        # Compiler-internal page-3 globals (not C-declared). Currently
+        # only the SSD1327 OLED 5x5 font cache (215 B at the start of
+        # page 3, populated at compile time so no runtime EEPROM read
+        # is needed).
+        if hasattr(self, '_oled_font_p3_data'):
+            self.emit('\tsection page3')
+            self.emit(f'; OLED 5x5 font cache at page3[{self._oled_font_p3_base}..{self._oled_font_p3_base+self._oled_font_size-1}] '
+                      f'(43 glyphs × 5 bytes)')
+            for b in self._oled_font_p3_data:
+                self.emit(f'\tbyte {b}')
+            self.emit('\tsection code')
+
         # LCD init data pre-populated in data page (compile-time).
         # Skip if overlay partition already emitted it at the right offset
         # (see _lcd_init_already_emitted flag set in overlay path).
@@ -2870,6 +2933,25 @@ class MK1CodeGen:
             self.emit('\tsection data')
             self.emit(f'; oled_putc {ch!r} at ({xv},{yv}) table @ data[{tbl_base}..{tbl_base+len(table)-1}]')
             for b in table:
+                self.emit(f'\tbyte {b}')
+            self.emit('\tsection code')
+
+        # OLED text_at index buffers (one byte per char in the literal,
+        # page-1 storage). The runtime stream helper walks each buffer.
+        for buf_base, buf, s, xv, yv in getattr(self, '_oled_text_at_bufs', []):
+            self.emit('\tsection data')
+            self.emit(f'; oled_text_at({xv},{yv},{s!r}) idx buf @ data[{buf_base}..{buf_base+len(buf)-1}]')
+            for b in buf:
+                self.emit(f'\tbyte {b}')
+            self.emit('\tsection code')
+
+        # OLED 4bpp expansion LUT (4 bytes in page 1) — used by
+        # __oled_stream_chars to translate a 2-bit input to one 4bpp
+        # output byte (0→0x00, 1→0x0F, 2→0xF0, 3→0xFF).
+        if hasattr(self, '_oled_lut_base'):
+            self.emit('\tsection data')
+            self.emit(f'; OLED 4bpp expansion LUT at data[{self._oled_lut_base}..{self._oled_lut_base+3}]')
+            for b in self._oled_lut_data:
                 self.emit(f'\tbyte {b}')
             self.emit('\tsection code')
 
@@ -3359,7 +3441,8 @@ class MK1CodeGen:
         # and each __oled_fill_<K> wraps its 8 KB stream in a START/STOP
         # transaction. Treat them like LCD runtime helpers and force the
         # I²C primitives resident whenever an OLED helper is in use.
-        oled_runtime = {'__oled_init', '__oled_putc_xfer'} | {
+        oled_runtime = {'__oled_init', '__oled_putc_xfer', '__oled_stream_chars',
+                        '__oled_set_window'} | {
             h for h in helpers if h.startswith('__oled_fill_')}
         if helpers & oled_runtime:
             for h in oled_runtime:
@@ -3644,6 +3727,69 @@ class MK1CodeGen:
             self.emit_ddrb(0x03)
             self.emit_ddrb(0x01)
             self.emit_ddrb(0x00)
+            self.emit('\tret')
+
+        if '__eeprom_seq_rd_to_p3' in helpers:
+            # Sequential AT24C32 EEPROM read into page 3.
+            # One I²C transaction: START + addr-write + RS + addr-read +
+            # N×(read byte; ACK-clock; store to page 3) + NACK-clock + STOP.
+            # ~10× faster than calling __eeprom_rd N times because we
+            # skip N-1 (START + 4-byte address-setup + STOP) sequences.
+            #
+            # Inputs:  $a = eeprom addr lo
+            #          $b = eeprom addr hi
+            #          $c = byte count (must be ≥ 1)
+            #          $d = page 3 destination offset
+            # Output:  page3[dest..dest+count-1] populated from EEPROM
+            # Init-only: this helper is called once per program at the
+            # OLED font-cache load and never again, so it lives in
+            # stage 1 (transient init code).
+            lbl_loop = self.label('esrp_lp')
+            lbl_last = self.label('esrp_last')
+            self.emit('__eeprom_seq_rd_to_p3:')
+            # Save inputs (push order: dest, count, eep_lo, eep_hi)
+            self.emit('\tpush $d')                 # save dest [.., dest]
+            self.emit('\tpush $c')                 # save count [.., dest, count]
+            self.emit('\tpush $a')                 # eep_lo [.., dest, count, lo]
+            self.emit('\tpush $b')                 # eep_hi [.., dest, count, lo, hi]
+            # I²C: START, dev addr write, addr_hi, addr_lo, RS, dev addr read
+            self.emit('\tjal __i2c_st_only')
+            self.emit('\tldi $a,0xAE'); self.emit('\tjal __i2c_sb')
+            self.emit('\tpop $a'); self.emit('\tjal __i2c_sb')   # eep_hi [.., dest, count, lo]
+            self.emit('\tpop $a'); self.emit('\tjal __i2c_sb')   # eep_lo [.., dest, count]
+            self.emit('\tjal __i2c_rs')
+            self.emit('\tldi $a,0xAF'); self.emit('\tjal __i2c_sb')
+            # Pull count + dest back into registers ($c = count, $d = dest)
+            self.emit('\tpop $c')                  # count [.., dest]
+            self.emit('\tpop $a'); self.emit('\tmov $a,$d')   # dest [.., empty]
+            # Read N bytes
+            self.emit(f'{lbl_loop}:')
+            self.emit('\tpush $c')                 # save count
+            self.emit('\tpush $d')                 # save dest
+            self.emit('\tjal __i2c_rb')            # byte → $d (clobbers $a/$b/$d)
+            self.emit('\tmov $d,$a')               # $a = byte
+            self.emit('\tpop $d')                  # restore dest
+            self.emit('\tpush $d')                 # keep on stack
+            self.emit('\tmov $d,$b')               # iderefp3 dest is $b
+            self.emit('\tiderefp3')                # page3[$b] = $a
+            self.emit('\tpop $d')                  # dest restored
+            self.emit('\tpop $c')                  # count restored
+            self.emit('\tincd')                    # dest++
+            self.emit('\tdecc')                    # count--
+            self.emit(f'\tjz {lbl_last}')
+            # Not last: send ACK clock pulse (drive SDA low through SCL pulse)
+            self.emit_ddrb(0x03)                   # SCL=0 SDA=0 (drive)
+            self.emit_ddrb(0x01)                   # SCL=1 SDA=0 (ACK clock)
+            self.emit_ddrb(0x03)                   # SCL=0 SDA=0
+            self.emit(f'\tj {lbl_loop}')
+            self.emit(f'{lbl_last}:')
+            # NACK clock + STOP
+            self.emit_ddrb(0x02)                   # SCL=0 SDA=Hi-Z (release)
+            self.emit_ddrb(0x00)                   # SCL=1 SDA=Hi-Z (NACK clock)
+            self.emit_ddrb(0x02)                   # SCL=0
+            self.emit_ddrb(0x03)                   # STOP setup: SCL=0 SDA=0
+            self.emit_ddrb(0x01)                   # SCL=1 SDA=0
+            self.emit_ddrb(0x00)                   # SDA=1 (STOP edge)
             self.emit('\tret')
 
         # __rtc_read_reg: read DS3231 register byte specified in $a.
@@ -4024,6 +4170,144 @@ class MK1CodeGen:
             self.emit(f'\tjnz {dlp}')
             self.emit('\tjal __i2c_sp')
             self.emit('\tout_imm 0x60')             # exit pad (see comment above)
+            self.emit('\tret')
+
+        if '__oled_set_window' in helpers:
+            # Sets the SSD1327 GDDRAM window via one I²C transaction.
+            # Inputs:  $a = col_start (0..63 in 2-pixel col-units)
+            #          $b = col_end (inclusive)
+            #          $c = row_start (0..127 px)
+            #          $d = row_end (inclusive)
+            # ~35 B; replaces ~55 B of inline window-set per caller,
+            # saves ~20 B per call site (used by oled_text_at and any
+            # other future oled_print_buf / oled_clear_line builtins).
+            self.emit('__oled_set_window:')
+            # Save args that won't survive __i2c_sb. $c is preserved.
+            self.emit('\tpush $d')                 # row_e
+            self.emit('\tpush $b')                 # col_e
+            self.emit('\tpush $a')                 # col_s
+            self.emit('\tjal __i2c_st_only')
+            self.emit('\tldi $a,0x7A'); self.emit('\tjal __i2c_sb')
+            self.emit('\tldi $a,0x00'); self.emit('\tjal __i2c_sb')   # CMD_STREAM
+            self.emit('\tldi $a,0x15'); self.emit('\tjal __i2c_sb')   # col cmd
+            self.emit('\tpop $a'); self.emit('\tjal __i2c_sb')        # col_s
+            self.emit('\tpop $a'); self.emit('\tjal __i2c_sb')        # col_e
+            self.emit('\tldi $a,0x75'); self.emit('\tjal __i2c_sb')   # row cmd
+            self.emit('\tmov $c,$a'); self.emit('\tjal __i2c_sb')     # row_s
+            self.emit('\tpop $a'); self.emit('\tjal __i2c_sb')        # row_e
+            self.emit('\tout_imm 0x70')             # window→stop pad
+            self.emit('\tjal __i2c_sp')
+            self.emit('\tret')
+
+        if '__oled_stream_chars' in helpers:
+            # Phase 4b' streaming text helper. Pumps expanded glyph
+            # data for `count` characters through an already-open OLED
+            # window in ONE I²C data-stream transaction. Caller is
+            # responsible for the prior window-set transaction
+            # (oled_text_at builtin emits it inline before the call).
+            #
+            #   $d in: page-1 address of an N-byte buffer of font
+            #          indices (0..N-1, one per glyph to render).
+            #   $c in: count (number of chars).
+            #
+            # Per char: re-reads the same 5 glyph row bytes from the
+            # page-3 font cache (3× per row, but page-3 reads via
+            # `derefp3` are 1 instruction so it's cheaper than the
+            # push/pop dance for stack reload). Each row's 5 source
+            # bits expand to 3 4bpp bytes via the page-1 LUT. After
+            # the 5 glyph rows, 6 zero bytes flush the descender +
+            # line-gap rows.
+            #
+            # Marker pads at window→data and data→stop transitions
+            # mirror the unexplained Phase 3 stair-stepping fix —
+            # don't remove without re-testing.
+            font_p3 = self._oled_font_p3_base if hasattr(self, '_oled_font_p3_base') else 0
+            lut_off = self._oled_lut_base if hasattr(self, '_oled_lut_base') else 0
+            cl = self.label('osc_cl')        # char loop
+            rl = self.label('osc_rl')        # row loop
+            bl = self.label('osc_bl')        # blank loop
+
+            self.emit('__oled_stream_chars:')
+            self.emit('\tpush $d')                  # save buf [.., buf]
+            self.emit('\tpush $c')                  # save count [.., buf, count]
+            self.emit('\tjal __i2c_st_only')
+            self.emit('\tldi $a,0x7A'); self.emit('\tjal __i2c_sb')
+            self.emit('\tldi $a,0x40'); self.emit('\tjal __i2c_sb')   # DATA_STREAM
+            self.emit('\tpop $c')                   # count [.., buf]
+            self.emit('\tpop $a'); self.emit('\tmov $a,$d')   # buf [.., empty]
+
+            self.emit(f'{cl}:')                     # char loop
+            self.emit('\tpush $c')                  # save outer count
+            self.emit('\tpush $d')                  # save buf ptr
+
+            # Read idx from page-1 buffer
+            self.emit('\tmov $d,$a')
+            self.emit('\tderef')                    # $a = idx
+
+            # Compute page-3 font addr = font_p3_base + idx*5
+            self.emit('\tmov $a,$b')               # $b = idx
+            self.emit('\tsll')                      # 2x
+            self.emit('\tsll')                      # 4x
+            self.emit('\tadd $b,$a')               # 5x
+            if font_p3:
+                self.emit(f'\taddi {font_p3},$a')
+            self.emit('\tmov $a,$c')               # $c = font addr (preserved)
+
+            # 5 glyph rows × 3 expanded bytes each
+            self.emit('\tldi $a,5')
+            self.emit('\tpush $a')                  # row counter
+            self.emit(f'{rl}:')
+            # Byte 0: bits[4:3] of row → LUT
+            self.emit('\tmov $c,$a')
+            self.emit('\tderefp3')                  # $a = row byte
+            self.emit('\tsrl'); self.emit('\tsrl'); self.emit('\tsrl')   # >> 3
+            self.emit('\tandi 0x03,$a')
+            if lut_off:
+                self.emit(f'\taddi {lut_off},$a')
+            self.emit('\tderef')                    # LUT[v]
+            self.emit('\tjal __i2c_sb')
+            # Byte 1: bits[2:1] → LUT
+            self.emit('\tmov $c,$a')
+            self.emit('\tderefp3')
+            self.emit('\tsrl')                      # >> 1
+            self.emit('\tandi 0x03,$a')
+            if lut_off:
+                self.emit(f'\taddi {lut_off},$a')
+            self.emit('\tderef')
+            self.emit('\tjal __i2c_sb')
+            # Byte 2: bit[0] → LUT (right margin always 0)
+            self.emit('\tmov $c,$a')
+            self.emit('\tderefp3')
+            self.emit('\tandi 0x01,$a')
+            self.emit('\tsll')                      # bit0 → bit1 position
+            if lut_off:
+                self.emit(f'\taddi {lut_off},$a')
+            self.emit('\tderef')
+            self.emit('\tjal __i2c_sb')
+            self.emit('\tincc')                     # advance to next row's font byte
+            # Row counter
+            self.emit('\tpop $a'); self.emit('\taddi -1,$a'); self.emit('\tpush $a')
+            self.emit('\tcmpi 0'); self.emit(f'\tjnz {rl}')
+            self.emit('\tpop $a')                   # discard row counter
+
+            # 6 blank bytes (descender + line-gap rows)
+            self.emit('\tldi $a,6')
+            self.emit('\tpush $a')                  # blank counter
+            self.emit(f'{bl}:')
+            self.emit('\tldi $a,0')
+            self.emit('\tjal __i2c_sb')
+            self.emit('\tpop $a'); self.emit('\taddi -1,$a'); self.emit('\tpush $a')
+            self.emit('\tcmpi 0'); self.emit(f'\tjnz {bl}')
+            self.emit('\tpop $a')                   # discard blank counter
+
+            # Char loop tail
+            self.emit('\tpop $d')                   # restore buf ptr
+            self.emit('\tincd')                     # buf++
+            self.emit('\tpop $c')                   # restore outer count
+            self.emit('\tdecc')
+            self.emit(f'\tjnz {cl}')
+            self.emit('\tout_imm 0x55')             # data→stop pad
+            self.emit('\tjal __i2c_sp')
             self.emit('\tret')
 
         # Updated __lcd_chr / __lcd_cmd for AiP31068L
@@ -4894,6 +5178,9 @@ class MK1CodeGen:
         # __eeprom_rd is init-only when not used by runtime eeprom array access
         if not getattr(self, '_needs_runtime_eeprom_rd', False):
             INIT_ONLY_NAMES.add('__eeprom_rd')
+        # __eeprom_seq_rd_to_p3 is always init-only — its sole caller is
+        # the OLED font-cache load which runs once in oled_init.
+        INIT_ONLY_NAMES.add('__eeprom_seq_rd_to_p3')
         # I2C helpers that are init-only when no runtime I2C is needed
         I2C_INIT_ONLY = {'__i2c_sb', '__i2c_sp', '__i2c_st', '__i2c_st_only', '__i2c_rb', '__i2c_rs'}
 
@@ -8562,6 +8849,18 @@ class MK1CodeGen:
                 for b in table:
                     assembled.append(f'\tbyte {b}')
                     emitted += 1
+            for buf_base, buf, s, xv, yv in getattr(self, '_oled_text_at_bufs', []):
+                emit_allocated_until(buf_base)
+                assembled.append(f'; oled_text_at({xv},{yv},{s!r}) idx buf @ data[{buf_base}..{buf_base+len(buf)-1}]')
+                for b in buf:
+                    assembled.append(f'\tbyte {b}')
+                    emitted += 1
+            if hasattr(self, '_oled_lut_base'):
+                emit_allocated_until(self._oled_lut_base)
+                assembled.append(f'; OLED 4bpp expansion LUT at data[{self._oled_lut_base}..{self._oled_lut_base+3}]')
+                for b in self._oled_lut_data:
+                    assembled.append(f'\tbyte {b}')
+                    emitted += 1
             # Any remaining slots → zero-fill
             emit_allocated_until(self.data_alloc)
             if note_entries:
@@ -10989,6 +11288,87 @@ class MK1CodeGen:
                     cur_x += 1
                 self._oled_cursor_x = cur_x
                 self._oled_cursor_y = cur_y
+                return
+
+            if name == 'oled_text_at':
+                # Phase 4b' streaming text: render a string literal
+                # at cell (x, y) in ONE I²C transaction. All three
+                # args must be compile-time constants.
+                #
+                # Compile-time work:
+                #   - Validate (x, y, x+len-1) lies within the cell
+                #     grid (21 cols × 18 rows).
+                #   - Translate each char to its font index, allocate
+                #     a buffer of indices in page 1.
+                #   - Emit window-set transaction inline (the cell
+                #     window covers exactly N×3 col-units wide × 7 px
+                #     tall; the chip auto-increments inside it).
+                #   - Emit `ldi $d, buf; ldi $c, N; jal __oled_stream
+                #     _chars` to pump expanded glyph data.
+                #
+                # Per-call cost: ~22 B inline (window-set) + N B page-1
+                # buffer (one byte per char). For a 21-char line:
+                # 22 + 21 = 43 B. For comparison, Phase 4a was 21 ×
+                # 27 = 567 B per 21-char line.
+                if len(args) != 3:
+                    raise Exception(
+                        f"oled_text_at(x, y, str) takes 3 arguments, got {len(args)}")
+                xv = self._const_eval(args[0])
+                yv = self._const_eval(args[1])
+                if xv is None or yv is None or args[2][0] != 'string':
+                    raise Exception(
+                        "oled_text_at(x, y, str) — x, y must be compile-time "
+                        "constants and str must be a string literal")
+                s = args[2][1]
+                if len(s) == 0:
+                    return  # zero-length text is a no-op
+                if not (0 <= xv <= 20):
+                    raise Exception(
+                        f"oled_text_at() x must be in [0, 20], got {xv}")
+                if not (0 <= yv <= 17):
+                    raise Exception(
+                        f"oled_text_at() y must be in [0, 17], got {yv}")
+                if xv + len(s) > 21:
+                    raise Exception(
+                        f"oled_text_at(): {len(s)}-char string at x={xv} "
+                        f"would extend past col 20 (would end at col "
+                        f"{xv + len(s) - 1}). Wrap onto another line "
+                        f"or shorten the string.")
+                self._oled_ensure_init()
+                self._oled_ensure_font_p3()
+                self._oled_ensure_lut()
+                if not hasattr(self, '_lcd_helpers'):
+                    self._lcd_helpers = set()
+                self._lcd_helpers.add('__oled_stream_chars')
+                self._lcd_helpers.add('__oled_set_window')
+                # Translate chars to font indices and allocate page-1 buf
+                buf = []
+                for ch in s:
+                    if ch not in self._oled_font_index_map:
+                        raise Exception(
+                            f"oled_text_at(): char {ch!r} (0x{ord(ch):02X}) "
+                            f"is not in the embedded 5x5 font. Supported: "
+                            f"{''.join(sorted(self._OLED_FONT_5X5.keys()))}")
+                    buf.append(self._oled_font_index_map[ch])
+                buf_base = self.data_alloc
+                self.data_alloc += len(buf)
+                if not hasattr(self, '_oled_text_at_bufs'):
+                    self._oled_text_at_bufs = []
+                self._oled_text_at_bufs.append((buf_base, buf, s, xv, yv))
+                # Window-set via shared sub-helper.
+                col_s = xv * 3
+                col_e = col_s + 3 * len(s) - 1   # inclusive
+                row_s = yv * 7
+                row_e = row_s + 6
+                self.emit(f'\tldi $a,{col_s}')
+                self.emit(f'\tldi $b,{col_e}')
+                self.emit(f'\tldi $c,{row_s}')
+                self.emit(f'\tldi $d,{row_e}')
+                self.emit('\tjal __oled_set_window')
+                # Stream chars
+                self.emit(f'\tldi $d,{buf_base}')
+                self.emit(f'\tldi $c,{len(s)}')
+                self.emit('\tjal __oled_stream_chars')
                 return
 
             if name == 'lcd_clear':
