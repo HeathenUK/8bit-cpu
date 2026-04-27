@@ -4223,7 +4223,7 @@ class MK1CodeGen:
             self.emit('\tldi $a,0x75'); self.emit('\tjal __i2c_sb')   # row cmd
             self.emit('\tmov $c,$a'); self.emit('\tjal __i2c_sb')     # row_s
             self.emit('\tpop $a'); self.emit('\tjal __i2c_sb')        # row_e
-            self.emit('\tout_imm 0x70')             # window→stop pad
+            self.emit('\tout_imm 0x70')             # window→stop pad (load-bearing per Phase 3)
             self.emit('\tj __i2c_sp')                # tail-call (no ret needed)
 
         if '__oled_stream_chars' in helpers:
@@ -4323,7 +4323,7 @@ class MK1CodeGen:
             self.emit('\tpop $c')                   # restore outer count
             self.emit('\tdecc')
             self.emit(f'\tjnz {cl}')
-            self.emit('\tout_imm 0x55')             # data→stop pad
+            self.emit('\tout_imm 0x55')             # data→stop pad (load-bearing per Phase 3)
             self.emit('\tj __i2c_sp')                # tail-call (no ret needed)
 
         # Updated __lcd_chr / __lcd_cmd for AiP31068L
@@ -11422,6 +11422,89 @@ class MK1CodeGen:
                 # Stream chars
                 self.emit(f'\tldi $d,{buf_base}')
                 self.emit(f'\tldi $c,{len(s)}')
+                self.emit('\tjal __oled_stream_chars')
+                return
+
+            if name == 'oled_print_buf':
+                # Runtime-data streaming text: render `count` chars
+                # from the page-1 byte array `buf` at cell (x, y).
+                # Each byte in buf must be a font index (0..N-1)
+                # produced by user code at runtime (e.g., a keymap
+                # lookup, a sprintf-into-buf, a menu's selected
+                # entry). The buffer can be updated between calls.
+                #
+                # Args: oled_print_buf(buf, count, x, y) where
+                #   buf    — name of a `unsigned char NAME[N]`
+                #            page-1 array (compile-time-known address).
+                #   count  — compile-time const, 1..21.
+                #   x, y   — compile-time const cell coords.
+                #
+                # Per call site: ~10 instructions inline. No new
+                # helpers — reuses __oled_set_window and __oled_
+                # stream_chars. The hot path is identical to
+                # oled_text_at; only the buffer source differs
+                # (runtime user array vs compile-time string).
+                if len(args) != 4:
+                    raise Exception(
+                        f"oled_print_buf(buf, count, x, y) takes 4 arguments, got {len(args)}")
+                if args[0][0] != 'var':
+                    raise Exception(
+                        "oled_print_buf(): first arg must be a page-1 array variable name")
+                buf_name = args[0][1]
+                if buf_name not in self.globals:
+                    if buf_name in self.page3_globals:
+                        raise Exception(
+                            f"oled_print_buf(): buffer '{buf_name}' is in page 3; "
+                            f"only page-1 arrays are supported (the streaming helper "
+                            f"reads via `deref`, not `derefp3`)")
+                    raise Exception(
+                        f"oled_print_buf(): unknown array '{buf_name}'")
+                buf_addr = self.globals[buf_name]
+                nchars = self._const_eval(args[1])
+                xv = self._const_eval(args[2])
+                yv = self._const_eval(args[3])
+                if nchars is None or xv is None or yv is None:
+                    raise Exception(
+                        "oled_print_buf(): count, x, y must be compile-time constants")
+                if not (1 <= nchars <= 21):
+                    raise Exception(
+                        f"oled_print_buf(): count must be in [1, 21], got {nchars}")
+                if not (0 <= xv <= 20):
+                    raise Exception(
+                        f"oled_print_buf(): x must be in [0, 20], got {xv}")
+                if not (0 <= yv <= 24):
+                    raise Exception(
+                        f"oled_print_buf(): y must be in [0, 24], got {yv}")
+                if xv + nchars > 21:
+                    raise Exception(
+                        f"oled_print_buf(): {nchars} chars at x={xv} would "
+                        f"extend past col 20")
+                self._oled_ensure_font_p3()
+                self._oled_ensure_lut()
+                self._oled_ensure_init()
+                if not hasattr(self, '_lcd_helpers'):
+                    self._lcd_helpers = set()
+                self._lcd_helpers.add('__oled_stream_chars')
+                self._lcd_helpers.add('__oled_set_window')
+                # Window-set
+                col_s = xv * 3
+                col_e = col_s + 3 * nchars - 1
+                row_s = yv * 5
+                row_e = row_s + 4
+                if col_s == 0:
+                    self.emit('\tclr $a')
+                else:
+                    self.emit(f'\tldi $a,{col_s}')
+                self.emit(f'\tldi $b,{col_e}')
+                if row_s == 0:
+                    self.emit('\tsub $c,$c')
+                else:
+                    self.emit(f'\tldi $c,{row_s}')
+                self.emit(f'\tldi $d,{row_e}')
+                self.emit('\tjal __oled_set_window')
+                # Stream from runtime buf
+                self.emit(f'\tldi $d,{buf_addr}')
+                self.emit(f'\tldi $c,{nchars}')
                 self.emit('\tjal __oled_stream_chars')
                 return
 
