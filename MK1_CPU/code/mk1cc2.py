@@ -6033,8 +6033,15 @@ class MK1CodeGen:
             # from multiple sites). Force-resident them.
             _force_resident_helpers = {
                 '__tone', '__play_note', '__delay_Nms',
-                '__oled_stream_chars', '__oled_set_window',
             }
+            # OLED helpers (__oled_stream_chars, __oled_set_window) used to be
+            # in this set to prevent the partitioner from duplicating them
+            # into each user-function overlay. Empirically, with the streaming
+            # architecture the partitioner only duplicates when there are
+            # multiple user-function call sites, and even then the right fix
+            # is bundle-mode (one overlay holding the helpers + the user fn
+            # that calls them). Force-residing them was preventing the
+            # bundling that programs like keypad_oled.c need to fit page 0.
 
             for hname in list(cond_res):
                 if hname in _force_resident_helpers:
