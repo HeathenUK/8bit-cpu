@@ -4225,7 +4225,6 @@ class MK1CodeGen:
             lut_off = self._oled_lut_base if hasattr(self, '_oled_lut_base') else 0
             cl = self.label('osc_cl')        # char loop
             rl = self.label('osc_rl')        # row loop
-            bl = self.label('osc_bl')        # blank loop
 
             self.emit('__oled_stream_chars:')
             self.emit('\tpush $d')                  # save buf [.., buf]
@@ -4290,17 +4289,11 @@ class MK1CodeGen:
             self.emit('\tcmpi 0'); self.emit(f'\tjnz {rl}')
             self.emit('\tpop $a')                   # discard row counter
 
-            # 6 blank bytes (descender + line-gap rows)
-            self.emit('\tldi $a,6')
-            self.emit('\tpush $a')                  # blank counter
-            self.emit(f'{bl}:')
-            self.emit('\tldi $a,0')
-            self.emit('\tjal __i2c_sb')
-            self.emit('\tpop $a'); self.emit('\taddi -1,$a'); self.emit('\tpush $a')
-            self.emit('\tcmpi 0'); self.emit(f'\tjnz {bl}')
-            self.emit('\tpop $a')                   # discard blank counter
-
-            # Char loop tail
+            # Char loop tail (no descender/line-gap rows — cells are
+            # 6 wide × 5 tall, giving a 21 × 25 character grid. Tighter
+            # vertical layout for menus + frees ~30 B of helper code
+            # vs the previous 6×7 cell which appended 6 zero bytes
+            # per char.)
             self.emit('\tpop $d')                   # restore buf ptr
             self.emit('\tincd')                     # buf++
             self.emit('\tpop $c')                   # restore outer count
@@ -6003,7 +5996,17 @@ class MK1CodeGen:
             # multi-callsite case works because the knapsack already keeps
             # them resident there. Root cause of the bundled-mode failure
             # is not yet pinned down; until it is, force-resident.
-            _force_resident_helpers = {'__tone', '__play_note', '__delay_Nms'}
+            #
+            # OLED runtime helpers join the same tier: any program where
+            # all `oled_text_at(...)` calls live in user functions would
+            # otherwise see __oled_stream_chars / __oled_set_window
+            # bundled into each overlay slot, defeating the streaming
+            # architecture's whole point (single resident copy, called
+            # from multiple sites). Force-resident them.
+            _force_resident_helpers = {
+                '__tone', '__play_note', '__delay_Nms',
+                '__oled_stream_chars', '__oled_set_window',
+            }
 
             for hname in list(cond_res):
                 if hname in _force_resident_helpers:
@@ -11325,9 +11328,9 @@ class MK1CodeGen:
                 if not (0 <= xv <= 20):
                     raise Exception(
                         f"oled_text_at() x must be in [0, 20], got {xv}")
-                if not (0 <= yv <= 17):
+                if not (0 <= yv <= 24):
                     raise Exception(
-                        f"oled_text_at() y must be in [0, 17], got {yv}")
+                        f"oled_text_at() y must be in [0, 24], got {yv}")
                 if xv + len(s) > 21:
                     raise Exception(
                         f"oled_text_at(): {len(s)}-char string at x={xv} "
@@ -11355,11 +11358,14 @@ class MK1CodeGen:
                 if not hasattr(self, '_oled_text_at_bufs'):
                     self._oled_text_at_bufs = []
                 self._oled_text_at_bufs.append((buf_base, buf, s, xv, yv))
-                # Window-set via shared sub-helper.
+                # Window-set via shared sub-helper. Cells are 6 wide × 5
+                # tall (no descender / line-gap rows), giving a 21 × 25
+                # cell grid. Two adjacent rows abut directly; insert
+                # blank space by skipping a y value.
                 col_s = xv * 3
                 col_e = col_s + 3 * len(s) - 1   # inclusive
-                row_s = yv * 7
-                row_e = row_s + 6
+                row_s = yv * 5
+                row_e = row_s + 4
                 self.emit(f'\tldi $a,{col_s}')
                 self.emit(f'\tldi $b,{col_e}')
                 self.emit(f'\tldi $c,{row_s}')
