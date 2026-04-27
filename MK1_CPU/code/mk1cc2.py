@@ -6939,12 +6939,16 @@ class MK1CodeGen:
                     replaced = False
                     oname, olines, _ofsize = overlay_asm_blocks[caller_idx]
                     new_olines = []
-                    current_func = None
+                    # Rewrite EVERY `jal callee` in this overlay (not just
+                    # the caller's body) so calls extracted into Phase 6
+                    # abstraction thunks (`__ovthunk_*`) also go through the
+                    # reload thunk. Without this, a 7× repeated call pattern
+                    # extracted into __ovthunk_0_0 would still contain a bare
+                    # `jal callee` whose target lives in a different overlay
+                    # — breaking the step 9b self-containment validator.
                     for line in olines:
                         s = line.strip()
-                        if s.endswith(':') and not s.startswith('.') and s.startswith('_'):
-                            current_func = s[:-1]
-                        if current_func == caller and s == f'jal {callee}':
+                        if s == f'jal {callee}':
                             new_olines.append(f'\tjal {thunk}')
                             replaced = True
                         else:
