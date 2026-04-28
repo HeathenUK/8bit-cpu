@@ -117,6 +117,48 @@ def _write_cached_hash(h, port):
         pass
 
 
+def dump_bufs(ser):
+    """Hex-dump the four 256B SRAM page buffers from the firmware's uploadBuf.
+
+    uploadBuf layout: [code(256), data(256), stack(256), page3(256)]. Reads
+    via the firmware's DUMP:offset,count command and prints a 16-row × 16-byte
+    grid per page. Use after UPLOAD when you suspect an emission-order bug —
+    e.g. the manifest claims overlay X is at offset 192 but its bytes actually
+    landed at 198, so `derefp3` reads zeros. A glance at the page-2 dump shows
+    the bytes' real position.
+    """
+    BLK = 64
+    raw = bytearray()
+    for off in range(0, 1024, BLK):
+        ser.reset_input_buffer()
+        ser.write(f'DUMP:{off},{BLK}\n'.encode())
+        # Skip non-hex diagnostic lines (firmware streams "EEPROM shim
+        # page 0x..." async during EEPROM writes; they sometimes land
+        # in the buffer between our DUMP request and the response).
+        line = ''
+        for _ in range(20):
+            line = ser.readline().decode(errors='replace').strip()
+            if not line:
+                break
+            toks = line.split()
+            if toks and all(len(t) == 2 for t in toks):
+                break
+        for tok in line.split():
+            if len(tok) == 2:
+                raw.append(int(tok, 16))
+    if len(raw) < 1024:
+        print(f'  dump short: got {len(raw)} bytes, expected 1024', file=sys.stderr)
+        return
+    for i, name in enumerate(['code', 'data', 'stack', 'page3']):
+        print(f'\n── {name} (page {i}, 256B) ──')
+        page = raw[i*256:(i+1)*256]
+        for row in range(16):
+            offset = row * 16
+            hex_part = ' '.join(f'{b:02X}' for b in page[offset:offset+16])
+            ascii_part = ''.join(chr(b) if 32 <= b < 127 else '.' for b in page[offset:offset+16])
+            print(f'  {offset:02X}: {hex_part}  |{ascii_part}|')
+
+
 def main():
     import argparse
     ap = argparse.ArgumentParser(description='MK1 Upload Helper')
@@ -128,6 +170,12 @@ def main():
     ap.add_argument('--timeout', type=int, default=120, help='Run timeout in seconds')
     ap.add_argument('--no-cache', action='store_true',
                     help='Always re-assemble; bypass the hash cache.')
+    ap.add_argument('--dump-bufs', action='store_true',
+                    help='After UPLOAD, hex-dump the four assembled SRAM page '
+                         'buffers (code/data/stack/page3) from the firmware '
+                         'uploadBuf. Useful when chasing emission-order bugs '
+                         '(manifest claims an offset but the bytes landed '
+                         'somewhere else). Also enabled by MK1_DUMP_BUFS=1.')
     args = ap.parse_args()
 
     # Compile if C source
@@ -167,6 +215,11 @@ def main():
     # Upload
     print('Uploading...')
     mk1_upload(ser)
+
+    # Optional: hex-dump the four SRAM page buffers from uploadBuf for
+    # emission-order debugging (see `dump_bufs` docstring).
+    if args.dump_bufs or os.environ.get('MK1_DUMP_BUFS') == '1':
+        dump_bufs(ser)
 
     # Run
     if args.run is not None:
