@@ -8727,11 +8727,34 @@ class MK1CodeGen:
                           file=_dbg_sys.stderr)
                     print(f"[KDUMP] slot available = {_ov_avail}B (page_0 250B - kernel {_kernel_chk}B)",
                           file=_dbg_sys.stderr)
+                    # `helper_bodies[h][2]` is the *merged* body — it
+                    # includes any tail-jump-target's bytes, which double-
+                    # counts shared helpers like __lcd_send_raw across
+                    # __lcd_chr and __lcd_cmd. Use `helper_original_ranges`
+                    # for each helper's own pre-merge byte count, then
+                    # also report the shared (merged-in) helpers
+                    # separately so the table sums to actual kernel size.
                     _kernel_helpers = []
+                    _named = set()
                     for _ke in _NO_OVERLAY:
                         _hn = _ke[:-1] if _ke.endswith(':') else _ke
                         if _hn in helper_bodies:
-                            _kernel_helpers.append((_hn, measure_lines(helper_bodies[_hn][2])))
+                            _named.add(_hn)
+                            _ostart, _oend = helper_original_ranges.get(_hn, (0, 0))
+                            _own_lines = new_resident[_ostart+1:_oend]  # skip label
+                            _kernel_helpers.append((_hn, measure_lines(_own_lines)))
+                    # Tail-jump targets that aren't in _NO_OVERLAY but are
+                    # in helper_bodies: these are co-located helpers
+                    # (e.g. __lcd_send_raw) whose bytes ALSO live in the
+                    # kernel because their callers (__lcd_chr/__lcd_cmd)
+                    # tail-jump into them. Report them so the sum lines up.
+                    for _hn, (_ostart, _oend, _) in helper_bodies.items():
+                        if _hn in _named:
+                            continue
+                        _own_lines = new_resident[_ostart+1:_oend]
+                        _sz = measure_lines(_own_lines)
+                        if _sz > 0:
+                            _kernel_helpers.append((_hn + ' (shared)', _sz))
                     _kernel_helpers.sort(key=lambda x: -x[1])
                     print(f"[KDUMP] kernel-resident helpers ({len(_kernel_helpers)} entries):",
                           file=_dbg_sys.stderr)
