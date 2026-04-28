@@ -7401,9 +7401,7 @@ class MK1CodeGen:
                 # failures on the DFRobot AiP31068L LCD) regressed
                 # `tone duration timing` and `rgb lcd smoke test` in
                 # hw_regression. The recovery is genuinely load-bearing
-                # for tone+lcd programs. The keypad fix is handled
-                # separately by keeping __keypad_scan resident in I2C
-                # programs.
+                # for tone+lcd programs.
                 loader.append('.ov_done:')
                 loader.append('\tldi $a,9')
                 loader.append('.ov_br:')
