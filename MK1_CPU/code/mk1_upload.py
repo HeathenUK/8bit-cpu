@@ -63,7 +63,7 @@ def mk1_run(ser, cycles=10000000, timeout=120):
         return None
 
 
-def compile_c(source_file, optimize=True, eeprom=False):
+def compile_c(source_file, optimize=True, eeprom=False, dump_page3=False):
     """Compile C to assembly. Returns asm text or None."""
     args = ['python3', COMPILER, source_file]
     if optimize:
@@ -71,7 +71,10 @@ def compile_c(source_file, optimize=True, eeprom=False):
     if eeprom:
         args.append('--eeprom')
     args.extend(['-o', '/tmp/_mk1_upload.asm'])
-    r = subprocess.run(args, capture_output=True, text=True)
+    env = os.environ.copy()
+    if dump_page3:
+        env['MK1_DEBUG_DUMP_PAGE3'] = '1'
+    r = subprocess.run(args, capture_output=True, text=True, env=env)
     if r.returncode != 0:
         print(f'Compile error: {r.stderr[:500]}', file=sys.stderr)
         return None
@@ -209,12 +212,23 @@ def main():
                          'uploadBuf. Useful when chasing emission-order bugs '
                          '(manifest claims an offset but the bytes landed '
                          'somewhere else). Also enabled by MK1_DUMP_BUFS=1.')
+    ap.add_argument('--debug-dump-page3', action='store_true',
+                    help='Compile with MK1_DEBUG_DUMP_PAGE3=1 — injects a '
+                         '256-byte page-3 dump into stage-1 init that runs '
+                         'AFTER preload but BEFORE main. The OI stream then '
+                         'carries 256 page-3 bytes prefixing the program '
+                         'output, so a RUNLOG capture shows live post-preload '
+                         'page-3 contents (catches EEPROM bit-bang corruption '
+                         'and similar runtime SRAM bugs). Costs ~12 B of '
+                         'stage-1 init code; programs near the 254 B limit '
+                         'may overflow.')
     args = ap.parse_args()
 
     # Compile if C source
     if args.input.endswith('.c'):
         print(f'Compiling {args.input}...')
-        asm = compile_c(args.input, optimize=args.optimize, eeprom=args.eeprom)
+        asm = compile_c(args.input, optimize=args.optimize, eeprom=args.eeprom,
+                        dump_page3=args.debug_dump_page3)
         if asm is None:
             sys.exit(1)
     else:

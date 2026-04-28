@@ -9002,6 +9002,31 @@ class MK1CodeGen:
                 self._i2c_ddrb_str(0x00),
             ])
         self._ee_preload_bytes = 0  # disable kernel-side preload emission
+
+        # Optional: dump entire page 3 to OI right after preload completes.
+        # `MK1_DEBUG_DUMP_PAGE3=1` injects a 256-iteration loop that emits
+        # each page-3 byte before main runs. The OI stream then carries 256
+        # bytes of page-3 dump prefixing the program's normal output —
+        # RUNLOG (with the firmware's expanded ring buffer) sees both. Use
+        # this to verify what the EEPROM bit-bang actually wrote (the bug
+        # class `--dump-bufs` doesn't cover — bit-bang corruption only
+        # shows in live page-3 contents post-preload). Cost: ~12 bytes of
+        # stage-1 init code; programs near the 254 B limit may overflow
+        # with it on.
+        import os as _dbg_os
+        if _dbg_os.environ.get('MK1_DEBUG_DUMP_PAGE3') == '1':
+            self_copy.extend([
+                '; ── DEBUG: dump page 3 (256B) to OI ──',
+                '\tldi $b,0',     # B = page3 index
+                '\tldi $d,0',     # D = counter (decd wraps 0→255 for 256 iters)
+                '.dp3_dump:',
+                '\tmov $b,$a',
+                '\tderefp3',      # A = page3[B]
+                '\tout',          # OI = A
+                '\tincb',
+                '\tdecd',
+                '\tjnz .dp3_dump',
+            ])
         self_copy.append('\tj 0')                        # jump to kernel at code[0]
 
         # ── Step 18: Assemble everything ──
