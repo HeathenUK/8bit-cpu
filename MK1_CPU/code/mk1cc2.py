@@ -9111,9 +9111,24 @@ class MK1CodeGen:
         # they used to squat in at the tail of the kernel image
         # (15-30 B per program), letting page-3 overlay storage start
         # earlier and giving the partitioner more room.
-        assembled.append('\tsection stack')
-        assembled.append(f'\torg {P2_MANIFEST_BASE}')
-        assembled.append('__manifest:')
+        # Defer manifest+pages emission until AFTER the p2 overlay
+        # bytes are emitted. The C++ assembler's stack section uses a
+        # monotonic write pointer (stack_size); the firmware's upload
+        # loader copies `r.stack_size` bytes to MK1's stack page. If
+        # manifest+pages emit FIRST (advancing stack_size to ~198) and
+        # `section stack_code` overlays follow (writing at stack_size=
+        # 198+), the manifest claims overlays start at offset 0 while
+        # the actual bytes are at offset 198 — the loader's `deref2`
+        # reads zeros, the slot loads blank, execution falls through to
+        # the page's HLT fill. Fix: stack_code bytes go first (at
+        # offsets matching the manifest's claim), then `org
+        # P2_MANIFEST_BASE` pads up with 0x00 (forward, benign), then
+        # the manifest writes at 192-197.
+        manifest_directives = [
+            '\tsection stack',
+            f'\torg {P2_MANIFEST_BASE}',
+            '__manifest:',
+        ]
         # Overlays ordered: page3 first (includes EEPROM-backed), then page1, then page2.
         # EEPROM-backed overlays were already merged into p3_overlays above.
         all_placed_ordered = list(p3_overlays) + list(p1_overlays) + list(p2_overlays)
@@ -9148,25 +9163,25 @@ class MK1CodeGen:
 
         # Manifest: [offset, size] per overlay (2 bytes each)
         for _, name, asm_lines, fsize, offset in all_placed_ordered:
-            assembled.append(f'\tbyte {offset}')
-            assembled.append(f'\tbyte {fsize}')
+            manifest_directives.append(f'\tbyte {offset}')
+            manifest_directives.append(f'\tbyte {fsize}')
 
         # Page table: [page] per overlay (1 byte each)
         # page values: 3=page3(derefp3), 1=page1(deref), 2=page2(deref2)
         # EEPROM-backed overlays are preloaded into page3, so they're page 3.
-        assembled.append('__pages:')
+        manifest_directives.append('__pages:')
         p3_set = {name for _, name, _, _, _ in p3_overlays}
         p1_set = {name for _, name, _, _, _ in p1_overlays}
         p2_set = {name for _, name, _, _, _ in p2_overlays}
         for _, name, asm_lines, fsize, offset in all_placed_ordered:
             if name in p3_set:
-                assembled.append('\tbyte 3')
+                manifest_directives.append('\tbyte 3')
             elif name in p1_set:
-                assembled.append('\tbyte 1')
+                manifest_directives.append('\tbyte 1')
             elif name in p2_set:
-                assembled.append('\tbyte 2')
+                manifest_directives.append('\tbyte 2')
             else:
-                assembled.append('\tbyte 3')  # fallback: page3
+                manifest_directives.append('\tbyte 3')  # fallback: page3
 
         # __ov_entry: marks the start of the overlay region (address OVERLAY_REGION).
         # Emitted after manifest so it resolves to the correct code address.
@@ -9285,6 +9300,15 @@ class MK1CodeGen:
             assembled.append(f'\torg {OVERLAY_REGION}')
             assembled.append('\tsection stack_code')
             assembled.extend(asm_lines)
+
+        # Now that the p2 overlay bytes have been emitted (at stack
+        # offsets 0..N matching the manifest's offset claims), emit the
+        # manifest+pages metadata at P2_MANIFEST_BASE (=0xC0=192). Pass
+        # 2's `org 192` pads stack[N..191] with 0x00, then the manifest
+        # bytes write at 192-197. Final stack_size = ~198 — the firmware
+        # uploads all 198 bytes to MK1's stack page, both overlays and
+        # manifest land at their correct offsets.
+        assembled.extend(manifest_directives)
 
         # EEPROM-backed overlay code: stored in EEPROM at ee_overlay_base.
         # At init time, the self_copy preload loop reads these bytes back
