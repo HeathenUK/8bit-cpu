@@ -25,10 +25,7 @@ void poll_once(void) {
 void main(void) {
     i2c_init();
     oled_init();
-    /* NOTE: oled_clear() doesn't fit alongside __keypad_scan in this
-     * program's overlay budget. Power-cycle the OLED (or run a small
-     * clear-only program first) before testing if a prior program left
-     * residual framebuffer content. */
+    oled_clear();          /* wipe residual framebuffer from any prior program */
     keypad_init();
     prev_key = 0xFF;
     while (1) poll_once();

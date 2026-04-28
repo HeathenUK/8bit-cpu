@@ -288,8 +288,20 @@
     "status": "ok"
   },
   "keypad_oled.c": {
-    "error_sig": "Exception: overlay placement would wrap into kernel; refusing codegen. available=41B, wrapping=__keypad_scan=80B, __oled_stream_chars=66B",
-    "status": "error"
+    "eeprom_used": 0,
+    "flags": [
+      "-O"
+    ],
+    "kernel": 169,
+    "mode": "overlay",
+    "overlay_largest": null,
+    "overlay_region": 169,
+    "overlay_slots": null,
+    "page0_used": 169,
+    "page1_allocated": 189,
+    "page3_used": 379,
+    "stage1_total": 242,
+    "status": "ok"
   },
   "keypad_overlay_iso.c": {
     "eeprom_used": 0,

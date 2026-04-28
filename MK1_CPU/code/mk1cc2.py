@@ -3473,9 +3473,17 @@ class MK1CodeGen:
         # _NO_OVERLAY upstream, which made it kernel-resident and
         # bypassed the INIT_ONLY_NAMES classification (~51 B kernel
         # bloat per program with OLED).
+        #
+        # __oled_fill_* helpers are NOT in this set either: they're
+        # init-only (oled_clear()/oled_fill() called from main's init
+        # prefix). Adding them here forced kernel-resident placement
+        # which crowds out the slot for programs like keypad_oled.c
+        # (slot 81→41 B → __keypad_scan and __oled_stream_chars both
+        # wrap). The init-only classification at the helper-emission
+        # step (~line 5328) handles them correctly without resident
+        # placement.
         oled_runtime = {'__oled_putc_xfer', '__oled_stream_chars',
-                        '__oled_set_window'} | {
-            h for h in helpers if h.startswith('__oled_fill_')}
+                        '__oled_set_window'}
         if helpers & oled_runtime:
             for h in oled_runtime:
                 if h in helpers:
@@ -5227,6 +5235,21 @@ class MK1CodeGen:
         # init` per program). Stage 1 placement frees ~78 B of stage-2
         # kernel space.
         INIT_ONLY_NAMES.add('__oled_init')
+        # __oled_fill_K helpers — emitted per distinct fill value used
+        # by oled_fill(K) / oled_clear(). All current corpus call sites
+        # are at init time (oled_clear() right after oled_init() to wipe
+        # any residual framebuffer from a prior program). Treating them
+        # as init-only puts the ~28 B helper in stage-1 init code rather
+        # than the runtime kernel — frees that much slot space, which
+        # is what unblocks oled_clear() in tight programs like
+        # keypad_oled.c. CONSTRAINT: oled_fill/oled_clear MUST be called
+        # only at init (before any non-init function call in main).
+        # Calling at runtime would jal a stage-1 address that self-copy
+        # has since overwritten → crash. If runtime fill is ever needed,
+        # add a separate `oled_fill_runtime(K)` builtin that emits a
+        # parallel runtime-resident helper.
+        for _fk in sorted(getattr(self, '_oled_fill_ks', set())):
+            INIT_ONLY_NAMES.add(f'__oled_fill_{_fk:02X}')
         # I2C helpers that are init-only when no runtime I2C is needed
         I2C_INIT_ONLY = {'__i2c_sb', '__i2c_sp', '__i2c_st', '__i2c_st_only', '__i2c_rb', '__i2c_rs'}
 
@@ -5308,6 +5331,12 @@ class MK1CodeGen:
             init_only_names = {'__lcd_init', '__tone_setup'}
             if not getattr(self, '_needs_runtime_i2c', False):
                 init_only_names.update({'__i2c_sb', '__i2c_sp', '__i2c_st', '__i2c_rb', '__i2c_rs'})
+            # __oled_fill_K helpers — see comment at INIT_ONLY_NAMES site
+            # above. All current corpus call sites are at init time;
+            # init-only classification frees ~28 B per helper from the
+            # runtime kernel.
+            for _fk in sorted(getattr(self, '_oled_fill_ks', set())):
+                init_only_names.add(f'__oled_fill_{_fk:02X}')
 
             init_helper_lines = []
             runtime_helper_lines = []
