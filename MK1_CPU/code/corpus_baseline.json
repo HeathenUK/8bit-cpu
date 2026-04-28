@@ -1,0 +1,955 @@
+{
+  "clock_test.c": {
+    "eeprom_used": 0,
+    "flags": [
+      "-O"
+    ],
+    "kernel": 6,
+    "mode": "flat",
+    "overlay_largest": null,
+    "overlay_region": null,
+    "overlay_slots": null,
+    "page0_used": 6,
+    "page1_allocated": 0,
+    "page3_used": 0,
+    "stage1_total": null,
+    "status": "ok"
+  },
+  "debug_lcd_min_markers.c": {
+    "eeprom_used": 0,
+    "flags": [
+      "-O"
+    ],
+    "kernel": 99,
+    "mode": "overlay",
+    "overlay_largest": null,
+    "overlay_region": 99,
+    "overlay_slots": null,
+    "page0_used": 99,
+    "page1_allocated": 48,
+    "page3_used": 99,
+    "stage1_total": 182,
+    "status": "ok"
+  },
+  "debug_tone_postcal.c": {
+    "eeprom_used": 0,
+    "flags": [
+      "-O"
+    ],
+    "kernel": 241,
+    "mode": "flat",
+    "overlay_largest": null,
+    "overlay_region": null,
+    "overlay_slots": null,
+    "page0_used": 241,
+    "page1_allocated": 3,
+    "page3_used": 0,
+    "stage1_total": null,
+    "status": "ok"
+  },
+  "delay_demo.c": {
+    "eeprom_used": 0,
+    "flags": [
+      "-O"
+    ],
+    "kernel": 153,
+    "mode": "flat",
+    "overlay_largest": null,
+    "overlay_region": null,
+    "overlay_slots": null,
+    "page0_used": 153,
+    "page1_allocated": 0,
+    "page3_used": 0,
+    "stage1_total": null,
+    "status": "ok"
+  },
+  "eeprom_compile_test.c": {
+    "eeprom_used": 0,
+    "flags": [
+      "-O"
+    ],
+    "kernel": 170,
+    "mode": "init_extraction",
+    "overlay_largest": null,
+    "overlay_region": null,
+    "overlay_slots": null,
+    "page0_used": 170,
+    "page1_allocated": 0,
+    "page3_used": 170,
+    "stage1_total": 249,
+    "status": "ok"
+  },
+  "eeprom_demo.c": {
+    "eeprom_used": 0,
+    "flags": [
+      "-O"
+    ],
+    "kernel": 220,
+    "mode": "flat",
+    "overlay_largest": null,
+    "overlay_region": null,
+    "overlay_slots": null,
+    "page0_used": 220,
+    "page1_allocated": 0,
+    "page3_used": 0,
+    "stage1_total": null,
+    "status": "ok"
+  },
+  "eeprom_font_test.c": {
+    "eeprom_used": 5,
+    "flags": [
+      "-O"
+    ],
+    "kernel": 175,
+    "mode": "flat",
+    "overlay_largest": null,
+    "overlay_region": null,
+    "overlay_slots": null,
+    "page0_used": 175,
+    "page1_allocated": 0,
+    "page3_used": 0,
+    "stage1_total": null,
+    "status": "ok"
+  },
+  "eeprom_overlay_write.c": {
+    "eeprom_used": 0,
+    "flags": [
+      "-O"
+    ],
+    "kernel": 211,
+    "mode": "flat",
+    "overlay_largest": null,
+    "overlay_region": null,
+    "overlay_slots": null,
+    "page0_used": 211,
+    "page1_allocated": 0,
+    "page3_used": 0,
+    "stage1_total": null,
+    "status": "ok"
+  },
+  "eeprom_test.c": {
+    "eeprom_used": 0,
+    "flags": [
+      "-O"
+    ],
+    "kernel": 183,
+    "mode": "flat",
+    "overlay_largest": null,
+    "overlay_region": null,
+    "overlay_slots": null,
+    "page0_used": 183,
+    "page1_allocated": 0,
+    "page3_used": 0,
+    "stage1_total": null,
+    "status": "ok"
+  },
+  "hw_out_smoke.c": {
+    "eeprom_used": 0,
+    "flags": [
+      "-O"
+    ],
+    "kernel": 10,
+    "mode": "flat",
+    "overlay_largest": null,
+    "overlay_region": null,
+    "overlay_slots": null,
+    "page0_used": 10,
+    "page1_allocated": 0,
+    "page3_used": 0,
+    "stage1_total": null,
+    "status": "ok"
+  },
+  "i2c_scan.c": {
+    "eeprom_used": 0,
+    "flags": [
+      "-O"
+    ],
+    "kernel": 196,
+    "mode": "flat",
+    "overlay_largest": null,
+    "overlay_region": null,
+    "overlay_slots": null,
+    "page0_used": 196,
+    "page1_allocated": 0,
+    "page3_used": 0,
+    "stage1_total": null,
+    "status": "ok"
+  },
+  "i2c_scan_lcd.c": {
+    "eeprom_used": 0,
+    "flags": [
+      "-O"
+    ],
+    "kernel": 151,
+    "mode": "overlay",
+    "overlay_largest": null,
+    "overlay_region": 151,
+    "overlay_slots": null,
+    "page0_used": 151,
+    "page1_allocated": 64,
+    "page3_used": 151,
+    "stage1_total": 194,
+    "status": "ok"
+  },
+  "keypad_demo.c": {
+    "eeprom_used": 0,
+    "flags": [
+      "-O"
+    ],
+    "kernel": 168,
+    "mode": "flat",
+    "overlay_largest": null,
+    "overlay_region": null,
+    "overlay_slots": null,
+    "page0_used": 168,
+    "page1_allocated": 0,
+    "page3_used": 0,
+    "stage1_total": null,
+    "status": "ok"
+  },
+  "keypad_i2c_iso.c": {
+    "eeprom_used": 0,
+    "flags": [
+      "-O"
+    ],
+    "kernel": 182,
+    "mode": "flat",
+    "overlay_largest": null,
+    "overlay_region": null,
+    "overlay_slots": null,
+    "page0_used": 182,
+    "page1_allocated": 0,
+    "page3_used": 0,
+    "stage1_total": null,
+    "status": "ok"
+  },
+  "keypad_lcd.c": {
+    "eeprom_used": 0,
+    "flags": [
+      "-O"
+    ],
+    "kernel": 161,
+    "mode": "overlay",
+    "overlay_largest": null,
+    "overlay_region": 161,
+    "overlay_slots": null,
+    "page0_used": 161,
+    "page1_allocated": 63,
+    "page3_used": 161,
+    "stage1_total": 206,
+    "status": "ok"
+  },
+  "keypad_lcd_iso.c": {
+    "eeprom_used": 0,
+    "flags": [
+      "-O"
+    ],
+    "kernel": 119,
+    "mode": "overlay",
+    "overlay_largest": null,
+    "overlay_region": 119,
+    "overlay_slots": null,
+    "page0_used": 119,
+    "page1_allocated": 47,
+    "page3_used": 119,
+    "stage1_total": 172,
+    "status": "ok"
+  },
+  "keypad_lcd_raw_probe.c": {
+    "eeprom_used": 0,
+    "flags": [
+      "-O"
+    ],
+    "kernel": 162,
+    "mode": "flat",
+    "overlay_largest": null,
+    "overlay_region": null,
+    "overlay_slots": null,
+    "page0_used": 162,
+    "page1_allocated": 47,
+    "page3_used": 0,
+    "stage1_total": null,
+    "status": "ok"
+  },
+  "keypad_lcd_scan_emu.c": {
+    "eeprom_used": 0,
+    "flags": [
+      "-O"
+    ],
+    "kernel": 129,
+    "mode": "init_extraction",
+    "overlay_largest": null,
+    "overlay_region": null,
+    "overlay_slots": null,
+    "page0_used": 129,
+    "page1_allocated": 47,
+    "page3_used": 129,
+    "stage1_total": 139,
+    "status": "ok"
+  },
+  "keypad_oled.c": {
+    "eeprom_used": 0,
+    "flags": [
+      "-O"
+    ],
+    "kernel": 169,
+    "mode": "overlay",
+    "overlay_largest": null,
+    "overlay_region": 169,
+    "overlay_slots": null,
+    "page0_used": 169,
+    "page1_allocated": 189,
+    "page3_used": 379,
+    "stage1_total": 240,
+    "status": "ok"
+  },
+  "keypad_overlay_iso.c": {
+    "eeprom_used": 0,
+    "flags": [
+      "-O"
+    ],
+    "kernel": 242,
+    "mode": "flat",
+    "overlay_largest": null,
+    "overlay_region": null,
+    "overlay_slots": null,
+    "page0_used": 242,
+    "page1_allocated": 0,
+    "page3_used": 0,
+    "stage1_total": null,
+    "status": "ok"
+  },
+  "keypad_scan_test.c": {
+    "eeprom_used": 0,
+    "flags": [
+      "-O"
+    ],
+    "kernel": 185,
+    "mode": "flat",
+    "overlay_largest": null,
+    "overlay_region": null,
+    "overlay_slots": null,
+    "page0_used": 185,
+    "page1_allocated": 0,
+    "page3_used": 0,
+    "stage1_total": null,
+    "status": "ok"
+  },
+  "keypad_smoke.c": {
+    "eeprom_used": 0,
+    "flags": [
+      "-O"
+    ],
+    "kernel": 23,
+    "mode": "flat",
+    "overlay_largest": null,
+    "overlay_region": null,
+    "overlay_slots": null,
+    "page0_used": 23,
+    "page1_allocated": 0,
+    "page3_used": 0,
+    "stage1_total": null,
+    "status": "ok"
+  },
+  "keypad_thunk_iso.c": {
+    "eeprom_used": 0,
+    "flags": [
+      "-O"
+    ],
+    "kernel": 145,
+    "mode": "overlay",
+    "overlay_largest": null,
+    "overlay_region": 145,
+    "overlay_slots": null,
+    "page0_used": 145,
+    "page1_allocated": 81,
+    "page3_used": 145,
+    "stage1_total": 174,
+    "status": "ok"
+  },
+  "keypad_wait_demo.c": {
+    "eeprom_used": 0,
+    "flags": [
+      "-O"
+    ],
+    "kernel": 126,
+    "mode": "overlay",
+    "overlay_largest": null,
+    "overlay_region": 126,
+    "overlay_slots": null,
+    "page0_used": 126,
+    "page1_allocated": 0,
+    "page3_used": 126,
+    "stage1_total": 194,
+    "status": "ok"
+  },
+  "lcd_clean.c": {
+    "eeprom_used": 0,
+    "flags": [
+      "-O"
+    ],
+    "kernel": 150,
+    "mode": "init_extraction",
+    "overlay_largest": null,
+    "overlay_region": null,
+    "overlay_slots": null,
+    "page0_used": 150,
+    "page1_allocated": 47,
+    "page3_used": 150,
+    "stage1_total": 208,
+    "status": "ok"
+  },
+  "lcd_hello.c": {
+    "eeprom_used": 0,
+    "flags": [
+      "-O"
+    ],
+    "kernel": 157,
+    "mode": "flat",
+    "overlay_largest": null,
+    "overlay_region": null,
+    "overlay_slots": null,
+    "page0_used": 157,
+    "page1_allocated": 47,
+    "page3_used": 0,
+    "stage1_total": null,
+    "status": "ok"
+  },
+  "lcd_minimal.c": {
+    "eeprom_used": 0,
+    "flags": [
+      "-O"
+    ],
+    "kernel": 139,
+    "mode": "flat",
+    "overlay_largest": null,
+    "overlay_region": null,
+    "overlay_slots": null,
+    "page0_used": 139,
+    "page1_allocated": 0,
+    "page3_used": 0,
+    "stage1_total": null,
+    "status": "ok"
+  },
+  "lcd_temp.c": {
+    "eeprom_used": 0,
+    "flags": [
+      "-O"
+    ],
+    "kernel": 206,
+    "mode": "overlay",
+    "overlay_largest": null,
+    "overlay_region": 206,
+    "overlay_slots": null,
+    "page0_used": 206,
+    "page1_allocated": 47,
+    "page3_used": 206,
+    "stage1_total": 236,
+    "status": "ok"
+  },
+  "lcd_temp_overlay.c": {
+    "eeprom_used": 0,
+    "flags": [
+      "-O"
+    ],
+    "kernel": 108,
+    "mode": "overlay",
+    "overlay_largest": null,
+    "overlay_region": 108,
+    "overlay_slots": null,
+    "page0_used": 108,
+    "page1_allocated": 47,
+    "page3_used": 108,
+    "stage1_total": 182,
+    "status": "ok"
+  },
+  "lcd_temp_overlay_cmd.c": {
+    "eeprom_used": 0,
+    "flags": [
+      "-O"
+    ],
+    "kernel": 108,
+    "mode": "overlay",
+    "overlay_largest": null,
+    "overlay_region": 108,
+    "overlay_slots": null,
+    "page0_used": 108,
+    "page1_allocated": 47,
+    "page3_used": 108,
+    "stage1_total": 242,
+    "status": "ok"
+  },
+  "lcd_test.c": {
+    "eeprom_used": 0,
+    "flags": [
+      "-O"
+    ],
+    "kernel": 183,
+    "mode": "flat",
+    "overlay_largest": null,
+    "overlay_region": null,
+    "overlay_slots": null,
+    "page0_used": 183,
+    "page1_allocated": 47,
+    "page3_used": 0,
+    "stage1_total": null,
+    "status": "ok"
+  },
+  "oled_clear.c": {
+    "eeprom_used": 0,
+    "flags": [
+      "-O"
+    ],
+    "kernel": 213,
+    "mode": "flat",
+    "overlay_largest": null,
+    "overlay_region": null,
+    "overlay_slots": null,
+    "page0_used": 213,
+    "page1_allocated": 75,
+    "page3_used": 0,
+    "stage1_total": null,
+    "status": "ok"
+  },
+  "oled_hello.c": {
+    "eeprom_used": 0,
+    "flags": [
+      "-O"
+    ],
+    "kernel": 212,
+    "mode": "flat",
+    "overlay_largest": null,
+    "overlay_region": null,
+    "overlay_slots": null,
+    "page0_used": 212,
+    "page1_allocated": 210,
+    "page3_used": 0,
+    "stage1_total": null,
+    "status": "ok"
+  },
+  "oled_letter_a.c": {
+    "eeprom_used": 0,
+    "flags": [
+      "-O"
+    ],
+    "kernel": 101,
+    "mode": "overlay",
+    "overlay_largest": null,
+    "overlay_region": 101,
+    "overlay_slots": null,
+    "page0_used": 101,
+    "page1_allocated": 75,
+    "page3_used": 101,
+    "stage1_total": 172,
+    "status": "ok"
+  },
+  "oled_mk1.c": {
+    "eeprom_used": 0,
+    "flags": [
+      "-O"
+    ],
+    "kernel": 213,
+    "mode": "flat",
+    "overlay_largest": null,
+    "overlay_region": null,
+    "overlay_slots": null,
+    "page0_used": 213,
+    "page1_allocated": 156,
+    "page3_used": 0,
+    "stage1_total": null,
+    "status": "ok"
+  },
+  "oled_temp.c": {
+    "error_sig": "Exception: overlay placement would wrap into kernel; refusing codegen. available=4B, wrapping=_show_temp=61B, _send_glyph=36B",
+    "status": "error"
+  },
+  "oled_test.c": {
+    "error_sig": "Exception: overlay placement would wrap into kernel; refusing codegen. available=41B, wrapping=_oled_glyph=88B",
+    "status": "error"
+  },
+  "oled_two_blocks.c": {
+    "eeprom_used": 0,
+    "flags": [
+      "-O"
+    ],
+    "kernel": 101,
+    "mode": "overlay",
+    "overlay_largest": null,
+    "overlay_region": 101,
+    "overlay_slots": null,
+    "page0_used": 101,
+    "page1_allocated": 75,
+    "page3_used": 101,
+    "stage1_total": 172,
+    "status": "ok"
+  },
+  "oled_white.c": {
+    "eeprom_used": 0,
+    "flags": [
+      "-O"
+    ],
+    "kernel": 213,
+    "mode": "flat",
+    "overlay_largest": null,
+    "overlay_region": null,
+    "overlay_slots": null,
+    "page0_used": 213,
+    "page1_allocated": 75,
+    "page3_used": 0,
+    "stage1_total": null,
+    "status": "ok"
+  },
+  "overlay_clock.c": {
+    "eeprom_used": 0,
+    "flags": [
+      "-O"
+    ],
+    "kernel": 137,
+    "mode": "overlay",
+    "overlay_largest": null,
+    "overlay_region": 137,
+    "overlay_slots": null,
+    "page0_used": 137,
+    "page1_allocated": 47,
+    "page3_used": 137,
+    "stage1_total": 242,
+    "status": "ok"
+  },
+  "overlay_dashboard.c": {
+    "error_sig": "Exception: overlay placement would wrap into kernel; refusing codegen. available=42B, wrapping=_show_temp=46B",
+    "status": "error"
+  },
+  "overlay_demo.c": {
+    "eeprom_used": 0,
+    "flags": [
+      "-O"
+    ],
+    "kernel": 131,
+    "mode": "flat",
+    "overlay_largest": null,
+    "overlay_region": null,
+    "overlay_slots": null,
+    "page0_used": 131,
+    "page1_allocated": 0,
+    "page3_used": 0,
+    "stage1_total": null,
+    "status": "ok"
+  },
+  "overlay_info.c": {
+    "error_sig": "Exception: overlay placement would wrap into kernel; refusing codegen. available=49B, wrapping=_info_screen=65B, __delay_cal=58B",
+    "status": "error"
+  },
+  "overlay_seconds.c": {
+    "eeprom_used": 0,
+    "flags": [
+      "-O"
+    ],
+    "kernel": 121,
+    "mode": "overlay",
+    "overlay_largest": null,
+    "overlay_region": 121,
+    "overlay_slots": null,
+    "page0_used": 121,
+    "page1_allocated": 53,
+    "page3_used": 121,
+    "stage1_total": 242,
+    "status": "ok"
+  },
+  "overlay_stopwatch.c": {
+    "eeprom_used": 0,
+    "flags": [
+      "-O"
+    ],
+    "kernel": 167,
+    "mode": "flat",
+    "overlay_largest": null,
+    "overlay_region": null,
+    "overlay_slots": null,
+    "page0_used": 167,
+    "page1_allocated": 0,
+    "page3_used": 0,
+    "stage1_total": null,
+    "status": "ok"
+  },
+  "overlay_temp_label.c": {
+    "eeprom_used": 0,
+    "flags": [
+      "-O"
+    ],
+    "kernel": 172,
+    "mode": "overlay",
+    "overlay_largest": null,
+    "overlay_region": 172,
+    "overlay_slots": null,
+    "page0_used": 172,
+    "page1_allocated": 54,
+    "page3_used": 172,
+    "stage1_total": 228,
+    "status": "ok"
+  },
+  "test1_clock.c": {
+    "eeprom_used": 0,
+    "flags": [
+      "-O"
+    ],
+    "kernel": 137,
+    "mode": "overlay",
+    "overlay_largest": null,
+    "overlay_region": 137,
+    "overlay_slots": null,
+    "page0_used": 137,
+    "page1_allocated": 47,
+    "page3_used": 137,
+    "stage1_total": 242,
+    "status": "ok"
+  },
+  "test2_temp.c": {
+    "eeprom_used": 0,
+    "flags": [
+      "-O"
+    ],
+    "kernel": 172,
+    "mode": "overlay",
+    "overlay_largest": null,
+    "overlay_region": 172,
+    "overlay_slots": null,
+    "page0_used": 172,
+    "page1_allocated": 54,
+    "page3_used": 172,
+    "stage1_total": 228,
+    "status": "ok"
+  },
+  "test3_seconds.c": {
+    "eeprom_used": 0,
+    "flags": [
+      "-O"
+    ],
+    "kernel": 121,
+    "mode": "overlay",
+    "overlay_largest": null,
+    "overlay_region": 121,
+    "overlay_slots": null,
+    "page0_used": 121,
+    "page1_allocated": 53,
+    "page3_used": 121,
+    "stage1_total": 242,
+    "status": "ok"
+  },
+  "test4_info.c": {
+    "error_sig": "Exception: overlay placement would wrap into kernel; refusing codegen. available=49B, wrapping=_info_screen=65B, __delay_cal=58B",
+    "status": "error"
+  },
+  "test_autosplit.c": {
+    "eeprom_used": 0,
+    "flags": [
+      "-O"
+    ],
+    "kernel": 151,
+    "mode": "flat",
+    "overlay_largest": null,
+    "overlay_region": null,
+    "overlay_slots": null,
+    "page0_used": 151,
+    "page1_allocated": 0,
+    "page3_used": 0,
+    "stage1_total": null,
+    "status": "ok"
+  },
+  "test_eeprom_overlay.c": {
+    "error_sig": "!! CODE OVERFLOW: 263B > 254B limit (over by 9B)",
+    "status": "error"
+  },
+  "test_i2c_ack_diag.c": {
+    "eeprom_used": 0,
+    "flags": [
+      "-O"
+    ],
+    "kernel": 138,
+    "mode": "init_extraction",
+    "overlay_largest": null,
+    "overlay_region": null,
+    "overlay_slots": null,
+    "page0_used": 138,
+    "page1_allocated": 47,
+    "page3_used": 138,
+    "stage1_total": 183,
+    "status": "ok"
+  },
+  "test_idx_eeprom.c": {
+    "eeprom_used": 0,
+    "flags": [
+      "-O"
+    ],
+    "kernel": 195,
+    "mode": "flat",
+    "overlay_largest": null,
+    "overlay_region": null,
+    "overlay_slots": null,
+    "page0_used": 195,
+    "page1_allocated": 200,
+    "page3_used": 0,
+    "stage1_total": null,
+    "status": "ok"
+  },
+  "test_lcd_eeprom.c": {
+    "error_sig": "Exception: overlay placement would wrap into kernel; refusing codegen. available=50B, wrapping=__delay_cal=58B",
+    "status": "error"
+  },
+  "test_music3.c": {
+    "eeprom_used": 0,
+    "flags": [
+      "-O"
+    ],
+    "kernel": 177,
+    "mode": "overlay",
+    "overlay_largest": null,
+    "overlay_region": 177,
+    "overlay_slots": null,
+    "page0_used": 177,
+    "page1_allocated": 9,
+    "page3_used": 177,
+    "stage1_total": 224,
+    "status": "ok"
+  },
+  "test_overlay_stress.c": {
+    "eeprom_used": 0,
+    "flags": [
+      "-O"
+    ],
+    "kernel": 193,
+    "mode": "overlay",
+    "overlay_largest": null,
+    "overlay_region": 193,
+    "overlay_slots": null,
+    "page0_used": 193,
+    "page1_allocated": 1,
+    "page3_used": 193,
+    "stage1_total": 213,
+    "status": "ok"
+  },
+  "test_pcf8574_writeread.c": {
+    "eeprom_used": 0,
+    "flags": [
+      "-O"
+    ],
+    "kernel": 206,
+    "mode": "flat",
+    "overlay_largest": null,
+    "overlay_region": null,
+    "overlay_slots": null,
+    "page0_used": 206,
+    "page1_allocated": 0,
+    "page3_used": 0,
+    "stage1_total": null,
+    "status": "ok"
+  },
+  "test_stopwatch.c": {
+    "eeprom_used": 0,
+    "flags": [
+      "-O"
+    ],
+    "kernel": 167,
+    "mode": "flat",
+    "overlay_largest": null,
+    "overlay_region": null,
+    "overlay_slots": null,
+    "page0_used": 167,
+    "page1_allocated": 0,
+    "page3_used": 0,
+    "stage1_total": null,
+    "status": "ok"
+  },
+  "tone_isolation.c": {
+    "eeprom_used": 0,
+    "flags": [
+      "-O"
+    ],
+    "kernel": 237,
+    "mode": "flat",
+    "overlay_largest": null,
+    "overlay_region": null,
+    "overlay_slots": null,
+    "page0_used": 237,
+    "page1_allocated": 3,
+    "page3_used": 0,
+    "stage1_total": null,
+    "status": "ok"
+  },
+  "tone_test.c": {
+    "eeprom_used": 0,
+    "flags": [
+      "-O"
+    ],
+    "kernel": 189,
+    "mode": "overlay",
+    "overlay_largest": null,
+    "overlay_region": 189,
+    "overlay_slots": null,
+    "page0_used": 189,
+    "page1_allocated": 12,
+    "page3_used": 189,
+    "stage1_total": 223,
+    "status": "ok"
+  },
+  "twinkle.c": {
+    "eeprom_used": 0,
+    "flags": [
+      "-O"
+    ],
+    "kernel": 197,
+    "mode": "overlay",
+    "overlay_largest": null,
+    "overlay_region": 197,
+    "overlay_slots": null,
+    "page0_used": 197,
+    "page1_allocated": 27,
+    "page3_used": 197,
+    "stage1_total": 227,
+    "status": "ok"
+  },
+  "twinkle_markers.c": {
+    "error_sig": "Exception: overlay placement would wrap into kernel; refusing codegen. available=32B, wrapping=__tone_precompute=71B",
+    "status": "error"
+  },
+  "twinkle_v2.c": {
+    "error_sig": "Exception: overlay placement would wrap into kernel; refusing codegen. available=53B, wrapping=__tone_precompute=71B",
+    "status": "error"
+  },
+  "twinkle_v3.c": {
+    "eeprom_used": 0,
+    "flags": [
+      "-O"
+    ],
+    "kernel": 198,
+    "mode": "overlay",
+    "overlay_largest": null,
+    "overlay_region": 198,
+    "overlay_slots": null,
+    "page0_used": 198,
+    "page1_allocated": 27,
+    "page3_used": 198,
+    "stage1_total": 239,
+    "status": "ok"
+  },
+  "twinkle_v4.c": {
+    "error_sig": "Exception: overlay placement would wrap into kernel; refusing codegen. available=29B, wrapping=__tone_precompute=71B",
+    "status": "error"
+  },
+  "twinkle_v5.c": {
+    "eeprom_used": 0,
+    "flags": [
+      "-O",
+      "--eeprom"
+    ],
+    "kernel": 155,
+    "mode": "overlay",
+    "overlay_largest": null,
+    "overlay_region": 155,
+    "overlay_slots": null,
+    "page0_used": 155,
+    "page1_allocated": 27,
+    "page3_used": 155,
+    "stage1_total": 224,
+    "status": "ok"
+  }
+}
