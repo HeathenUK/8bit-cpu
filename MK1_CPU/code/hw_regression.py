@@ -73,12 +73,29 @@ def assemble_upload(ser, asm_text, timeout=15):
     else:
         ser.write(payload)
     ser.timeout = timeout
+    # Skip non-JSON diagnostic lines (e.g. "EEPROM shim page 0x0100: ..."
+    # that the firmware streams during EEPROM writes from a PRIOR test's
+    # UPLOAD — they arrive at the host serial buffer slightly later than
+    # the prior UPLOAD's JSON response and end up first-in-line for the
+    # next ASM read). Loop until we get a `{...}` line or hit timeout.
+    r = None
     raw_reply = b''
-    try:
-        raw_reply = ser.readline()
-        r = json.loads(raw_reply.decode().strip())
-    except Exception as e:
-        print(f'    ASM parse error: {e}; raw={raw_reply[:200]!r}', file=sys.stderr)
+    for _ in range(20):
+        try:
+            raw_reply = ser.readline()
+        except Exception:
+            break
+        if not raw_reply:
+            break
+        line = raw_reply.decode(errors='replace').strip()
+        if line.startswith('{'):
+            try:
+                r = json.loads(line)
+                break
+            except Exception:
+                continue
+    if r is None:
+        print(f'    ASM parse error: no JSON in response; last raw={raw_reply[:200]!r}', file=sys.stderr)
         return False
     if not r.get('ok'):
         print(f'    ASM failed: {r}', file=sys.stderr)
@@ -110,7 +127,18 @@ def dump_pages(ser, timeout=10):
     for off in range(0, 1024, BLK):
         ser.reset_input_buffer()
         ser.write(f'DUMP:{off},{BLK}\n'.encode())
-        line = ser.readline().decode().strip()
+        # Skip non-hex diagnostic lines (e.g. EEPROM shim output from a
+        # prior UPLOAD that the firmware streams asynchronously). The
+        # DUMP response is a single line of `XX XX XX...` hex tokens.
+        line = ''
+        for _ in range(20):
+            line = ser.readline().decode(errors='replace').strip()
+            if not line:
+                break
+            toks = line.split()
+            # Heuristic: a real DUMP line has BLK tokens of length 2.
+            if toks and all(len(t) == 2 for t in toks):
+                break
         for tok in line.split():
             if len(tok) == 2:
                 out.append(int(tok, 16))
@@ -133,10 +161,27 @@ def runlog(ser, cycles=5_000_000, us=1, timeout=30):
     ser.reset_input_buffer()
     ser.timeout = timeout
     ser.write(f'RUNLOG:{cycles},{us}\n'.encode())
-    line = ser.readline().decode().strip()
-    try:
-        r = json.loads(line)
-    except Exception as e:
+    # Skip non-RUNLOG-shaped lines: EEPROM shim diagnostic strings AND
+    # leftover UPLOAD `{"ok":true,...}` JSONs from a prior write that
+    # finished after we'd moved on. RUNLOG's response always carries
+    # `"cyc"`, so use that to disambiguate.
+    line = ''
+    r = None
+    for _ in range(20):
+        try:
+            line = ser.readline().decode(errors='replace').strip()
+        except Exception:
+            line = ''
+            break
+        if not line:
+            break
+        if line.startswith('{') and '"cyc"' in line:
+            try:
+                r = json.loads(line)
+                break
+            except Exception:
+                continue
+    if r is None:
         return {'cyc': 0, 'cnt': 0, 'vals': [], 'error': f'parse failed: {line[:80]}'}
     return r
 
@@ -786,6 +831,79 @@ TESTS = [
         }''',
         [0xF0, 0xA1, 0xA2, 0xB1, 0xB2, 0xC1, 0xC2, 0xD1, 0xD2, 0xF1],
         cycles=200_000,
+    ),
+    Test(
+        # Forces the 5th leaf into the EEPROM tier (after pages 1+2+3
+        # fill). The runtime preload reads bytes from the AT24C32 via
+        # the inline I²C bit-bang and writes them into page-3 storage;
+        # then the overlay loader copies from page-3 to the slot at
+        # call time. This exercises the full EEPROM data path:
+        # assembler → ESP32 shim → AT24C32 → MK1 bit-bang → page 3
+        # → overlay slot → execute.
+        #
+        # Pre-fix, two bugs masked each other on this shape:
+        #   1. The assembler's `section eeprom` write pointer starts at
+        #      0, but mk1cc2 padded only 240B (assuming a 16B header
+        #      was already there) — so `out_imm 0xD1` at the start of
+        #      the EEPROM-backed leaf landed at eeprom[240] while the
+        #      preload read from address 0x100 (=256), pulling bytes
+        #      16-bytes into the leaf instead. First byte read became
+        #      `jal 0xAC` and execution wandered.
+        #   2. The inline preload's sentinel-bit loop exited via `jc`
+        #      AFTER `sllb` shifted the sentinel into CF — but BEFORE
+        #      the 8th SDA read, so every byte had bit 0 cleared.
+        #
+        # Hits the EEPROM bit-bang AND the partitioner's ee→p3 hand-off
+        # in one test. Failure modes from regressions in any of those
+        # paths produce a wrong byte at run time.
+        'overlay placement: eeprom storage end-to-end',
+        '''unsigned char fill[100];
+        unsigned char ta[16]; unsigned char tb[16]; unsigned char tc[16];
+        unsigned char td[16]; unsigned char te[16];
+        void leaf_a(void) {
+            out(0xA1);
+            ta[0]++; ta[1]++; ta[2]++; ta[3]++; ta[4]++; ta[5]++; ta[6]++;
+            ta[7]++; ta[8]++; ta[9]++; ta[10]++; ta[11]++; ta[12]++; ta[13]++;
+            out(0xA2);
+        }
+        void leaf_b(void) {
+            out(0xB1);
+            tb[0]++; tb[1]++; tb[2]++; tb[3]++; tb[4]++; tb[5]++; tb[6]++;
+            tb[7]++; tb[8]++; tb[9]++; tb[10]++; tb[11]++; tb[12]++; tb[13]++;
+            out(0xB2);
+        }
+        void leaf_c(void) {
+            out(0xC1);
+            tc[0]++; tc[1]++; tc[2]++; tc[3]++; tc[4]++; tc[5]++; tc[6]++;
+            tc[7]++; tc[8]++; tc[9]++; tc[10]++; tc[11]++; tc[12]++; tc[13]++;
+            out(0xC2);
+        }
+        void leaf_d(void) {
+            out(0xD1);
+            td[0]++; td[1]++; td[2]++; td[3]++; td[4]++; td[5]++; td[6]++;
+            td[7]++; td[8]++; td[9]++; td[10]++; td[11]++; td[12]++; td[13]++;
+            out(0xD2);
+        }
+        void leaf_e(void) {
+            out(0xE1);
+            te[0]++; te[1]++; te[2]++; te[3]++; te[4]++; te[5]++; te[6]++;
+            te[7]++; te[8]++; te[9]++; te[10]++; te[11]++; te[12]++; te[13]++;
+            out(0xE2);
+        }
+        void main(void) {
+            i2c_init();
+            out(0xDE); out(0xAD); out(0xBE);
+            out(0x80);
+            leaf_a(); leaf_b(); leaf_c(); leaf_d(); leaf_e();
+            out(0x81);
+            halt();
+        }''',
+        [0x80, 0xA1, 0xA2, 0xB1, 0xB2, 0xC1, 0xC2, 0xD1, 0xD2, 0xE1, 0xE2, 0x81],
+        eeprom=True,
+        cycles=300_000,
+        # Sim doesn't model the AT24C32 / I²C bit-bang preload, so the
+        # EEPROM-backed leaf wouldn't load. Skip the sim leg.
+        needs_hw_peripherals=True,
     ),
     Test(
         'xs-abstract init-touch: thunk extracted from init code',
