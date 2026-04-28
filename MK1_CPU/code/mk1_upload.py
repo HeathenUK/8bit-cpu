@@ -81,6 +81,42 @@ def compile_c(source_file, optimize=True, eeprom=False):
         return f.read()
 
 
+# Hash-cache for skip-asm-if-unchanged. Stored at /tmp/.mk1_asm_cache —
+# a single line of `<sha1>:<port>` for the most-recently-uploaded asm.
+# When the asm hash matches AND the port matches, we know the ESP32's
+# uploadBuf still holds the right bytes (assuming no power-cycle since
+# the previous upload), so we can skip the ASM serial transfer (the
+# slow step — kilobytes over UART) and go straight to UPLOAD. Saves
+# ~0.5–1.5 s per iteration.
+#
+# Trade: if the ESP32 was power-cycled between runs, uploadBuf is
+# whatever was there before. Pass `--no-cache` to bypass, or `make
+# reset` then re-run (a reset doesn't clear uploadBuf either, but a
+# real power cycle does — and you'll know because the next ASM will
+# be fresh).
+ASM_CACHE_PATH = '/tmp/.mk1_asm_cache'
+
+def _asm_hash(asm_text):
+    import hashlib
+    return hashlib.sha1(asm_text.encode()).hexdigest()
+
+def _read_cached_hash(port):
+    try:
+        with open(ASM_CACHE_PATH) as f:
+            line = f.read().strip()
+        h, p = line.split(':', 1)
+        return h if p == port else None
+    except (FileNotFoundError, ValueError):
+        return None
+
+def _write_cached_hash(h, port):
+    try:
+        with open(ASM_CACHE_PATH, 'w') as f:
+            f.write(f'{h}:{port}\n')
+    except OSError:
+        pass
+
+
 def main():
     import argparse
     ap = argparse.ArgumentParser(description='MK1 Upload Helper')
@@ -90,6 +126,8 @@ def main():
     ap.add_argument('--run', nargs='?', const=10000000, type=int, help='Run after upload (optional cycle count)')
     ap.add_argument('--port', default=PORT, help=f'Serial port (default: {PORT})')
     ap.add_argument('--timeout', type=int, default=120, help='Run timeout in seconds')
+    ap.add_argument('--no-cache', action='store_true',
+                    help='Always re-assemble; bypass the hash cache.')
     args = ap.parse_args()
 
     # Compile if C source
@@ -107,18 +145,24 @@ def main():
     time.sleep(1)
     ser.reset_input_buffer()
 
-    # Assemble
-    print(f'Assembling ({len(asm)} bytes of source)...')
-    r = mk1_asm(ser, asm)
-    if r is None or not r.get('ok'):
-        if r and r.get('detail'):
-            for err in r['detail']:
-                print(f"  Error line {err['line']}: {err['msg']}", file=sys.stderr)
-        elif r:
-            print(f"  {r}", file=sys.stderr)
-        ser.close()
-        sys.exit(1)
-    print(f'  code={r["code"]}B data={r.get("data",0)}B')
+    # Hash + cache check — skip ASM if uploadBuf already has these bytes.
+    asm_h = _asm_hash(asm)
+    cached_h = None if args.no_cache else _read_cached_hash(args.port)
+    if cached_h == asm_h:
+        print(f'Skipping assembly (cache hit, hash={asm_h[:8]}...)')
+    else:
+        print(f'Assembling ({len(asm)} bytes of source)...')
+        r = mk1_asm(ser, asm)
+        if r is None or not r.get('ok'):
+            if r and r.get('detail'):
+                for err in r['detail']:
+                    print(f"  Error line {err['line']}: {err['msg']}", file=sys.stderr)
+            elif r:
+                print(f"  {r}", file=sys.stderr)
+            ser.close()
+            sys.exit(1)
+        print(f'  code={r["code"]}B data={r.get("data",0)}B')
+        _write_cached_hash(asm_h, args.port)
 
     # Upload
     print('Uploading...')
