@@ -8763,29 +8763,83 @@ class MK1CodeGen:
         if not has_p1 and not has_p2 and not has_p3 and not has_eeprom:
             return  # nothing placed
 
-        # EEPROM-backed overlays: stored in EEPROM, preloaded into freed page3
-        # space during init (after self-copy frees page3[0..KERNEL_SIZE-1]).
-        # At runtime they're accessed via derefp3, same as regular page3 overlays.
-        # Re-assign EEPROM overlay offsets to page3 addresses in the freed range.
+        # EEPROM-backed overlays: stored in EEPROM, preloaded into freed
+        # SRAM space during init. Historically the destination was always
+        # page 3 (using `iderefp3`) — that page's [0..meta_base-1] region
+        # is freed up after self-copy moves the kernel image to code. But
+        # programs with few page-1 globals (or sparse page-2 native
+        # overlay use) often have *more* free space in page 1 or page 2.
+        # Picking the destination based on which page has the most slack
+        # roughly doubles the EEPROM-backed budget for those programs and
+        # unblocks corpus programs that currently overflow on the page-3
+        # cap alone.
+        #
+        # Strategy: prefer page 3 if it fits (preserves existing behavior
+        # for programs that already work). Else fall back to page 1, then
+        # page 2. Error if none has space — caller knows the EEPROM
+        # payload is bigger than the largest free SRAM region.
         if has_eeprom:
-            # Freed page3 range after self-copy: [0 .. meta_base-1]
-            # (kernel image is no longer needed after self-copy copies it to code)
-            # Place EEPROM-backed overlays at page3[0..].
-            p3_ee_offset = 0
+            ee_total = sum(fsize for _, _, _, fsize, _ in ee_overlays)
+            # Free space in each candidate destination, after native overlay
+            # placement above:
+            #   p3: kernel-image region freed by self-copy ≈ p3_code_offset
+            #   p1: leftover after globals + native p1 overlays = p1_capacity
+            #   p2: leftover within OVERLAY_BYTES = p2_capacity
+            _opts = [
+                ('p3', p3_code_offset, 0),
+                ('p1', p1_capacity, p1_code_offset),
+                ('p2', p2_capacity, p2_code_offset),
+            ]
+            _fits = [(t, cap, start) for t, cap, start in _opts if cap >= ee_total]
+            if not _fits:
+                raise Exception(
+                    f"EEPROM payload {ee_total}B exceeds every preload "
+                    f"destination's free space (p3={p3_code_offset}B, "
+                    f"p1={p1_capacity}B, p2={p2_capacity}B)"
+                )
+            _p3_fit = next((o for o in _fits if o[0] == 'p3'), None)
+            if _p3_fit is not None:
+                preload_target, _, preload_dest_start = _p3_fit
+            else:
+                preload_target, _, preload_dest_start = max(_fits, key=lambda x: x[1])
+
+            # Re-map EEPROM overlay offsets into the chosen destination's
+            # address range. Each entry's 5th tuple slot is the runtime
+            # address the loader's deref will read.
+            cur_off = preload_dest_start
             for ei in range(len(ee_overlays)):
                 idx, name, asm_lines, fsize, _ee_offset = ee_overlays[ei]
-                ee_overlays[ei] = (idx, name, asm_lines, fsize, p3_ee_offset)
-                p3_ee_offset += fsize
-            # These are now page3 overlays from the loader's perspective
-            p3_overlays = list(ee_overlays) + list(p3_overlays)
-            has_p3 = True
-            # EEPROM preload runs after self-copy. __i2c_sb is typically
-            # resident (mini-copied). __i2c_rb uses _init copy (at init
-            # addresses, intact after self-copy). Preload code in self_copy
-            # uses _init suffixed labels set below.
+                ee_overlays[ei] = (idx, name, asm_lines, fsize, cur_off)
+                cur_off += fsize
+
+            # Merge the EEPROM-backed entries into the target page's
+            # overlay list. Manifest emission below reads these lists; the
+            # `pages` table assigns the correct deref op (deref/deref2/
+            # derefp3) based on which list each name lives in.
+            if preload_target == 'p3':
+                # Existing behavior: ee bytes occupy the freed kernel-image
+                # region BELOW where native p3 overlays start.
+                p3_overlays = list(ee_overlays) + list(p3_overlays)
+                has_p3 = True
+            elif preload_target == 'p1':
+                # ee bytes go AFTER native p1 overlays + globals.
+                p1_overlays = list(p1_overlays) + list(ee_overlays)
+                has_p1 = True
+                p1_code_offset = cur_off
+                p1_capacity = 256 - cur_off
+            elif preload_target == 'p2':
+                p2_overlays = list(p2_overlays) + list(ee_overlays)
+                has_p2 = True
+                p2_code_offset = cur_off
+                p2_capacity = P2_OVERLAY_BYTES - cur_off
+
+            # Stash for the preload code emitter below — chooses ideref op.
+            self._ee_preload_target = preload_target
+
             import sys
-            print(f"  EEPROM-backed: {len(ee_overlays)} overlays ({p3_ee_offset}B) "
-                  f"preloaded from EEPROM 0x{ee_overlay_base:04X} → page3[0..{p3_ee_offset-1}]",
+            print(f"  EEPROM-backed: {len(ee_overlays)} overlays ({ee_total}B) "
+                  f"preloaded from EEPROM 0x{ee_overlay_base:04X} → "
+                  f"{preload_target}[{preload_dest_start}..{preload_dest_start+ee_total-1}]",
                   file=sys.stderr)
 
         # ── Step 15: Final kernel sizing ──
@@ -8930,6 +8984,17 @@ class MK1CodeGen:
         ee_preload_bytes = sum(fsize for _, _, _, fsize, _ in ee_overlays)
         if ee_preload_bytes > 0:
             ee_hi_byte = (ee_overlay_base >> 8) & 0xFF
+            # Pick the right ideref op for the chosen preload destination.
+            # Set by `has_eeprom` block above; defaults to page 3 for safety.
+            _preload_target = getattr(self, '_ee_preload_target', 'p3')
+            _ideref_op = {'p3': 'iderefp3',
+                          'p1': 'ideref',
+                          'p2': 'ideref2'}[_preload_target]
+            # Page 3 historically relied on C being zero from CPU reset
+            # (saves 2B). Pages 1/2 need C initialized to the preload start
+            # offset (where native overlays + globals end). Emit `ldi $c,N`
+            # only when the target needs a non-zero starting offset.
+            ee0 = ee_overlays[0][4] if ee_overlays else 0
             self_copy.extend([
                 '; ── EEPROM preload (inline sequential read) ──',
                 '\texrw 2',
@@ -8952,10 +9017,14 @@ class MK1CodeGen:
                 '\tldi $a,0xAF',
                 '\tjal __i2c_sb',
                 f'\tldi $d,{ee_preload_bytes}',
-                # $c is the page3 write address counter, starts at 0. CPU
-                # reset zeroes all GPRs; the preceding self_copy loop and
-                # __i2c_sb calls clobber A/B/D but not C — so C is still 0
-                # here without an explicit ldi. Saves 2B in stage-1.
+            ])
+            # $c is the page-X write address counter. For p3 (default), the
+            # CPU-reset-zeroed C is fine — saves 2B. For p1/p2 destinations
+            # the start offset is non-zero (lives after globals + native
+            # overlays), so emit an explicit ldi.
+            if ee0 != 0:
+                self_copy.append(f'\tldi $c,{ee0}')
+            self_copy.extend([
                 '.ee_byte:',
                 # Inner bit loop: explicit push/pop counter. B accumulates
                 # the byte; sllb shifts left (bit 0 always 0 after) then
@@ -8983,12 +9052,12 @@ class MK1CodeGen:
                 '\tjnz .ee_bit',
                 '\tpop $a',
                 # B=read_byte (from sentinel loop), C=address counter.
-                # Need: A=byte, B=address for iderefp3.
+                # Need: A=byte, B=address for the page-X store op.
                 # Old code used push/pop to save byte across C→B; the two-mov
                 # version saves 2B by routing byte through A directly.
                 '\tmov $b,$a',            # A = B (byte)
                 '\tmov $c,$b',            # B = C (address)
-                '\tiderefp3',             # page3[B=addr] = A=byte
+                f'\t{_ideref_op}',        # page<X>[B=addr] = A=byte
                 self._i2c_ddrb_str(0x03),
                 self._i2c_ddrb_str(0x01),
                 self._i2c_ddrb_str(0x03),
