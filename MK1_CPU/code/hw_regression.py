@@ -267,7 +267,8 @@ def compile_c(source_path, eeprom=False, optimize=True, extra_env=None):
 
 class Test:
     def __init__(self, name, source, expected, eeprom=False, cycles=500_000, us=2,
-                 env=None, expected_intervals_ms=None, interval_tolerance_pct=5):
+                 env=None, expected_intervals_ms=None, interval_tolerance_pct=5,
+                 audio=False):
         self.name = name
         self.source = source
         self.expected = expected   # list of ints, prefix of expected OI history
@@ -288,6 +289,11 @@ class Test:
         # a real calibration bug to investigate.
         self.expected_intervals_ms = expected_intervals_ms
         self.interval_tolerance_pct = interval_tolerance_pct
+        # If True, this test plays sound through the piezo (e.g. via
+        # `tone()` builtin). Skipped by default since the audible chirp
+        # is disruptive in shared spaces. Pass `--audio` on the CLI to
+        # include them in the run.
+        self.audio = audio
 
 
 def run_one(ser, test, verbose=False):
@@ -543,6 +549,60 @@ TESTS = [
         cycles=50_000,
     ),
     Test(
+        # Forces an overlay-extracted user fn into PAGE 2 storage
+        # (`section stack_code`) and calls it from main. Catches
+        # bugs where page-2 overlay bytes drift away from the
+        # manifest's declared offset — specifically the manifest-
+        # emission-order bug fixed in `73d9a6d`. Before that fix,
+        # this test fails: leaf_a's body loads as zeros (wrong page-2
+        # offset), the slot executes through zeros into HLT, only
+        # main's `out(0xF0)` repeats.
+        #
+        # Layout forced by the four globals (148 B in page 1) plus
+        # three ~74B leaf bodies: leaf_a → page 2 (stack_code),
+        # leaf_b → page 1 (data_code), leaf_c → kernel-resident.
+        # Different placements per page exercise the loader's
+        # page-dispatch arms (`.copy_p1` / `.copy_p2`) end-to-end.
+        'overlay placement: page-2 storage end-to-end',
+        '''unsigned char fill_p1[100];
+        unsigned char tally_a[14];
+        unsigned char tally_b[14];
+        unsigned char tally_c[14];
+        void leaf_a(void) {
+            out(0xA1);
+            tally_a[0]++; tally_a[1]++; tally_a[2]++; tally_a[3]++;
+            tally_a[4]++; tally_a[5]++; tally_a[6]++; tally_a[7]++;
+            tally_a[8]++; tally_a[9]++; tally_a[10]++; tally_a[11]++;
+            tally_a[12]++; tally_a[13]++;
+            out(0xA2);
+        }
+        void leaf_b(void) {
+            out(0xB1);
+            tally_b[0]++; tally_b[1]++; tally_b[2]++; tally_b[3]++;
+            tally_b[4]++; tally_b[5]++; tally_b[6]++; tally_b[7]++;
+            tally_b[8]++; tally_b[9]++; tally_b[10]++; tally_b[11]++;
+            tally_b[12]++; tally_b[13]++;
+            out(0xB2);
+        }
+        void leaf_c(void) {
+            out(0xC1);
+            tally_c[0]++; tally_c[1]++; tally_c[2]++; tally_c[3]++;
+            tally_c[4]++; tally_c[5]++; tally_c[6]++; tally_c[7]++;
+            tally_c[8]++; tally_c[9]++; tally_c[10]++; tally_c[11]++;
+            tally_c[12]++; tally_c[13]++;
+            out(0xC2);
+        }
+        void main(void) {
+            out(0xDE); out(0xAD); out(0xBE);
+            out(0xF0); leaf_a(); out(0xF1);
+            leaf_b(); out(0xF2);
+            leaf_c(); out(0xF3);
+            halt();
+        }''',
+        [0xF0, 0xA1, 0xA2, 0xF1, 0xB1, 0xB2, 0xF2, 0xC1, 0xC2, 0xF3],
+        cycles=100_000,
+    ),
+    Test(
         'xs-abstract init-touch: thunk extracted from init code',
         # With MIN_LEN=3, the 3-instr I2C STOP pattern (ddrb_imm 0x03/0x01/0x00)
         # extracts as a kernel thunk. The thunk occurrences span BOTH the
@@ -651,6 +711,7 @@ TESTS = [
         # to half_period correctly). Overlay-mode tone precision is a
         # separate, deferred investigation.
         interval_tolerance_pct=10,
+        audio=True,
     ),
     Test(
         # Exercises BOTH paths through the LCD driver: the PCA9633
@@ -715,10 +776,15 @@ def main():
     ap.add_argument('--cycles', type=int, default=2_000_000)
     ap.add_argument('-v', '--verbose', action='store_true')
     ap.add_argument('--filter', help='Run only tests whose name contains this substring')
+    ap.add_argument('--audio', action='store_true',
+                    help='Include audio/piezo tests (skipped by default; '
+                         'they chirp through the speaker which is disruptive)')
     args = ap.parse_args()
 
     ser = open_serial(args.port)
-    print(f'MK1 hardware regression  port={args.port}  replications={args.replications}')
+    skipped_audio = sum(1 for t in TESTS if t.audio) if not args.audio else 0
+    audio_note = '' if args.audio else f'  (audio: skipped — pass --audio to include)'
+    print(f'MK1 hardware regression  port={args.port}  replications={args.replications}{audio_note}')
     print()
     passed = 0
     failed = 0
@@ -726,6 +792,8 @@ def main():
         if args.filter and args.filter not in t.name:
             continue
         if t.name.startswith('__skip'):
+            continue
+        if t.audio and not args.audio:
             continue
         if args.cycles != 2_000_000:
             t.cycles = args.cycles
