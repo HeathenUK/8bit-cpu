@@ -9,13 +9,17 @@ Usage:
 """
 
 import sys
+import os as _os
 import argparse
 from copy import deepcopy
 
 # ── Import microcode definitions ─────────────────────────────────────
 
-# Execute microcode.py up to (but not including) generate_microcode
-_mc_source = open('microcode.py').read()
+# Execute microcode.py up to (but not including) generate_microcode.
+# Resolve relative to this file so importers don't have to chdir.
+_mc_path = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)),
+                          'microcode.py')
+_mc_source = open(_mc_path).read()
 _mc_defs = _mc_source.split('def generate_microcode')[0]
 exec(compile(_mc_defs, 'microcode.py', 'exec'))
 

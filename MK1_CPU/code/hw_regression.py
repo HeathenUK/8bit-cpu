@@ -92,6 +92,38 @@ def assemble_upload(ser, asm_text, timeout=15):
     return True
 
 
+def dump_pages(ser, timeout=10):
+    """Fetch the four 256B SRAM pages from the ESP32's uploadBuf.
+
+    uploadBuf layout: [code(256), data(256), stack(256), page3(256)].
+    Returns a dict {'code', 'data', 'stack', 'page3'} of bytearrays —
+    the same shape `verify_via_sim.esp32_assemble_and_dump()` returns.
+
+    Used by the sim cross-check (--differential): after `assemble_upload`
+    has written the assembler output into uploadBuf, this lets us run
+    the same program in the simulator without re-uploading or re-
+    opening the serial port.
+    """
+    ser.timeout = timeout
+    out = bytearray()
+    BLK = 64
+    for off in range(0, 1024, BLK):
+        ser.reset_input_buffer()
+        ser.write(f'DUMP:{off},{BLK}\n'.encode())
+        line = ser.readline().decode().strip()
+        for tok in line.split():
+            if len(tok) == 2:
+                out.append(int(tok, 16))
+    if len(out) < 1024:
+        raise RuntimeError(f'DUMP short: got {len(out)} bytes, expected 1024')
+    return {
+        'code':  out[0:256],
+        'data':  out[256:512],
+        'stack': out[512:768],
+        'page3': out[768:1024],
+    }
+
+
 def runlog(ser, cycles=5_000_000, us=1, timeout=30):
     """RUNLOG: continuous OI capture. Returns dict with vals list."""
     # Reset BEFORE each run — UPLOAD doesn't reset PC, and any prior run
@@ -268,7 +300,7 @@ def compile_c(source_path, eeprom=False, optimize=True, extra_env=None):
 class Test:
     def __init__(self, name, source, expected, eeprom=False, cycles=500_000, us=2,
                  env=None, expected_intervals_ms=None, interval_tolerance_pct=5,
-                 audio=False):
+                 audio=False, needs_hw_peripherals=False):
         self.name = name
         self.source = source
         self.expected = expected   # list of ints, prefix of expected OI history
@@ -294,14 +326,29 @@ class Test:
         # is disruptive in shared spaces. Pass `--audio` on the CLI to
         # include them in the run.
         self.audio = audio
+        # If True, the test depends on responses from physical I²C
+        # peripherals (RTC SQW for delay_calibrate, LCD ack for
+        # writes, etc.) that the simulator doesn't model. The
+        # `--differential` sim cross-check skips these tests because
+        # sim's empty/hung output isn't a real divergence — it just
+        # means the peripheral isn't there. Hardware leg still runs.
+        self.needs_hw_peripherals = needs_hw_peripherals
 
 
-def run_one(ser, test, verbose=False):
+def run_one(ser, test, verbose=False, differential=False):
     """Compile + upload + runlog once. Return (passed, actual_trimmed, notes).
 
     Retries up to 3 times on cnt=0 (no captures = MK1 didn't even reach
     the first out_imm — almost always indicates the upload didn't latch
-    or RESET held the CPU). Each retry re-uploads."""
+    or RESET held the CPU). Each retry re-uploads.
+
+    With `differential=True`, also runs the program in the simulator
+    (using the assembled bytes from uploadBuf, no recompile) and asserts
+    the sim's deduped output matches the hardware's. Catches sim ↔
+    hardware divergences — exactly the class of bug that masked the
+    page-2 manifest issue (where sim halted but hardware ran with
+    degenerate output, and trusting either alone gave a false signal).
+    """
     wrapped = wrap_with_sentinel(test.source)
     with open('/tmp/_hwreg_src.c', 'w') as f:
         f.write(wrapped)
@@ -310,11 +357,36 @@ def run_one(ser, test, verbose=False):
     if asm is None:
         return False, [], f'compile error: {compile_err[:200]}'
 
+    sim_actual = None
+    sim_notes = ''
+
     last_notes = ''
     for attempt in range(3):
         if not assemble_upload(ser, asm):
             last_notes = f'assemble/upload failed (attempt {attempt+1})'
             continue
+
+        # Run in sim once (after the first successful assemble_upload).
+        # Pull pages straight from uploadBuf — no re-assembly. Tests
+        # marked `needs_hw_peripherals` are skipped — sim doesn't
+        # model RTC SQW / LCD ACK / etc.
+        if differential and sim_actual is None and not test.needs_hw_peripherals:
+            try:
+                import mk1sim
+                pages = dump_pages(ser)
+                cpu = mk1sim.MK1()
+                cpu.mem[0] = bytearray(pages['code'])
+                cpu.mem[1] = bytearray(pages['data'])
+                cpu.mem[2] = bytearray(pages['stack'])
+                cpu.mem[3] = bytearray(pages['page3'])
+                cpu.run(test.cycles)
+                sim_dedup = dedup_consecutive(cpu.output_history)
+                sim_actual = find_sequence(sim_dedup, test.expected)
+                sim_notes = f' sim={sim_actual} halted={cpu.halted}'
+            except Exception as e:
+                sim_actual = ['<sim_error>']
+                sim_notes = f' sim_error={e}'
+
         r = runlog(ser, cycles=test.cycles, us=test.us)
         if 'error' in r:
             last_notes = r['error']
@@ -369,6 +441,14 @@ def run_one(ser, test, verbose=False):
                     continue
                 return False, actual, last_notes
             last_notes += f' intervals_ms={[f"{x:.1f}" for x in actual_ms]}'
+        # Differential check: hardware passed; does sim agree?
+        if differential and sim_actual is not None:
+            if sim_actual != actual:
+                return False, actual, (
+                    last_notes +
+                    f' SIM_HW_DIVERGENCE: hw={actual} sim={sim_actual}{sim_notes}'
+                )
+            last_notes += sim_notes
         return True, actual, last_notes
     return False, [], last_notes
 
@@ -385,11 +465,12 @@ def _ts_for_sequence(vals, ts, expected):
     return None
 
 
-def run_test(ser, test, replications=3, verbose=False):
+def run_test(ser, test, replications=3, verbose=False, differential=False):
     """Run a test `replications` times. All must pass with identical output."""
     actuals = []
     for i in range(replications):
-        passed, actual, notes = run_one(ser, test, verbose=verbose)
+        passed, actual, notes = run_one(ser, test, verbose=verbose,
+                                        differential=differential)
         actuals.append(actual)
         if not passed:
             print(f'  [FAIL rep {i+1}/{replications}] {test.name}', file=sys.stderr)
@@ -675,6 +756,7 @@ TESTS = [
         cycles=2_000_000,
         expected_intervals_ms=[50.0, 100.0, 50.0],
         interval_tolerance_pct=5,
+        needs_hw_peripherals=True,  # delay_calibrate() reads RTC SQW
     ),
     Test(
         'tone duration timing',
@@ -712,6 +794,7 @@ TESTS = [
         # separate, deferred investigation.
         interval_tolerance_pct=10,
         audio=True,
+        needs_hw_peripherals=True,  # delay_calibrate() reads RTC SQW
     ),
     Test(
         # Exercises BOTH paths through the LCD driver: the PCA9633
@@ -732,6 +815,7 @@ TESTS = [
             halt();
         }''',
         [42], eeprom=True, cycles=500_000,
+        needs_hw_peripherals=True,  # lcd_init/lcd_rgb/printf talk to LCD over I2C
     ),
     Test(
         # Issue #1: regparam in $a was elided (no save) for functions
@@ -779,12 +863,18 @@ def main():
     ap.add_argument('--audio', action='store_true',
                     help='Include audio/piezo tests (skipped by default; '
                          'they chirp through the speaker which is disruptive)')
+    ap.add_argument('--differential', action='store_true',
+                    help='Also run each test in the simulator and assert '
+                         'the sim output matches hardware. Catches sim ↔ '
+                         'hardware divergences (compiler emission bugs that '
+                         'manifest only on real silicon, etc.)')
     args = ap.parse_args()
 
     ser = open_serial(args.port)
     skipped_audio = sum(1 for t in TESTS if t.audio) if not args.audio else 0
     audio_note = '' if args.audio else f'  (audio: skipped — pass --audio to include)'
-    print(f'MK1 hardware regression  port={args.port}  replications={args.replications}{audio_note}')
+    diff_note = '  (sim cross-check enabled)' if args.differential else ''
+    print(f'MK1 hardware regression  port={args.port}  replications={args.replications}{audio_note}{diff_note}')
     print()
     passed = 0
     failed = 0
@@ -797,7 +887,8 @@ def main():
             continue
         if args.cycles != 2_000_000:
             t.cycles = args.cycles
-        if run_test(ser, t, replications=args.replications, verbose=args.verbose):
+        if run_test(ser, t, replications=args.replications, verbose=args.verbose,
+                    differential=args.differential):
             passed += 1
         else:
             failed += 1
