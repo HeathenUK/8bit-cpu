@@ -9191,7 +9191,7 @@ class MK1CodeGen:
         assembled.append('__ov_entry:')
 
         # Pad page3 buffer up to where the partitioner claimed the first
-        # p3 overlay starts. `p3_code_offset` was set to
+        # NATIVE p3 overlay starts. `p3_code_offset` was set to
         # `meta_base + meta_table_size` (line ~8410) which adds headroom
         # over the actual kernel image size — so manifest claims the
         # overlay is at offset X but the assembler's natural page3_size
@@ -9203,10 +9203,24 @@ class MK1CodeGen:
         # issue fixed in `73d9a6d`. The forward `org` pads with 0x00
         # which is fine — those bytes are never executed (they sit in
         # the gap between the kernel image and the first overlay).
-        if p3_overlays:
-            first_p3_offset = p3_overlays[0][4]
+        #
+        # EEPROM-backed overlays appear in `p3_overlays` (they're loaded
+        # into page3 at runtime via __eeprom_preload) but their bytes
+        # live in the eeprom section, not in page3 at upload time. They
+        # have manifest offsets starting at 0 (where the runtime preload
+        # places them). Filter them out of the alignment calc — their
+        # offsets are smaller than kernel_image_size and would force a
+        # backward org that wipes the kernel image bytes. The native p3
+        # overlays' offsets start AFTER the eeprom-preload region by
+        # design (they're placed at p3_code_offset += eeprom-preload
+        # size at the point eeprom slots are reserved).
+        ee_overlay_names = {name for _, name, _, _, _ in ee_overlays} if has_eeprom else set()
+        native_p3_offsets = [off for _, name, _, _, off in p3_overlays
+                             if name not in ee_overlay_names]
+        if native_p3_offsets:
+            first_native_p3_offset = min(native_p3_offsets)
             assembled.append('\tsection page3')
-            assembled.append(f'\torg {first_p3_offset}')
+            assembled.append(f'\torg {first_native_p3_offset}')
 
         # Phase 3: Overlay code at OVERLAY_REGION addresses into storage pages
         # Skip EEPROM-backed overlays (they go to EEPROM section, not page3_code)
