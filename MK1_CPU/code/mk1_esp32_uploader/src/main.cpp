@@ -1842,7 +1842,8 @@ static void handleSerialCommand(const String& line) {
         }
         uint32_t cksum = 0;
         for (int i = 0; i < uploadSize; i++) cksum += uploadBuf[i];
-        Serial.printf("{\"ok\":true,\"code\":%d,\"data\":%d,\"cksum\":%u,\"hex\":\"", codeBytes, dataBytes, cksum);
+        Serial.printf("{\"ok\":true,\"code\":%d,\"data\":%d,\"eeprom\":%d,\"cksum\":%u,\"hex\":\"",
+            codeBytes, dataBytes, r.eeprom_size, cksum);
         for (int i = 0; i < codeBytes && i < 16; i++) {
             if (i) Serial.print(' ');
             Serial.printf("%02X", r.code[i]);
@@ -2435,6 +2436,23 @@ static void handleSerialCommand(const String& line) {
         for (int i = 0; i < cnt && off + i < (int)sizeof(uploadBuf); i++) {
             if (i) Serial.print(' ');
             Serial.printf("%02X", uploadBuf[off + i]);
+        }
+        Serial.println();
+    }
+    else if (line.startsWith("DUMP_EE:")) {
+        // DUMP_EE:offset,count — dump assembler.result.eeprom bytes as hex.
+        // Diagnostic for emission-order bugs in the EEPROM section (e.g. an
+        // overlay landing at eeprom[0xF0] instead of eeprom[0x100] because
+        // the 16-byte header pad was skipped). Reads the assembler's eeprom
+        // buffer, NOT the AT24C32 — what was *meant* to be written.
+        int comma = line.indexOf(',', 8);
+        int off = line.substring(8, comma > 0 ? comma : line.length()).toInt();
+        int cnt = comma > 0 ? line.substring(comma + 1).toInt() : 16;
+        if (cnt > 64) cnt = 64;
+        const AsmResult& er = assembler.result;
+        for (int i = 0; i < cnt && off + i < EEPROM_SIZE; i++) {
+            if (i) Serial.print(' ');
+            Serial.printf("%02X", er.eeprom[off + i]);
         }
         Serial.println();
     }

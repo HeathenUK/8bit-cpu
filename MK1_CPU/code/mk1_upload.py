@@ -117,46 +117,79 @@ def _write_cached_hash(h, port):
         pass
 
 
-def dump_bufs(ser):
-    """Hex-dump the four 256B SRAM page buffers from the firmware's uploadBuf.
+def _read_hex_line(ser):
+    """Read serial lines until one looks like hex tokens, skipping diagnostic
+    strings (firmware streams "EEPROM shim page 0x..." async during EEPROM
+    writes; they sometimes land in the buffer between our DUMP request and
+    the response). Returns the matching line or '' on timeout."""
+    for _ in range(20):
+        line = ser.readline().decode(errors='replace').strip()
+        if not line:
+            return ''
+        toks = line.split()
+        if toks and all(len(t) == 2 for t in toks):
+            return line
+    return ''
 
-    uploadBuf layout: [code(256), data(256), stack(256), page3(256)]. Reads
-    via the firmware's DUMP:offset,count command and prints a 16-row × 16-byte
-    grid per page. Use after UPLOAD when you suspect an emission-order bug —
-    e.g. the manifest claims overlay X is at offset 192 but its bytes actually
-    landed at 198, so `derefp3` reads zeros. A glance at the page-2 dump shows
-    the bytes' real position.
-    """
+
+def _dump_region(ser, cmd, total, label_offset_base=0):
+    """Dump `total` bytes via repeated `cmd:off,BLK` calls. Returns bytearray."""
     BLK = 64
     raw = bytearray()
-    for off in range(0, 1024, BLK):
+    for off in range(0, total, BLK):
         ser.reset_input_buffer()
-        ser.write(f'DUMP:{off},{BLK}\n'.encode())
-        # Skip non-hex diagnostic lines (firmware streams "EEPROM shim
-        # page 0x..." async during EEPROM writes; they sometimes land
-        # in the buffer between our DUMP request and the response).
-        line = ''
-        for _ in range(20):
-            line = ser.readline().decode(errors='replace').strip()
-            if not line:
-                break
-            toks = line.split()
-            if toks and all(len(t) == 2 for t in toks):
-                break
+        ser.write(f'{cmd}:{off + label_offset_base},{BLK}\n'.encode())
+        line = _read_hex_line(ser)
         for tok in line.split():
             if len(tok) == 2:
                 raw.append(int(tok, 16))
+    return raw
+
+
+def _hex_print(name, page, base=0, width=16):
+    """Pretty 16-byte-wide hex grid with ASCII gutter."""
+    print(f'\n── {name} ({len(page)}B) ──')
+    for row in range(0, len(page), width):
+        offset = base + row
+        chunk = page[row:row+width]
+        hex_part = ' '.join(f'{b:02X}' for b in chunk)
+        ascii_part = ''.join(chr(b) if 32 <= b < 127 else '.' for b in chunk)
+        print(f'  {offset:04X}: {hex_part:<{width*3-1}}  |{ascii_part}|')
+
+
+def dump_bufs(ser, eeprom_size=0):
+    """Hex-dump the four 256B SRAM page buffers from the firmware's uploadBuf,
+    plus the EEPROM buffer when `eeprom_size > 0`.
+
+    uploadBuf layout: [code(256), data(256), stack(256), page3(256)]. Reads
+    via the firmware's DUMP:offset,count command. Use after UPLOAD when you
+    suspect an emission-order bug — e.g. the manifest claims overlay X is at
+    offset 192 but its bytes actually landed at 198, so `derefp3` reads zeros.
+    A glance at the page-2 dump shows the bytes' real position.
+
+    EEPROM buffer dump targets the `assembler.result.eeprom[]` buffer (what
+    was *meant* to be written to AT24C32, NOT the live AT24C32 contents).
+    Catches alignment issues where eg. an overlay lands at eeprom[0xF0]
+    instead of eeprom[0x100] because the 16-byte header pad was skipped.
+    """
+    raw = _dump_region(ser, 'DUMP', 1024)
     if len(raw) < 1024:
         print(f'  dump short: got {len(raw)} bytes, expected 1024', file=sys.stderr)
         return
     for i, name in enumerate(['code', 'data', 'stack', 'page3']):
-        print(f'\n── {name} (page {i}, 256B) ──')
-        page = raw[i*256:(i+1)*256]
-        for row in range(16):
-            offset = row * 16
-            hex_part = ' '.join(f'{b:02X}' for b in page[offset:offset+16])
-            ascii_part = ''.join(chr(b) if 32 <= b < 127 else '.' for b in page[offset:offset+16])
-            print(f'  {offset:02X}: {hex_part}  |{ascii_part}|')
+        _hex_print(f'{name} (page {i})', raw[i*256:(i+1)*256])
+    if eeprom_size > 0:
+        # Round up to next 64B block so we cover the full payload.
+        ee_total = (eeprom_size + 63) & ~63
+        ee_raw = _dump_region(ser, 'DUMP_EE', ee_total)
+        if len(ee_raw) >= eeprom_size:
+            _hex_print(f'eeprom (assembler buffer, {eeprom_size}B used)',
+                       ee_raw[:eeprom_size])
+        else:
+            print(f'  eeprom dump short: got {len(ee_raw)} bytes, expected {eeprom_size}',
+                  file=sys.stderr)
+            print(f'  (firmware may need re-flashing for DUMP_EE support)',
+                  file=sys.stderr)
 
 
 def main():
@@ -196,6 +229,7 @@ def main():
     # Hash + cache check — skip ASM if uploadBuf already has these bytes.
     asm_h = _asm_hash(asm)
     cached_h = None if args.no_cache else _read_cached_hash(args.port)
+    eeprom_size = 0
     if cached_h == asm_h:
         print(f'Skipping assembly (cache hit, hash={asm_h[:8]}...)')
     else:
@@ -210,16 +244,20 @@ def main():
             ser.close()
             sys.exit(1)
         print(f'  code={r["code"]}B data={r.get("data",0)}B')
+        eeprom_size = r.get('eeprom', 0)
         _write_cached_hash(asm_h, args.port)
+
+    # Optional: hex-dump the four SRAM page buffers from uploadBuf and the
+    # assembler's EEPROM buffer for emission-order debugging (see `dump_bufs`
+    # docstring). MUST be done BEFORE UPLOAD: writeEepromData internally
+    # re-runs the assembler to build I²C shim programs, which zeros
+    # `result.eeprom[]`. The SRAM uploadBuf is unaffected.
+    if args.dump_bufs or os.environ.get('MK1_DUMP_BUFS') == '1':
+        dump_bufs(ser, eeprom_size=eeprom_size)
 
     # Upload
     print('Uploading...')
     mk1_upload(ser)
-
-    # Optional: hex-dump the four SRAM page buffers from uploadBuf for
-    # emission-order debugging (see `dump_bufs` docstring).
-    if args.dump_bufs or os.environ.get('MK1_DUMP_BUFS') == '1':
-        dump_bufs(ser)
 
     # Run
     if args.run is not None:
