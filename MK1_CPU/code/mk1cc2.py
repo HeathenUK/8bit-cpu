@@ -3709,16 +3709,16 @@ class MK1CodeGen:
             self.emit('\tldi $d,8')        # D = bit counter
             self.emit(f'{lbl_rb}:')
             self.emit('\tmov $b,$a')       # A = accumulated
-            self.emit('\tsll')             # A <<= 1
-            self.emit('\tmov $a,$b')       # B = shifted
+            self.emit('\tsll')             # A <<= 1; bit 0 = 0 after shift
+            self.emit('\tmov $a,$b')       # B = shifted (bit 0 = 0)
             self.emit_ddrb(0x00)   # SCL HIGH
             self.emit('\texrw 0')          # A = port B
-            self.emit('\texrw 0')          # A = port B
+            self.emit('\texrw 0')          # A = port B (bus settle)
             self.emit('\ttst 0x01')        # test SDA
             self.emit(f'\tjz {lbl_rz}')
-            self.emit('\tmov $b,$a')       # A = accumulated
-            self.emit('\tori 0x01,$a')     # set bit 0
-            self.emit('\tmov $a,$b')       # B = result
+            # B[0] = 0 (just shifted in), so OR-1 == +1 == incb (1B vs 4B
+            # for the mov/ori/mov sequence). Saves 3 B per __i2c_rb.
+            self.emit('\tincb')            # set bit 0
             self.emit(f'{lbl_rz}:')
             self.emit_ddrb(0x02)   # SCL LOW
             self.emit('\tdecd')            # D--, A clobbered (unused here)
@@ -3912,16 +3912,15 @@ class MK1CodeGen:
             self.emit('\tldi $d,8')
             self.emit(f'{lbl_rdb}:')
             self.emit('\tmov $b,$a')
-            self.emit('\tsll')
+            self.emit('\tsll')                # bit 0 = 0 after shift
             self.emit('\tmov $a,$b')
             self.emit_ddrb(0x00)    # SCL HIGH
             self.emit('\tnop')
             self.emit('\texrw 0')           # read port
             self.emit('\ttst 0x01')
             self.emit(f'\tjz {lbl_rz}')
-            self.emit('\tmov $b,$a')
-            self.emit('\tori 0x01,$a')
-            self.emit('\tmov $a,$b')
+            # B[0] = 0 (just shifted in), so OR-1 == +1 == incb.
+            self.emit('\tincb')
             self.emit(f'{lbl_rz}:')
             self.emit_ddrb(0x02)    # SCL LOW
             self.emit('\tmov $d,$a')
