@@ -8957,28 +8957,31 @@ class MK1CodeGen:
                 # __i2c_sb calls clobber A/B/D but not C — so C is still 0
                 # here without an explicit ldi. Saves 2B in stage-1.
                 '.ee_byte:',
-                # Sentinel-bit inner loop: B starts at 0x01. Each iteration
-                # rotates B left through CF and ORs in the SDA bit. After
-                # 8 iterations the sentinel (original bit 0) has been shifted
-                # out into CF — `jc` exits. Saves the push/pop counter
-                # dance (~12B per call). Relies on sll setting CF post-flash.
-                '\tldi $b,0x01',          # sentinel at bit 0
+                # Inner bit loop: explicit push/pop counter. B accumulates
+                # the byte; sllb shifts left (bit 0 always 0 after) then
+                # `incb` sets bit 0 = 1 if SDA was high (1B vs 4B for the
+                # mov/ori/mov OR sequence). Earlier sentinel-bit trick
+                # (B=0x01, jc on shifted-out CF) saved ~12B but read only
+                # 7 bits per byte — sllb's CF-set exited *before* the 8th
+                # read, leaving every byte's bit 0 cleared.
+                '\tldi $b,0',
+                '\tpush_imm 8',
                 '.ee_bit:',
                 '\tmov $b,$a',
-                '\tsll',                  # A = B << 1, CF = old bit 7
+                '\tsll',                  # A = B << 1; bit 0 = 0 after shift
                 '\tmov $a,$b',            # B = shifted
-                '\tjc .ee_byte_end',      # sentinel shifted out → 8 bits done
                 self._i2c_ddrb_str(0x00),        # SCL HIGH (release, slave drives SDA)
                 '\texrw 0',               # A = port B (bit 0 = SDA)
                 '\ttst 0x01',
                 '\tjz .ee_bz',
-                '\tmov $b,$a',
-                '\tori 0x01,$a',          # B |= 1
-                '\tmov $a,$b',
+                '\tincb',                 # B[0] = 0 after sllb, so OR-1 == +1
                 '.ee_bz:',
                 self._i2c_ddrb_str(0x02),        # SCL LOW
-                '\tj .ee_bit',
-                '.ee_byte_end:',
+                '\tpop $a',
+                '\tdec',
+                '\tpush $a',
+                '\tjnz .ee_bit',
+                '\tpop $a',
                 # B=read_byte (from sentinel loop), C=address counter.
                 # Need: A=byte, B=address for iderefp3.
                 # Old code used push/pop to save byte across C→B; the two-mov
@@ -9346,12 +9349,24 @@ class MK1CodeGen:
         # The ESP32 writes er.eeprom (which this section appends to) to the
         # AT24C32 EEPROM during upload; after that the ESP32 has no role.
         if ee_overlays:
-            # Pad from self.eeprom_alloc to ee_overlay_base with zeros so
-            # overlays land at the known base address the preload uses.
-            pad_count = ee_overlay_base - self.eeprom_alloc
+            # Pad from start of EEPROM buffer to ee_overlay_base. The
+            # C++ assembler's `section eeprom` write pointer starts at
+            # 0, NOT at 0x10. If a prior `section eeprom` already emitted
+            # the 16-byte header (when self.eeprom_data is non-empty),
+            # skip it; otherwise emit zeros from 0 to cover the header
+            # region too. Without this, ee_overlay_base=0x100 became
+            # eeprom[0xF0] in the buffer and the runtime preload (which
+            # reads address 0x100 from the AT24C32) got bytes 16-bytes
+            # into the first overlay — out_imm 0xD1 looked like jal
+            # 0xAC. Bug existed since the inline preload landed.
+            if self.eeprom_data:
+                pad_start = self.eeprom_alloc  # header + globals already emitted
+            else:
+                pad_start = 0  # nothing emitted yet — start from buffer offset 0
+            pad_count = ee_overlay_base - pad_start
             if pad_count > 0:
                 assembled.append('\tsection eeprom')
-                assembled.append(f'; pad {pad_count}B from 0x{self.eeprom_alloc:04X} → 0x{ee_overlay_base:04X}')
+                assembled.append(f'; pad {pad_count}B from 0x{pad_start:04X} → 0x{ee_overlay_base:04X}')
                 for _ in range(pad_count):
                     assembled.append('\tbyte 0')
                 # Advance the compiler's eeprom_alloc so downstream eeprom
