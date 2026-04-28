@@ -9,7 +9,8 @@ unsigned char prev_key;
 
 void show(unsigned char idx) {
     display[0] = idx;
-    oled_print_buf(display, 1, 10, 12);
+    /* (col, row) = (8, 4): roughly screen-centre on the 16×8 cell grid */
+    oled_print_buf(display, 1, 8, 4);
 }
 
 void poll_once(void) {
@@ -24,6 +25,7 @@ void poll_once(void) {
 void main(void) {
     i2c_init();
     oled_init();
+    oled_clear();          /* wipe any residual content from a prior program */
     keypad_init();
     prev_key = 0xFF;
     while (1) poll_once();

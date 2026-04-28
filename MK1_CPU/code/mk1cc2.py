@@ -4118,15 +4118,39 @@ class MK1CodeGen:
             helper_name = f'__oled_fill_{k:02X}'
             if helper_name not in helpers:
                 continue
+            # Body shape was the unrolled-byte-send fast path (~80 B per
+            # helper, ~127 cyc/byte) which optimised for animation-style
+            # frequent fills. In practice oled_fill / oled_clear are
+            # almost always init-time one-shots where boot delay matters
+            # less than code-page footprint. Loop via the kernel-resident
+            # __i2c_sb instead — drops each helper from ~80 B to ~25 B
+            # (~55 B saved) at the cost of fill time roughly tripling
+            # (~127 cyc/byte → ~440 cyc/byte = ~22 s for the full 8192-
+            # byte clear at 165 kHz). The byte saving is what unblocks
+            # programs that need oled_clear() but currently bust the
+            # stage-1/kernel budget; if a program ever needs the fast
+            # path back it can be re-introduced under a separate builtin.
             self.emit(f'{helper_name}:')
             self.emit('\tjal __i2c_st_only')
             self.emit('\tldi $a,0x7A')         # OLED write addr
             self.emit('\tjal __i2c_sb')
             self.emit('\tldi $a,0x40')         # control: data stream
             self.emit('\tjal __i2c_sb')
-            # 8192-byte fill via the shared unrolled helper.
-            self.emit_unrolled_i2c_fill_const(k, 8192)
-            self.emit('\tout_imm 0x30')        # DEBUG: fill loop complete
+            # 8192-byte fill: outer × inner = 32 × 256 via __i2c_sb.
+            outer_lbl = self.label('ofl_o')
+            inner_lbl = self.label('ofl_i')
+            self.emit('\tldi $b,32')           # outer = 32 (32 × 256 = 8192)
+            self.emit(f'{outer_lbl}:')
+            self.emit('\tpush $b')             # save outer counter
+            self.emit('\tldi $c,0')            # inner = 256 (decc wraps 0→255)
+            self.emit(f'{inner_lbl}:')
+            self.emit(f'\tldi $a,{k}')         # constant fill byte
+            self.emit('\tjal __i2c_sb')
+            self.emit('\tdecc')
+            self.emit(f'\tjnz {inner_lbl}')
+            self.emit('\tpop $b')              # restore outer
+            self.emit('\tdecb')
+            self.emit(f'\tjnz {outer_lbl}')
             self.emit('\tjal __i2c_sp')
             self.emit('\tret')
 
