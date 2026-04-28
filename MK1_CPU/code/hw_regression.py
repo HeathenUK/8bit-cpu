@@ -684,6 +684,110 @@ TESTS = [
         cycles=100_000,
     ),
     Test(
+        # Cross-page reload thunk: caller (`leaf_a`) lands in page-1
+        # overlay storage (`section data_code`), callee (`leaf_b`) in
+        # page-2 (`section stack_code`), connected by a generated
+        # `__ovrl_leaf_a_leaf_b` reload thunk. This is the
+        # `keypad_oled.c` shape — the manifest-emission bug fixed in
+        # `73d9a6d` would have manifested here as leaf_b loading blank
+        # (slot reads zeros from page-2 offset 0 because the actual
+        # bytes are at offset 198+). Complements the page-2 storage
+        # test by exercising the reload thunk WHEN it crosses pages.
+        #
+        # Layout forced by the four globals (148 B in page 1) and three
+        # ~70B leaves: leaf_a → page 1 (data_code), leaf_b → page 2
+        # (stack_code), leaf_c → kernel-resident.
+        'overlay placement: cross-page reload thunk (p1 caller -> p2 callee)',
+        '''unsigned char fill_p1[100];
+        unsigned char tally_a[16];
+        unsigned char tally_b[16];
+        unsigned char tally_c[16];
+        void leaf_b(void) {
+            out(0xB1);
+            tally_b[0]++; tally_b[1]++; tally_b[2]++; tally_b[3]++;
+            tally_b[4]++; tally_b[5]++; tally_b[6]++; tally_b[7]++;
+            tally_b[8]++; tally_b[9]++; tally_b[10]++; tally_b[11]++;
+            tally_b[12]++; tally_b[13]++;
+            out(0xB2);
+        }
+        void leaf_a(void) {
+            out(0xA1); leaf_b(); out(0xA2);
+            tally_a[0]++; tally_a[1]++; tally_a[2]++; tally_a[3]++;
+            tally_a[4]++; tally_a[5]++; tally_a[6]++; tally_a[7]++;
+            tally_a[8]++; tally_a[9]++; tally_a[10]++; tally_a[11]++;
+            tally_a[12]++; tally_a[13]++;
+        }
+        void leaf_c(void) {
+            out(0xC1);
+            tally_c[0]++; tally_c[1]++; tally_c[2]++; tally_c[3]++;
+            tally_c[4]++; tally_c[5]++; tally_c[6]++; tally_c[7]++;
+            tally_c[8]++; tally_c[9]++; tally_c[10]++; tally_c[11]++;
+            tally_c[12]++; tally_c[13]++;
+            out(0xC2);
+        }
+        void main(void) {
+            out(0xDE); out(0xAD); out(0xBE);
+            out(0xF0); leaf_a(); out(0xF1);
+            leaf_c(); out(0xF2);
+            halt();
+        }''',
+        [0xF0, 0xA1, 0xB1, 0xB2, 0xA2, 0xF1, 0xC1, 0xC2, 0xF2],
+        cycles=100_000,
+    ),
+    Test(
+        # Page-3 overlay storage: forces an overlay-extracted user fn
+        # into `section page3_code` (page 3, after the transient kernel
+        # image). Five globals (148 B in page 1) plus four ~70B leaves
+        # exhaust pages 1+2 (1 leaf in page 1, 2 in page 2) so the
+        # fourth spills to page 3.
+        #
+        # Catches the same bug class as the page-2 storage test, but
+        # for the page-3 emission path. Pre-fix, the partitioner
+        # advanced p3_code_offset by `meta_table_size` (a hangover from
+        # when the manifest lived in page 3), so the manifest claimed
+        # the overlay started at e.g. offset 135 while the bytes
+        # actually landed at offset 123 (right after the kernel image)
+        # — the loader's `derefp3` read zeros, the slot loaded blank,
+        # main re-entered.
+        'overlay placement: page-3 storage end-to-end',
+        '''unsigned char fill[100];
+        unsigned char ta[16]; unsigned char tb[16];
+        unsigned char tc[16]; unsigned char td[16];
+        void leaf_a(void) {
+            out(0xA1);
+            ta[0]++; ta[1]++; ta[2]++; ta[3]++; ta[4]++; ta[5]++; ta[6]++;
+            ta[7]++; ta[8]++; ta[9]++; ta[10]++; ta[11]++; ta[12]++; ta[13]++;
+            out(0xA2);
+        }
+        void leaf_b(void) {
+            out(0xB1);
+            tb[0]++; tb[1]++; tb[2]++; tb[3]++; tb[4]++; tb[5]++; tb[6]++;
+            tb[7]++; tb[8]++; tb[9]++; tb[10]++; tb[11]++; tb[12]++; tb[13]++;
+            out(0xB2);
+        }
+        void leaf_c(void) {
+            out(0xC1);
+            tc[0]++; tc[1]++; tc[2]++; tc[3]++; tc[4]++; tc[5]++; tc[6]++;
+            tc[7]++; tc[8]++; tc[9]++; tc[10]++; tc[11]++; tc[12]++; tc[13]++;
+            out(0xC2);
+        }
+        void leaf_d(void) {
+            out(0xD1);
+            td[0]++; td[1]++; td[2]++; td[3]++; td[4]++; td[5]++; td[6]++;
+            td[7]++; td[8]++; td[9]++; td[10]++; td[11]++; td[12]++; td[13]++;
+            out(0xD2);
+        }
+        void main(void) {
+            out(0xDE); out(0xAD); out(0xBE);
+            out(0xF0);
+            leaf_a(); leaf_b(); leaf_c(); leaf_d();
+            out(0xF1);
+            halt();
+        }''',
+        [0xF0, 0xA1, 0xA2, 0xB1, 0xB2, 0xC1, 0xC2, 0xD1, 0xD2, 0xF1],
+        cycles=200_000,
+    ),
+    Test(
         'xs-abstract init-touch: thunk extracted from init code',
         # With MIN_LEN=3, the 3-instr I2C STOP pattern (ddrb_imm 0x03/0x01/0x00)
         # extracts as a kernel thunk. The thunk occurrences span BOTH the

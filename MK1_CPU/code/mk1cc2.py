@@ -9190,6 +9190,24 @@ class MK1CodeGen:
         assembled.append('\tsection page3_code')
         assembled.append('__ov_entry:')
 
+        # Pad page3 buffer up to where the partitioner claimed the first
+        # p3 overlay starts. `p3_code_offset` was set to
+        # `meta_base + meta_table_size` (line ~8410) which adds headroom
+        # over the actual kernel image size — so manifest claims the
+        # overlay is at offset X but the assembler's natural page3_size
+        # at this point is just `kernel_image_size`. Without this pad,
+        # the bytes emit at kernel_image_size (e.g. 123) and the
+        # manifest claims X (e.g. 135), so the loader's `derefp3` reads
+        # zeros from page3[X], the slot loads blank, execution falls
+        # into HLT fill or reset. Same bug class as the page-2 manifest
+        # issue fixed in `73d9a6d`. The forward `org` pads with 0x00
+        # which is fine — those bytes are never executed (they sit in
+        # the gap between the kernel image and the first overlay).
+        if p3_overlays:
+            first_p3_offset = p3_overlays[0][4]
+            assembled.append('\tsection page3')
+            assembled.append(f'\torg {first_p3_offset}')
+
         # Phase 3: Overlay code at OVERLAY_REGION addresses into storage pages
         # Skip EEPROM-backed overlays (they go to EEPROM section, not page3_code)
         ee_names = {name for _, name, _, _, _ in ee_overlays} if has_eeprom else set()
