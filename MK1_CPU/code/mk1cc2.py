@@ -137,16 +137,15 @@ P2_MANIFEST_BASE     = 0xC0
 #   0 is capped at 250 B by the partitioner; the slot at 0xF0..0xFF
 #   sits in the unused tail. Helpers that need a bigger slot can grow
 #   this region downward when the time comes.
-# 64 B slot starting at code[0xC0]: enough for genuine helpers
-# (oled_putc, lcd_chr, etc.) while leaving 192 B of page-0 budget
-# for kernel + main + non-cold helpers when cold-tier is active.
-# Cold-tier infrastructure (__cold_call + __eeprom_r2c_loop +
-# __i2c_sb + __i2c_rb) currently runs ~120-150 B kernel-resident,
-# so a program with cold-tier active has ~40-70 B for non-cold
-# user code. Tight but workable; the cold-tier pays for itself
-# only when the user has functions worth pushing cold.
+# Cold-tier slot lives at the high end of code page 0. The runtime
+# dispatcher loads each cold helper into addresses
+# [COLD_SLOT_BASE .. COLD_SLOT_BASE + max_cold_size - 1]. Slot size
+# is right-sized at compile time to fit the largest cold helper —
+# a program with only 30 B helpers reserves a 30 B slot rather than
+# the worst-case 64 B. `COLD_SLOT_BYTES` is the upper cap; the
+# partitioner picks `min(max_cold_size, COLD_SLOT_BYTES)` and
+# positions the slot accordingly.
 COLD_TABLE_BASE      = 0x10
-COLD_SLOT_BASE       = 0xC0
 COLD_SLOT_BYTES      = 64
 
 # Mnemonics that assemble to >1 byte. Mirrors the per-mnemonic byte
@@ -2796,8 +2795,14 @@ class MK1CodeGen:
         # as a cold helper (auto-id by current cold_helpers length, ee64
         # address from the bump allocator). Body byte size is enforced
         # against COLD_SLOT_BYTES so a too-large helper fails compile
-        # rather than silently corrupting kernel state at runtime.
+        # rather than silently corrupting kernel state at runtime. The
+        # actual slot size and base address are right-sized after
+        # compilation: `cold_slot_size = max(byte_size for cold funcs)`
+        # (or 0 if no cold tier active), `cold_slot_base = 256 -
+        # cold_slot_size`.
         self.cold_function_bodies = []
+        self.cold_slot_size = 0
+        self.cold_slot_base = 256  # sentinel: no cold tier yet
         if cold_fns_to_compile:
             saved_code = self.code
             for fn in cold_fns_to_compile:
@@ -2819,6 +2824,14 @@ class MK1CodeGen:
                     (cold_id, fn[0], cold_lines, byte_size, ee64_addr))
                 self.ee64_alloc += byte_size
             self.code = saved_code
+        # Right-size the slot to the largest cold body. Programs with
+        # cold byte-array helpers (`ee64 unsigned char[]`) also count
+        # — the dispatcher loads them into the same slot.
+        for _cid, _addr, sz, _name in self.cold_helpers:
+            if sz > self.cold_slot_size:
+                self.cold_slot_size = sz
+        if self.cold_slot_size > 0:
+            self.cold_slot_base = 256 - self.cold_slot_size
 
         # Rewrite direct calls to cold functions in the main code stream:
         # `jal _foo` becomes `ldi $a,id; jal __cold_call`. Must run after
@@ -2849,6 +2862,25 @@ class MK1CodeGen:
                         continue
                 new_code.append(line)
             self.code = new_code
+
+        # (C) Transitive deps: every compiler helper called from a cold
+        # function body has to be kernel-resident. A cold function runs
+        # from the COLD_SLOT_BASE region; if it does `jal __lcd_chr` and
+        # __lcd_chr lives in an overlay at some other address, the call
+        # lands wherever the overlay LRU happens to have placed it — i.e.
+        # garbage. Collecting the set here so _classify_helpers can force
+        # them into the no_ov set.
+        self._cold_function_callee_helpers = set()
+        for cold_id, fname, cold_lines, _bsz, _addr in self.cold_function_bodies:
+            for line in cold_lines:
+                s = line.strip()
+                # Match `jal __helper` (compiler helpers — leading __).
+                # User-function calls (`jal _foo`) are an error from a
+                # cold body and would have been caught above if they
+                # were cold; warm user calls aren't legal here.
+                if s.startswith('jal __'):
+                    target = s[len('jal '):].split()[0]
+                    self._cold_function_callee_helpers.add(target)
 
         # In --eeprom mode, the preload uses only __i2c_sb (inline sequential
         # read — no __eeprom_rd / __i2c_rb function dependencies). Ensure
@@ -3227,7 +3259,7 @@ class MK1CodeGen:
             for cold_id, fname, cold_lines, byte_size, ee64_addr in cold_bodies:
                 self.emit(f'; ee64 cold function _{fname} (id {cold_id}, '
                           f'{byte_size}B at ee64[0x{ee64_addr:04X}])')
-                self.emit(f'\torg {COLD_SLOT_BASE}')
+                self.emit(f'\torg {self.cold_slot_base}')
                 for line in cold_lines:
                     self.emit(line)
             self.emit('\tsection code')
@@ -3741,6 +3773,15 @@ class MK1CodeGen:
             no_ov.add('__cold_call:')
             if '__eeprom_r2c_loop' in helpers:
                 no_ov.add('__eeprom_r2c_loop:')
+
+        # (C) Cold-function callees: every compiler helper invoked from a
+        # cold-function body has to be kernel-resident — a cold function
+        # runs from a fixed slot address and a `jal __X` to an overlayed
+        # __X would land wherever the LRU happened to place it. The set
+        # is collected during cold-function compilation in compile().
+        for h in getattr(self, '_cold_function_callee_helpers', set()):
+            if h in helpers:
+                no_ov.add(f'{h}:')
 
         # Tone runtime helpers must be resident if used — they're called via jal
         # from every overlay that plays notes. Inlining would bloat each overlay.
@@ -5176,12 +5217,12 @@ class MK1CodeGen:
             self.emit('\tjal __i2c_sb')
             # Bulk-read into the cold slot. r2c_loop expects B = dest,
             # count on stack; len is already there (top of stack).
-            self.emit(f'\tldi $b,{COLD_SLOT_BASE}')
+            self.emit(f'\tldi $b,{self.cold_slot_base}')
             self.emit('\tjal __eeprom_r2c_loop')
             self.emit('\tpop $a')                          # discard count
             # Enter the loaded helper. jal_r pushes return PC; the cold
             # helper's `ret` returns back here, then we ret to caller.
-            self.emit(f'\tldi $a,{COLD_SLOT_BASE}')
+            self.emit(f'\tldi $a,{self.cold_slot_base}')
             self.emit('\tjal_r')
             self.emit('\tret')
 
@@ -6433,6 +6474,24 @@ class MK1CodeGen:
             } | {h for h in _helpers_used if h.startswith('__oled_fill_')})
             if _oled_runtime_used:
                 _force_resident_helpers |= {'__i2c_st_only', '__i2c_sp'}
+            # Cold-tier infrastructure must stay resident — the dispatcher
+            # is reached from any cold call site, and the bulk-read loop
+            # is called from the dispatcher itself (resident → resident).
+            # The cold-tier I²C primitives have to stay reachable too so
+            # the dispatcher can drive the AT24C512 without relying on an
+            # overlay-loaded helper. Without these forces, the
+            # conditionally-resident pruning at the end of step 8b kicks
+            # __cold_call back out into overlay-eligible territory, and
+            # any cold call from main jumps into whatever overlay
+            # happens to be loaded at __cold_call's address.
+            if '__cold_call' in _helpers_used:
+                _force_resident_helpers |= {
+                    '__cold_call', '__eeprom_r2c_loop',
+                    '__i2c_sb', '__i2c_rb',
+                }
+                # (C) Helpers transitively called from cold function bodies.
+                _force_resident_helpers |= getattr(
+                    self, '_cold_function_callee_helpers', set())
             # OLED helpers (__oled_stream_chars, __oled_set_window) used to be
             # in this set to prevent the partitioner from duplicating them
             # into each user-function overlay. Empirically, with the streaming

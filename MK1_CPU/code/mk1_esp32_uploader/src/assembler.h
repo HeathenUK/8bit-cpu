@@ -584,11 +584,24 @@ private:
                 char tok[32]; parseToken(p, tok, sizeof(tok));
                 int target = resolveValue(tok, lineNum, pass1);
                 if (bank == 0) {
-                    int current = result.code_size;
-                    if (target > current) {
-                        while (result.code_size < target) emitCode(0x7F, pass1);
-                    } else {
+                    // Special case: when emitting into the ee64 buffer
+                    // (codeEmitTarget=6), `org` is being used purely to
+                    // set the code-PC for label resolution — the actual
+                    // ee64 byte-write position is controlled by
+                    // result.ee64_size and is independent. Padding via
+                    // emitCode here would dump 0x7F filler bytes INTO
+                    // the ee64 image, shifting subsequent cold-function
+                    // bodies away from their advertised ee64 addresses.
+                    // Just snap the code-PC directly.
+                    if (codeEmitTarget == 6) {
                         result.code_size = target;
+                    } else {
+                        int current = result.code_size;
+                        if (target > current) {
+                            while (result.code_size < target) emitCode(0x7F, pass1);
+                        } else {
+                            result.code_size = target;
+                        }
                     }
                 } else if (bank == 1) {
                     int current = result.data_size;
