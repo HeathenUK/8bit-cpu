@@ -159,7 +159,7 @@ TOKEN_PATTERNS = [
 ]
 KEYWORDS = {'if', 'else', 'while', 'for', 'do', 'return', 'unsigned', 'char',
             'void', 'int', 'switch', 'case', 'default', 'break', 'continue',
-            'u8', 'u16', 'eeprom', 'sizeof', 'typedef', 'static'}
+            'u8', 'u16', 'eeprom', 'ee64', 'sizeof', 'typedef', 'static'}
 
 class Token:
     def __init__(self, type, value, line):
@@ -254,8 +254,15 @@ class Parser:
                 self.expect(';')
                 self.typedefs[alias] = typ
                 continue
-            # Check for 'eeprom' storage qualifier before type
-            storage = 'eeprom' if self.match('eeprom') else 'ram'
+            # Check for storage qualifiers before type. `ee64` overrides
+            # `eeprom` if both somehow appear; in practice they're
+            # mutually exclusive.
+            if self.match('ee64'):
+                storage = 'ee64'
+            elif self.match('eeprom'):
+                storage = 'eeprom'
+            else:
+                storage = 'ram'
             typ = self.parse_type()
             name = self.expect('IDENT').value
             if self.match('('):
@@ -2617,6 +2624,15 @@ class MK1CodeGen:
         self.eeprom_globals = {}  # name → EEPROM address
         self.eeprom_alloc = 0x0010  # skip 16-byte header (checksum + reserved)
         self.eeprom_data = []  # list of (addr, bytes) for upload
+        # Cold tier (AT24C512). Each `ee64` array becomes a cold helper
+        # with an auto-assigned id (declaration order). The compiler
+        # emits its bytes into the ee64 image (uploaded by ESP32 to
+        # AT24C512) and stage-1 init code that populates the cold
+        # dispatcher's metadata table at page3[COLD_TABLE_BASE].
+        self.ee64_globals = {}            # name → ee64 address
+        self.ee64_alloc = 0
+        self.ee64_data = []               # (addr, bytes) for upload
+        self.cold_helpers = []            # (id, ee64_addr, length, name)
         self.global_sizes = {name: (len(init) if isinstance(init, list) else 1)
                              for name, init, _storage in globals_}
 
@@ -2629,6 +2645,21 @@ class MK1CodeGen:
                 self.eeprom_globals[name] = self.eeprom_alloc
                 self.eeprom_data.append((self.eeprom_alloc, init))
                 self.eeprom_alloc += size
+            elif storage == 'ee64':
+                # Cold-tier helper. Bytes get uploaded to AT24C512;
+                # implicit cold-helper id assigned by declaration order.
+                if not isinstance(init, list):
+                    raise Exception(f"ee64 variable '{name}' must be an initialized array")
+                if size > COLD_SLOT_BYTES:
+                    raise Exception(
+                        f"ee64 helper '{name}' is {size} B, exceeds slot "
+                        f"size {COLD_SLOT_BYTES} B (COLD_SLOT_BYTES). "
+                        "Either shrink the helper or grow the slot.")
+                cold_id = len(self.cold_helpers)
+                self.ee64_globals[name] = self.ee64_alloc
+                self.ee64_data.append((self.ee64_alloc, init))
+                self.cold_helpers.append((cold_id, self.ee64_alloc, size, name))
+                self.ee64_alloc += size
             elif self.data_alloc + size <= 256:
                 self.globals[name] = self.data_alloc
                 self.data_alloc += size
@@ -2897,10 +2928,29 @@ class MK1CodeGen:
         flat_mode = (getattr(self, '_overlay_kernel_size', None) is None
                      and not getattr(self, '_init_extraction_done', False))
         if flat_mode:
+            # Cold-helper metadata init lines, generated once and inserted
+            # right after the SP preamble. Mirrors the path in
+            # _overlay_partition for init-extraction mode.
+            cold_init_lines = []
+            cold_helpers = getattr(self, 'cold_helpers', [])
+            if cold_helpers:
+                cold_init_lines.append('\t; cold-helper metadata table init')
+                for cold_id, ee_addr, length, _name in cold_helpers:
+                    entries = [
+                        ((ee_addr >> 8) & 0xFF, COLD_TABLE_BASE + cold_id * 3 + 0),
+                        (ee_addr & 0xFF,        COLD_TABLE_BASE + cold_id * 3 + 1),
+                        (length & 0xFF,         COLD_TABLE_BASE + cold_id * 3 + 2),
+                    ]
+                    for value, p3_addr in entries:
+                        cold_init_lines.append(f'\tldi $a,{value}')
+                        cold_init_lines.append(f'\tldi $b,{p3_addr}')
+                        cold_init_lines.append('\tiderefp3')
             for mi, line in enumerate(self.code):
                 if line.strip() == '_main:':
                     self.code.insert(mi + 1, '\tldi $b,0xFF')
                     self.code.insert(mi + 2, '\tmov $b,$sp')
+                    for j, cl in enumerate(cold_init_lines):
+                        self.code.insert(mi + 3 + j, cl)
                     break
 
         # Emit page 1 globals UNLESS the overlay partitioner already inlined
@@ -3026,6 +3076,18 @@ class MK1CodeGen:
                 self.emit(f'\tbyte {ratio}')
                 self.emit(f'\tbyte {cyc_lo}')
                 self.emit(f'\tbyte {cyc_hi}')
+            self.emit('\tsection code')
+
+        # Emit ee64 data section (for ESP32 upload to AT24C512).
+        # No header pad — cold-helper bytes start at addr 0 since the
+        # dispatcher reads (addr_hi, addr_lo, len) per helper from page
+        # 3, not from any in-EEPROM checksum/header structure.
+        if self.ee64_data:
+            self.emit('\tsection ee64')
+            for addr, data in self.ee64_data:
+                self.emit(f'; ee64 helper at 0x{addr:04X} ({len(data)} bytes)')
+                for b in data:
+                    self.emit(f'\tbyte {b}')
             self.emit('\tsection code')
 
         # Emit EEPROM data section (for ESP32 upload shim)
@@ -7344,6 +7406,25 @@ class MK1CodeGen:
                 '\tldi $b,0xFF',     # SP init via $b to keep $a = 0 (reset state)
                 '\tmov $b,$sp',
             ]
+            # Cold-helper metadata: write (addr_hi, addr_lo, len) into
+            # page3[COLD_TABLE_BASE + id*3] for each cold helper. Three
+            # `ldi $a,N; ldi $b,M; iderefp3` triples per helper = 15 B.
+            # Lives in the runtime kernel (not stage-1 init) so it
+            # re-runs on reset; that's fine — all writes are to constant
+            # addresses with constant values.
+            cold_helpers = getattr(self, 'cold_helpers', [])
+            if cold_helpers:
+                preamble.append('\t; cold-helper metadata table init')
+                for cold_id, ee_addr, length, _name in cold_helpers:
+                    entries = [
+                        ((ee_addr >> 8) & 0xFF, COLD_TABLE_BASE + cold_id * 3 + 0),
+                        (ee_addr & 0xFF,        COLD_TABLE_BASE + cold_id * 3 + 1),
+                        (length & 0xFF,         COLD_TABLE_BASE + cold_id * 3 + 2),
+                    ]
+                    for value, p3_addr in entries:
+                        preamble.append(f'\tldi $a,{value}')
+                        preamble.append(f'\tldi $b,{p3_addr}')
+                        preamble.append('\tiderefp3')
             if getattr(self, '_ee_preload_bytes', 0) > 0:
                 preamble.append('\tjal __eeprom_preload')
             preamble.extend([
@@ -14513,6 +14594,7 @@ def main():
             elif 'section page3' in s and 'kernel' not in s and 'code' not in s:
                 section = 'page3_data'; continue
             elif 'section p3patch' in s: section = 'p3patch'; continue
+            elif 'section ee64' in s: section = 'ee64'; continue
             elif 'section eeprom' in s: section = 'eeprom'; continue
             elif 'section data_code' in s: section = 'data'; continue
             elif 'section stack_code' in s: section = 'stack'; continue
@@ -14607,6 +14689,7 @@ def main():
         elif 'section page3' in s and 'kernel' not in s and 'code' not in s:
             section = 'page3_data'; continue
         elif 'section p3patch' in s: section = 'p3patch'; continue
+        elif 'section ee64' in s: section = 'ee64'; continue
         elif 'section eeprom' in s: section = 'eeprom'; continue
         elif 'section data_code' in s: section = 'data'; continue
         elif 'section stack_code' in s: section = 'stack'; continue
@@ -14797,6 +14880,16 @@ def main():
         print(f"  EEPROM:     {eeprom_payload}B used, {4096 - eeprom_payload}B free  (AT24C32)", file=sys.stderr)
     else:
         print(f"  EEPROM:     unused  (4096B available)", file=sys.stderr)
+
+    ee64_used = getattr(gen, 'ee64_alloc', 0) if gen is not None else 0
+    cold_count = len(getattr(gen, 'cold_helpers', []) if gen is not None else [])
+    if ee64_used > 0:
+        metrics['ee64_used'] = ee64_used
+        metrics['ee64_free'] = 65536 - ee64_used
+        metrics['cold_helpers'] = cold_count
+        print(f"  EE64:       {ee64_used}B used, {65536 - ee64_used}B free  "
+              f"(AT24C512, {cold_count} cold helper{'s' if cold_count != 1 else ''})",
+              file=sys.stderr)
 
     if init_extraction:
         total_free = (MAX_CODE - kernel_bytes) + (256 - data_runtime) + 256 + (4096 - eeprom_payload)

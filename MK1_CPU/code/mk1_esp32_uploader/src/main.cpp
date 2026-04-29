@@ -63,6 +63,7 @@ static void loadAsmResultForUpload(const AsmResult& r);
 static int runUploadedUntilFirstOut(int maxCycles);
 static bool runUploadedUntilHalt(int maxCycles);
 static void writeEepromData(const uint8_t* data, int size);
+static void writeEe64Data(const uint8_t* data, int size);
 static inline uint8_t IRAM_ATTR decodeBus(uint32_t gpio);
 
 // ── Clock measurement ────────────────────────────────────────────────
@@ -1848,8 +1849,8 @@ static void handleSerialCommand(const String& line) {
         }
         uint32_t cksum = 0;
         for (int i = 0; i < uploadSize; i++) cksum += uploadBuf[i];
-        Serial.printf("{\"ok\":true,\"code\":%d,\"data\":%d,\"eeprom\":%d,\"cksum\":%u,\"hex\":\"",
-            codeBytes, dataBytes, r.eeprom_size, cksum);
+        Serial.printf("{\"ok\":true,\"code\":%d,\"data\":%d,\"eeprom\":%d,\"ee64\":%d,\"cksum\":%u,\"hex\":\"",
+            codeBytes, dataBytes, r.eeprom_size, r.ee64_size, cksum);
         for (int i = 0; i < codeBytes && i < 16; i++) {
             if (i) Serial.print(' ');
             Serial.printf("%02X", r.code[i]);
@@ -1859,11 +1860,20 @@ static void handleSerialCommand(const String& line) {
     else if (line == "UPLOAD") {
         if (uploadSize == 0) { Serial.println("{\"ok\":false}"); return; }
 
-        // Write EEPROM data if present (before uploading user program)
+        // Write EEPROM data if present (before uploading user program).
+        // Both writeEepromData and writeEe64Data internally re-run the
+        // assembler for I²C shim programs, which zeros result.*_size
+        // fields (and the code buffer) but leaves the eeprom/ee64
+        // buffer contents intact. Save sizes up front so we don't lose
+        // track after the first write.
         const AsmResult& er = assembler.result;
-        int eepromBytes = er.eeprom_size;  // save before writeEepromData clobbers result
+        int eepromBytes = er.eeprom_size;
+        int ee64Bytes = er.ee64_size;
         if (eepromBytes > 0) {
             writeEepromData(er.eeprom, eepromBytes);
+        }
+        if (ee64Bytes > 0) {
+            writeEe64Data(er.ee64, ee64Bytes);
         }
 
         uploadToMK1(uploadBuf, uploadSize);
@@ -1871,8 +1881,9 @@ static void handleSerialCommand(const String& line) {
         // Hard rule: ESP32 has NO role post-upload. EEPROM-backed overlays
         // are now preloaded by MK1 itself during init (reads from AT24C32
         // via I2C, writes to page3). We only write the EEPROM during upload.
-        if (eepromBytes > 0)
-            Serial.printf("{\"ok\":true,\"eeprom\":%d}\n", eepromBytes);
+        if (eepromBytes > 0 || ee64Bytes > 0)
+            Serial.printf("{\"ok\":true,\"eeprom\":%d,\"ee64\":%d}\n",
+                          eepromBytes, ee64Bytes);
         else
             Serial.println("{\"ok\":true}");
     }
@@ -2462,6 +2473,20 @@ static void handleSerialCommand(const String& line) {
         }
         Serial.println();
     }
+    else if (line.startsWith("DUMP_EE64:")) {
+        // DUMP_EE64:offset,count — dump assembler.result.ee64 bytes as hex.
+        // Same shape as DUMP_EE but for the AT24C512 cold-tier image.
+        int comma = line.indexOf(',', 10);
+        int off = line.substring(10, comma > 0 ? comma : line.length()).toInt();
+        int cnt = comma > 0 ? line.substring(comma + 1).toInt() : 16;
+        if (cnt > 64) cnt = 64;
+        const AsmResult& er = assembler.result;
+        for (int i = 0; i < cnt && off + i < EE64_SIZE; i++) {
+            if (i) Serial.print(' ');
+            Serial.printf("%02X", er.ee64[off + i]);
+        }
+        Serial.println();
+    }
     else if (line.startsWith("RUNLOG:")) {
         // RUNLOG:cycles,us[,halt] — run without stopping on OI, log all OI
         // values. Halt detection is optional because the HLT bodge signal is
@@ -2748,6 +2773,153 @@ static void writeEepromData(const uint8_t* data, int size) {
         // so we must set the bus direction here.
         disableOutput();
         digitalWrite(PIN_DIR, HIGH);    // ESP32 → CPU direction
+        busSetOutput();
+        enableOutput();
+        disableClock();
+    }
+}
+
+// ── AT24C512 (cold tier) write via MK1 I²C shim ─────────────────────
+//
+// Mirrors writeEepromData but targets the 64KB AT24C512 at 0x50.
+// Shim sends device byte 0xA0 (vs 0xAE), uses full 16-bit addressing
+// (the AT24C32 shim already does too — top 4 bits were just ignored
+// by the 12-bit-addressed chip). Page size: 32 B, well within the
+// AT24C512's 128 B page boundary, and small enough that the asmBuf
+// holds the inlined `ldi $a,N; jal __sb` pair per byte.
+//
+// Reads from result.ee64 (which persists across the shim re-assemble
+// because pass() only resets the size counters, not the buffer
+// contents). Caller is responsible for saving ee64_size before
+// invoking this — see UPLOAD handler.
+
+static void writeEe64Data(const uint8_t* data, int size) {
+    // 32-byte pages. AT24C512 supports up to 128 but the asmBuf would
+    // overflow with 128 inlined `ldi/jal` pairs.
+    static const int PAGE_SZ = 32;
+    Serial.printf("EE64 write start: size=%d src[0]=%d src[%d]=%d\n",
+        size, size > 0 ? data[0] : 0, size - 1, size > 0 ? data[size - 1] : 0);
+
+    for (int offset = 0; offset < size; offset += PAGE_SZ) {
+        int pageLen = size - offset;
+        if (pageLen > PAGE_SZ) pageLen = PAGE_SZ;
+
+        int addrHi = (offset >> 8) & 0xFF;
+        int addrLo = offset & 0xFF;
+
+        char asmBuf[2048];
+        int pos = 0;
+        pos += snprintf(asmBuf + pos, sizeof(asmBuf) - pos,
+            "; EE64 page write at 0x%04X (%d bytes)\n"
+            "    ldi $d, 0\n"
+            ".dly:\n"
+            "    dec\n"
+            "    jnz .dly\n"
+            "    clr $a\n"
+            "    exw 0 0\n"
+            "    ddrb_imm 0x00\n"
+            "    ddrb_imm 0x03\n"
+            "    ddrb_imm 0x01\n"
+            "    ddrb_imm 0x00\n"
+            // ACK poll: wait for any prior write cycle to complete.
+            ".poll:\n"
+            "    exrw 2\n"
+            "    ddrb_imm 0x01\n"
+            "    ddrb_imm 0x03\n"
+            "    ldi $a, 0xA0\n"
+            "    jal __sb\n"
+            "    ddrb_imm 0x03\n"
+            "    ddrb_imm 0x01\n"
+            "    ddrb_imm 0x00\n"
+            "    tst 0x01\n"
+            "    jnz .poll\n"
+            // START + dev write + addr_hi + addr_lo
+            "    exrw 2\n"
+            "    ddrb_imm 0x01\n"
+            "    ddrb_imm 0x03\n"
+            "    ldi $a, 0xA0\n"
+            "    jal __sb\n"
+            "    ldi $a, %d\n"
+            "    jal __sb\n"
+            "    ldi $a, %d\n"
+            "    jal __sb\n",
+            offset, pageLen, addrHi, addrLo);
+
+        for (int i = 0; i < pageLen; i++) {
+            pos += snprintf(asmBuf + pos, sizeof(asmBuf) - pos,
+                "    ldi $a, %d\n"
+                "    jal __sb\n",
+                data[offset + i]);
+        }
+        pos += snprintf(asmBuf + pos, sizeof(asmBuf) - pos,
+            "    ddrb_imm 0x03\n"
+            "    ddrb_imm 0x01\n"
+            "    ddrb_imm 0x00\n"
+            "    hlt\n"
+            "__sb:\n"
+            "    mov $a, $b\n"
+            "    ldi $a, 8\n"
+            "    mov $a, $c\n"
+            ".isb:\n"
+            "    mov $b, $a\n"
+            "    tst 0x80\n"
+            "    jnz .isbh\n"
+            "    ddrb_imm 0x03\n"
+            "    ddrb_imm 0x01\n"
+            "    ddrb_imm 0x03\n"
+            "    j .isbn\n"
+            ".isbh:\n"
+            "    ddrb_imm 0x02\n"
+            "    ddrb_imm 0x00\n"
+            "    ddrb_imm 0x02\n"
+            ".isbn:\n"
+            "    mov $b, $a\n"
+            "    sll\n"
+            "    mov $a, $b\n"
+            "    mov $c, $a\n"
+            "    dec\n"
+            "    mov $a, $c\n"
+            "    jnz .isb\n"
+            "    ddrb_imm 0x02\n"
+            "    ddrb_imm 0x00\n"
+            "    exrw 0\n"
+            "    ddrb_imm 0x02\n"
+            "    ret\n");
+
+        assembler.assemble(asmBuf);
+        const AsmResult& pr = assembler.result;
+        if (pr.error_count != 0) {
+            Serial.printf("EE64 write ASM error at offset 0x%04X\n", offset);
+            continue;
+        }
+        Serial.printf("EE64 shim page 0x%04X: %dB code\n", offset, pr.code_size);
+
+        uint8_t shimBuf[256];
+        memcpy(shimBuf, pr.code, CODE_SIZE);
+        uploadToMK1(shimBuf, CODE_SIZE);
+
+        stopCustomClock();
+        detachOIMonitorForManualRun();
+
+        busSetInput();
+        disableOutput();
+        digitalWrite(PIN_DIR, LOW);
+        enableOutput();
+
+        int clkGpio = digitalPinToGPIONumber(PIN_CLK);
+        uint32_t clkMask = 1 << clkGpio;
+        pinMode(PIN_CLK, OUTPUT);
+        digitalWrite(PIN_CLK, LOW);
+
+        for (int i = 0; i < 100000; i++) {
+            GPIO.out_w1ts = clkMask;
+            delayMicroseconds(1);
+            GPIO.out_w1tc = clkMask;
+            delayMicroseconds(1);
+        }
+        pinMode(PIN_CLK, INPUT);
+        disableOutput();
+        digitalWrite(PIN_DIR, HIGH);
         busSetOutput();
         enableOutput();
         disableClock();

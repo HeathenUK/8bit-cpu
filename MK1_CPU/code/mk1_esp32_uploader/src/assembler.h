@@ -38,7 +38,8 @@ struct AsmError {
     char message[80];
 };
 
-static const int EEPROM_SIZE = 4096;  // AT24C32 = 4KB
+static const int EEPROM_SIZE = 4096;   // AT24C32 = 4KB (warm tier)
+static const int EE64_SIZE   = 65536;  // AT24C512 = 64KB (cold tier)
 
 struct AsmResult {
     uint8_t code[CODE_SIZE];
@@ -46,12 +47,14 @@ struct AsmResult {
     uint8_t stack[DATA_SIZE];   // page 2 (stack page) overlay storage
     uint8_t page3[DATA_SIZE];
     uint8_t eeprom[EEPROM_SIZE]; // AT24C32 EEPROM data for upload
+    uint8_t ee64[EE64_SIZE];     // AT24C512 cold-tier image for upload
     uint8_t p3patch[DATA_SIZE]; // page3 patch: written AFTER init self-copy
     int code_size;
     int data_size;
     int stack_size;
     int page3_size;
     int eeprom_size;
+    int ee64_size;
     int p3patch_size;           // bytes to patch in page3 after self-copy
     int p3patch_cycles;         // clock cycles needed for init before patching
     AsmError errors[MAX_ERRORS];
@@ -340,6 +343,11 @@ private:
             result.code_size++;  // advance code PC for label resolution
             return;
         }
+        if (codeEmitTarget == 6) {
+            emitEe64(byte, pass1);
+            result.code_size++;  // advance code PC for label resolution
+            return;
+        }
         if (!pass1 && result.code_size < CODE_SIZE)
             result.code[result.code_size] = byte;
         result.code_size++;
@@ -371,6 +379,12 @@ private:
         result.eeprom_size++;
     }
 
+    void emitEe64(uint8_t byte, bool pass1) {
+        if (!pass1 && result.ee64_size < EE64_SIZE)
+            result.ee64[result.ee64_size] = byte;
+        result.ee64_size++;
+    }
+
     void emitP3Patch(uint8_t byte, bool pass1) {
         if (!pass1 && result.p3patch_size < DATA_SIZE)
             result.p3patch[result.p3patch_size] = byte;
@@ -395,6 +409,7 @@ private:
             result.stack_size = 0;
             result.page3_size = 0;
             result.eeprom_size = 0;
+            result.ee64_size = 0;
             result.p3patch_size = 0;
         }
 
@@ -454,7 +469,13 @@ private:
                     // Instructions and bytes go to p3patch buffer at code PC.
                     bank = 0;
                     codeEmitTarget = 5;  // emit to p3patch buffer
-            } else if (strstr(lp, "eeprom")) {
+            } else if (strstr(lp, "ee64")) {
+                    // Cold tier: bytes emitted into AT24C512 image.
+                    // Match BEFORE "eeprom"/"data" so the substring "64"
+                    // doesn't get swallowed.
+                    bank = 0;
+                    codeEmitTarget = 6;
+                } else if (strstr(lp, "eeprom")) {
                     bank = 0;  // bank=0 so instructions are parsed normally
                     codeEmitTarget = 4;  // emit assembled bytes to EEPROM buffer
                 } else if (strstr(lp, "page3")) {

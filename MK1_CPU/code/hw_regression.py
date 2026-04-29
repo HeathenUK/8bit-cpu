@@ -1072,6 +1072,23 @@ TESTS = [
         void main(void) { g(0, 5); halt(); }''',
         [6, 7, 8], cycles=50_000,
     ),
+    Test(
+        # Cold tier end-to-end: helper bytes declared as `ee64` array,
+        # uploaded by ESP32 to AT24C512 at 0x50, dispatcher loads from
+        # chip into code-page slot at runtime, executes. The 4 bytes
+        # are `ldi $a, 0xCD; out; ret`. Confirms the full cold-tier
+        # path (compiler partitioner + ee64 image upload + writeEe64Data
+        # I²C shim + __cold_call dispatcher + cold slot exec) without
+        # any prior-run seed dependency.
+        'cold tier: ee64 helper end-to-end',
+        '''ee64 unsigned char cold_helper_0[] = {0x38, 0xCD, 0x06, 0x6C};
+        void main(void) {
+            i2c_init();
+            cold_call(0);
+            halt();
+        }''',
+        [205], cycles=500_000,
+    ),
 ]
 
 
