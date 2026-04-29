@@ -122,6 +122,25 @@ P2_STACK_BUDGET      = P2_STACK_HI   - P2_STACK_LO   + 1   #  16
 # base is reserved for future fixed-slot growth.
 P2_MANIFEST_BASE     = 0xC0
 
+# ── Cold tier (AT24C512 @ 0x50) ──────────────────────────────────────
+# Layout for runtime cold-call dispatch (Phase 4 of cold-tier rollout).
+# Helpers tagged COLD live in the 64KB EEPROM and are loaded into a
+# fixed code-page slot on demand. The dispatcher (`__cold_call`) reads
+# (ee64_addr_hi, ee64_addr_lo, byte_count) from a 3-byte-per-entry
+# table in page 3 starting at COLD_TABLE_BASE.
+#
+# COLD_TABLE_BASE = 0x10: skip the first 16 B of page 3 to leave room
+#   for OLED font cache or other front-of-page-3 callers if they ever
+#   coexist with cold-tier on the same program. 32 B (page3[0x10..0x2F])
+#   gives 10 cold helpers — generous for now.
+# COLD_SLOT_BASE = 0xF0: 16 B at the high end of the code page. Page
+#   0 is capped at 250 B by the partitioner; the slot at 0xF0..0xFF
+#   sits in the unused tail. Helpers that need a bigger slot can grow
+#   this region downward when the time comes.
+COLD_TABLE_BASE      = 0x10
+COLD_SLOT_BASE       = 0xF0
+COLD_SLOT_BYTES      = 16
+
 # ── Tokenizer (from mk1cc.py) ────────────────────────────────────────
 
 TOKEN_PATTERNS = [
@@ -1177,7 +1196,7 @@ class MK1CodeGen:
                 'i2c_stream_result',
                 'ora_imm', 'orb_imm', 'ddra_imm',
                 'write_code', 'call_code', 'eeprom_read_to_code',
-                'ee64_read_to_code',
+                'ee64_read_to_code', 'cold_call',
                 'peek3', 'poke3'}
     # NOTE: i2c_send_byte, i2c_read_byte, eeprom_write_byte, eeprom_read_byte,
     # rtc_read_seconds, rtc_read_temp, lcd_cmd, lcd_char, lcd_init are NOT builtins —
@@ -1205,6 +1224,7 @@ class MK1CodeGen:
         'eeprom_write_byte',
         'eeprom_write',
         'ee64_write_byte',
+        'cold_call',
         'i2c_stream',      # __i2c_stream pointer in $d
         'i2c_stream_result',
         'delay',           # __delay_Nms product high in $d
@@ -3508,6 +3528,16 @@ class MK1CodeGen:
         if '__i2c_stream' in helpers:
             no_ov.add('__i2c_stream:')
 
+        # __cold_call: dispatcher for runtime AT24C512 helper loads.
+        # Always kernel-resident — it must be reachable from any caller
+        # site (including overlays). Forces __eeprom_r2c_loop resident
+        # too, since a resident caller can't reach a helper that lives
+        # in an overlay slot.
+        if '__cold_call' in helpers:
+            no_ov.add('__cold_call:')
+            if '__eeprom_r2c_loop' in helpers:
+                no_ov.add('__eeprom_r2c_loop:')
+
         # Tone runtime helpers must be resident if used — they're called via jal
         # from every overlay that plays notes. Inlining would bloat each overlay.
         # NOTE: __tone_setup is NOT included here — it's init-only (precomputes
@@ -4889,6 +4919,66 @@ class MK1CodeGen:
             self.emit_ddrb(0x03)     # SDA LOW
             self.emit_ddrb(0x01)     # SCL HIGH
             self.emit_ddrb(0x00)     # STOP
+            self.emit('\tret')
+
+        # __cold_call: kernel-resident dispatcher for the AT24C512 cold tier.
+        # Entry: $a = helper_id (0..N-1).
+        # Looks up (ee64_addr_hi, ee64_addr_lo, byte_count) from a 3-byte-
+        # per-entry metadata table at page3[COLD_TABLE_BASE], bulk-reads
+        # the helper bytes from AT24C512 into code[COLD_SLOT_BASE] via the
+        # chip-agnostic __eeprom_r2c_loop, then jal_r's into the loaded
+        # code. The cold helper does its work and `ret`s back here, which
+        # then ret's to the original caller.
+        #
+        # Latency: ~5-10 ms per cold call at 100 kHz I²C for a ~50 B
+        # helper (chip read time + slot copy). Slot is overwritten each
+        # call, so back-to-back cold calls to different helpers each pay
+        # the load cost; reuse of the same id within tight loops would be
+        # wasteful — partitioner should avoid that pattern.
+        if '__cold_call' in helpers:
+            self.emit('__cold_call:')
+            # Compute ptr = COLD_TABLE_BASE + 3 * id; preserve in $b.
+            self.emit('\tmov $a,$b')                       # b = id
+            self.emit('\tsll')                             # a = 2*id
+            self.emit('\tadd $b,$a')                       # a = 3*id
+            self.emit(f'\taddi {COLD_TABLE_BASE},$a')      # a = ptr
+            self.emit('\tmov $a,$b')                       # b = ptr (preserved across derefp3)
+            # Read len, addr_lo, addr_hi from page 3, push reverse-order
+            # so stack ends as [len, lo, hi] with hi on top.
+            self.emit('\taddi 2,$a')                       # a = ptr+2
+            self.emit('\tderefp3')                         # a = page3[ptr+2] = len
+            self.emit('\tpush $a')
+            self.emit('\tmov $b,$a')
+            self.emit('\taddi 1,$a')                       # a = ptr+1
+            self.emit('\tderefp3')                         # a = addr_lo
+            self.emit('\tpush $a')
+            self.emit('\tmov $b,$a')                       # a = ptr
+            self.emit('\tderefp3')                         # a = addr_hi
+            self.emit('\tpush $a')
+            # I²C: START + 0xA0 + addr_hi + addr_lo + REP-START + 0xA1
+            self.emit('\texrw 2')
+            self.emit_ddrb(0x01)
+            self.emit_ddrb(0x03)
+            self.emit('\tldi $a,0xA0')
+            self.emit('\tjal __i2c_sb')
+            self.emit('\tpop $a')                          # addr_hi
+            self.emit('\tjal __i2c_sb')
+            self.emit('\tpop $a')                          # addr_lo
+            self.emit('\tjal __i2c_sb')
+            self.emit_ddrb(0x00)                           # REP-START
+            self.emit_ddrb(0x01)
+            self.emit_ddrb(0x03)
+            self.emit('\tldi $a,0xA1')
+            self.emit('\tjal __i2c_sb')
+            # Bulk-read into the cold slot. r2c_loop expects B = dest,
+            # count on stack; len is already there (top of stack).
+            self.emit(f'\tldi $b,{COLD_SLOT_BASE}')
+            self.emit('\tjal __eeprom_r2c_loop')
+            self.emit('\tpop $a')                          # discard count
+            # Enter the loaded helper. jal_r pushes return PC; the cold
+            # helper's `ret` returns back here, then we ret to caller.
+            self.emit(f'\tldi $a,{COLD_SLOT_BASE}')
+            self.emit('\tjal_r')
             self.emit('\tret')
 
         # __keypad_scan: 4x4 matrix scanner for the keypad on PA4-7 (rows)
@@ -12673,6 +12763,33 @@ class MK1CodeGen:
                 self.emit('\tpop $a')
                 self.emit('\ttst 0x01')
                 self.emit(f'\tjnz {lbl}')
+                return
+
+            if name == 'cold_call':
+                # cold_call(id) — invoke a cold-tier helper by id.
+                # Loads the helper from AT24C512 into the runtime cold
+                # slot via __cold_call, jumps in. Helper metadata
+                # (ee64 addr + length) must already be in
+                # page3[COLD_TABLE_BASE + id*3] (3 bytes per entry).
+                # Phase 4 scaffolding: caller is responsible for seeding
+                # the metadata (typically via poke3). Phase 5 wires the
+                # partitioner to populate it automatically and to keep
+                # cold helpers' bytes synchronized with the EEPROM image.
+                if not args:
+                    self.gen_error("cold_call(id)")
+                    return
+                if not hasattr(self, '_lcd_helpers'):
+                    self._lcd_helpers = set()
+                self._lcd_helpers.add('__i2c_sb')
+                self._lcd_helpers.add('__i2c_rb')
+                self._lcd_helpers.add('__eeprom_r2c_loop')
+                self._lcd_helpers.add('__cold_call')
+                c = self._const_eval(args[0])
+                if c is not None:
+                    self.emit(f'\tldi $a,{c & 0xFF}')
+                else:
+                    self.gen_expr(args[0])
+                self.emit('\tjal __cold_call')
                 return
 
             if name == 'ee64_read_to_code':
