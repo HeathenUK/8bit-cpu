@@ -2488,18 +2488,24 @@ static void handleSerialCommand(const String& line) {
         Serial.println();
     }
     else if (line.startsWith("RUNLOG:")) {
-        // RUNLOG:cycles,us[,halt] — run without stopping on OI, log all OI
-        // values. Halt detection is optional because the HLT bodge signal is
-        // noisy enough that checking it in the hot path both slows the clock
-        // and can change timing-sensitive tests.
+        // RUNLOG:cycles,us[,halt[,maxoi]] — run cycles cycles, capture OI
+        // events. Halt detection is optional (HLT bodge signal is noisy
+        // enough that checking it in the hot path can change timing-
+        // sensitive tests). `maxoi`: stop the loop early once N OI events
+        // have been captured (0 = unlimited; 1+ avoids long sequences of
+        // duplicate OI events from programs that halt+restart over the
+        // cycle window).
         int comma = line.indexOf(',', 7);
         int comma2 = comma > 0 ? line.indexOf(',', comma + 1) : -1;
+        int comma3 = comma2 > 0 ? line.indexOf(',', comma2 + 1) : -1;
         int n = line.substring(7, comma > 0 ? comma : line.length()).toInt();
         int us = comma > 0 ? line.substring(comma + 1, comma2 > 0 ? comma2 : line.length()).toInt() : 1;
-        bool haltDetect = comma2 > 0 ? (line.substring(comma2 + 1).toInt() != 0) : false;
+        bool haltDetect = comma2 > 0 ? (line.substring(comma2 + 1, comma3 > 0 ? comma3 : line.length()).toInt() != 0) : false;
+        int maxoi = comma3 > 0 ? line.substring(comma3 + 1).toInt() : 0;
         if (n < 1) n = 1;
         if (n > 100000000) n = 100000000;
         if (us < 0) us = 0;
+        if (maxoi < 0) maxoi = 0;
 
         stopCustomClock();
         detachOIMonitorForManualRun();
@@ -2535,7 +2541,7 @@ static void handleSerialCommand(const String& line) {
                 oiCount++;
                 lastOutputVal = val;
                 outputCaptured = true;
-                // DON'T break — keep running
+                if (maxoi > 0 && (int)oiCount >= maxoi) { GPIO.out_w1tc = clkMask; break; }
             }
             if (haltDetect && i > 4 && hltOpcodeObserved(gpio1)) {
                 halted = true;
@@ -2551,6 +2557,7 @@ static void handleSerialCommand(const String& line) {
                 oiCount++;
                 lastOutputVal = val;
                 outputCaptured = true;
+                if (maxoi > 0 && (int)oiCount >= maxoi) break;
             }
             if (haltDetect && i > 4 && hltOpcodeObserved(gpio2)) {
                 halted = true;

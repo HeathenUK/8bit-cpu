@@ -152,15 +152,26 @@ def dump_pages(ser, timeout=10):
     }
 
 
-def runlog(ser, cycles=5_000_000, us=1, timeout=30):
-    """RUNLOG: continuous OI capture. Returns dict with vals list."""
+def runlog(ser, cycles=5_000_000, us=1, timeout=30, maxoi=0):
+    """RUNLOG: continuous OI capture. Returns dict with vals list.
+
+    `maxoi` (0 = unlimited): stop the firmware loop early once N OI
+    events have been captured. Useful for tests where the program
+    halts and the CPU restarts from PC=0, producing duplicate OI
+    events over the cycle window — without `maxoi`, RUNLOG keeps
+    capturing on every restart and `vals` is full of duplicates.
+    """
     # Reset BEFORE each run — UPLOAD doesn't reset PC, and any prior run
     # leaves CPU at its halt-trap. Without this, the new run starts in
     # the middle of wherever the previous run ended.
     full_reset(ser)
     ser.reset_input_buffer()
     ser.timeout = timeout
-    ser.write(f'RUNLOG:{cycles},{us}\n'.encode())
+    if maxoi > 0:
+        # 4-arg form: cycles, us, halt(=0), maxoi
+        ser.write(f'RUNLOG:{cycles},{us},0,{maxoi}\n'.encode())
+    else:
+        ser.write(f'RUNLOG:{cycles},{us}\n'.encode())
     # Skip non-RUNLOG-shaped lines: EEPROM shim diagnostic strings AND
     # leftover UPLOAD `{"ok":true,...}` JSONs from a prior write that
     # finished after we'd moved on. RUNLOG's response always carries
@@ -432,7 +443,14 @@ def run_one(ser, test, verbose=False, differential=False):
                 sim_actual = ['<sim_error>']
                 sim_notes = f' sim_error={e}'
 
-        r = runlog(ser, cycles=test.cycles, us=test.us)
+        # Cap OI capture at 2× expected length: enough to disambiguate
+        # repeated halt+restart programs (which would otherwise spam
+        # `vals` with duplicates across the full cycle window) while
+        # still leaving room for any leading garbage / sentinel bytes.
+        # Doubled rather than exact-match so dual-edge sampling and the
+        # injected sentinel don't trip the cap before real output lands.
+        maxoi_cap = max(64, len(test.expected) * 4)
+        r = runlog(ser, cycles=test.cycles, us=test.us, maxoi=maxoi_cap)
         if 'error' in r:
             last_notes = r['error']
             continue
@@ -1088,6 +1106,23 @@ TESTS = [
             halt();
         }''',
         [205], cycles=500_000,
+    ),
+    Test(
+        # Phase 6: an `ee64`-tagged C function compiles into the
+        # cold-tier image, gets called via the runtime dispatcher.
+        # Confirms the partitioner-emitted path: parser tags the
+        # function cold, codegen captures the body, emits in
+        # `section ee64` with `org COLD_SLOT_BASE`, registers a
+        # cold-helper id, and rewrites the call site to go through
+        # __cold_call. End user writes a normal C function.
+        'cold tier: ee64 C function end-to-end',
+        '''ee64 void chime(void) { out(0xCE); }
+        void main(void) {
+            i2c_init();
+            chime();
+            halt();
+        }''',
+        [206], cycles=500_000,
     ),
 ]
 

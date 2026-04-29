@@ -137,9 +137,55 @@ P2_MANIFEST_BASE     = 0xC0
 #   0 is capped at 250 B by the partitioner; the slot at 0xF0..0xFF
 #   sits in the unused tail. Helpers that need a bigger slot can grow
 #   this region downward when the time comes.
+# 64 B slot starting at code[0xC0]: enough for genuine helpers
+# (oled_putc, lcd_chr, etc.) while leaving 192 B of page-0 budget
+# for kernel + main + non-cold helpers when cold-tier is active.
+# Cold-tier infrastructure (__cold_call + __eeprom_r2c_loop +
+# __i2c_sb + __i2c_rb) currently runs ~120-150 B kernel-resident,
+# so a program with cold-tier active has ~40-70 B for non-cold
+# user code. Tight but workable; the cold-tier pays for itself
+# only when the user has functions worth pushing cold.
 COLD_TABLE_BASE      = 0x10
-COLD_SLOT_BASE       = 0xF0
-COLD_SLOT_BYTES      = 16
+COLD_SLOT_BASE       = 0xC0
+COLD_SLOT_BYTES      = 64
+
+# Mnemonics that assemble to >1 byte. Mirrors the per-mnemonic byte
+# accounting in `measure_lines` (closure inside `_overlay_partition`)
+# and the final size report. Promoted to module scope so cold-function
+# compilation can size its output before the partitioner runs.
+_TWO_BYTE_MNEMONICS = {
+    'ldsp', 'stsp', 'push_imm', 'jal', 'jc', 'jz', 'jnc', 'jnz', 'j',
+    'ldi', 'cmp', 'addi', 'subi', 'andi', 'ori', 'ld', 'st', 'ldsp_b',
+    'ldp3', 'stp3', 'ocall', 'tst', 'out_imm', 'cmpi', 'ddrb_imm',
+    'ddra_imm', 'ora_imm', 'orb_imm',
+}
+
+def _measure_asm_bytes(lines):
+    """Estimate assembled byte size of asm-text lines.
+    Mirrors the size logic the partitioner uses; matches the firmware
+    assembler within rounding (`byte` directives count 1; `cmp $reg`
+    is 1 B vs `cmp <imm>` is 2 B; `ddrb2_imm`/`ddrb3_imm` count their
+    actual macro expansion length)."""
+    size = 0
+    for line in lines:
+        s = line.strip()
+        if not s or s.endswith(':') or s.startswith(';'):
+            continue
+        mn = s.split()[0]
+        if mn == 'byte':
+            size += 1
+        elif mn == 'cmp':
+            parts = s.split()
+            size += 1 if (len(parts) > 1 and parts[1].startswith('$')) else 2
+        elif mn == 'ddrb2_imm':
+            size += 3
+        elif mn == 'ddrb3_imm':
+            size += 4
+        elif mn in _TWO_BYTE_MNEMONICS:
+            size += 2
+        else:
+            size += 1
+    return size
 
 # ── Tokenizer (from mk1cc.py) ────────────────────────────────────────
 
@@ -231,6 +277,7 @@ class Parser:
         self.tokens, self.pos = tokens, 0
         self.typedefs = {}           # alias → type string ('u8'/'u16')
         self.globals_sizes = {}      # name → size in bytes (arrays: length)
+        self.cold_function_names = set()  # functions tagged with `ee64`
 
     def peek(self): return self.tokens[self.pos]
     def advance(self):
@@ -267,7 +314,14 @@ class Parser:
             name = self.expect('IDENT').value
             if self.match('('):
                 fn = self.parse_function(typ, name)
-                if fn: functions.append(fn)
+                if fn:
+                    if storage == 'ee64':
+                        # Cold function — gets routed to AT24C512, called
+                        # via __cold_call. Tracked by name so later
+                        # codegen / call-rewrite knows which functions
+                        # are cold.
+                        self.cold_function_names.add(name)
+                    functions.append(fn)
             elif self.match('='):
                 val = self.expect('NUMBER').value; self.expect(';')
                 globals_.append((name, val, storage))
@@ -2618,6 +2672,10 @@ class MK1CodeGen:
         tokens = tokenize(source)
         parser = Parser(tokens)
         globals_, functions = parser.parse_program()
+        # Cold C-function names (declared `ee64 void f(...) {...}`).
+        # Codegen captures their bodies into the AT24C512 image and
+        # rewrites direct `jal _f` to `cold_call(id)` via __cold_call.
+        self.cold_function_names = set(parser.cold_function_names)
 
         self.page3_globals = {}  # name → page 3 address (for overflow arrays)
         self.page3_alloc = 0
@@ -2721,8 +2779,76 @@ class MK1CodeGen:
         if main_fn:
             self.compile_function(*main_fn)
 
-        for fn in other_fns:
+        # Cold functions go to a separate buffer — their bytes get written
+        # into the AT24C512 image rather than the main code stream, and
+        # internal labels need to resolve to the cold-slot address (set
+        # via `org COLD_SLOT_BASE` when emitted later). Non-cold helpers
+        # compile inline as normal.
+        cold_fns_to_compile = [fn for fn in other_fns
+                               if fn[0] in self.cold_function_names]
+        warm_fns = [fn for fn in other_fns
+                    if fn[0] not in self.cold_function_names]
+        for fn in warm_fns:
             self.compile_function(*fn)
+
+        # Compile cold functions one at a time, capturing each function's
+        # asm lines into `cold_function_bodies`. Each one gets registered
+        # as a cold helper (auto-id by current cold_helpers length, ee64
+        # address from the bump allocator). Body byte size is enforced
+        # against COLD_SLOT_BYTES so a too-large helper fails compile
+        # rather than silently corrupting kernel state at runtime.
+        self.cold_function_bodies = []
+        if cold_fns_to_compile:
+            saved_code = self.code
+            for fn in cold_fns_to_compile:
+                self.code = []
+                self.compile_function(*fn)
+                cold_lines = list(self.code)
+                byte_size = _measure_asm_bytes(cold_lines)
+                if byte_size > COLD_SLOT_BYTES:
+                    raise Exception(
+                        f"cold function '{fn[0]}' is {byte_size} B, "
+                        f"exceeds slot size {COLD_SLOT_BYTES} B "
+                        f"(COLD_SLOT_BYTES). Either shrink the function "
+                        f"or grow the slot.")
+                cold_id = len(self.cold_helpers)
+                ee64_addr = self.ee64_alloc
+                self.cold_helpers.append(
+                    (cold_id, ee64_addr, byte_size, fn[0]))
+                self.cold_function_bodies.append(
+                    (cold_id, fn[0], cold_lines, byte_size, ee64_addr))
+                self.ee64_alloc += byte_size
+            self.code = saved_code
+
+        # Rewrite direct calls to cold functions in the main code stream:
+        # `jal _foo` becomes `ldi $a,id; jal __cold_call`. Must run after
+        # cold functions are registered (so the id map exists) and
+        # before _overlay_partition (which treats self.code as definitive).
+        # Cold-function bodies themselves don't get rewritten here —
+        # cold→cold calls aren't supported in Phase 6 (a cold function
+        # calling another cold one would jump into the slot expecting
+        # its callee's bytes, but the slot still contains its own
+        # bytes; chaining requires re-entering through the dispatcher
+        # which is future work).
+        if self.cold_function_names:
+            cold_call_map = {fname: cid
+                             for cid, _addr, _size, fname in self.cold_helpers
+                             if fname in self.cold_function_names}
+            self._lcd_helpers = getattr(self, '_lcd_helpers', set())
+            self._lcd_helpers |= {'__i2c_sb', '__i2c_rb',
+                                  '__eeprom_r2c_loop', '__cold_call'}
+            new_code = []
+            for line in self.code:
+                s = line.strip()
+                if s.startswith('jal _'):
+                    target = s[len('jal _'):]
+                    if target in cold_call_map:
+                        cid = cold_call_map[target]
+                        new_code.append(f'\tldi $a,{cid}')
+                        new_code.append('\tjal __cold_call')
+                        continue
+                new_code.append(line)
+            self.code = new_code
 
         # In --eeprom mode, the preload uses only __i2c_sb (inline sequential
         # read — no __eeprom_rd / __i2c_rb function dependencies). Ensure
@@ -3079,15 +3205,31 @@ class MK1CodeGen:
             self.emit('\tsection code')
 
         # Emit ee64 data section (for ESP32 upload to AT24C512).
-        # No header pad — cold-helper bytes start at addr 0 since the
-        # dispatcher reads (addr_hi, addr_lo, len) per helper from page
-        # 3, not from any in-EEPROM checksum/header structure.
-        if self.ee64_data:
+        # Mixes raw byte arrays (from `ee64 unsigned char[]` decls) and
+        # compiled cold-function bodies (from `ee64 void f() {…}` decls).
+        # Both share the AT24C512 image; both are loaded into the cold
+        # slot at runtime via __cold_call.
+        cold_bodies = getattr(self, 'cold_function_bodies', [])
+        if self.ee64_data or cold_bodies:
             self.emit('\tsection ee64')
+            # Raw byte arrays first — sequential, no `org` needed.
             for addr, data in self.ee64_data:
-                self.emit(f'; ee64 helper at 0x{addr:04X} ({len(data)} bytes)')
+                self.emit(f'; ee64 array at 0x{addr:04X} ({len(data)} bytes)')
                 for b in data:
                     self.emit(f'\tbyte {b}')
+            # Compiled cold function bodies. Each gets `org COLD_SLOT_BASE`
+            # before emission so its internal labels resolve to slot
+            # addresses (not ee64-buffer addresses). The firmware
+            # assembler's `org` only affects the code-PC counter (used
+            # for label resolution); ee64-buffer write position is
+            # independent and continues from wherever it was, so byte
+            # addresses in the AT24C512 image remain contiguous.
+            for cold_id, fname, cold_lines, byte_size, ee64_addr in cold_bodies:
+                self.emit(f'; ee64 cold function _{fname} (id {cold_id}, '
+                          f'{byte_size}B at ee64[0x{ee64_addr:04X}])')
+                self.emit(f'\torg {COLD_SLOT_BASE}')
+                for line in cold_lines:
+                    self.emit(line)
             self.emit('\tsection code')
 
         # Emit EEPROM data section (for ESP32 upload shim)
