@@ -1177,6 +1177,7 @@ class MK1CodeGen:
                 'i2c_stream_result',
                 'ora_imm', 'orb_imm', 'ddra_imm',
                 'write_code', 'call_code', 'eeprom_read_to_code',
+                'ee64_read_to_code',
                 'peek3', 'poke3'}
     # NOTE: i2c_send_byte, i2c_read_byte, eeprom_write_byte, eeprom_read_byte,
     # rtc_read_seconds, rtc_read_temp, lcd_cmd, lcd_char, lcd_init are NOT builtins —
@@ -1203,6 +1204,7 @@ class MK1CodeGen:
         'eeprom_read',
         'eeprom_write_byte',
         'eeprom_write',
+        'ee64_write_byte',
         'i2c_stream',      # __i2c_stream pointer in $d
         'i2c_stream_result',
         'delay',           # __delay_Nms product high in $d
@@ -12544,9 +12546,17 @@ class MK1CodeGen:
                 return
 
             if name == 'i2c_ack':
-                # Send ACK (pull SDA LOW, clock SCL once)
+                # Send ACK (pull SDA LOW, clock SCL once).
+                # 4-step pattern matching __eeprom_r2c_loop: drop SCL LOW
+                # *before* releasing SDA so the SDA rise happens with SCL
+                # already LOW. The shorter 3-step pattern (0x01→0x02 in
+                # one VIA write) relies on RC timing (SCL falling faster
+                # than SDA rising via pullup) to avoid glitching a STOP
+                # condition; AT24C512 sequential reads were dropping after
+                # byte 1 with the 3-step form. +1 ddrb is worth bus safety.
                 self.emit_ddrb(0x03)   # SDA LOW, SCL LOW
                 self.emit_ddrb(0x01)   # SDA LOW, SCL HIGH
+                self.emit_ddrb(0x03)   # SDA LOW, SCL LOW (SCL falls first)
                 self.emit_ddrb(0x02)   # SDA released, SCL LOW
                 return
 
@@ -12608,6 +12618,100 @@ class MK1CodeGen:
                 self.emit('\tpush $a')             # count on stack
                 self.emit('\tjal __eeprom_r2c_loop')
                 self.emit('\tpop $a')              # clean stack
+                return
+
+            if name == 'ee64_write_byte':
+                # ee64_write_byte(addr16, data) — write one byte to AT24C512
+                # at I²C address 0x50 (write byte 0xA0). 16-bit memory addr.
+                # Hardware-test scaffolding for the cold-tier mechanism;
+                # production cold-loading uses the runtime dispatcher
+                # (Phase 4) which emits the same shape directly. ACK-polls
+                # the write cycle so no __delay_cal dependency.
+                if not args or len(args) < 2:
+                    self.gen_error("ee64_write_byte(addr16, data)")
+                    return
+                addr_c = self._const_eval(args[0])
+                if addr_c is None:
+                    self.gen_error("ee64_write_byte: address must be a constant")
+                    return
+                if not hasattr(self, '_lcd_helpers'):
+                    self._lcd_helpers = set()
+                self._lcd_helpers.add('__i2c_sb')
+                addr_hi = (addr_c >> 8) & 0xFF
+                addr_lo = addr_c & 0xFF
+                # START + dev write + addr_hi + addr_lo + data + STOP
+                self.emit('\texrw 2')
+                self.emit_ddrb(0x01)
+                self.emit_ddrb(0x03)
+                self.emit('\tldi $a,0xA0')
+                self.emit('\tjal __i2c_sb')
+                self.emit(f'\tldi $a,{addr_hi}')
+                self.emit('\tjal __i2c_sb')
+                self.emit(f'\tldi $a,{addr_lo}')
+                self.emit('\tjal __i2c_sb')
+                c = self._const_eval(args[1])
+                if c is not None:
+                    self.emit(f'\tldi $a,{c & 0xFF}')
+                else:
+                    self.gen_expr(args[1])
+                self.emit('\tjal __i2c_sb')
+                self.emit_ddrb(0x03)
+                self.emit_ddrb(0x01)
+                self.emit_ddrb(0x00)
+                # ACK poll until write cycle completes (chip NACKs while busy)
+                lbl = self.label('e64wp')
+                self.emit(f'{lbl}:')
+                self.emit('\texrw 2')
+                self.emit_ddrb(0x01)
+                self.emit_ddrb(0x03)
+                self.emit('\tldi $a,0xA0')
+                self.emit('\tjal __i2c_sb')
+                self.emit('\tpush $a')
+                self.emit_ddrb(0x03)
+                self.emit_ddrb(0x01)
+                self.emit_ddrb(0x00)
+                self.emit('\tpop $a')
+                self.emit('\ttst 0x01')
+                self.emit(f'\tjnz {lbl}')
+                return
+
+            if name == 'ee64_read_to_code':
+                # ee64_read_to_code(ee_addr16, code_addr, count) — bulk
+                # sequential I2C read from AT24C512 → code page via istc.
+                # Mirrors eeprom_read_to_code but targets the 64KB chip
+                # (device 0xA0/0xA1, full 16-bit addressing). Reuses the
+                # chip-agnostic __eeprom_r2c_loop for the read loop body.
+                if len(args) < 3:
+                    self.gen_error("ee64_read_to_code(ee_addr, code_addr, count)")
+                ee_addr = self._const_eval(args[0])
+                code_addr = self._const_eval(args[1])
+                count = self._const_eval(args[2])
+                if ee_addr is None or code_addr is None or count is None:
+                    self.gen_error("ee64_read_to_code: all args must be constants")
+                if not hasattr(self, '_lcd_helpers'):
+                    self._lcd_helpers = set()
+                self._lcd_helpers.add('__i2c_sb')
+                self._lcd_helpers.add('__i2c_rb')
+                self._lcd_helpers.add('__eeprom_r2c_loop')
+                # START + dev write + addr_hi + addr_lo + REP-START + dev read
+                self.emit_ddrb(0x01)
+                self.emit_ddrb(0x03)
+                self.emit('\tldi $a,0xA0')
+                self.emit('\tjal __i2c_sb')
+                self.emit(f'\tldi $a,{(ee_addr >> 8) & 0xFF}')
+                self.emit('\tjal __i2c_sb')
+                self.emit(f'\tldi $a,{ee_addr & 0xFF}')
+                self.emit('\tjal __i2c_sb')
+                self.emit_ddrb(0x00)
+                self.emit_ddrb(0x01)
+                self.emit_ddrb(0x03)
+                self.emit('\tldi $a,0xA1')
+                self.emit('\tjal __i2c_sb')
+                self.emit(f'\tldi $b,{code_addr & 0xFF}')
+                self.emit(f'\tldi $a,{count & 0xFF}')
+                self.emit('\tpush $a')
+                self.emit('\tjal __eeprom_r2c_loop')
+                self.emit('\tpop $a')
                 return
 
             if name == 'call_code':
