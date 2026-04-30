@@ -2000,6 +2000,11 @@ class MK1CodeGen:
         rename_map = {}
         kept = []
         for name, params, body, ret_type in functions:
+            if name in self.cold_function_names:
+                # ee64-tagged: user wants this body in cold tier, not
+                # replaced with a kernel-resident builtin. Skip aliasing.
+                kept.append((name, params, body, ret_type))
+                continue
             if self._is_builtin_i2c_send_byte_alias(name, params, body, ret_type):
                 aliases.add(name)
                 continue
