@@ -160,9 +160,9 @@ def _hex_print(name, page, base=0, width=16):
         print(f'  {offset:04X}: {hex_part:<{width*3-1}}  |{ascii_part}|')
 
 
-def dump_bufs(ser, eeprom_size=0):
+def dump_bufs(ser, eeprom_size=0, ee64_size=0):
     """Hex-dump the four 256B SRAM page buffers from the firmware's uploadBuf,
-    plus the EEPROM buffer when `eeprom_size > 0`.
+    plus the EEPROM and EE64 buffers when their sizes are non-zero.
 
     uploadBuf layout: [code(256), data(256), stack(256), page3(256)]. Reads
     via the firmware's DUMP:offset,count command. Use after UPLOAD when you
@@ -170,10 +170,14 @@ def dump_bufs(ser, eeprom_size=0):
     offset 192 but its bytes actually landed at 198, so `derefp3` reads zeros.
     A glance at the page-2 dump shows the bytes' real position.
 
-    EEPROM buffer dump targets the `assembler.result.eeprom[]` buffer (what
-    was *meant* to be written to AT24C32, NOT the live AT24C32 contents).
-    Catches alignment issues where eg. an overlay lands at eeprom[0xF0]
-    instead of eeprom[0x100] because the 16-byte header pad was skipped.
+    EEPROM/EE64 buffer dumps target `assembler.result.eeprom[]` and
+    `result.ee64[]` (what was *meant* to be written to AT24C32 / AT24C512,
+    NOT the live chip contents). Catches alignment issues where eg. an
+    overlay lands at eeprom[0xF0] instead of eeprom[0x100] because the
+    16-byte header pad was skipped. For the cold tier specifically, these
+    are useful upper-bound sanity checks: if the buffer dump is wrong,
+    the chip will be wrong too. If the buffer dump is right but the chip
+    is wrong, the I²C-shim transfer is at fault.
     """
     raw = _dump_region(ser, 'DUMP', 1024)
     if len(raw) < 1024:
@@ -182,7 +186,6 @@ def dump_bufs(ser, eeprom_size=0):
     for i, name in enumerate(['code', 'data', 'stack', 'page3']):
         _hex_print(f'{name} (page {i})', raw[i*256:(i+1)*256])
     if eeprom_size > 0:
-        # Round up to next 64B block so we cover the full payload.
         ee_total = (eeprom_size + 63) & ~63
         ee_raw = _dump_region(ser, 'DUMP_EE', ee_total)
         if len(ee_raw) >= eeprom_size:
@@ -192,6 +195,17 @@ def dump_bufs(ser, eeprom_size=0):
             print(f'  eeprom dump short: got {len(ee_raw)} bytes, expected {eeprom_size}',
                   file=sys.stderr)
             print(f'  (firmware may need re-flashing for DUMP_EE support)',
+                  file=sys.stderr)
+    if ee64_size > 0:
+        ee_total = (ee64_size + 63) & ~63
+        ee_raw = _dump_region(ser, 'DUMP_EE64', ee_total)
+        if len(ee_raw) >= ee64_size:
+            _hex_print(f'ee64 (assembler buffer, {ee64_size}B used)',
+                       ee_raw[:ee64_size])
+        else:
+            print(f'  ee64 dump short: got {len(ee_raw)} bytes, expected {ee64_size}',
+                  file=sys.stderr)
+            print(f'  (firmware may need re-flashing for DUMP_EE64 support)',
                   file=sys.stderr)
 
 
@@ -244,6 +258,7 @@ def main():
     asm_h = _asm_hash(asm)
     cached_h = None if args.no_cache else _read_cached_hash(args.port)
     eeprom_size = 0
+    ee64_size = 0
     if cached_h == asm_h:
         print(f'Skipping assembly (cache hit, hash={asm_h[:8]}...)')
     else:
@@ -259,15 +274,17 @@ def main():
             sys.exit(1)
         print(f'  code={r["code"]}B data={r.get("data",0)}B')
         eeprom_size = r.get('eeprom', 0)
+        ee64_size = r.get('ee64', 0)
         _write_cached_hash(asm_h, args.port)
 
     # Optional: hex-dump the four SRAM page buffers from uploadBuf and the
-    # assembler's EEPROM buffer for emission-order debugging (see `dump_bufs`
-    # docstring). MUST be done BEFORE UPLOAD: writeEepromData internally
-    # re-runs the assembler to build I²C shim programs, which zeros
-    # `result.eeprom[]`. The SRAM uploadBuf is unaffected.
+    # assembler's EEPROM/EE64 buffers for emission-order debugging (see
+    # `dump_bufs` docstring). MUST be done BEFORE UPLOAD: writeEepromData
+    # and writeEe64Data internally re-run the assembler to build I²C shim
+    # programs, which zeros `result.eeprom[]` / `result.ee64[]`. The SRAM
+    # uploadBuf is unaffected.
     if args.dump_bufs or os.environ.get('MK1_DUMP_BUFS') == '1':
-        dump_bufs(ser, eeprom_size=eeprom_size)
+        dump_bufs(ser, eeprom_size=eeprom_size, ee64_size=ee64_size)
 
     # Upload
     print('Uploading...')
