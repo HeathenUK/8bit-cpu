@@ -65,6 +65,15 @@ KERNEL_STATE = {
                     'has been copied from EEPROM to page 3 so a second '
                     'oled_init() call skips the multi-byte sequential '
                     'EEPROM read.'),
+    'cold_current_id': KSlot(
+        page=2, offset=0xB4, size=1, owner='__cold_call',
+        description='id of the cold helper currently loaded into the '
+                    'cold slot. 0xFF = no cold helper loaded (running '
+                    'from main/kernel). Used by __cold_call to track '
+                    'which helper to RELOAD after a cold→cold call '
+                    "returns — a callee's bytes overwrote the caller's "
+                    "in the slot, so the caller's bytes need to be "
+                    'reloaded before its `ret` lands on slot bytes.'),
 }
 
 # Phase 1 introduced f-string aliases (`K_CALIB_BLOCKS`, etc.) for
@@ -2841,36 +2850,70 @@ class MK1CodeGen:
         if self.cold_slot_size > 0:
             self.cold_slot_base = 256 - self.cold_slot_size
 
-        # Rewrite direct calls to cold functions in the main code stream:
-        # `jal _foo` becomes `ldi $a,id; jal __cold_call`. Must run after
-        # cold functions are registered (so the id map exists) and
-        # before _overlay_partition (which treats self.code as definitive).
-        # Cold-function bodies themselves don't get rewritten here —
-        # cold→cold calls aren't supported in Phase 6 (a cold function
-        # calling another cold one would jump into the slot expecting
-        # its callee's bytes, but the slot still contains its own
-        # bytes; chaining requires re-entering through the dispatcher
-        # which is future work).
+        # Rewrite direct calls to cold functions: `jal _foo` becomes
+        # `ldi $a,id; jal __cold_call`. Applies to BOTH the main code
+        # stream AND cold function bodies — the latter enables cold→cold
+        # chaining (a cold function calling another cold function
+        # re-enters the dispatcher, which save/restores the
+        # currently-loaded helper around the callee's run).
+        # Must run after cold functions are registered (so the id map
+        # exists) and before _overlay_partition (which treats self.code
+        # as definitive).
         if self.cold_function_names:
             cold_call_map = {fname: cid
                              for cid, _addr, _size, fname in self.cold_helpers
                              if fname in self.cold_function_names}
             self._lcd_helpers = getattr(self, '_lcd_helpers', set())
-            # __cold_call inlines the bulk-read loop; doesn't need
-            # __eeprom_r2c_loop as a separate kernel-resident helper.
-            self._lcd_helpers |= {'__i2c_sb', '__i2c_rb', '__cold_call'}
-            new_code = []
-            for line in self.code:
-                s = line.strip()
-                if s.startswith('jal _'):
-                    target = s[len('jal _'):]
-                    if target in cold_call_map:
-                        cid = cold_call_map[target]
-                        new_code.append(f'\tldi $a,{cid}')
-                        new_code.append('\tjal __cold_call')
-                        continue
-                new_code.append(line)
-            self.code = new_code
+            # __cold_call calls __cold_load_helper for both the
+            # initial-load and the post-callee reload path. The bulk-
+            # read loop is inlined inside __cold_load_helper so
+            # __eeprom_r2c_loop doesn't need to be kernel-resident.
+            self._lcd_helpers |= {'__i2c_sb', '__i2c_rb',
+                                  '__cold_call', '__cold_load_helper'}
+
+            def _rewrite_cold_calls(lines):
+                rewritten = []
+                for line in lines:
+                    s = line.strip()
+                    if s.startswith('jal _'):
+                        target = s[len('jal _'):]
+                        if target in cold_call_map:
+                            cid = cold_call_map[target]
+                            rewritten.append(f'\tldi $a,{cid}')
+                            rewritten.append('\tjal __cold_call')
+                            continue
+                    rewritten.append(line)
+                return rewritten
+
+            self.code = _rewrite_cold_calls(self.code)
+            # Also rewrite within cold function bodies. Each body is
+            # (id, name, lines, byte_size, ee64_addr); re-measure size
+            # post-rewrite and reallocate ee64 addresses sequentially
+            # (rewriting can change body length: 2 B `jal _b` → 4 B
+            # `ldi $a,N; jal __cold_call`).
+            if self.cold_function_bodies:
+                new_bodies = []
+                self.ee64_alloc = 0  # reset and re-pack
+                self.cold_helpers = []  # rebuild
+                for cold_id, fname, body, _old_size, _old_addr in self.cold_function_bodies:
+                    rewritten_body = _rewrite_cold_calls(body)
+                    new_size = _measure_asm_bytes(rewritten_body)
+                    if new_size > COLD_SLOT_BYTES:
+                        raise Exception(
+                            f"cold function '{fname}' is {new_size} B "
+                            f"after cold→cold rewriting; exceeds slot "
+                            f"size {COLD_SLOT_BYTES} B.")
+                    new_addr = self.ee64_alloc
+                    self.cold_helpers.append((cold_id, new_addr, new_size, fname))
+                    new_bodies.append((cold_id, fname, rewritten_body, new_size, new_addr))
+                    self.ee64_alloc += new_size
+                self.cold_function_bodies = new_bodies
+                # Recompute slot size from new sizes.
+                max_cold = max((sz for _id, _a, sz, _n in self.cold_helpers),
+                               default=0)
+                self.cold_slot_size = max_cold
+                if max_cold > 0:
+                    self.cold_slot_base = 256 - max_cold
 
         # (C) Transitive deps: every compiler helper called from a cold
         # function body has to be kernel-resident. A cold function runs
@@ -3103,12 +3146,28 @@ class MK1CodeGen:
             # `ldi $a,V; ldi $b,P; iderefp3` triple. (Init-extraction /
             # overlay mode below still emits runtime init because page 3
             # gets clobbered by the kernel image during self-copy.)
+            cold_helpers = getattr(self, 'cold_helpers', [])
+            cold_active = bool(cold_helpers)
             for mi, line in enumerate(self.code):
                 if line.strip() == '_main:':
                     self.code.insert(mi + 1, '\tldi $b,0xFF')
                     self.code.insert(mi + 2, '\tmov $b,$sp')
+                    if cold_active:
+                        # cold_current_id = 0xFF (sentinel: nothing
+                        # loaded). Required so the first cold_call's
+                        # post-callee reload path correctly skips the
+                        # caller-reload branch instead of trying to
+                        # reload a non-existent caller.
+                        self.code.insert(mi + 3, '\tldi $a,0xFF')
+                        # Inline the kstate store rather than emit_kstate_store
+                        # — that helper writes to self.code which is what
+                        # we're currently mutating. The cold_current_id
+                        # slot lives at page2[0xB4]; page-2 store is
+                        # `ldi $b,0xB4; iderefp3` … wait, page 2 needs
+                        # ideref2 not iderefp3. Use the helper output.
+                        self.code.insert(mi + 4, '\tldi $b,0xB4')
+                        self.code.insert(mi + 5, '\tideref2')
                     break
-            cold_helpers = getattr(self, 'cold_helpers', [])
             if cold_helpers:
                 self.emit('\tsection page3')
                 self.emit(f'\torg {COLD_TABLE_BASE}')
@@ -3780,6 +3839,7 @@ class MK1CodeGen:
         # pull it in, and that path may put it in an overlay).
         if '__cold_call' in helpers:
             no_ov.add('__cold_call:')
+            no_ov.add('__cold_load_helper:')
 
         # (C) Cold-function callees: every compiler helper invoked from a
         # cold-function body has to be kernel-resident — a cold function
@@ -5188,8 +5248,49 @@ class MK1CodeGen:
         # the load cost; reuse of the same id within tight loops would be
         # wasteful — partitioner should avoid that pattern.
         if '__cold_call' in helpers:
+            # __cold_call: enter with A = new helper id. Saves the
+            # currently-loaded helper id onto the stack, sets the
+            # current id to new, calls __cold_load_helper to fetch the
+            # helper's bytes into the slot, jal_r's into the slot.
+            # After the cold helper returns, pops the saved caller id;
+            # if non-sentinel, reloads the caller's bytes into the slot
+            # so the caller's `ret` (or next instruction) lands on its
+            # own bytes — the cold→cold chaining contract.
+            #
+            # Sentinel 0xFF in `cold_current_id` means "no cold helper
+            # loaded" (caller is main or kernel-resident code).
+            # `_main`'s preamble initializes the slot to 0xFF.
             self.emit('__cold_call:')
-            # Compute ptr = COLD_TABLE_BASE + 3 * id; preserve in $b.
+            self.emit('\tmov $a,$d')                       # save new_id in D
+            self.emit_kstate_load('cold_current_id')       # A = caller's id
+            self.emit('\tpush $a')                         # save caller id on stack
+            self.emit('\tmov $d,$a')                       # A = new_id
+            self.emit_kstate_store('cold_current_id')      # current = new_id
+            self.emit('\tjal __cold_load_helper')          # load new helper into slot
+            self.emit(f'\tldi $a,{self.cold_slot_base}')
+            self.emit('\tjal_r')                           # run cold helper
+            # Cold helper returned. Restore caller's id and reload its
+            # bytes (unless caller was the sentinel = main/kernel).
+            self.emit('\tpop $a')                          # A = saved caller id
+            self.emit_kstate_store('cold_current_id')      # current = caller id
+            self.emit('\tcmpi 0xFF')
+            cc_done = self.label('cc_done')
+            self.emit(f'\tjz {cc_done}')
+            # Caller is itself a cold helper — reload its bytes so its
+            # next instruction lands on the right slot byte.
+            self.emit('\tjal __cold_load_helper')
+            self.emit(f'{cc_done}:')
+            self.emit('\tret')
+
+        # __cold_load_helper: reads `cold_current_id` from kstate, looks
+        # up its (addr_hi, addr_lo, len) in the page-3 metadata table,
+        # bulk-reads `len` bytes from AT24C512 into code[COLD_SLOT_BASE].
+        # Factored out of __cold_call so we can call it twice from the
+        # dispatcher: once for the new helper, once for the caller-reload
+        # path on cold→cold returns.
+        if '__cold_load_helper' in helpers:
+            self.emit('__cold_load_helper:')
+            self.emit_kstate_load('cold_current_id')       # A = id
             self.emit('\tmov $a,$b')                       # b = id
             self.emit('\tsll')                             # a = 2*id
             self.emit('\tadd $b,$a')                       # a = 3*id
@@ -5197,14 +5298,14 @@ class MK1CodeGen:
             self.emit('\tmov $a,$b')                       # b = ptr (preserved across derefp3)
             # Read len, addr_lo, addr_hi from page 3, push reverse-order
             # so stack ends as [len, lo, hi] with hi on top.
-            self.emit('\taddi 2,$a')                       # a = ptr+2
-            self.emit('\tderefp3')                         # a = page3[ptr+2] = len
+            self.emit('\taddi 2,$a')
+            self.emit('\tderefp3')                         # a = len
             self.emit('\tpush $a')
             self.emit('\tmov $b,$a')
-            self.emit('\taddi 1,$a')                       # a = ptr+1
+            self.emit('\taddi 1,$a')
             self.emit('\tderefp3')                         # a = addr_lo
             self.emit('\tpush $a')
-            self.emit('\tmov $b,$a')                       # a = ptr
+            self.emit('\tmov $b,$a')
             self.emit('\tderefp3')                         # a = addr_hi
             self.emit('\tpush $a')
             # I²C: START + 0xA0 + addr_hi + addr_lo + REP-START + 0xA1
@@ -5222,49 +5323,37 @@ class MK1CodeGen:
             self.emit_ddrb(0x03)
             self.emit('\tldi $a,0xA1')
             self.emit('\tjal __i2c_sb')
-            # Bulk-read into the cold slot. Inlining the loop body here
-            # (rather than `jal __eeprom_r2c_loop`) lets `__eeprom_r2c_loop`
-            # stay overlay-eligible — it's only forced kernel-resident for
-            # `eeprom_read_to_code`-using programs now, not cold-tier
-            # ones. Saves ~33 B kernel for the typical
-            # cold-tier-without-eeprom-read program.
-            #
-            # `len` is on top of stack from the metadata-read above; pop
-            # it into the count kstate slot. B holds the slot dest.
-            self.emit(f'\tldi $b,{self.cold_slot_base}')   # B = dest
+            # Bulk-read inlined: len on top of stack. Pop count and
+            # store to kstate FIRST (the kstate store clobbers B), then
+            # set B = slot_base for the istc_inc loop.
             self.emit('\tpop $a')                          # A = count
-            self.emit_kstate_store('overlay_r2c_count')    # save count
-            cc_loop = self.label('cc_r2c')
-            cc_last = self.label('cc_r2cl')
-            self.emit(f'{cc_loop}:')
-            self.emit('\tpush_b')                          # save dest before i2c_rb clobbers B
-            self.emit('\tjal __i2c_rb')                    # D = byte
-            self.emit('\tpop_b')                           # B = dest
-            self.emit('\tmov $d,$a')                       # A = byte
-            self.emit('\tistc_inc')                        # code[B] = A; B++
-            self.emit('\tpush_b')                          # save dest+1
-            self.emit_kstate_load('overlay_r2c_count')     # A = remaining
-            self.emit('\tdec')                             # A--, ZF set
-            self.emit_kstate_store('overlay_r2c_count')    # writeback
-            self.emit('\tpop_b')                           # B = dest+1 (ZF preserved)
-            self.emit(f'\tjz {cc_last}')
-            # ACK after each non-last byte
+            self.emit_kstate_store('overlay_r2c_count')
+            self.emit(f'\tldi $b,{self.cold_slot_base}')   # B = dest
+            clh_loop = self.label('clh_r2c')
+            clh_last = self.label('clh_r2cl')
+            self.emit(f'{clh_loop}:')
+            self.emit('\tpush_b')
+            self.emit('\tjal __i2c_rb')
+            self.emit('\tpop_b')
+            self.emit('\tmov $d,$a')
+            self.emit('\tistc_inc')
+            self.emit('\tpush_b')
+            self.emit_kstate_load('overlay_r2c_count')
+            self.emit('\tdec')
+            self.emit_kstate_store('overlay_r2c_count')
+            self.emit('\tpop_b')
+            self.emit(f'\tjz {clh_last}')
             self.emit_ddrb(0x03)
             self.emit_ddrb(0x01)
             self.emit_ddrb(0x03)
             self.emit_ddrb(0x02)
-            self.emit(f'\tj {cc_loop}')
-            # Last byte: NACK + STOP
-            self.emit(f'{cc_last}:')
-            self.emit_ddrb(0x00)                           # SCL HIGH (NACK)
-            self.emit_ddrb(0x02)                           # SCL LOW
-            self.emit_ddrb(0x03)                           # SDA LOW
-            self.emit_ddrb(0x01)                           # SCL HIGH
-            self.emit_ddrb(0x00)                           # STOP
-            # Enter the loaded helper. jal_r pushes return PC; the cold
-            # helper's `ret` returns back here, then we ret to caller.
-            self.emit(f'\tldi $a,{self.cold_slot_base}')
-            self.emit('\tjal_r')
+            self.emit(f'\tj {clh_loop}')
+            self.emit(f'{clh_last}:')
+            self.emit_ddrb(0x00)
+            self.emit_ddrb(0x02)
+            self.emit_ddrb(0x03)
+            self.emit_ddrb(0x01)
+            self.emit_ddrb(0x00)
             self.emit('\tret')
 
         # __keypad_scan: 4x4 matrix scanner for the keypad on PA4-7 (rows)
@@ -6527,7 +6616,7 @@ class MK1CodeGen:
             # happens to be loaded at __cold_call's address.
             if '__cold_call' in _helpers_used:
                 _force_resident_helpers |= {
-                    '__cold_call',
+                    '__cold_call', '__cold_load_helper',
                     '__i2c_sb', '__i2c_rb',
                 }
                 # (C) Helpers transitively called from cold function bodies.
@@ -7667,6 +7756,14 @@ class MK1CodeGen:
                         preamble.append(f'\tldi $a,{value}')
                         preamble.append(f'\tldi $b,{p3_addr}')
                         preamble.append('\tiderefp3')
+                # cold_current_id = 0xFF sentinel (no cold helper loaded
+                # initially). Required for the cold→cold dispatcher's
+                # save/restore logic to correctly skip caller-reload
+                # when the chain unwinds back to main/kernel.
+                preamble.append('\t; cold_current_id = 0xFF (sentinel)')
+                preamble.append('\tldi $a,0xFF')
+                preamble.append('\tldi $b,0xB4')
+                preamble.append('\tideref2')
             if getattr(self, '_ee_preload_bytes', 0) > 0:
                 preamble.append('\tjal __eeprom_preload')
             preamble.extend([
@@ -13105,8 +13202,8 @@ class MK1CodeGen:
                     self._lcd_helpers = set()
                 self._lcd_helpers.add('__i2c_sb')
                 self._lcd_helpers.add('__i2c_rb')
-                self._lcd_helpers.add('__eeprom_r2c_loop')
                 self._lcd_helpers.add('__cold_call')
+                self._lcd_helpers.add('__cold_load_helper')
                 c = self._const_eval(args[0])
                 if c is not None:
                     self.emit(f'\tldi $a,{c & 0xFF}')
