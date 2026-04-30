@@ -2907,7 +2907,13 @@ class MK1CodeGen:
                         target = s[len('jal _'):]
                         if target in cold_call_map:
                             cid = cold_call_map[target]
-                            rewritten.append(f'\tldi $a,{cid}')
+                            # Pass id via stack rather than $a so the
+                            # caller's $a is intact at the moment of
+                            # dispatch (the dispatcher still clobbers
+                            # $a internally; preserving caller args
+                            # all the way into the helper requires a
+                            # follow-on save/restore pass).
+                            rewritten.append(f'\tpush_imm {cid}')
                             rewritten.append('\tjal __cold_call')
                             continue
                     rewritten.append(line)
@@ -4064,11 +4070,12 @@ class MK1CodeGen:
                         target = s[len(prefix):].split()[0].split(';')[0].strip()
                         if target in cold_call_map:
                             cid = cold_call_map[target]
-                            out.append(f'\tldi $a,{cid}')
+                            # Pass id via stack (matches the user-fn
+                            # rewriter at line ~2912; dispatcher still
+                            # clobbers $a internally).
+                            out.append(f'\tpush_imm {cid}')
                             out.append('\tjal __cold_call')
                             if prefix == 'j _':
-                                # Tail-jump replaced by call+ret so caller's
-                                # ret target is preserved.
                                 out.append('\tret')
                             break
                 else:
@@ -5477,6 +5484,15 @@ class MK1CodeGen:
             # loaded" (caller is main or kernel-resident code).
             # `_main`'s preamble initializes the slot to 0xFF.
             self.emit('__cold_call:')
+            # Stack on entry: [..., id, RA] with RA on top (caller did
+            # `push_imm <id>; jal __cold_call`). Extract id from under
+            # the return address. Note: $a is still clobbered here —
+            # full caller-register preservation requires a save/restore
+            # of caller's $a across the dispatch (helper expects $a
+            # = parameter at entry); not implemented yet.
+            self.emit('\tpop_b')                           # B = RA
+            self.emit('\tpop $a')                          # A = id
+            self.emit('\tpush_b')                          # restore RA on top
             self.emit('\tmov $a,$d')                       # save new_id in D
             self.emit_kstate_load('cold_current_id')       # A = caller's id
             self.emit('\tpush $a')                         # save caller id on stack
@@ -13420,11 +13436,14 @@ class MK1CodeGen:
                 self._lcd_helpers.add('__i2c_rb')
                 self._lcd_helpers.add('__cold_call')
                 self._lcd_helpers.add('__cold_load_helper')
+                # Pass id on stack so caller's $a/$b/$c/$d are
+                # preserved across the dispatch.
                 c = self._const_eval(args[0])
                 if c is not None:
-                    self.emit(f'\tldi $a,{c & 0xFF}')
+                    self.emit(f'\tpush_imm {c & 0xFF}')
                 else:
                     self.gen_expr(args[0])
+                    self.emit('\tpush $a')
                 self.emit('\tjal __cold_call')
                 return
 

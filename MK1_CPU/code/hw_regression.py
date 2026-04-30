@@ -1128,16 +1128,9 @@ TESTS = [
         # Phase 1 auto-cold: BOTH user functions are NOT tagged
         # ee64 in source. MK1_FORCE_COLD_USER seeds them as
         # synthetic ee64 — same code path the outer retry takes
-        # on overlay-wrap. Pattern matches the existing
-        # `cold tier: ee64 C function end-to-end` test (chime):
-        # cold call followed by halt or another cold call.
-        # Uses back-to-back cold calls so both are exercised
-        # through the dispatcher and main reaches halt cleanly.
-        # NOTE: A pre-existing dispatcher bug breaks the case
-        # where a non-cold instruction follows a cold call —
-        # documented in WORKLOG. Tests that pattern would fail
-        # for source-`ee64` functions too; not a Phase 1
-        # regression.
+        # on overlay-wrap. Back-to-back cold calls verify the
+        # dispatcher loads, runs, and returns through the cold
+        # tier on real hardware.
         'cold tier: auto-cold user function (Phase 1)',
         '''void emit_a(void) { out(0xC1); }
         void emit_b(void) { out(0xC4); }
