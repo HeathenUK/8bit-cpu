@@ -2804,6 +2804,20 @@ static void writeEe64Data(const uint8_t* data, int size) {
     // 32-byte pages. AT24C512 supports up to 128 but the asmBuf would
     // overflow with 128 inlined `ldi/jal` pairs.
     static const int PAGE_SZ = 32;
+    // CRITICAL: snapshot `data` to a local mirror BEFORE the per-page
+    // loop. Each iteration's `assembler.assemble(asmBuf)` calls
+    // `memset(&result, 0, sizeof(result))` to clear stale state, and
+    // `data` typically points into `result.ee64`. Without this copy,
+    // iter 1's snprintf reads correct bytes, iter 1's assemble zeros
+    // result.ee64, iter 2+'s snprintf reads zeros and writes zeros to
+    // the chip — same bug `writeEepromData` already works around with
+    // a 512 B stack buffer (it just happens to fit since AT24C32 is
+    // 4 KB max). For the 64 KB AT24C512, can't put 64 KB on the stack;
+    // use a static mirror instead.
+    static uint8_t ee64Mirror[EE64_SIZE];
+    if (size > EE64_SIZE) size = EE64_SIZE;
+    memcpy(ee64Mirror, data, size);
+    data = ee64Mirror;
     Serial.printf("EE64 write start: size=%d src[0]=%d src[%d]=%d\n",
         size, size > 0 ? data[0] : 0, size - 1, size > 0 ? data[size - 1] : 0);
 

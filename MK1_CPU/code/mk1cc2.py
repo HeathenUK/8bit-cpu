@@ -14876,7 +14876,16 @@ def main():
 
     # Page & EEPROM utilisation report
     import sys
-    MAX_CODE = 250  # safe code page limit
+    # Cold-tier reserves [cold_slot_base..255] in the code page for the
+    # runtime dispatcher to load helpers into. Program code must not
+    # extend into that range — otherwise the dispatcher's istc_inc
+    # writes corrupt program bytes and execution falls into garbage
+    # after the cold helper returns. Narrow MAX_CODE accordingly.
+    cold_slot_size = getattr(gen, 'cold_slot_size', 0) or 0
+    if cold_slot_size > 0:
+        MAX_CODE = 256 - cold_slot_size
+    else:
+        MAX_CODE = 250  # safe code page limit (6 B reserved for halt-trap)
     init_extraction = getattr(gen, '_init_extraction_done', False)
     overlay_mode = hasattr(gen, '_overlay_kernel_size')  # full overlay path
 
