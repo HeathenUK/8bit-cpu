@@ -683,6 +683,10 @@ class MK1CodeGen:
         self.optimize = optimize
         self.b_expr = None  # AST expr currently in B, for cache reuse
         self._prefer_delay_cal_init = False
+        # User functions auto-promoted to cold tier by the outer retry
+        # in _prepare_compile when overlay placement would wrap into kernel.
+        # Treated identically to source-level `ee64` tags from this point on.
+        self._auto_cold_user_fns = set()
 
         # ── Port-pin shadow ──────────────────────────────────────────
         # Tracks bits each builtin claims on VIA port A/B so that every
@@ -2689,6 +2693,10 @@ class MK1CodeGen:
         # Codegen captures their bodies into the AT24C512 image and
         # rewrites direct `jal _f` to `cold_call(id)` via __cold_call.
         self.cold_function_names = set(parser.cold_function_names)
+        # Auto-cold promotions from the outer retry: user functions the
+        # partitioner couldn't place because they exceed the overlay
+        # slot. Treated identically to source-level `ee64` tags.
+        self.cold_function_names |= getattr(self, '_auto_cold_user_fns', set())
 
         self.page3_globals = {}  # name → page 3 address (for overflow arrays)
         self.page3_alloc = 0
@@ -14855,13 +14863,16 @@ def main():
 
     with open(args.input) as f: source = f.read()
 
-    def _prepare_compile(prefer_delay_cal_init=False, capture_log=False):
+    def _prepare_compile(prefer_delay_cal_init=False, capture_log=False,
+                         auto_cold_fns=None):
         gen = MK1CodeGen(optimize=args.optimize)
         # Stash the in-flight gen so the exception handler can recover
         # `_matcher_fires` even on compile failure (populated during
         # _simplify_function_bodies, before _overlay_partition can throw).
         _prepare_compile._last_gen = gen
         gen._prefer_delay_cal_init = prefer_delay_cal_init
+        if auto_cold_fns:
+            gen._auto_cold_user_fns = set(auto_cold_fns)
         if hasattr(args, 'eeprom') and args.eeprom:
             gen.eeprom_mode = True
             gen.eeprom_base = args.eeprom_base
@@ -14986,12 +14997,48 @@ def main():
         except Exception:
             pass
 
-    try:
-        gen, asm, lines, _code_bytes_try, _init_limit_try, _compile_log = _prepare_compile(
-            prefer_delay_cal_init=True, capture_log=True)
-    except Exception as _e:
-        _emit_partial_metrics(getattr(_prepare_compile, '_last_gen', None), str(_e))
-        raise
+    # Outer auto-cold retry: when overlay placement reports that a USER
+    # function would wrap into kernel, the partitioner has tried every
+    # placement option and there is no SRAM slot big enough. Promote
+    # that function to the cold tier (synthetic ee64) and recompile.
+    # Iterates until compile succeeds or no further auto-promotion is
+    # possible (cap to avoid runaway loops).
+    import re as _re_ac
+    _auto_cold = set()
+    _MAX_AUTO_COLD = 8
+    while True:
+        try:
+            gen, asm, lines, _code_bytes_try, _init_limit_try, _compile_log = _prepare_compile(
+                prefer_delay_cal_init=True, capture_log=True,
+                auto_cold_fns=_auto_cold)
+            break
+        except Exception as _e:
+            _msg = str(_e)
+            if 'wrap into kernel' not in _msg or len(_auto_cold) >= _MAX_AUTO_COLD:
+                _emit_partial_metrics(getattr(_prepare_compile, '_last_gen', None), _msg)
+                raise
+            # Parse `wrapping=_show_temp=46B[, _other=NB,...]`. Pick user
+            # function names (`_name`, single leading underscore, not
+            # `__helper`); skip phase-split synthesizes (`_name_p1`).
+            _wraps = _re_ac.findall(r'(_[A-Za-z][\w]*)=\d+B', _msg)
+            _picked = None
+            for _w in _wraps:
+                if _w.startswith('__'):
+                    continue
+                if _re_ac.search(r'_p\d+$', _w):
+                    continue
+                _user = _w[1:]  # strip leading _
+                if _user in _auto_cold:
+                    continue
+                _picked = _user
+                break
+            if _picked is None:
+                _emit_partial_metrics(getattr(_prepare_compile, '_last_gen', None), _msg)
+                raise
+            import sys as _ac_sys
+            print(f"  Auto-cold: promoting {_picked} to cold tier "
+                  f"(overlay placement would wrap)", file=_ac_sys.stderr)
+            _auto_cold.add(_picked)
     if (_code_bytes_try > _init_limit_try and
             getattr(gen, '_prefer_delay_cal_init', False)):
         import sys as _retry_sys
@@ -14999,7 +15046,7 @@ def main():
               f"({_code_bytes_try}B > {_init_limit_try}B); using runtime/overlay placement",
               file=_retry_sys.stderr)
         gen, asm, lines, _code_bytes_try, _init_limit_try, _compile_log = _prepare_compile(
-            prefer_delay_cal_init=False)
+            prefer_delay_cal_init=False, auto_cold_fns=_auto_cold)
     elif _compile_log:
         import sys as _compile_log_sys
         print(_compile_log, end='', file=_compile_log_sys.stderr)
