@@ -74,6 +74,16 @@ KERNEL_STATE = {
                     "returns — a callee's bytes overwrote the caller's "
                     "in the slot, so the caller's bytes need to be "
                     'reloaded before its `ret` lands on slot bytes.'),
+    'cold_call_arg': KSlot(
+        page=2, offset=0xB5, size=1, owner='__cold_call',
+        description="caller's $a saved by __cold_call's prologue and "
+                    'restored by the cold helper body prologue. Lets '
+                    'cold helpers receive their parameter in $a even '
+                    "though the dispatcher's setup and the final "
+                    '`jal_r {slot_base}` overwrite $a. Each cold helper '
+                    '(user `ee64` or auto-cold) gets a 4-byte synthetic '
+                    'prologue (`ldi $a,0xB5; deref2`) prepended at '
+                    'compile time when its body reads $a as input.'),
 }
 
 # Phase 1 introduced f-string aliases (`K_CALIB_BLOCKS`, etc.) for
@@ -1188,6 +1198,15 @@ class MK1CodeGen:
     def emit_kstate_store(self, slot_name):
         for line in self._kstate_store_lines(slot_name):
             self.emit(line)
+
+    def _cold_arg_prologue(self):
+        """Lines a cold helper body prepends to recover its $a
+        parameter from kstate cold_call_arg. The dispatcher saves
+        caller's $a there before its own setup clobbers $a; the
+        helper restores it as its first instructions. 3 bytes
+        (`ldi $a,0xB5; deref2`)."""
+        slot = KERNEL_STATE['cold_call_arg']
+        return [f'\tldi $a,{slot.offset}', '\tderef2']
 
     # ── Dead variable analysis ───────────────────────────────────────
 
@@ -2844,6 +2863,13 @@ class MK1CodeGen:
                 # dispatcher reads N bytes when only M < N exist and
                 # loads garbage past byte M into the slot.
                 cold_lines = peephole(list(self.code))
+                # Caller-arg prologue: if this cold function takes a
+                # parameter (first arg in $a), the dispatcher already
+                # clobbered $a by the time the slot runs. Prepend a
+                # 3-byte load from the kstate `cold_call_arg` slot
+                # so the body sees its parameter at entry.
+                if self.func_params.get(fn[0], 0) > 0:
+                    cold_lines = self._cold_arg_prologue() + cold_lines
                 byte_size = _measure_asm_bytes(cold_lines)
                 if byte_size > COLD_SLOT_BYTES:
                     raise Exception(
@@ -2907,13 +2933,18 @@ class MK1CodeGen:
                         target = s[len('jal _'):]
                         if target in cold_call_map:
                             cid = cold_call_map[target]
-                            # Pass id via stack rather than $a so the
-                            # caller's $a is intact at the moment of
-                            # dispatch (the dispatcher still clobbers
-                            # $a internally; preserving caller args
-                            # all the way into the helper requires a
-                            # follow-on save/restore pass).
-                            rewritten.append(f'\tpush_imm {cid}')
+                            # Pass id in $b so caller's $a (the helper's
+                            # parameter) is intact at dispatcher entry.
+                            # `push_imm` would set $a := imm as a side
+                            # effect (its microcode loads imm→A before
+                            # pushing), which destroys caller's $a;
+                            # `ldi $b, X` only writes $b. The `;!keep`
+                            # marker tells peephole not to elide this
+                            # even when register-tracking thinks $b
+                            # already holds the right value at this
+                            # point — the dispatcher's contract requires
+                            # the load to actually execute.
+                            rewritten.append(f'\tldi $b,{cid} ;!keep')
                             rewritten.append('\tjal __cold_call')
                             continue
                     rewritten.append(line)
@@ -4001,6 +4032,11 @@ class MK1CodeGen:
         for name, body_lines in extracted_bodies.items():
             body = list(body_lines[1:])  # drop the label line
             body = peephole(body)
+            # Kernel helpers virtually always read their first arg from
+            # $a (rtc_read_reg, eeprom_rd, i2c_sb, lcd_chr, …). The
+            # dispatcher's setup clobbers $a, so prepend the recovery
+            # prologue (3 bytes) so the helper sees its caller's $a.
+            body = self._cold_arg_prologue() + body
             size = _measure_asm_bytes(body)
             if size == 0:
                 rejected_back.extend(body_lines)
@@ -4070,10 +4106,8 @@ class MK1CodeGen:
                         target = s[len(prefix):].split()[0].split(';')[0].strip()
                         if target in cold_call_map:
                             cid = cold_call_map[target]
-                            # Pass id via stack (matches the user-fn
-                            # rewriter at line ~2912; dispatcher still
-                            # clobbers $a internally).
-                            out.append(f'\tpush_imm {cid}')
+                            # Pass id in $b (preserves caller's $a).
+                            out.append(f'\tldi $b,{cid} ;!keep')
                             out.append('\tjal __cold_call')
                             if prefix == 'j _':
                                 out.append('\tret')
@@ -5484,16 +5518,22 @@ class MK1CodeGen:
             # loaded" (caller is main or kernel-resident code).
             # `_main`'s preamble initializes the slot to 0xFF.
             self.emit('__cold_call:')
-            # Stack on entry: [..., id, RA] with RA on top (caller did
-            # `push_imm <id>; jal __cold_call`). Extract id from under
-            # the return address. Note: $a is still clobbered here —
-            # full caller-register preservation requires a save/restore
-            # of caller's $a across the dispatch (helper expects $a
-            # = parameter at entry); not implemented yet.
-            self.emit('\tpop_b')                           # B = RA
-            self.emit('\tpop $a')                          # A = id
-            self.emit('\tpush_b')                          # restore RA on top
-            self.emit('\tmov $a,$d')                       # save new_id in D
+            # Entry contract: caller did `ldi $b, <id>; jal __cold_call`.
+            # So $b = id and $a = caller's parameter for the cold helper.
+            # Stack: [..., RA] with RA on top.
+            #
+            # Save caller's $a (helper's parameter) to kstate
+            # cold_call_arg. Cold helper bodies that read $a get a
+            # synthesized prologue (`ldi $a,0xB5; deref2`) that
+            # reloads $a; helpers that ignore $a pay 3 wasted bytes.
+            #
+            # kstate_store uses $b as the address register, which would
+            # destroy our id. Stash $b on the stack while we run the
+            # store, then pop it back.
+            self.emit('\tpush_b')                          # save id (in $b)
+            self.emit_kstate_store('cold_call_arg')        # page2[0xB5] = $a
+            self.emit('\tpop_b')                           # B = id
+            self.emit('\tmov $b,$d')                       # save id in D
             self.emit_kstate_load('cold_current_id')       # A = caller's id
             self.emit('\tpush $a')                         # save caller id on stack
             self.emit('\tmov $d,$a')                       # A = new_id
@@ -5501,8 +5541,22 @@ class MK1CodeGen:
             self.emit('\tjal __cold_load_helper')          # load new helper into slot
             self.emit(f'\tldi $a,{self.cold_slot_base}')
             self.emit('\tjal_r')                           # run cold helper
-            # Cold helper returned. Restore caller's id and reload its
-            # bytes (unless caller was the sentinel = main/kernel).
+            # `jal_r` pushes PC+1 (= addr of this next instr) and `ret`
+            # does PC = pop()+1, so the slot's `ret` lands on (addr+1)
+            # — skipping the first byte of whatever follows. Insert a
+            # 1-byte NOP (`move $a,$a`, opcode 0x00) so the off-by-one
+            # falls on the NOP, leaving the real epilogue intact.
+            # (Symmetric to how `jal imm` works: jal pushes addr_of_imm,
+            # ret does pop+1, lands on next instr — but jal_r has no
+            # imm byte to absorb the +1.)
+            self.emit('\tmov $a,$a ;!keep')                # jal_r off-by-one filler
+            # Cold helper returned with its return value in $a. Save
+            # it (reusing the cold_call_arg slot — the helper already
+            # consumed its input arg at the prologue, so the slot is
+            # free) so the post-slot cleanup can clobber $a freely.
+            self.emit_kstate_store('cold_call_arg')        # cold_call_arg = retval
+            # Restore caller's id and reload its bytes (unless caller
+            # was the sentinel = main/kernel).
             self.emit('\tpop $a')                          # A = saved caller id
             self.emit_kstate_store('cold_current_id')      # current = caller id
             self.emit('\tcmpi 0xFF')
@@ -5512,6 +5566,11 @@ class MK1CodeGen:
             # next instruction lands on the right slot byte.
             self.emit('\tjal __cold_load_helper')
             self.emit(f'{cc_done}:')
+            # Restore helper's return value to $a before returning to
+            # caller (the cleanup above clobbered $a).
+            self.emit('\tldi $a,'
+                      f'{KERNEL_STATE["cold_call_arg"].offset}')
+            self.emit('\tderef2')
             self.emit('\tret')
 
         # __cold_load_helper: reads `cold_current_id` from kstate, looks
@@ -13436,14 +13495,15 @@ class MK1CodeGen:
                 self._lcd_helpers.add('__i2c_rb')
                 self._lcd_helpers.add('__cold_call')
                 self._lcd_helpers.add('__cold_load_helper')
-                # Pass id on stack so caller's $a/$b/$c/$d are
-                # preserved across the dispatch.
+                # Pass id in $b so caller's $a is preserved (the cold
+                # helper expects its first arg in $a). `push_imm`
+                # would clobber $a as a side effect.
                 c = self._const_eval(args[0])
                 if c is not None:
-                    self.emit(f'\tpush_imm {c & 0xFF}')
+                    self.emit(f'\tldi $b,{c & 0xFF} ;!keep')
                 else:
                     self.gen_expr(args[0])
-                    self.emit('\tpush $a')
+                    self.emit('\tmov $a,$b')
                 self.emit('\tjal __cold_call')
                 return
 

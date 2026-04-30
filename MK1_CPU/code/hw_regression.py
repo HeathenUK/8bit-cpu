@@ -1143,6 +1143,44 @@ TESTS = [
         [0xC1, 0xC4], cycles=500_000,
         env={'MK1_FORCE_COLD_USER': 'emit_a,emit_b'},
     ),
+    Test(
+        # Verifies the caller-arg prologue: cold helper takes a
+        # runtime parameter in $a (defeated const-fold via peek3) and
+        # outputs it via `out(y)`. The dispatcher's prologue saves
+        # caller's $a to kstate cold_call_arg; the helper body's
+        # synthesized prologue (`ldi $a,0xB5; deref2`) reloads it
+        # before the body runs. Void return — return-value handling
+        # is a separate (still-open) issue documented in WORKLOG.
+        'cold tier: caller-arg preservation (void return)',
+        '''unsigned char x;
+        ee64 void echo(unsigned char y) { out(y); }
+        void main(void) {
+            i2c_init();
+            poke3(57, 0);
+            x = peek3(0);
+            echo(x);
+            halt();
+        }''',
+        [57], cycles=500_000,
+    ),
+    Test(
+        # Verifies the dispatcher preserves the helper's RETURN value
+        # too: helper computes y+5 in $a, dispatcher saves it across
+        # the post-slot cleanup, restores before final ret. main's
+        # `out(add5(x))` outputs 55 = 50+5. Defeats const-fold via
+        # peek3.
+        'cold tier: caller-arg + retval through dispatcher',
+        '''unsigned char x;
+        ee64 unsigned char add5(unsigned char y) { return y + 5; }
+        void main(void) {
+            i2c_init();
+            poke3(50, 0);
+            x = peek3(0);
+            out(add5(x));
+            halt();
+        }''',
+        [55], cycles=500_000,
+    ),
 ]
 
 
