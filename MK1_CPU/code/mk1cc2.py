@@ -15212,8 +15212,29 @@ def main():
     # Iterates until compile succeeds or no further auto-promotion is
     # possible (cap to avoid runaway loops).
     import re as _re_ac
+    import os as _env_ac
     _auto_cold = set()        # user fns
     _force_helpers = set()    # kernel helpers (start with __)
+    # Test/debug seed: env vars let regression fixtures force the
+    # auto-cold path deterministically rather than relying on overlay-
+    # wrap to trigger it. Names are comma-separated bare identifiers.
+    _seed_user = _env_ac.environ.get('MK1_FORCE_COLD_USER', '').strip()
+    if _seed_user:
+        for _n in _seed_user.split(','):
+            _n = _n.strip()
+            if _n:
+                _auto_cold.add(_n)
+    _seed_helper = _env_ac.environ.get('MK1_FORCE_COLD_HELPER', '').strip()
+    if _seed_helper:
+        for _n in _seed_helper.split(','):
+            _n = _n.strip()
+            if _n:
+                # Helpers are referenced as `__name`; canonicalize so the
+                # extractor's label match works whether the user wrote
+                # `__name` or `name`.
+                if not _n.startswith('__'):
+                    _n = '__' + _n.lstrip('_')
+                _force_helpers.add(_n)
     _MAX_AUTO_COLD = 16
     _prefer_dc = True
     while True:
