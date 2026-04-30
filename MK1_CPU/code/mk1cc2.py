@@ -687,6 +687,11 @@ class MK1CodeGen:
         # in _prepare_compile when overlay placement would wrap into kernel.
         # Treated identically to source-level `ee64` tags from this point on.
         self._auto_cold_user_fns = set()
+        # Compiler helpers (names starting with __) auto-promoted to cold
+        # tier when overlay placement can't fit the kernel. Bodies are
+        # extracted from self.code after _emit_i2c_helpers runs, then
+        # routed through __cold_call. Phase 2 of skinny-kernel auto-paging.
+        self._force_cold_helpers = set()
 
         # ── Port-pin shadow ──────────────────────────────────────────
         # Tracks bits each builtin claims on VIA port A/B so that every
@@ -2872,6 +2877,16 @@ class MK1CodeGen:
         # Must run after cold functions are registered (so the id map
         # exists) and before _overlay_partition (which treats self.code
         # as definitive).
+        # If Phase 2 helper auto-cold is active (force-cold helpers
+        # populated by the outer retry in _prepare_compile), the cold
+        # dispatcher infrastructure must be emitted even when no source
+        # `ee64` user function exists. Pre-register dispatcher helpers
+        # in _lcd_helpers so `_emit_i2c_helpers` emits the bodies.
+        if self._force_cold_helpers:
+            self._lcd_helpers = getattr(self, '_lcd_helpers', set())
+            self._lcd_helpers |= {'__i2c_sb', '__i2c_rb',
+                                  '__cold_call', '__cold_load_helper'}
+
         if self.cold_function_names:
             cold_call_map = {fname: cid
                              for cid, _addr, _size, fname in self.cold_helpers
@@ -2979,6 +2994,13 @@ class MK1CodeGen:
 
         # Emit I2C/LCD helpers AFTER all functions
         self._emit_i2c_helpers()
+
+        # Phase 2: extract force-cold helpers from self.code into the
+        # cold tier. Runs after _emit_i2c_helpers so helper bodies are
+        # available to extract. The dispatcher (__cold_call /
+        # __cold_load_helper) was emitted by _emit_i2c_helpers because
+        # we pre-registered it in _lcd_helpers above.
+        self._extract_force_cold_helpers()
 
         # Emit tone init code (ddra + precomp loop) as prefix to _main.
         # Must be AFTER all tone()/silence() calls are compiled (so note table is complete)
@@ -3899,6 +3921,187 @@ class MK1CodeGen:
             name = label.rstrip(':')
             if name.startswith('__') and name not in unconditional:
                 self._conditionally_resident.add(name)
+
+    def _extract_force_cold_helpers(self):
+        """Phase 2 of skinny-kernel auto-paging.
+
+        For each helper name in `self._force_cold_helpers`, locate its
+        body in `self.code` and migrate it into the AT24C512 cold tier.
+        Call sites in `self.code` (and any pre-existing cold function
+        bodies) are rewritten from `jal __helper` to the dispatcher
+        sequence `ldi $a,id; jal __cold_call`. The dispatcher itself
+        (`__cold_call`, `__cold_load_helper`) was emitted by
+        `_emit_i2c_helpers` because we pre-registered it before that
+        ran.
+
+        First-cut constraints (intentionally narrow):
+          - Helper body must end in `ret` (leaf-style); helpers that
+            tail-jump into another helper are rejected.
+          - Helper body must fit COLD_SLOT_BYTES.
+          - Helpers whose body has any inbound `j __helper` (tail
+            branches from elsewhere) are not detected here — relying
+            on the helper-resolution check at compile() to catch the
+            case where a `j __helper` would dangle after extraction.
+
+        Rejected helpers stay kernel-resident; the outer retry's next
+        iteration will see the same wrap and pick a different
+        candidate.
+        """
+        targets = getattr(self, '_force_cold_helpers', set())
+        if not targets:
+            return
+
+        # Skip helpers already in the cold tier (e.g. from a previous
+        # compile pass that left state behind).
+        already = {('_' + n.lstrip('_'))[1:]
+                   for _id, _addr, _sz, n in self.cold_helpers}
+        # `fname` convention used by the call-site rewriter: target name
+        # after stripping `jal _` prefix. For `__rtc_read_reg` that is
+        # `_rtc_read_reg` (one leading underscore).
+        targets = {n for n in targets if (n[1:] not in already)}
+        if not targets:
+            return
+
+        # Single forward pass: extract bodies of force-cold helpers,
+        # leave everything else untouched.
+        new_code = []
+        extracted_bodies = {}  # name → list of body lines (incl. label)
+        i = 0
+        while i < len(self.code):
+            line = self.code[i]
+            s = line.strip()
+            if (s.endswith(':') and not s.startswith('.') and
+                    not s.startswith(';')):
+                name = s[:-1]
+                if name in targets:
+                    body = [line]
+                    j = i + 1
+                    while j < len(self.code):
+                        ns = self.code[j].strip()
+                        if (ns.endswith(':') and not ns.startswith('.') and
+                                not ns.startswith(';')):
+                            break
+                        body.append(self.code[j])
+                        j += 1
+                    extracted_bodies[name] = body
+                    i = j
+                    continue
+            new_code.append(line)
+            i += 1
+
+        accepted = []  # (name, body_without_label_lines)
+        rejected_back = []  # full body lines to restore to self.code
+        import sys as _ac_sys
+        for name, body_lines in extracted_bodies.items():
+            body = list(body_lines[1:])  # drop the label line
+            body = peephole(body)
+            size = _measure_asm_bytes(body)
+            if size == 0:
+                rejected_back.extend(body_lines)
+                continue
+            if size > COLD_SLOT_BYTES:
+                print(f"  Auto-cold (helper): {name} body is {size}B, "
+                      f"exceeds slot {COLD_SLOT_BYTES}B; rejected",
+                      file=_ac_sys.stderr)
+                rejected_back.extend(body_lines)
+                continue
+            # Find last real instruction.
+            last_inst = None
+            for b in reversed(body):
+                bs = b.strip()
+                if (not bs or bs.endswith(':') or bs.startswith(';')):
+                    continue
+                last_inst = bs.split()[0]
+                break
+            if last_inst != 'ret':
+                print(f"  Auto-cold (helper): {name} doesn't end in `ret` "
+                      f"(last={last_inst!r}); rejected",
+                      file=_ac_sys.stderr)
+                rejected_back.extend(body_lines)
+                continue
+            accepted.append((name, body, size))
+
+        if rejected_back:
+            new_code.extend(rejected_back)
+        self.code = new_code
+
+        if not accepted:
+            return
+
+        # Register accepted helpers in the cold tier.
+        for name, body, size in accepted:
+            cold_id = len(self.cold_helpers)
+            ee64_addr = self.ee64_alloc
+            fname = name[1:]  # __rtc_read_reg → _rtc_read_reg
+            self.cold_helpers.append((cold_id, ee64_addr, size, fname))
+            self.cold_function_bodies.append(
+                (cold_id, fname, body, size, ee64_addr))
+            self.ee64_alloc += size
+            print(f"  Auto-cold (helper): {name} → cold tier id={cold_id}, "
+                  f"{size}B at ee64[0x{ee64_addr:04X}]",
+                  file=_ac_sys.stderr)
+
+        # Right-size cold slot to the largest body.
+        max_cold = max((sz for _id, _a, sz, _n in self.cold_helpers),
+                       default=0)
+        if max_cold > self.cold_slot_size:
+            self.cold_slot_size = max_cold
+        if self.cold_slot_size > 0:
+            self.cold_slot_base = 256 - self.cold_slot_size
+
+        # Rewrite `jal __helper` (and `j __helper`) call sites to the
+        # cold-call dispatcher sequence. Same convention as the user-fn
+        # rewriter at line ~2892: target = line.lstrip 'jal _' / 'j _'.
+        cold_call_map = {fname: cid
+                         for cid, _addr, _size, fname in self.cold_helpers}
+
+        def _rewrite(lines):
+            out = []
+            for line in lines:
+                s = line.strip()
+                for prefix in ('jal _', 'j _'):
+                    if s.startswith(prefix):
+                        target = s[len(prefix):].split()[0].split(';')[0].strip()
+                        if target in cold_call_map:
+                            cid = cold_call_map[target]
+                            out.append(f'\tldi $a,{cid}')
+                            out.append('\tjal __cold_call')
+                            if prefix == 'j _':
+                                # Tail-jump replaced by call+ret so caller's
+                                # ret target is preserved.
+                                out.append('\tret')
+                            break
+                else:
+                    out.append(line)
+                    continue
+                # break-from-prefix-loop fallthrough = handled
+            return out
+
+        self.code = _rewrite(self.code)
+        # Rewrite within already-extracted cold function bodies (cold→
+        # cold). Each call inflates from 2B to 4B (and tail-jumps to 5B),
+        # so re-measure and re-pack ee64 addresses sequentially.
+        if self.cold_function_bodies:
+            new_bodies = []
+            self.ee64_alloc = 0
+            self.cold_helpers = []
+            for cold_id, fname, body, _old_size, _old_addr in self.cold_function_bodies:
+                rewritten = _rewrite(body)
+                new_size = _measure_asm_bytes(rewritten)
+                if new_size > COLD_SLOT_BYTES:
+                    raise Exception(
+                        f"cold helper '{fname}' is {new_size}B after "
+                        f"cold→cold rewriting; exceeds slot size "
+                        f"{COLD_SLOT_BYTES}B.")
+                new_addr = self.ee64_alloc
+                self.cold_helpers.append((cold_id, new_addr, new_size, fname))
+                new_bodies.append((cold_id, fname, rewritten, new_size, new_addr))
+                self.ee64_alloc += new_size
+            self.cold_function_bodies = new_bodies
+            self.cold_slot_size = max(
+                (sz for _id, _a, sz, _n in self.cold_helpers), default=0)
+            if self.cold_slot_size > 0:
+                self.cold_slot_base = 256 - self.cold_slot_size
 
     def _emit_i2c_helpers(self):
         """Emit I2C/LCD helper subroutines if any lcd_cmd/lcd_char builtins were used.
@@ -14864,7 +15067,7 @@ def main():
     with open(args.input) as f: source = f.read()
 
     def _prepare_compile(prefer_delay_cal_init=False, capture_log=False,
-                         auto_cold_fns=None):
+                         auto_cold_fns=None, force_cold_helpers=None):
         gen = MK1CodeGen(optimize=args.optimize)
         # Stash the in-flight gen so the exception handler can recover
         # `_matcher_fires` even on compile failure (populated during
@@ -14873,6 +15076,8 @@ def main():
         gen._prefer_delay_cal_init = prefer_delay_cal_init
         if auto_cold_fns:
             gen._auto_cold_user_fns = set(auto_cold_fns)
+        if force_cold_helpers:
+            gen._force_cold_helpers = set(force_cold_helpers)
         if hasattr(args, 'eeprom') and args.eeprom:
             gen.eeprom_mode = True
             gen.eeprom_base = args.eeprom_base
@@ -14998,56 +15203,76 @@ def main():
             pass
 
     # Outer auto-cold retry: when overlay placement reports that a USER
-    # function would wrap into kernel, the partitioner has tried every
-    # placement option and there is no SRAM slot big enough. Promote
-    # that function to the cold tier (synthetic ee64) and recompile.
+    # function or kernel HELPER would wrap into kernel, the partitioner
+    # has tried every placement option and there is no SRAM slot big
+    # enough. Promote the wrapping symbol to the cold tier and
+    # recompile. User functions go through `_auto_cold_user_fns`
+    # (Phase 1, treated as synthetic `ee64`). Helpers go through
+    # `_force_cold_helpers` (Phase 2, body extracted post-emission).
     # Iterates until compile succeeds or no further auto-promotion is
     # possible (cap to avoid runaway loops).
     import re as _re_ac
-    _auto_cold = set()
-    _MAX_AUTO_COLD = 8
+    _auto_cold = set()        # user fns
+    _force_helpers = set()    # kernel helpers (start with __)
+    _MAX_AUTO_COLD = 16
+    _prefer_dc = True
     while True:
         try:
             gen, asm, lines, _code_bytes_try, _init_limit_try, _compile_log = _prepare_compile(
-                prefer_delay_cal_init=True, capture_log=True,
-                auto_cold_fns=_auto_cold)
+                prefer_delay_cal_init=_prefer_dc, capture_log=True,
+                auto_cold_fns=_auto_cold,
+                force_cold_helpers=_force_helpers)
+            # Init-extract overflow: redo with delay_cal as overlay.
+            if (_code_bytes_try > _init_limit_try and _prefer_dc):
+                import sys as _retry_sys
+                print(f"  Placement retry: init-only __delay_cal overflowed stage 1 "
+                      f"({_code_bytes_try}B > {_init_limit_try}B); "
+                      f"using runtime/overlay placement",
+                      file=_retry_sys.stderr)
+                _prefer_dc = False
+                continue
             break
         except Exception as _e:
             _msg = str(_e)
-            if 'wrap into kernel' not in _msg or len(_auto_cold) >= _MAX_AUTO_COLD:
+            _total = len(_auto_cold) + len(_force_helpers)
+            if 'wrap into kernel' not in _msg or _total >= _MAX_AUTO_COLD:
                 _emit_partial_metrics(getattr(_prepare_compile, '_last_gen', None), _msg)
                 raise
-            # Parse `wrapping=_show_temp=46B[, _other=NB,...]`. Pick user
-            # function names (`_name`, single leading underscore, not
-            # `__helper`); skip phase-split synthesizes (`_name_p1`).
-            _wraps = _re_ac.findall(r'(_[A-Za-z][\w]*)=\d+B', _msg)
-            _picked = None
+            # Parse `wrapping=_name=46B[, _other=NB,...]`. Single-
+            # underscore names are user fns; double-underscore are
+            # kernel helpers; skip phase-splits (`_name_pN`).
+            _wraps = _re_ac.findall(r'(_+[A-Za-z][\w]*)=\d+B', _msg)
+            _picked_user = None
+            _picked_helper = None
             for _w in _wraps:
-                if _w.startswith('__'):
-                    continue
                 if _re_ac.search(r'_p\d+$', _w):
                     continue
-                _user = _w[1:]  # strip leading _
-                if _user in _auto_cold:
-                    continue
-                _picked = _user
-                break
-            if _picked is None:
+                if _w.startswith('__'):
+                    if _w in _force_helpers:
+                        continue
+                    if _picked_helper is None:
+                        _picked_helper = _w
+                else:
+                    _user = _w[1:]
+                    if _user in _auto_cold:
+                        continue
+                    if _picked_user is None:
+                        _picked_user = _user
+            # Prefer user fns first (cheaper, Phase 1 path) before
+            # falling back to helper extraction.
+            import sys as _ac_sys
+            if _picked_user is not None:
+                print(f"  Auto-cold: promoting {_picked_user} to cold tier "
+                      f"(overlay placement would wrap)", file=_ac_sys.stderr)
+                _auto_cold.add(_picked_user)
+            elif _picked_helper is not None:
+                print(f"  Auto-cold: promoting helper {_picked_helper} to "
+                      f"cold tier (kernel doesn't fit)", file=_ac_sys.stderr)
+                _force_helpers.add(_picked_helper)
+            else:
                 _emit_partial_metrics(getattr(_prepare_compile, '_last_gen', None), _msg)
                 raise
-            import sys as _ac_sys
-            print(f"  Auto-cold: promoting {_picked} to cold tier "
-                  f"(overlay placement would wrap)", file=_ac_sys.stderr)
-            _auto_cold.add(_picked)
-    if (_code_bytes_try > _init_limit_try and
-            getattr(gen, '_prefer_delay_cal_init', False)):
-        import sys as _retry_sys
-        print(f"  Placement retry: init-only __delay_cal overflowed stage 1 "
-              f"({_code_bytes_try}B > {_init_limit_try}B); using runtime/overlay placement",
-              file=_retry_sys.stderr)
-        gen, asm, lines, _code_bytes_try, _init_limit_try, _compile_log = _prepare_compile(
-            prefer_delay_cal_init=False, auto_cold_fns=_auto_cold)
-    elif _compile_log:
+    if _compile_log:
         import sys as _compile_log_sys
         print(_compile_log, end='', file=_compile_log_sys.stderr)
 
