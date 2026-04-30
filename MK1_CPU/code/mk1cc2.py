@@ -146,7 +146,7 @@ P2_MANIFEST_BASE     = 0xC0
 # partitioner picks `min(max_cold_size, COLD_SLOT_BYTES)` and
 # positions the slot accordingly.
 COLD_TABLE_BASE      = 0x10
-COLD_SLOT_BYTES      = 64
+COLD_SLOT_BYTES      = 128
 
 # Mnemonics that assemble to >1 byte. Mirrors the per-mnemonic byte
 # accounting in `measure_lines` (closure inside `_overlay_partition`)
@@ -2808,7 +2808,15 @@ class MK1CodeGen:
             for fn in cold_fns_to_compile:
                 self.code = []
                 self.compile_function(*fn)
-                cold_lines = list(self.code)
+                # Apply peephole here, BEFORE measuring + recording
+                # ee64 offsets. The main-stream peephole pass runs later
+                # over self.code (which by then contains the cold body
+                # in section ee64); without doing it here too, the
+                # metadata-table `len` reflects pre-peephole size but
+                # the actual ee64-image bytes are post-peephole, so the
+                # dispatcher reads N bytes when only M < N exist and
+                # loads garbage past byte M into the slot.
+                cold_lines = peephole(list(self.code))
                 byte_size = _measure_asm_bytes(cold_lines)
                 if byte_size > COLD_SLOT_BYTES:
                     raise Exception(
