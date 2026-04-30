@@ -2863,12 +2863,22 @@ static void writeEe64Data(const uint8_t* data, int size) {
             "    ddrb_imm 0x01\n"
             "    ddrb_imm 0x00\n"
             "    hlt\n"
+            // __sb mirrors the kernel's `__i2c_sb` (mk1cc2.py line ~3579)
+            // byte-for-byte: byte arrives in A, gets stashed in D, B holds
+            // an 8-cycle counter, decb decrements in place each iter,
+            // single `exrw 0` reads ACK at end. This is the same routine
+            // the C-level `i2c_send_byte` builtin uses, which has been
+            // exercised end-to-end against AT24C32 AND AT24C512 in the
+            // hw_regression corpus and the Phase 1/2 tests. The previous
+            // shim-local __sb (different register convention, dec+mov
+            // dance for counter) was AT24C32-tolerant but AT24C512 lost
+            // bytes mid-page-write. Mirroring the kernel routine exactly
+            // removes the divergence.
             "__sb:\n"
-            "    mov $a, $b\n"
-            "    ldi $a, 8\n"
-            "    mov $a, $c\n"
+            "    mov $a, $d\n"      // D = byte (survives ldi A clobber)
+            "    ldi $b, 8\n"        // B = counter
             ".isb:\n"
-            "    mov $b, $a\n"
+            "    mov $d, $a\n"      // A = byte (reload for tst)
             "    tst 0x80\n"
             "    jnz .isbh\n"
             "    ddrb_imm 0x03\n"
@@ -2880,13 +2890,11 @@ static void writeEe64Data(const uint8_t* data, int size) {
             "    ddrb_imm 0x00\n"
             "    ddrb_imm 0x02\n"
             ".isbn:\n"
-            "    mov $b, $a\n"
-            "    sll\n"
-            "    mov $a, $b\n"
-            "    mov $c, $a\n"
-            "    dec\n"
-            "    mov $a, $c\n"
+            "    sll\n"              // A = byte << 1
+            "    mov $a, $d\n"      // D = shifted byte for next iter
+            "    decb\n"             // B--, sets ZF
             "    jnz .isb\n"
+            // ACK clock — single exrw 0 matches the kernel routine
             "    ddrb_imm 0x02\n"
             "    ddrb_imm 0x00\n"
             "    exrw 0\n"
