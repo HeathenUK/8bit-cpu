@@ -15346,6 +15346,52 @@ def main():
         init_limit_local = 254 if (init_extraction_local or overlay_mode_local) else 250
         return gen, asm, lines, code_bytes_local, init_limit_local, compile_log
 
+    # Phase 3 skinny-kernel mode: when the program uses cold tier, helpers
+    # currently classified as init-only (`__lcd_init`, `__oled_init`,
+    # `__delay_cal`, …) can be promoted to the cold tier. The dispatcher
+    # rewriter rewrites their call sites whether the caller lives in init
+    # or runtime, and `_extract_force_cold_helpers` runs BEFORE
+    # `_overlay_partition` so the partitioner sees a smaller program —
+    # often small enough to skip init_extraction entirely and compile flat.
+    #
+    # Listed here so the auto-cold loop can seed them when a program
+    # overflows AFTER Phase 2.5 has exhausted its kernel-section
+    # candidates. Keep narrow: only helpers whose body is leaf-style
+    # (ends in ret) and whose every call site is reachable through the
+    # dispatcher contract. Adding speculative entries that don't actually
+    # exist in the code is harmless — `_extract_force_cold_helpers`
+    # silently skips missing names — but adding entries that DO exist
+    # but tail-jump (no `ret`) costs a wasted compile pass.
+    PHASE3_INIT_BUILTINS = (
+        '__lcd_init',
+        '__oled_init',
+        '__delay_cal',
+        '__rtc_read_reg',
+        '__lcd_send_raw',
+    )
+
+    def _phase3_pick_init_builtin(g, asm_lines, already_helper):
+        """Find a known init builtin that's still in the kernel image and
+        not already forced to cold. Used when Phase 2.5 has exhausted
+        normal kernel-section candidates but the program is still over
+        budget and init_extraction is active.
+
+        Walk asm_lines looking for top-level labels whose name matches
+        PHASE3_INIT_BUILTINS. Return the first match that's not already
+        a force-cold target. None if no candidate found."""
+        present = set()
+        for line in asm_lines:
+            s = line.strip()
+            if (s.endswith(':') and not s.startswith('.')
+                    and not s.startswith(';')):
+                name = s[:-1]
+                if name in PHASE3_INIT_BUILTINS:
+                    present.add(name)
+        for name in PHASE3_INIT_BUILTINS:
+            if name in present and name not in already_helper:
+                return name
+        return None
+
     def _phase25_pick_overflow_helper(g, asm_lines, already_helper, already_user):
         """Phase 2.5: detect post-compile runtime kernel overflow and pick
         the next-largest helper to auto-promote to cold tier.
@@ -15677,6 +15723,35 @@ def main():
                       file=_ov_sys.stderr)
                 _force_helpers.add(_overflow_pick)
                 continue
+            # Phase 3 skinny-kernel: Phase 2.5 found no kernel-section
+            # candidate, but the program may still overflow AND have
+            # init-classified helpers (`__lcd_init`, etc.) that aren't
+            # in the partitioner's runtime-helper pool. Seed one and
+            # retry — the dispatcher rewriter will rewrite both init
+            # and runtime call sites, and `_extract_force_cold_helpers`
+            # runs ahead of `_overlay_partition` so the partitioner
+            # sees the post-promotion code (often small enough to skip
+            # init_extraction entirely → flat mode → dispatcher always
+            # reachable from init).
+            #
+            # Only fires when cold tier is already active (force-helpers
+            # or auto-cold has touched this program) — we don't want to
+            # spontaneously enable cold tier on programs that fit
+            # comfortably in their existing mode.
+            _cold_active = bool(_force_helpers or _auto_cold)
+            _overflow = ('CODE OVERFLOW' in (_compile_log or '')
+                         or _code_bytes_try > _init_limit_try)
+            if (_cold_active and _overflow
+                    and len(_auto_cold) + len(_force_helpers) < _MAX_AUTO_COLD):
+                _p3_pick = _phase3_pick_init_builtin(
+                    gen, lines, _force_helpers)
+                if _p3_pick is not None:
+                    import sys as _p3_sys
+                    print(f"  Auto-cold (skinny-kernel): promoting init "
+                          f"builtin {_p3_pick} to cold tier",
+                          file=_p3_sys.stderr)
+                    _force_helpers.add(_p3_pick)
+                    continue
             break
         except Exception as _e:
             _msg = str(_e)
