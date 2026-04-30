@@ -15,6 +15,46 @@
     "stage1_total": null,
     "status": "ok"
   },
+  "cold_chain_demo.c": {
+    "eeprom_used": 0,
+    "flags": [
+      "-O"
+    ],
+    "kernel": 222,
+    "mode": "flat",
+    "overlay_largest": null,
+    "overlay_region": null,
+    "overlay_slots": null,
+    "page0_used": 222,
+    "page1_allocated": 0,
+    "page3_used": 7,
+    "stage1_total": null,
+    "status": "ok"
+  },
+  "cold_fib_demo.c": {
+    "error_sig": "!! CODE OVERFLOW: 222B > 213B limit (over by 9B)",
+    "status": "error"
+  },
+  "cold_fn_test.c": {
+    "eeprom_used": 0,
+    "flags": [
+      "-O"
+    ],
+    "kernel": 222,
+    "mode": "flat",
+    "overlay_largest": null,
+    "overlay_region": null,
+    "overlay_slots": null,
+    "page0_used": 222,
+    "page1_allocated": 0,
+    "page3_used": 4,
+    "stage1_total": null,
+    "status": "ok"
+  },
+  "cold_multi_demo.c": {
+    "error_sig": "!! CODE OVERFLOW: 238B > 235B limit (over by 3B)",
+    "status": "error"
+  },
   "debug_lcd_min_markers.c": {
     "eeprom_used": 0,
     "flags": [
@@ -34,17 +74,18 @@
   "debug_tone_postcal.c": {
     "eeprom_used": 0,
     "flags": [
-      "-O"
+      "-O",
+      "--eeprom"
     ],
-    "kernel": 241,
-    "mode": "flat",
+    "kernel": 157,
+    "mode": "overlay",
     "overlay_largest": null,
-    "overlay_region": null,
+    "overlay_region": 157,
     "overlay_slots": null,
-    "page0_used": 241,
+    "page0_used": 157,
     "page1_allocated": 3,
-    "page3_used": 0,
-    "stage1_total": null,
+    "page3_used": 157,
+    "stage1_total": 223,
     "status": "ok"
   },
   "delay_demo.c": {
@@ -58,6 +99,86 @@
     "overlay_region": null,
     "overlay_slots": null,
     "page0_used": 153,
+    "page1_allocated": 0,
+    "page3_used": 0,
+    "stage1_total": null,
+    "status": "ok"
+  },
+  "ee64_dispatch_test.c": {
+    "eeprom_used": 0,
+    "flags": [
+      "-O"
+    ],
+    "kernel": 238,
+    "mode": "flat",
+    "overlay_largest": null,
+    "overlay_region": null,
+    "overlay_slots": null,
+    "page0_used": 238,
+    "page1_allocated": 0,
+    "page3_used": 0,
+    "stage1_total": null,
+    "status": "ok"
+  },
+  "ee64_helper_test.c": {
+    "eeprom_used": 0,
+    "flags": [
+      "-O"
+    ],
+    "kernel": 222,
+    "mode": "flat",
+    "overlay_largest": null,
+    "overlay_region": null,
+    "overlay_slots": null,
+    "page0_used": 222,
+    "page1_allocated": 0,
+    "page3_used": 4,
+    "stage1_total": null,
+    "status": "ok"
+  },
+  "ee64_probe.c": {
+    "eeprom_used": 0,
+    "flags": [
+      "-O"
+    ],
+    "kernel": 186,
+    "mode": "flat",
+    "overlay_largest": null,
+    "overlay_region": null,
+    "overlay_slots": null,
+    "page0_used": 186,
+    "page1_allocated": 0,
+    "page3_used": 0,
+    "stage1_total": null,
+    "status": "ok"
+  },
+  "ee64_run_test.c": {
+    "eeprom_used": 0,
+    "flags": [
+      "-O"
+    ],
+    "kernel": 226,
+    "mode": "flat",
+    "overlay_largest": null,
+    "overlay_region": null,
+    "overlay_slots": null,
+    "page0_used": 226,
+    "page1_allocated": 0,
+    "page3_used": 0,
+    "stage1_total": null,
+    "status": "ok"
+  },
+  "ee64_seq_test.c": {
+    "eeprom_used": 0,
+    "flags": [
+      "-O"
+    ],
+    "kernel": 231,
+    "mode": "flat",
+    "overlay_largest": null,
+    "overlay_region": null,
+    "overlay_slots": null,
+    "page0_used": 231,
     "page1_allocated": 0,
     "page3_used": 0,
     "stage1_total": null,
@@ -306,17 +427,18 @@
   "keypad_overlay_iso.c": {
     "eeprom_used": 0,
     "flags": [
-      "-O"
+      "-O",
+      "--eeprom"
     ],
-    "kernel": 242,
-    "mode": "flat",
+    "kernel": 119,
+    "mode": "overlay",
     "overlay_largest": null,
-    "overlay_region": null,
+    "overlay_region": 119,
     "overlay_slots": null,
-    "page0_used": 242,
+    "page0_used": 119,
     "page1_allocated": 0,
-    "page3_used": 0,
-    "stage1_total": null,
+    "page3_used": 119,
+    "stage1_total": 182,
     "status": "ok"
   },
   "keypad_scan_test.c": {
@@ -560,11 +682,15 @@
     "status": "ok"
   },
   "oled_temp.c": {
-    "error_sig": "Exception: overlay placement would wrap into kernel; refusing codegen. available=7B, wrapping=_show_temp=61B, _send_glyph=36B",
+    "error_sig": "!! CODE OVERFLOW: 264B > 173B limit (over by 91B)",
+    "status": "error"
+  },
+  "oled_temp_cold.c": {
+    "error_sig": "!! CODE OVERFLOW: 264B > 173B limit (over by 91B)",
     "status": "error"
   },
   "oled_test.c": {
-    "error_sig": "Exception: overlay placement would wrap into kernel; refusing codegen. available=41B, wrapping=_oled_glyph=88B",
+    "error_sig": "!! CODE OVERFLOW: 353B > 165B limit (over by 188B)",
     "status": "error"
   },
   "oled_two_blocks.c": {
@@ -616,7 +742,11 @@
     "status": "ok"
   },
   "overlay_dashboard.c": {
-    "error_sig": "Exception: overlay placement would wrap into kernel; refusing codegen. available=42B, wrapping=_show_temp=46B",
+    "error_sig": "!! CODE OVERFLOW: 279B > 254B limit (over by 25B)",
+    "status": "error"
+  },
+  "overlay_dashboard_cold.c": {
+    "error_sig": "Exception: overlay placement would wrap into kernel; refusing codegen. available=-109B, wrapping=_main_p1=37B",
     "status": "error"
   },
   "overlay_demo.c": {
@@ -636,8 +766,20 @@
     "status": "ok"
   },
   "overlay_info.c": {
-    "error_sig": "Exception: overlay placement would wrap into kernel; refusing codegen. available=49B, wrapping=_info_screen=65B, __delay_cal=58B",
-    "status": "error"
+    "eeprom_used": 0,
+    "flags": [
+      "-O"
+    ],
+    "kernel": 182,
+    "mode": "init_extraction",
+    "overlay_largest": null,
+    "overlay_region": null,
+    "overlay_slots": null,
+    "page0_used": 182,
+    "page1_allocated": 72,
+    "page3_used": 182,
+    "stage1_total": 227,
+    "status": "ok"
   },
   "overlay_seconds.c": {
     "eeprom_used": 0,
@@ -736,8 +878,20 @@
     "status": "ok"
   },
   "test4_info.c": {
-    "error_sig": "Exception: overlay placement would wrap into kernel; refusing codegen. available=49B, wrapping=_info_screen=65B, __delay_cal=58B",
-    "status": "error"
+    "eeprom_used": 0,
+    "flags": [
+      "-O"
+    ],
+    "kernel": 182,
+    "mode": "init_extraction",
+    "overlay_largest": null,
+    "overlay_region": null,
+    "overlay_slots": null,
+    "page0_used": 182,
+    "page1_allocated": 72,
+    "page3_used": 182,
+    "stage1_total": 227,
+    "status": "ok"
   },
   "test_autosplit.c": {
     "eeprom_used": 0,
@@ -792,8 +946,20 @@
     "status": "ok"
   },
   "test_lcd_eeprom.c": {
-    "error_sig": "Exception: overlay placement would wrap into kernel; refusing codegen. available=53B, wrapping=__delay_cal=58B",
-    "status": "error"
+    "eeprom_used": 0,
+    "flags": [
+      "-O"
+    ],
+    "kernel": 184,
+    "mode": "init_extraction",
+    "overlay_largest": null,
+    "overlay_region": null,
+    "overlay_slots": null,
+    "page0_used": 184,
+    "page1_allocated": 47,
+    "page3_used": 184,
+    "stage1_total": 229,
+    "status": "ok"
   },
   "test_music3.c": {
     "eeprom_used": 0,
@@ -862,17 +1028,18 @@
   "tone_isolation.c": {
     "eeprom_used": 0,
     "flags": [
-      "-O"
+      "-O",
+      "--eeprom"
     ],
-    "kernel": 237,
-    "mode": "flat",
+    "kernel": 153,
+    "mode": "overlay",
     "overlay_largest": null,
-    "overlay_region": null,
+    "overlay_region": 153,
     "overlay_slots": null,
-    "page0_used": 237,
+    "page0_used": 153,
     "page1_allocated": 3,
-    "page3_used": 0,
-    "stage1_total": null,
+    "page3_used": 153,
+    "stage1_total": 223,
     "status": "ok"
   },
   "tone_test.c": {
@@ -908,11 +1075,11 @@
     "status": "ok"
   },
   "twinkle_markers.c": {
-    "error_sig": "Exception: overlay placement would wrap into kernel; refusing codegen. available=32B, wrapping=__tone_precompute=71B",
+    "error_sig": "Exception: overlay placement would wrap into kernel; refusing codegen. available=-141B, wrapping=__tone_precompute=71B",
     "status": "error"
   },
   "twinkle_v2.c": {
-    "error_sig": "Exception: overlay placement would wrap into kernel; refusing codegen. available=53B, wrapping=__tone_precompute=71B",
+    "error_sig": "Exception: overlay placement would wrap into kernel; refusing codegen. available=-124B, wrapping=__tone_precompute=71B",
     "status": "error"
   },
   "twinkle_v3.c": {
@@ -932,7 +1099,7 @@
     "status": "ok"
   },
   "twinkle_v4.c": {
-    "error_sig": "Exception: overlay placement would wrap into kernel; refusing codegen. available=29B, wrapping=__tone_precompute=71B",
+    "error_sig": "Exception: overlay placement would wrap into kernel; refusing codegen. available=-82B, wrapping=__tone_precompute=71B",
     "status": "error"
   },
   "twinkle_v5.c": {
