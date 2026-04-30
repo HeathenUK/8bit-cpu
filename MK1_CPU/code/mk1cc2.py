@@ -178,6 +178,47 @@ _TWO_BYTE_MNEMONICS = {
     'ddra_imm', 'ora_imm', 'orb_imm',
 }
 
+def _helper_clobbers_a_first(body_lines):
+    """True if the helper's first real instruction writes `$a` as its
+    first action — meaning the caller's `$a` is immediately discarded
+    and the auto-cold prologue (`ldi $a,0xB5; deref2`) would just
+    reload a value that's about to be overwritten.
+
+    The mk1 mnemonic `move SRC, DST` always writes DST. Recognised
+    forms in the assembler dialect:
+      - `ldi $a, X`   (= `move imm, $a`) → writes $a
+      - `clr $a`      (= `move 0, $a` typically)
+      - `mov $X, $a`  → writes $a
+      - `pop $a`      (= `load $a, [$sp]`) → writes $a
+
+    Used by `_extract_force_cold_helpers` to decide whether to prepend
+    the 3-byte arg-recovery prologue. Conservative: any unrecognised
+    first instruction returns False (prologue gets prepended)."""
+    for raw in body_lines:
+        s = raw.strip()
+        if not s or s.endswith(':') or s.startswith(';'):
+            continue
+        # First real instruction. Parse mnemonic + operands.
+        toks = s.split(None, 1)
+        mn = toks[0]
+        rest = toks[1] if len(toks) > 1 else ''
+        # `ldi $a` / `clr $a` / `pop $a` / explicit `mov X, $a`.
+        if mn == 'ldi' and rest.startswith('$a'):
+            return True
+        if mn == 'clr' and rest.startswith('$a'):
+            return True
+        if mn == 'pop' and rest.startswith('$a'):
+            return True
+        if mn == 'mov':
+            # `mov SRC, DST` — DST is the second arg.
+            parts = [p.strip() for p in rest.split(',')]
+            if len(parts) == 2 and parts[1] == '$a':
+                return True
+        # Unrecognised first instruction: assume $a may be live.
+        return False
+    return False
+
+
 def _measure_asm_bytes(lines):
     """Estimate assembled byte size of asm-text lines.
     Mirrors the size logic the partitioner uses; matches the firmware
@@ -2865,11 +2906,32 @@ class MK1CodeGen:
                 cold_lines = peephole(list(self.code))
                 # Caller-arg prologue: if this cold function takes a
                 # parameter (first arg in $a), the dispatcher already
-                # clobbered $a by the time the slot runs. Prepend a
+                # clobbered $a by the time the slot runs. Insert a
                 # 3-byte load from the kstate `cold_call_arg` slot
-                # so the body sees its parameter at entry.
+                # AFTER the function-entry label so the body sees
+                # its parameter at entry. (Insertion-after-label
+                # rather than prepend: dead-code elim drops items
+                # between the previous helper's `ret` and the next
+                # top-level label; placing the prologue past the
+                # label makes it survive that pass.)
                 if self.func_params.get(fn[0], 0) > 0:
-                    cold_lines = self._cold_arg_prologue() + cold_lines
+                    # Find the function's entry label inside cold_lines
+                    # and insert prologue right after it. If no label
+                    # is found (shouldn't happen — compile_function
+                    # emits one), fall back to prepending.
+                    _label_idx = None
+                    for _i, _l in enumerate(cold_lines):
+                        _ls = _l.strip()
+                        if (_ls.endswith(':') and not _ls.startswith('.')
+                                and not _ls.startswith(';')):
+                            _label_idx = _i
+                            break
+                    if _label_idx is None:
+                        cold_lines = self._cold_arg_prologue() + cold_lines
+                    else:
+                        cold_lines = (cold_lines[:_label_idx + 1]
+                                      + self._cold_arg_prologue()
+                                      + cold_lines[_label_idx + 1:])
                 byte_size = _measure_asm_bytes(cold_lines)
                 if byte_size > COLD_SLOT_BYTES:
                     raise Exception(
@@ -4030,13 +4092,34 @@ class MK1CodeGen:
         rejected_back = []  # full body lines to restore to self.code
         import sys as _ac_sys
         for name, body_lines in extracted_bodies.items():
-            body = list(body_lines[1:])  # drop the label line
-            body = peephole(body)
-            # Kernel helpers virtually always read their first arg from
-            # $a (rtc_read_reg, eeprom_rd, i2c_sb, lcd_chr, …). The
-            # dispatcher's setup clobbers $a, so prepend the recovery
-            # prologue (3 bytes) so the helper sees its caller's $a.
-            body = self._cold_arg_prologue() + body
+            label_line = body_lines[0]
+            body_only = list(body_lines[1:])
+            body_only = peephole(body_only)
+            # Kernel helpers that read their first arg from $a
+            # (rtc_read_reg, eeprom_rd, i2c_sb, lcd_chr, …) need a
+            # prologue to recover $a from kstate — the dispatcher's
+            # setup clobbers it. But many kernel helpers don't take
+            # any arg (delay_cal, i2c_sp, i2c_rb, …) and can skip
+            # the 3-byte prologue, saving slot space (which sets
+            # the runtime kernel budget at 256 - cold_slot_size).
+            #
+            # Detection rule: if the first real instruction writes
+            # $a as its first action (`ldi $a,...`, `clr $a`,
+            # `mov $X,$a`, `pop $a`), then $a's caller value is
+            # immediately discarded — prologue would only restore a
+            # value that gets thrown away. Conservative: when in
+            # doubt, prepend the prologue.
+            _clobbers = _helper_clobbers_a_first(body_only)
+            # Body layout: label line first (so dead_code_elim sees a
+            # Label to clear in_dead before the prologue), THEN
+            # prologue, THEN original body. Without the label-first
+            # layout, the prologue lines that follow the previous
+            # helper's `ret` get dropped by Pass-1 dead-code elim
+            # before reaching the next internal label.
+            if _clobbers:
+                body = [label_line] + body_only
+            else:
+                body = [label_line] + self._cold_arg_prologue() + body_only
             size = _measure_asm_bytes(body)
             if size == 0:
                 rejected_back.extend(body_lines)
@@ -15263,6 +15346,252 @@ def main():
         init_limit_local = 254 if (init_extraction_local or overlay_mode_local) else 250
         return gen, asm, lines, code_bytes_local, init_limit_local, compile_log
 
+    def _phase25_pick_overflow_helper(g, asm_lines, already_helper, already_user):
+        """Phase 2.5: detect post-compile runtime kernel overflow and pick
+        the next-largest helper to auto-promote to cold tier.
+
+        Returns the helper name (e.g. `__rtc_read_reg`) or `None`.
+        `None` means either no overflow OR no eligible candidate.
+
+        Eligibility:
+          - Helper lives in `section page3_kernel` (init_extraction /
+            overlay modes) or `section code` (flat mode).
+          - Body ends in `ret` (leaf-style; same constraint
+            `_extract_force_cold_helpers` enforces).
+          - Body fits in COLD_SLOT_BYTES.
+          - Not already in `already_helper` (this iteration) or
+            represented as a single-underscore user fn already in
+            `already_user`.
+          - Net byte effect on the runtime kernel must be positive
+            (body bytes saved > 2 × kernel-side call sites bloated
+            by `ldi $b,id ;!keep`).
+          - Promotion must not push the stage-1 init code past its
+            254 B budget (each init-side call site adds +2 B from
+            the same rewriter).
+
+        Picker bias: largest net runtime savings first. Ties broken
+        by larger body, then name.
+        """
+        cold_slot = getattr(g, 'cold_slot_size', 0) or 0
+        max_code = (256 - cold_slot) if cold_slot > 0 else 250
+        init_extr = getattr(g, '_init_extraction_done', False)
+        overlay_mode = hasattr(g, '_overlay_kernel_size')
+
+        # Walk lines: tracked sections + per-helper byte tally. Match
+        # _measure_asm_bytes' two-byte set so the picker's size estimate
+        # lines up with what the partitioner would measure post-extract.
+        two_byte = {'ldsp', 'ldsp_b', 'stsp', 'push_imm', 'jal',
+                    'jc', 'jz', 'jnc', 'jnz', 'j', 'ldi', 'cmp',
+                    'addi', 'subi', 'andi', 'ori', 'ld', 'st',
+                    'ldp3', 'stp3', 'ocall', 'tst', 'out_imm',
+                    'cmpi', 'ddrb_imm', 'ddra_imm', 'ora_imm',
+                    'orb_imm'}
+
+        def _is_kernel_section(s):
+            if init_extr or overlay_mode:
+                return ('section page3_kernel' in s
+                        or 'section page3_code' in s)
+            return ('section code' in s
+                    and 'data_code' not in s
+                    and 'stack_code' not in s
+                    and 'page3_code' not in s)
+
+        # Walk every line in the asm: track current section + (in
+        # kernel) the current helper. ALSO scan call references per
+        # section — dispatcher rewriting (`jal __X` → `ldi $b,id;
+        # jal __cold_call`) adds +2 B at every call site, and we
+        # need to know which sections those sites live in to model
+        # the per-stage byte impact (kernel = page3_kernel; init =
+        # `code`; everything else is bookkeeping).
+        # Asm defaults to `section code` before any explicit
+        # `section ...` marker — assembler convention. In flat mode
+        # the whole code section IS the kernel (no separate init
+        # stage); in init-extraction / overlay modes the default
+        # `code` section holds stage-1 init code and the runtime
+        # kernel lives in `section page3_kernel`. Set both
+        # `cur_section` and `in_kernel` consistently with that.
+        if init_extr or overlay_mode:
+            cur_section = 'init'
+            in_kernel = False
+        else:
+            cur_section = 'kernel'
+            in_kernel = True
+        kernel_bytes = 0
+        init_bytes = 0
+        helper_lines = {}     # name → list of body lines (no label)
+        kernel_calls = {}     # name → kernel-section call count
+        init_calls = {}       # name → init-section call count
+        other_calls = {}      # name → other-section call count
+        cur_helper = None
+        def _is_init_section(s):
+            return ('section code' in s
+                    and 'data_code' not in s
+                    and 'stack_code' not in s
+                    and 'page3_code' not in s
+                    and 'page3_kernel' not in s)
+        for line in asm_lines:
+            s = line.strip()
+            if 'section ' in s or s.strip().startswith('org '):
+                in_kernel = _is_kernel_section(s)
+                if in_kernel:
+                    cur_section = 'kernel'
+                elif _is_init_section(s):
+                    cur_section = 'init'
+                else:
+                    cur_section = 'other'
+                cur_helper = None
+                continue
+            # Count call-site references per section. The dispatcher
+            # rewriter visits both kernel `self.code` and already-
+            # extracted cold function bodies (via `_rewrite` in
+            # `_extract_force_cold_helpers`), and rewrites both
+            # `jal __X` and `j __X`.
+            for prefix in ('jal __', 'j __'):
+                if s.startswith(prefix):
+                    tgt = s[len(prefix) - 2:].split()[0].split(';')[0].strip()
+                    if tgt.startswith('__'):
+                        bucket = (kernel_calls if cur_section == 'kernel'
+                                  else init_calls if cur_section == 'init'
+                                  else other_calls)
+                        bucket[tgt] = bucket.get(tgt, 0) + 1
+                    break
+            # Tally init-section bytes for the post-promotion init
+            # overflow check.
+            if cur_section == 'init' and s and not s.endswith(':') and not s.startswith(';'):
+                mn = s.split()[0]
+                if mn == 'byte':
+                    init_bytes += 1
+                elif mn == 'cmp':
+                    parts = s.split()
+                    init_bytes += 1 if (len(parts) > 1 and parts[1].startswith('$')) else 2
+                elif mn == 'ddrb2_imm':
+                    init_bytes += 3
+                elif mn == 'ddrb3_imm':
+                    init_bytes += 4
+                elif mn in two_byte:
+                    init_bytes += 2
+                else:
+                    init_bytes += 1
+            if not in_kernel:
+                continue
+            # Top-level label? (no leading dot, ends with `:`).
+            if (s.endswith(':') and not s.startswith('.')
+                    and not s.startswith(';')):
+                name = s[:-1]
+                # Helpers begin with `__` (kernel) or `_` (user fn).
+                # Pick `__` only — user fns go through `_auto_cold_user_fns`
+                # which is a separate path.
+                if name.startswith('__'):
+                    cur_helper = name
+                    helper_lines[cur_helper] = []
+                else:
+                    cur_helper = None
+                continue
+            # Body line under cur_helper: count bytes + capture line for
+            # leaf-check.
+            if cur_helper is not None and not s.startswith(';'):
+                helper_lines[cur_helper].append(s)
+            # Tally kernel_bytes for the overflow check.
+            if not s or s.startswith(';'):
+                continue
+            mn = s.split()[0]
+            if mn == 'byte':
+                kernel_bytes += 1
+            elif mn == 'cmp':
+                parts = s.split()
+                kernel_bytes += 1 if (len(parts) > 1 and parts[1].startswith('$')) else 2
+            elif mn == 'ddrb2_imm':
+                kernel_bytes += 3
+            elif mn == 'ddrb3_imm':
+                kernel_bytes += 4
+            elif mn in two_byte:
+                kernel_bytes += 2
+            else:
+                kernel_bytes += 1
+
+        if kernel_bytes <= max_code:
+            return None  # no overflow
+
+        # Score candidates. Body bytes computed the same way the
+        # extractor measures: count instruction sizes; ignore label.
+        def _measure(body):
+            n = 0
+            for ln in body:
+                if not ln or ln.startswith(';') or ln.endswith(':'):
+                    continue
+                mn = ln.split()[0]
+                if mn == 'byte':
+                    n += 1
+                elif mn == 'cmp':
+                    parts = ln.split()
+                    n += 1 if (len(parts) > 1 and parts[1].startswith('$')) else 2
+                elif mn == 'ddrb2_imm':
+                    n += 3
+                elif mn == 'ddrb3_imm':
+                    n += 4
+                elif mn in two_byte:
+                    n += 2
+                else:
+                    n += 1
+            return n
+
+        def _ends_in_ret(body):
+            for ln in reversed(body):
+                if not ln or ln.startswith(';') or ln.endswith(':'):
+                    continue
+                return ln.split()[0] == 'ret'
+            return False
+
+        # Dispatcher infrastructure: must remain kernel-resident.
+        # `__cold_call` / `__cold_load_helper` ARE the cold-tier loader;
+        # `__i2c_sb` / `__i2c_rb` are called from `__cold_load_helper`'s
+        # bulk-read loop. Promoting any of them creates a chicken-egg
+        # bootstrap failure (the dispatcher would have to load itself).
+        DISPATCHER_INFRA = {
+            '__cold_call', '__cold_load_helper',
+            '__i2c_sb', '__i2c_rb',
+        }
+        # Stage-1 init budget. Init-extraction reserves 14 B for the
+        # copy loop; the resident dispatcher infrastructure already
+        # lives in init too. Total stage-1 must fit in 254 B (the
+        # `init_limit_local` the auto-cold loop already polices for
+        # the `_prefer_dc` retry path).
+        INIT_LIMIT = 254
+        candidates = []
+        for name, body in helper_lines.items():
+            if name in already_helper:
+                continue
+            if name in DISPATCHER_INFRA:
+                continue
+            sz = _measure(body)
+            if sz == 0 or sz > COLD_SLOT_BYTES:
+                continue
+            if not _ends_in_ret(body):
+                continue
+            # Per-section call counts.
+            kc = kernel_calls.get(name, 0)
+            ic = init_calls.get(name, 0)
+            # Kernel net savings: body removed (-sz) + calls grow
+            # by 2 B each (+2*kc). Net = sz - 2*kc.
+            kernel_net = sz - 2 * kc
+            if kernel_net <= 0:
+                # Promotion would not actually shrink the kernel —
+                # body savings cancelled by call-site bloat. Skip.
+                continue
+            # Init-side bloat: each init call grows by 2 B. Skip if
+            # this would push stage-1 past its budget.
+            init_after = init_bytes + 2 * ic
+            if init_after > INIT_LIMIT:
+                continue
+            # Score: maximize kernel net savings, prefer larger
+            # bodies on ties (frees more contiguous space), name
+            # tiebreaker.
+            candidates.append((kernel_net, sz, name))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda t: (-t[0], -t[1], t[2]))
+        return candidates[0][2]
+
     def _emit_partial_metrics(g, exc_msg):
         """Emit metrics with `compile_ok=False` + matcher_fires when compile
         fails. Keeps the corpus audit / regression baseline complete: programs
@@ -15330,6 +15659,23 @@ def main():
                       f"using runtime/overlay placement",
                       file=_retry_sys.stderr)
                 _prefer_dc = False
+                continue
+            # Phase 2.5: post-compile runtime kernel overflow.
+            # `wrap into kernel` only fires during overlay partitioning
+            # — once auto-cold has carried the program past wrap, the
+            # remaining kernel can still be too big for the runtime
+            # code page (256 - cold_slot_size). Detect that here and
+            # promote the next-largest non-cold leaf helper.
+            _overflow_pick = _phase25_pick_overflow_helper(
+                gen, lines, _force_helpers, _auto_cold)
+            if _overflow_pick is not None and (
+                    len(_auto_cold) + len(_force_helpers) < _MAX_AUTO_COLD):
+                import sys as _ov_sys
+                print(f"  Auto-cold (overflow): promoting helper "
+                      f"{_overflow_pick} to cold tier "
+                      f"(post-compile kernel overflow)",
+                      file=_ov_sys.stderr)
+                _force_helpers.add(_overflow_pick)
                 continue
             break
         except Exception as _e:
