@@ -2828,7 +2828,7 @@ static void writeEe64Data(const uint8_t* data, int size) {
         int addrHi = (offset >> 8) & 0xFF;
         int addrLo = offset & 0xFF;
 
-        char asmBuf[2048];
+        char asmBuf[3072];
         int pos = 0;
         pos += snprintf(asmBuf + pos, sizeof(asmBuf) - pos,
             "; EE64 page write at 0x%04X (%d bytes)\n"
@@ -2842,6 +2842,14 @@ static void writeEe64Data(const uint8_t* data, int size) {
             "    ddrb_imm 0x03\n"
             "    ddrb_imm 0x01\n"
             "    ddrb_imm 0x00\n"
+            // Retry counter: $c = 4 attempts. Per-byte ACK is checked
+            // after every jal __sb; any NACK aborts to .nack which
+            // sends STOP, decrements $c, and re-runs the whole
+            // transaction. Without this, a single data-byte NACK
+            // would silently lose the rest of the page (every
+            // subsequent send is ignored by the chip until STOP).
+            "    ldi $c, 4\n"
+            ".attempt:\n"
             // ACK poll: wait for any prior write cycle to complete.
             ".poll:\n"
             "    exrw 2\n"
@@ -2854,25 +2862,48 @@ static void writeEe64Data(const uint8_t* data, int size) {
             "    ddrb_imm 0x00\n"
             "    tst 0x01\n"
             "    jnz .poll\n"
-            // START + dev write + addr_hi + addr_lo
+            // START + dev write + addr_hi + addr_lo (with per-byte ACK).
             "    exrw 2\n"
             "    ddrb_imm 0x01\n"
             "    ddrb_imm 0x03\n"
             "    ldi $a, 0xA0\n"
             "    jal __sb\n"
+            "    tst 0x01\n"
+            "    jnz .nack\n"
             "    ldi $a, %d\n"
             "    jal __sb\n"
+            "    tst 0x01\n"
+            "    jnz .nack\n"
             "    ldi $a, %d\n"
-            "    jal __sb\n",
+            "    jal __sb\n"
+            "    tst 0x01\n"
+            "    jnz .nack\n",
             offset, pageLen, addrHi, addrLo);
 
         for (int i = 0; i < pageLen; i++) {
             pos += snprintf(asmBuf + pos, sizeof(asmBuf) - pos,
                 "    ldi $a, %d\n"
-                "    jal __sb\n",
+                "    jal __sb\n"
+                "    tst 0x01\n"
+                "    jnz .nack\n",
                 data[offset + i]);
         }
         pos += snprintf(asmBuf + pos, sizeof(asmBuf) - pos,
+            // All bytes ACKed — STOP and halt.
+            "    ddrb_imm 0x03\n"
+            "    ddrb_imm 0x01\n"
+            "    ddrb_imm 0x00\n"
+            "    hlt\n"
+            // NACK handler: STOP, decrement retry, re-attempt or give up.
+            ".nack:\n"
+            "    ddrb_imm 0x03\n"
+            "    ddrb_imm 0x01\n"
+            "    ddrb_imm 0x00\n"
+            "    decc\n"
+            "    jnz .attempt\n"
+            // All retries exhausted — STOP again and halt. ESP32 has no
+            // way to tell write failed (no return path), so we just
+            // give up gracefully rather than spinning forever.
             "    ddrb_imm 0x03\n"
             "    ddrb_imm 0x01\n"
             "    ddrb_imm 0x00\n"
