@@ -2856,8 +2856,9 @@ class MK1CodeGen:
                              for cid, _addr, _size, fname in self.cold_helpers
                              if fname in self.cold_function_names}
             self._lcd_helpers = getattr(self, '_lcd_helpers', set())
-            self._lcd_helpers |= {'__i2c_sb', '__i2c_rb',
-                                  '__eeprom_r2c_loop', '__cold_call'}
+            # __cold_call inlines the bulk-read loop; doesn't need
+            # __eeprom_r2c_loop as a separate kernel-resident helper.
+            self._lcd_helpers |= {'__i2c_sb', '__i2c_rb', '__cold_call'}
             new_code = []
             for line in self.code:
                 s = line.strip()
@@ -3094,30 +3095,29 @@ class MK1CodeGen:
         flat_mode = (getattr(self, '_overlay_kernel_size', None) is None
                      and not getattr(self, '_init_extraction_done', False))
         if flat_mode:
-            # Cold-helper metadata init lines, generated once and inserted
-            # right after the SP preamble. Mirrors the path in
-            # _overlay_partition for init-extraction mode.
-            cold_init_lines = []
-            cold_helpers = getattr(self, 'cold_helpers', [])
-            if cold_helpers:
-                cold_init_lines.append('\t; cold-helper metadata table init')
-                for cold_id, ee_addr, length, _name in cold_helpers:
-                    entries = [
-                        ((ee_addr >> 8) & 0xFF, COLD_TABLE_BASE + cold_id * 3 + 0),
-                        (ee_addr & 0xFF,        COLD_TABLE_BASE + cold_id * 3 + 1),
-                        (length & 0xFF,         COLD_TABLE_BASE + cold_id * 3 + 2),
-                    ]
-                    for value, p3_addr in entries:
-                        cold_init_lines.append(f'\tldi $a,{value}')
-                        cold_init_lines.append(f'\tldi $b,{p3_addr}')
-                        cold_init_lines.append('\tiderefp3')
+            # In flat mode there's no kernel self-copy: page 3 is written
+            # from `result.page3` at upload and persists. Emit cold-helper
+            # metadata as STATIC page-3 bytes via `section page3; org
+            # COLD_TABLE_BASE; byte ...` — saves ~9–15 B of code-page
+            # preamble per helper compared to the equivalent runtime
+            # `ldi $a,V; ldi $b,P; iderefp3` triple. (Init-extraction /
+            # overlay mode below still emits runtime init because page 3
+            # gets clobbered by the kernel image during self-copy.)
             for mi, line in enumerate(self.code):
                 if line.strip() == '_main:':
                     self.code.insert(mi + 1, '\tldi $b,0xFF')
                     self.code.insert(mi + 2, '\tmov $b,$sp')
-                    for j, cl in enumerate(cold_init_lines):
-                        self.code.insert(mi + 3 + j, cl)
                     break
+            cold_helpers = getattr(self, 'cold_helpers', [])
+            if cold_helpers:
+                self.emit('\tsection page3')
+                self.emit(f'\torg {COLD_TABLE_BASE}')
+                self.emit('; cold-helper metadata table (static; page 3 persists in flat mode)')
+                for cold_id, ee_addr, length, _name in cold_helpers:
+                    self.emit(f'\tbyte {(ee_addr >> 8) & 0xFF}    ; helper {cold_id} addr_hi')
+                    self.emit(f'\tbyte {ee_addr & 0xFF}    ; helper {cold_id} addr_lo')
+                    self.emit(f'\tbyte {length & 0xFF}    ; helper {cold_id} len')
+                self.emit('\tsection code')
 
         # Emit page 1 globals UNLESS the overlay partitioner already inlined
         # them (overlay mode emits globals inside the data section before
@@ -3774,13 +3774,12 @@ class MK1CodeGen:
 
         # __cold_call: dispatcher for runtime AT24C512 helper loads.
         # Always kernel-resident — it must be reachable from any caller
-        # site (including overlays). Forces __eeprom_r2c_loop resident
-        # too, since a resident caller can't reach a helper that lives
-        # in an overlay slot.
+        # site (including overlays). The bulk-read loop is inlined
+        # directly into __cold_call's body, so __eeprom_r2c_loop is
+        # NOT forced resident here (only `eeprom_read_to_code` callers
+        # pull it in, and that path may put it in an overlay).
         if '__cold_call' in helpers:
             no_ov.add('__cold_call:')
-            if '__eeprom_r2c_loop' in helpers:
-                no_ov.add('__eeprom_r2c_loop:')
 
         # (C) Cold-function callees: every compiler helper invoked from a
         # cold-function body has to be kernel-resident — a cold function
@@ -5223,11 +5222,45 @@ class MK1CodeGen:
             self.emit_ddrb(0x03)
             self.emit('\tldi $a,0xA1')
             self.emit('\tjal __i2c_sb')
-            # Bulk-read into the cold slot. r2c_loop expects B = dest,
-            # count on stack; len is already there (top of stack).
-            self.emit(f'\tldi $b,{self.cold_slot_base}')
-            self.emit('\tjal __eeprom_r2c_loop')
-            self.emit('\tpop $a')                          # discard count
+            # Bulk-read into the cold slot. Inlining the loop body here
+            # (rather than `jal __eeprom_r2c_loop`) lets `__eeprom_r2c_loop`
+            # stay overlay-eligible — it's only forced kernel-resident for
+            # `eeprom_read_to_code`-using programs now, not cold-tier
+            # ones. Saves ~33 B kernel for the typical
+            # cold-tier-without-eeprom-read program.
+            #
+            # `len` is on top of stack from the metadata-read above; pop
+            # it into the count kstate slot. B holds the slot dest.
+            self.emit(f'\tldi $b,{self.cold_slot_base}')   # B = dest
+            self.emit('\tpop $a')                          # A = count
+            self.emit_kstate_store('overlay_r2c_count')    # save count
+            cc_loop = self.label('cc_r2c')
+            cc_last = self.label('cc_r2cl')
+            self.emit(f'{cc_loop}:')
+            self.emit('\tpush_b')                          # save dest before i2c_rb clobbers B
+            self.emit('\tjal __i2c_rb')                    # D = byte
+            self.emit('\tpop_b')                           # B = dest
+            self.emit('\tmov $d,$a')                       # A = byte
+            self.emit('\tistc_inc')                        # code[B] = A; B++
+            self.emit('\tpush_b')                          # save dest+1
+            self.emit_kstate_load('overlay_r2c_count')     # A = remaining
+            self.emit('\tdec')                             # A--, ZF set
+            self.emit_kstate_store('overlay_r2c_count')    # writeback
+            self.emit('\tpop_b')                           # B = dest+1 (ZF preserved)
+            self.emit(f'\tjz {cc_last}')
+            # ACK after each non-last byte
+            self.emit_ddrb(0x03)
+            self.emit_ddrb(0x01)
+            self.emit_ddrb(0x03)
+            self.emit_ddrb(0x02)
+            self.emit(f'\tj {cc_loop}')
+            # Last byte: NACK + STOP
+            self.emit(f'{cc_last}:')
+            self.emit_ddrb(0x00)                           # SCL HIGH (NACK)
+            self.emit_ddrb(0x02)                           # SCL LOW
+            self.emit_ddrb(0x03)                           # SDA LOW
+            self.emit_ddrb(0x01)                           # SCL HIGH
+            self.emit_ddrb(0x00)                           # STOP
             # Enter the loaded helper. jal_r pushes return PC; the cold
             # helper's `ret` returns back here, then we ret to caller.
             self.emit(f'\tldi $a,{self.cold_slot_base}')
@@ -6494,7 +6527,7 @@ class MK1CodeGen:
             # happens to be loaded at __cold_call's address.
             if '__cold_call' in _helpers_used:
                 _force_resident_helpers |= {
-                    '__cold_call', '__eeprom_r2c_loop',
+                    '__cold_call',
                     '__i2c_sb', '__i2c_rb',
                 }
                 # (C) Helpers transitively called from cold function bodies.
