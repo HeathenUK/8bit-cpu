@@ -5664,7 +5664,12 @@ class MK1CodeGen:
         # path on cold→cold returns.
         if '__cold_load_helper' in helpers:
             self.emit('__cold_load_helper:')
-            self.emit_kstate_load('cold_current_id')       # A = id
+            # Caller convention: $a = helper id. Both call sites in
+            # `__cold_call` (initial-load and chain-reload) leave the
+            # id in $a after their respective `kstate_store
+            # cold_current_id` (which only touches $b), so we don't
+            # need to re-read the id from kstate here. Saves 3 B
+            # vs the prior `ldi $a,offset; deref2` reload.
             self.emit('\tmov $a,$b')                       # b = id
             self.emit('\tsll')                             # a = 2*id
             self.emit('\tadd $b,$a')                       # a = 3*id
@@ -5697,11 +5702,14 @@ class MK1CodeGen:
             self.emit_ddrb(0x03)
             self.emit('\tldi $a,0xA1')
             self.emit('\tjal __i2c_sb')
-            # Bulk-read inlined: len on top of stack. Pop count and
-            # store to kstate FIRST (the kstate store clobbers B), then
-            # set B = slot_base for the istc_inc loop.
+            # Bulk-read inlined: len on top of stack. Park count in
+            # $c — neither `__i2c_sb` nor `__i2c_rb` touches $c, and
+            # `decc` is a single-byte op that updates the count and
+            # sets ZF in one go. Saves ~10 B vs the prior kstate-
+            # backed counter (which needed push_b/load/dec/store/
+            # pop_b around every iteration).
             self.emit('\tpop $a')                          # A = count
-            self.emit_kstate_store('overlay_r2c_count')
+            self.emit('\tmov $a,$c')                       # C = count
             self.emit(f'\tldi $b,{self.cold_slot_base}')   # B = dest
             clh_loop = self.label('clh_r2c')
             clh_last = self.label('clh_r2cl')
@@ -5711,11 +5719,7 @@ class MK1CodeGen:
             self.emit('\tpop_b')
             self.emit('\tmov $d,$a')
             self.emit('\tistc_inc')
-            self.emit('\tpush_b')
-            self.emit_kstate_load('overlay_r2c_count')
-            self.emit('\tdec')
-            self.emit_kstate_store('overlay_r2c_count')
-            self.emit('\tpop_b')
+            self.emit('\tdecc')                            # C-- (sets ZF)
             self.emit(f'\tjz {clh_last}')
             self.emit_ddrb(0x03)
             self.emit_ddrb(0x01)
