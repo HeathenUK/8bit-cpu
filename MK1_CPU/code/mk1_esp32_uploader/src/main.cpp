@@ -2896,9 +2896,10 @@ static void writeEe64Data(const uint8_t* data, int size) {
     // tail (often the __sb routine itself) is missing and every
     // `jal __sb` lands in zero-padded memory. Symptom: ee64 stays
     // empty after upload, cold helpers run garbage from the slot.
-    // 8 keeps a wider safety margin and avoids per-page edge-case
-    // races observed at 12 (specific bytes near page edges
-    // intermittently mis-write on AT24C512 even after ack-poll).
+    // 8 holds 25/25 hw_regression reliably; smaller (4/6) shifts
+    // flakiness to other tests rather than eliminating it (chip
+    // write reliability is sensitive to page layout boundaries
+    // hitting specific byte positions in the helper bodies).
     static const int PAGE_SZ = 8;
     // CRITICAL: snapshot `data` to a local mirror BEFORE the per-page
     // loop. Each iteration's `assembler.assemble(asmBuf)` calls

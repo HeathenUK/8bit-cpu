@@ -4416,8 +4416,7 @@ class MK1CodeGen:
             '.crl_lp:',
             '\tpush $a',          # save current ptr
             '\tderefp3',          # A = page3[ptr] = id
-            '\tldi $b,0xFF',
-            '\tcmp $b',
+            '\tcmpi 0xFF',        # 2 B vs 3 B for ldi+cmp
             '\tjz .crl_dn',
             '\tmov $a,$b',        # B = id (for __cold_call)
             '\tpop $a',           # A = ptr
@@ -4564,6 +4563,34 @@ class MK1CodeGen:
 
         total_runs = len(main_plans) + sum(len(p[3]) for p in body_plans)
         if total_runs == 0:
+            return
+
+        # Gate: only fire if total savings ≥ 4 B. Each bundle in main
+        # saves (per-call bytes × N) − 7 B (the runlist dispatch site).
+        # Bundles inside cold bodies save bytes within ee64 (slot
+        # impact only); only count main-side savings here for the gate.
+        # Bundling adds ~28 B of fixed ee64 cost (__cold_run_list + 3 B
+        # metadata + per-bundle list bytes) and grows ee64 size enough
+        # to expose AT24C512 page-write flakiness on small programs
+        # (Phase 1 with 6 B → 30 B ee64 corrupts a byte mid-stream).
+        # 4 B is the minimum savings worth that risk.
+        def _bundle_savings(plans, in_main):
+            total = 0
+            for _start, _n, run in plans:
+                # Estimate per-call cost: 4 B (no arg, `ldi $b,ID;!keep`
+                # + `jal __cold_call`) or 7 B (with arg, additional
+                # `ldi $a,LIT`). We don't know precisely without
+                # re-scanning the original lines; conservatively use
+                # 4 B per call (lower bound). Bundle replaces with
+                # 7 B (`ldi $a,addr; ldi $b,id;!keep; jal __cold_call`).
+                per_call = 4
+                cost = 7
+                total += per_call * len(run) - cost
+            return total
+
+        main_savings = _bundle_savings(main_plans, True)
+        body_savings = sum(_bundle_savings(p[3], False) for p in body_plans)
+        if main_savings + body_savings < 4:
             return
 
         # Register __cold_run_list as a cold helper. Its id is the next
@@ -5042,11 +5069,12 @@ class MK1CodeGen:
             self.emit(f'{lbl_loop}:')
             self.emit('\tmov $d,$a')
             self.emit('\tderefp3')            # A = page3[D]
-            self.emit('\tldi $b,0xFF')
-            self.emit('\tcmp $b')
+            # `cmpi X` (2 B) replaces `ldi $b,X; cmp $b` (3 B). $b is
+            # not read between sentinel checks here, so the load was
+            # redundant. Saves 1 B per check × 5 checks = 5 B body.
+            self.emit('\tcmpi 0xFF')
             self.emit(f'\tjz {lbl_done}')     # END
-            self.emit('\tldi $b,0xFE')
-            self.emit('\tcmp $b')
+            self.emit('\tcmpi 0xFE')
             self.emit(f'\tjnz {lbl_ns}')
             # START
             self.emit('\texrw 2')
@@ -5054,8 +5082,7 @@ class MK1CodeGen:
             self.emit_ddrb(0x03)
             self.emit(f'\tj {lbl_adv}')
             self.emit(f'{lbl_ns}:')
-            self.emit('\tldi $b,0xFD')
-            self.emit('\tcmp $b')
+            self.emit('\tcmpi 0xFD')
             self.emit(f'\tjnz {lbl_nr}')
             # STOP
             self.emit_ddrb(0x03)
@@ -5063,8 +5090,7 @@ class MK1CodeGen:
             self.emit_ddrb(0x00)
             self.emit(f'\tj {lbl_adv}')
             self.emit(f'{lbl_nr}:')
-            self.emit('\tldi $b,0xFB')
-            self.emit('\tcmp $b')
+            self.emit('\tcmpi 0xFB')
             lbl_nrd = self.label('is_nrd')
             self.emit(f'\tjnz {lbl_nrd}')
             # READ: inline i2c_rb, result in C
@@ -5094,8 +5120,7 @@ class MK1CodeGen:
             self.emit('\tpop $d')           # restore pointer
             self.emit(f'\tj {lbl_adv}')
             self.emit(f'{lbl_nrd}:')
-            self.emit('\tldi $b,0xFC')
-            self.emit('\tcmp $b')
+            self.emit('\tcmpi 0xFC')
             self.emit(f'\tjnz {lbl_send}')
             # REPEAT: next byte = count, send 0x00 count times
             self.emit('\tmov $d,$a')
@@ -5837,9 +5862,8 @@ class MK1CodeGen:
             self.emit(f'{lbl_chi}:')
             self.emit('\tdec')
             self.emit(f'\tjnz {lbl_chi}')
-            self.emit('\tmov $b,$a')
-            self.emit('\tinc')
-            self.emit('\tmov $a,$b')
+            # B++ in 1 B (was 3 B: mov $b,$a; inc; mov $a,$b).
+            self.emit('\tincb')
             self.emit('\texrw 1')
             self.emit('\ttst 0x01')
             self.emit(f'\tjz {lbl_done}')
@@ -6140,17 +6164,20 @@ class MK1CodeGen:
             self.emit('\tmov $a,$b')                       # b = id
             self.emit('\tsll')                             # a = 2*id
             self.emit('\tadd $b,$a')                       # a = 3*id
-            self.emit(f'\taddi {COLD_TABLE_BASE},$a')      # a = ptr
-            self.emit('\tmov $a,$b')                       # b = ptr (preserved across derefp3)
-            # Read len, addr_lo, addr_hi from page 3, push reverse-order
-            # so stack ends as [len, lo, hi] with hi on top.
-            self.emit('\taddi 2,$a')
+            # Walk down from len → lo → hi using `decb` to step the
+            # base pointer instead of recomputing base + offset for
+            # each derefp3. Saves 2 B over the prior `addi 16; mov;
+            # addi 2; derefp3; mov; addi 1; derefp3; mov; derefp3`
+            # form by reusing $b as a base+offset cursor.
+            self.emit(f'\taddi {COLD_TABLE_BASE + 2},$a')  # a = ptr+2 (len addr)
+            self.emit('\tmov $a,$b')                       # b = ptr+2
             self.emit('\tderefp3')                         # a = len
             self.emit('\tpush $a')
+            self.emit('\tdecb')                            # b = ptr+1
             self.emit('\tmov $b,$a')
-            self.emit('\taddi 1,$a')
             self.emit('\tderefp3')                         # a = addr_lo
             self.emit('\tpush $a')
+            self.emit('\tdecb')                            # b = ptr
             self.emit('\tmov $b,$a')
             self.emit('\tderefp3')                         # a = addr_hi
             self.emit('\tpush $a')
