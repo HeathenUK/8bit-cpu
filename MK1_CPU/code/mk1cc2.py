@@ -219,6 +219,49 @@ def _helper_clobbers_a_first(body_lines):
     return False
 
 
+def _pad_1byte_to_2byte(lines):
+    """Pad every 1-byte instruction in `lines` with a NOP (`mov $a,$a`,
+    1 B; opcode 0x00) so each "instruction unit" is exactly 2 bytes.
+    The streamer (`__stream` in the runtime kernel) assumes a 2-byte
+    fetch granularity — slot[0..1] always holds [opcode, operand],
+    and `jal_r 252` runs the pair before slot[254]=ret returns. With
+    padding, a 1-byte op consumes slot[0] and the NOP at slot[1] is
+    a harmless `move $a, $a`.
+
+    Labels, comments, blank lines, and `byte`/`org`/`section`
+    directives pass through unchanged. `cmp $reg` is the one tricky
+    case (1 B without imm, 2 B with imm) — handled per
+    `_measure_asm_bytes`. `ddrb2_imm` (3 B) and `ddrb3_imm` (4 B)
+    aren't currently emitted by the compiler (disabled due to bus
+    glitches per mk1cc2.py:14983) and would need their own padding
+    rule if ever re-enabled — the streamer assumes max 2 B units.
+    """
+    out = []
+    for line in lines:
+        out.append(line)
+        s = line.strip()
+        if not s or s.endswith(':') or s.startswith(';'):
+            continue
+        mn = s.split()[0]
+        if mn == 'byte':
+            continue   # raw byte directive, don't pad
+        if mn == 'cmp':
+            parts = s.split()
+            sz = 1 if (len(parts) > 1 and parts[1].startswith('$')) else 2
+        elif mn == 'ddrb2_imm':
+            sz = 3   # currently disabled in compiler emission
+        elif mn == 'ddrb3_imm':
+            sz = 4
+        elif mn in _TWO_BYTE_MNEMONICS:
+            sz = 2
+        else:
+            sz = 1
+        if sz == 1:
+            indent = line[:len(line) - len(line.lstrip())] or '\t'
+            out.append(f'{indent}byte 0x00 ; stream-pad NOP')
+    return out
+
+
 def _measure_asm_bytes(lines):
     """Estimate assembled byte size of asm-text lines.
     Mirrors the size logic the partitioner uses; matches the firmware
@@ -743,6 +786,16 @@ class MK1CodeGen:
         # extracted from self.code after _emit_i2c_helpers runs, then
         # routed through __cold_call. Phase 2 of skinny-kernel auto-paging.
         self._force_cold_helpers = set()
+
+        # Cold helpers that should be STREAMED (executed byte-by-byte
+        # from EE64 via __stream) rather than slot-loaded via
+        # __cold_call. Streamed helpers don't contribute to the cold
+        # slot floor — they have no upper size limit (~64 KB EE64),
+        # at the cost of ~10× per-instruction slowdown vs slot-load.
+        # Phase 5 of skinny-kernel auto-paging (after Phase 4 split
+        # is exhausted): if the program still overflows, the
+        # slot-floor helper is flipped to streamed.
+        self._streamed_helper_names = set()
 
         # ── Port-pin shadow ──────────────────────────────────────────
         # Tracks bits each builtin claims on VIA port A/B so that every
@@ -3103,8 +3156,12 @@ class MK1CodeGen:
             self.code = saved_code
         # Right-size the slot to the largest cold body. Programs with
         # cold byte-array helpers (`ee64 unsigned char[]`) also count
-        # — the dispatcher loads them into the same slot.
+        # — the dispatcher loads them into the same slot. Streamed
+        # helpers DON'T use the slot (they execute byte-by-byte via
+        # __stream), so they're excluded from the floor calculation.
         for _cid, _addr, sz, _name in self.cold_helpers:
+            if _name in self._streamed_helper_names:
+                continue
             if sz > self.cold_slot_size:
                 self.cold_slot_size = sz
         if self.cold_slot_size > 0:
@@ -3124,22 +3181,60 @@ class MK1CodeGen:
         # dispatcher infrastructure must be emitted even when no source
         # `ee64` user function exists. Pre-register dispatcher helpers
         # in _lcd_helpers so `_emit_i2c_helpers` emits the bodies.
-        if self._force_cold_helpers:
+        # Helpers we need depend on whether ANY cold helper is
+        # slot-loaded vs all streamed. The cold dispatcher
+        # (__cold_call / __cold_load_helper) is only needed for
+        # slot-loaded helpers; the streamer (__stream) is only
+        # needed for streamed helpers. Always need __i2c_sb / __i2c_rb
+        # if either tier is active.
+        _streamed_canon = {n.lstrip('_')
+                           for n in self._streamed_helper_names}
+
+        def _has_non_streamed_force_helper():
+            for n in self._force_cold_helpers:
+                if n.lstrip('_') not in _streamed_canon:
+                    return True
+            return False
+
+        def _has_non_streamed_user_fn():
+            for n in self.cold_function_names:
+                if n.lstrip('_') not in _streamed_canon:
+                    return True
+            return False
+
+        if self._force_cold_helpers or self.cold_function_names:
             self._lcd_helpers = getattr(self, '_lcd_helpers', set())
-            self._lcd_helpers |= {'__i2c_sb', '__i2c_rb',
-                                  '__cold_call', '__cold_load_helper'}
+            self._lcd_helpers |= {'__i2c_sb', '__i2c_rb'}
+            if (_has_non_streamed_force_helper()
+                    or _has_non_streamed_user_fn()):
+                self._lcd_helpers |= {'__cold_call', '__cold_load_helper'}
+
+        if self._streamed_helper_names:
+            self._lcd_helpers = getattr(self, '_lcd_helpers', set())
+            self._lcd_helpers |= {'__i2c_sb', '__i2c_rb', '__stream'}
 
         if self.cold_function_names:
             cold_call_map = {fname: cid
                              for cid, _addr, _size, fname in self.cold_helpers
                              if fname in self.cold_function_names}
+            # ee64 offset map for streamed helpers — call sites for
+            # streamed helpers go via `jal __stream` with the helper's
+            # ee64 address (low byte) as the entry argument.
+            cold_addr_map = {fname: addr
+                             for cid, addr, _size, fname in self.cold_helpers}
             self._lcd_helpers = getattr(self, '_lcd_helpers', set())
             # __cold_call calls __cold_load_helper for both the
-            # initial-load and the post-callee reload path. The bulk-
-            # read loop is inlined inside __cold_load_helper so
-            # __eeprom_r2c_loop doesn't need to be kernel-resident.
-            self._lcd_helpers |= {'__i2c_sb', '__i2c_rb',
-                                  '__cold_call', '__cold_load_helper'}
+            # initial-load and the post-callee reload path. We only
+            # need them if some user fn is slot-loaded (not all
+            # streamed). __i2c_sb / __i2c_rb are needed by either
+            # tier.
+            self._lcd_helpers |= {'__i2c_sb', '__i2c_rb'}
+            streamed_canon = {n.lstrip('_') for n in self._streamed_helper_names}
+            if any(fname.lstrip('_') not in streamed_canon
+                   for fname in cold_call_map):
+                self._lcd_helpers |= {'__cold_call', '__cold_load_helper'}
+            if streamed_canon:
+                self._lcd_helpers.add('__stream')
 
             def _rewrite_cold_calls(lines):
                 rewritten = []
@@ -3148,20 +3243,20 @@ class MK1CodeGen:
                     if s.startswith('jal _'):
                         target = s[len('jal _'):]
                         if target in cold_call_map:
-                            cid = cold_call_map[target]
-                            # Pass id in $b so caller's $a (the helper's
-                            # parameter) is intact at dispatcher entry.
-                            # `push_imm` would set $a := imm as a side
-                            # effect (its microcode loads imm→A before
-                            # pushing), which destroys caller's $a;
-                            # `ldi $b, X` only writes $b. The `;!keep`
-                            # marker tells peephole not to elide this
-                            # even when register-tracking thinks $b
-                            # already holds the right value at this
-                            # point — the dispatcher's contract requires
-                            # the load to actually execute.
-                            rewritten.append(f'\tldi $b,{cid} ;!keep')
-                            rewritten.append('\tjal __cold_call')
+                            if target.lstrip('_') in streamed_canon:
+                                # Streamed helper: pass ee64 offset_lo
+                                # in $a, jal __stream. (Hi byte assumed 0
+                                # in this PoC; full 64K addressing is
+                                # a one-line extension to the streamer.)
+                                addr = cold_addr_map[target]
+                                rewritten.append(f'\tldi $a,{addr & 0xFF} ;!keep')
+                                rewritten.append('\tjal __stream')
+                            else:
+                                cid = cold_call_map[target]
+                                # Pass id in $b so caller's $a (the helper's
+                                # parameter) is intact at dispatcher entry.
+                                rewritten.append(f'\tldi $b,{cid} ;!keep')
+                                rewritten.append('\tjal __cold_call')
                             continue
                     rewritten.append(line)
                 return rewritten
@@ -3189,9 +3284,12 @@ class MK1CodeGen:
                     new_bodies.append((cold_id, fname, rewritten_body, new_size, new_addr))
                     self.ee64_alloc += new_size
                 self.cold_function_bodies = new_bodies
-                # Recompute slot size from new sizes.
-                max_cold = max((sz for _id, _a, sz, _n in self.cold_helpers),
-                               default=0)
+                # Recompute slot size from new sizes (streamed helpers
+                # don't contribute to the slot floor).
+                max_cold = max(
+                    (sz for _id, _a, sz, n in self.cold_helpers
+                     if n not in self._streamed_helper_names),
+                    default=0)
                 self.cold_slot_size = max_cold
                 if max_cold > 0:
                     self.cold_slot_base = 256 - max_cold
@@ -3630,11 +3728,26 @@ class MK1CodeGen:
             # independent and continues from wherever it was, so byte
             # addresses in the AT24C512 image remain contiguous.
             for cold_id, fname, cold_lines, byte_size, ee64_addr in cold_bodies:
-                self.emit(f'; ee64 cold function _{fname} (id {cold_id}, '
-                          f'{byte_size}B at ee64[0x{ee64_addr:04X}])')
-                self.emit(f'\torg {self.cold_slot_base}')
-                for line in cold_lines:
-                    self.emit(line)
+                if fname in self._streamed_helper_names:
+                    # Streamed body: labels must resolve to EE64
+                    # offsets (not slot addresses), and every
+                    # instruction must be 2 bytes (the streamer
+                    # assumes 2-byte alignment) — pad 1-byte ops
+                    # with NOP (mov $a,$a, 0x00).
+                    padded = _pad_1byte_to_2byte(cold_lines)
+                    padded_size = _measure_asm_bytes(padded)
+                    self.emit(f'; ee64 STREAMED function _{fname} '
+                              f'(id {cold_id}, {byte_size}B raw, '
+                              f'{padded_size}B padded at ee64[0x{ee64_addr:04X}])')
+                    self.emit(f'\torg {ee64_addr}')
+                    for line in padded:
+                        self.emit(line)
+                else:
+                    self.emit(f'; ee64 cold function _{fname} (id {cold_id}, '
+                              f'{byte_size}B at ee64[0x{ee64_addr:04X}])')
+                    self.emit(f'\torg {self.cold_slot_base}')
+                    for line in cold_lines:
+                        self.emit(line)
             self.emit('\tsection code')
 
         # Emit EEPROM data section (for ESP32 upload shim)
@@ -4146,6 +4259,10 @@ class MK1CodeGen:
         if '__cold_call' in helpers:
             no_ov.add('__cold_call:')
             no_ov.add('__cold_load_helper:')
+        if '__stream' in helpers:
+            # The streamer must be reachable from any caller site
+            # (and itself calls __i2c_sb / __i2c_rb).
+            no_ov.add('__stream:')
 
         # (C) Cold-function callees: every compiler helper invoked from a
         # cold-function body has to be kernel-resident — a cold function
@@ -4297,11 +4414,24 @@ class MK1CodeGen:
                 rejected_back.extend(body_lines)
                 continue
             if size > COLD_SLOT_BYTES:
+                # Phase 5 of skinny-kernel auto-paging: a helper too
+                # big for the slot can still go into the cold tier as
+                # a STREAMED helper. The streamer fetches bytes one at
+                # a time from EE64 with no slot-size ceiling. Automatic
+                # promotion to streaming runs only when slot-loading is
+                # IMPOSSIBLE (size > slot); for helpers that fit but
+                # are slot-floor problems for the runtime kernel,
+                # streaming would add ~130 B of __stream kernel for a
+                # smaller slot reduction — net loss — so the auto-
+                # promotion gate is "size > 256 B", not "is slot floor".
+                self._streamed_helper_names.add(name)
                 print(f"  Auto-cold (helper): {name} body is {size}B, "
-                      f"exceeds slot {COLD_SLOT_BYTES}B; rejected",
+                      f"exceeds slot {COLD_SLOT_BYTES}B; routing to "
+                      f"__stream",
                       file=_ac_sys.stderr)
-                rejected_back.extend(body_lines)
-                continue
+                # Fall through to register the helper — it'll be
+                # emitted with `org <ee64_addr>` and NOP padding;
+                # call sites get rewritten to `jal __stream`.
             # Find last real instruction.
             last_inst = None
             for b in reversed(body):
@@ -4338,9 +4468,11 @@ class MK1CodeGen:
                   f"{size}B at ee64[0x{ee64_addr:04X}]",
                   file=_ac_sys.stderr)
 
-        # Right-size cold slot to the largest body.
-        max_cold = max((sz for _id, _a, sz, _n in self.cold_helpers),
-                       default=0)
+        # Right-size cold slot to the largest non-streamed body.
+        max_cold = max(
+            (sz for _id, _a, sz, n in self.cold_helpers
+             if n not in self._streamed_helper_names),
+            default=0)
         if max_cold > self.cold_slot_size:
             self.cold_slot_size = max_cold
         if self.cold_slot_size > 0:
@@ -4351,6 +4483,14 @@ class MK1CodeGen:
         # rewriter at line ~2892: target = line.lstrip 'jal _' / 'j _'.
         cold_call_map = {fname: cid
                          for cid, _addr, _size, fname in self.cold_helpers}
+        cold_addr_map = {fname: addr
+                         for cid, addr, _size, fname in self.cold_helpers}
+        # The streamed-helper name set may come in with various amounts
+        # of leading underscores (env var typically uses `__name` for
+        # kernel helpers; cold_call_map keys store `_name` after the
+        # extractor strips one leading underscore). Normalise by
+        # stripping all leading underscores.
+        streamed_canon = {n.lstrip('_') for n in self._streamed_helper_names}
 
         def _rewrite(lines):
             out = []
@@ -4360,10 +4500,16 @@ class MK1CodeGen:
                     if s.startswith(prefix):
                         target = s[len(prefix):].split()[0].split(';')[0].strip()
                         if target in cold_call_map:
-                            cid = cold_call_map[target]
-                            # Pass id in $b (preserves caller's $a).
-                            out.append(f'\tldi $b,{cid} ;!keep')
-                            out.append('\tjal __cold_call')
+                            is_streamed = target.lstrip('_') in streamed_canon
+                            if is_streamed:
+                                addr = cold_addr_map[target]
+                                out.append(f'\tldi $a,{addr & 0xFF} ;!keep')
+                                out.append('\tjal __stream')
+                            else:
+                                cid = cold_call_map[target]
+                                # Pass id in $b (preserves caller's $a).
+                                out.append(f'\tldi $b,{cid} ;!keep')
+                                out.append('\tjal __cold_call')
                             if prefix == 'j _':
                                 out.append('\tret')
                             break
@@ -4395,7 +4541,9 @@ class MK1CodeGen:
                 self.ee64_alloc += new_size
             self.cold_function_bodies = new_bodies
             self.cold_slot_size = max(
-                (sz for _id, _a, sz, _n in self.cold_helpers), default=0)
+                (sz for _id, _a, sz, n in self.cold_helpers
+                 if n not in self._streamed_helper_names),
+                default=0)
             if self.cold_slot_size > 0:
                 self.cold_slot_base = 256 - self.cold_slot_size
 
@@ -4680,8 +4828,11 @@ class MK1CodeGen:
         self.cold_function_bodies = new_function_bodies
 
         # Right-size slot to new max (may have shrunk or grown).
+        # Streamed helpers don't contribute to the slot floor.
         self.cold_slot_size = max(
-            (sz for _id, _a, sz, _n in self.cold_helpers), default=0)
+            (sz for _id, _a, sz, n in self.cold_helpers
+             if n not in self._streamed_helper_names),
+            default=0)
         if self.cold_slot_size > 0:
             self.cold_slot_base = 256 - self.cold_slot_size
 
@@ -6226,6 +6377,152 @@ class MK1CodeGen:
             self.emit_ddrb(0x03)
             self.emit_ddrb(0x01)
             self.emit_ddrb(0x00)
+            self.emit('\tret')
+
+        # __stream: byte-by-byte EE64 fetch+exec for streamed cold helpers.
+        # Entry: $a = ee64 offset (lo) of the streamed helper's body.
+        #
+        # Maintains a 3-byte exec buffer at code[252..254] = [opcode,
+        # operand, ret(0x6C)]. Each iteration reads 2 bytes from EE64,
+        # writes them to slot[252..253], jal_r's into slot[252]; the
+        # slot's ret returns to the streamer's post-jal_r filler. The
+        # ret byte at slot[254] is set once at __stream entry.
+        #
+        # Recognised in-stream control flow:
+        #   - 0x6C (ret)  → terminate, return to caller of __stream
+        #   - 0x3D (j N)  → close I²C, set vpc = N, re-seek
+        #   - 0xAC (jal X)→ close I²C, indirect-call kernel addr X,
+        #                    re-open I²C at vpc+2 after return
+        #
+        # State: page3[STREAM_VPC_P3] caches the EE64 read offset across
+        # the I²C close/reopen needed for jumps and calls.
+        #
+        # Compile-time constraint on streamed bodies: every instruction
+        # is emitted as 2 bytes. 1-byte instructions are padded with
+        # NOP (mov $a,$a, 0x00). The compiler does this padding when
+        # serialising a body to ee64.
+        #
+        # Cold-tier dispatch from a streamed body: streamed bodies that
+        # need to call other cold helpers do so via `jal __cold_call`
+        # — which is a code-page address, so the `jal X` handler above
+        # routes correctly. Streamed bodies must not contain
+        # `jal __stream` (no recursive streaming in this PoC).
+        if '__stream' in helpers:
+            STREAM_VPC_P3 = 0xE0
+            STREAM_SLOT_BASE = 252        # slot[252..254] = [op, oper, ret]
+            self.emit('__stream:')
+            # Save vpc to page3
+            self.emit(f'\tldi $b,{STREAM_VPC_P3}')
+            self.emit('\tiderefp3')
+            # Pre-seed slot[254] = 0x6C (ret)
+            self.emit(f'\tldi $b,{STREAM_SLOT_BASE + 2}')
+            self.emit('\tldi $a,0x6C')
+            self.emit('\tistc_inc')
+
+            l_outer = self.label('stm_outer')
+            l_fetch = self.label('stm_fetch')
+            l_normal = self.label('stm_normal')
+            l_jmp = self.label('stm_jmp')
+            l_jal = self.label('stm_jal')
+            l_done = self.label('stm_done')
+            l_ack = self.label('stm_ack')
+            l_stop = self.label('stm_stop')
+            l_vpcadd = self.label('stm_vpc')
+
+            self.emit(f'{l_outer}:')
+            # Open I²C random-read at chip_addr = page3[STREAM_VPC_P3].
+            self.emit('\texrw 2')
+            self.emit_ddrb(0x01)
+            self.emit_ddrb(0x03)
+            self.emit('\tldi $a,0xA0')
+            self.emit('\tjal __i2c_sb')
+            self.emit('\tclr $a')              # addr_hi = 0
+            self.emit('\tjal __i2c_sb')
+            self.emit(f'\tldi $a,{STREAM_VPC_P3}')
+            self.emit('\tderefp3')             # A = vpc_lo
+            self.emit('\tjal __i2c_sb')
+            # REP-START + SLA+R (read mode)
+            self.emit_ddrb(0x00)
+            self.emit_ddrb(0x01)
+            self.emit_ddrb(0x03)
+            self.emit('\tldi $a,0xA1')
+            self.emit('\tjal __i2c_sb')
+
+            self.emit(f'{l_fetch}:')
+            self.emit('\tjal __i2c_rb')
+            self.emit('\tmov $b,$a')
+            self.emit('\tcmpi 0x6C')
+            self.emit(f'\tjz {l_done}')
+            self.emit('\tcmpi 0x3D')
+            self.emit(f'\tjz {l_jmp}')
+            self.emit('\tcmpi 0xAC')
+            self.emit(f'\tjz {l_jal}')
+            # Default fall-through: regular 2-byte instruction.
+
+            self.emit(f'{l_normal}:')
+            self.emit(f'\tjal {l_ack}')
+            self.emit(f'\tldi $b,{STREAM_SLOT_BASE}')
+            self.emit('\tistc_inc')           # slot[252] = opcode, B=253
+            self.emit('\tpush_b')
+            self.emit('\tjal __i2c_rb')
+            self.emit('\tmov $b,$a')
+            self.emit('\tpop_b')
+            self.emit('\tistc_inc')           # slot[253] = operand
+            self.emit(f'\tjal {l_ack}')
+            self.emit(f'\tjal {l_vpcadd}')
+            self.emit(f'\tldi $a,{STREAM_SLOT_BASE}')
+            self.emit('\tjal_r')
+            self.emit('\tmov $a,$a ;!keep')   # off-by-one filler
+            self.emit(f'\tj {l_fetch}')
+
+            self.emit(f'{l_jmp}:')
+            self.emit(f'\tjal {l_ack}')
+            self.emit('\tjal __i2c_rb')
+            self.emit('\tmov $b,$a')
+            self.emit(f'\tldi $b,{STREAM_VPC_P3}')
+            self.emit('\tiderefp3')
+            self.emit(f'\tjal {l_stop}')
+            self.emit(f'\tj {l_outer}')
+
+            self.emit(f'{l_jal}:')
+            self.emit(f'\tjal {l_ack}')
+            self.emit('\tjal __i2c_rb')
+            self.emit('\tmov $b,$a')           # A = kernel target
+            self.emit('\tpush_b')              # save target
+            self.emit(f'\tjal {l_vpcadd}')     # vpc += 2 (past the jal)
+            self.emit(f'\tjal {l_stop}')
+            self.emit('\tpop_b')
+            self.emit('\tmov $b,$a')           # A = target
+            self.emit('\tjal_r')
+            self.emit('\tmov $a,$a ;!keep')
+            self.emit(f'\tj {l_outer}')
+
+            self.emit(f'{l_done}:')
+            self.emit(f'\tjal {l_stop}')
+            self.emit('\tret')
+
+            # Helpers
+            self.emit(f'{l_ack}:')
+            self.emit_ddrb(0x03)
+            self.emit_ddrb(0x01)
+            self.emit_ddrb(0x03)
+            self.emit_ddrb(0x02)
+            self.emit('\tret')
+
+            self.emit(f'{l_stop}:')
+            self.emit_ddrb(0x00)
+            self.emit_ddrb(0x02)
+            self.emit_ddrb(0x03)
+            self.emit_ddrb(0x01)
+            self.emit_ddrb(0x00)
+            self.emit('\tret')
+
+            self.emit(f'{l_vpcadd}:')
+            self.emit(f'\tldi $a,{STREAM_VPC_P3}')
+            self.emit('\tderefp3')
+            self.emit('\taddi 2,$a')
+            self.emit(f'\tldi $b,{STREAM_VPC_P3}')
+            self.emit('\tiderefp3')
             self.emit('\tret')
 
         # __keypad_scan: 4x4 matrix scanner for the keypad on PA4-7 (rows)
@@ -15728,7 +16025,8 @@ def main():
 
     def _prepare_compile(prefer_delay_cal_init=False, capture_log=False,
                          auto_cold_fns=None, force_cold_helpers=None,
-                         extract_main_body=False, extract_main_chunks=1):
+                         extract_main_body=False, extract_main_chunks=1,
+                         streamed_helpers=None):
         gen = MK1CodeGen(optimize=args.optimize)
         # Stash the in-flight gen so the exception handler can recover
         # `_matcher_fires` even on compile failure (populated during
@@ -15739,6 +16037,8 @@ def main():
             gen._auto_cold_user_fns = set(auto_cold_fns)
         if force_cold_helpers:
             gen._force_cold_helpers = set(force_cold_helpers)
+        if streamed_helpers:
+            gen._streamed_helper_names = set(streamed_helpers)
         if extract_main_body:
             gen._extract_main_body = True
             gen._extract_main_body_chunks = max(1, int(extract_main_chunks))
@@ -16243,6 +16543,17 @@ def main():
                 if not _n.startswith('__'):
                     _n = '__' + _n.lstrip('_')
                 _force_helpers.add(_n)
+    _seed_stream = _env_ac.environ.get('MK1_STREAM_HELPERS', '').strip()
+    _streamed_helpers = set()  # canonical names (with leading underscores
+                               # for kernel helpers, bare for user fns)
+    if _seed_stream:
+        for _n in _seed_stream.split(','):
+            _n = _n.strip()
+            if _n:
+                # User fns are stored bare (no leading underscore) to
+                # match cold_call_map keys; kernel helpers carry their
+                # `__` prefix per existing convention.
+                _streamed_helpers.add(_n)
     _MAX_AUTO_COLD = 16
     _prefer_dc = True
     _extract_main_body_tried = False
@@ -16256,7 +16567,8 @@ def main():
                 auto_cold_fns=_auto_cold,
                 force_cold_helpers=_force_helpers,
                 extract_main_body=_extract_main_body_tried,
-                extract_main_chunks=_extract_main_chunks)
+                extract_main_chunks=_extract_main_chunks,
+                streamed_helpers=_streamed_helpers)
             # Init-extract overflow: redo with delay_cal as overlay.
             if (_code_bytes_try > _init_limit_try and _prefer_dc):
                 import sys as _retry_sys
