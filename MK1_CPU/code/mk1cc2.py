@@ -3255,6 +3255,11 @@ class MK1CodeGen:
         # we pre-registered it in _lcd_helpers above.
         self._extract_force_cold_helpers()
 
+        # Option (3): bundle consecutive cold-call sites. Runs AFTER
+        # all cold-tier registration so it sees the final helper id
+        # space and can append __cold_run_list at the end.
+        self._bundle_cold_calls()
+
         # Emit tone init code (ddra + precomp loop) as prefix to _main.
         # Must be AFTER all tone()/silence() calls are compiled (so note table is complete)
         # and BEFORE dead function elimination.
@@ -3464,6 +3469,19 @@ class MK1CodeGen:
                     self.emit(f'\tbyte {(ee_addr >> 8) & 0xFF}    ; helper {cold_id} addr_hi')
                     self.emit(f'\tbyte {ee_addr & 0xFF}    ; helper {cold_id} addr_lo')
                     self.emit(f'\tbyte {length & 0xFF}    ; helper {cold_id} len')
+                # Cold-call bundle lists (option 3): emit (id, arg)
+                # byte pairs terminated by 0xFF, immediately after the
+                # metadata table. Read at runtime by __cold_run_list.
+                _list_data = getattr(self, '_cold_list_data', None)
+                if _list_data:
+                    self.emit(f'; cold-call bundle lists ({len(_list_data)} bytes)')
+                    cur_addr = COLD_TABLE_BASE + 3 * len(cold_helpers)
+                    for p3_addr, byte_val in _list_data:
+                        if p3_addr != cur_addr:
+                            self.emit(f'\torg {p3_addr}')
+                            cur_addr = p3_addr
+                        self.emit(f'\tbyte {byte_val}')
+                        cur_addr += 1
                 self.emit('\tsection code')
 
         # Emit page 1 globals UNLESS the overlay partitioner already inlined
@@ -4380,6 +4398,301 @@ class MK1CodeGen:
                 (sz for _id, _a, sz, _n in self.cold_helpers), default=0)
             if self.cold_slot_size > 0:
                 self.cold_slot_base = 256 - self.cold_slot_size
+
+    def _cold_run_list_body(self):
+        """Returns asm lines for `__cold_run_list` cold helper.
+
+        Entry: $a = page-3 address of list (sequence of (id, arg) byte pairs
+        terminated by 0xFF in id position).
+        Iterates the list, calling __cold_call for each entry. Final
+        retval (last call's $a) preserved across `ret`.
+        """
+        return [
+            '__cold_run_list:',
+            # Cold-helper arg-recovery prologue (caller's $a saved at
+            # page2[0xB5] by __cold_call's setup). 3 B.
+            '\tldi $a,0xB5',
+            '\tderef2',
+            '.crl_lp:',
+            '\tpush $a',          # save current ptr
+            '\tderefp3',          # A = page3[ptr] = id
+            '\tldi $b,0xFF',
+            '\tcmp $b',
+            '\tjz .crl_dn',
+            '\tmov $a,$b',        # B = id (for __cold_call)
+            '\tpop $a',           # A = ptr
+            '\tinc',              # A = ptr + 1
+            '\tpush $a',          # save ptr+1
+            '\tderefp3',          # A = page3[ptr+1] = arg
+            '\tjal __cold_call',  # callee runs; $a = retval after
+            '\tmov $a,$d',        # D = retval (save before pop)
+            '\tpop $a',           # A = ptr+1
+            '\tinc',              # A = ptr+2 (next id offset)
+            '\tj .crl_lp',
+            '.crl_dn:',
+            '\tpop $a',           # balance stack
+            '\tmov $d,$a',        # A = saved retval
+            '\tret',
+        ]
+
+    def _bundle_cold_calls(self):
+        """Option (3): bundle consecutive cold-call sites into a single
+        `__cold_run_list` dispatch.
+
+        Detects runs of N≥2 consecutive cold-call call-sites
+        (`[ldi $a,LIT;] ldi $b,ID ;!keep; jal __cold_call`) with no
+        intervening instructions or labels. Replaces each run with:
+            ldi $a, list_addr
+            ldi $b, runlist_id ;!keep
+            jal __cold_call
+        and emits the (id, arg) pairs as page-3 bytes terminated by 0xFF.
+
+        Saves up to 7 B per call beyond the first in each run. Closes
+        small kernel overflows (overlay_dashboard 8B) and shrinks
+        synthetic main bodies that contain call clusters.
+
+        Skipped in overlay mode (each list byte costs ~5 B of runtime
+        kernel preamble for `iderefp3` writes — net loss). Lists go
+        in page 3 immediately after the cold-helper metadata table.
+        """
+        import re as _re_b
+        if not getattr(self, 'cold_helpers', None):
+            return
+        if getattr(self, '_overlay_kernel_size', None) is not None:
+            return  # overlay mode
+
+        # Parse a cold-call call-site at lines[i]. Returns
+        # (n_consumed, helper_id, arg_value, arg_present) or
+        # (0, None, None, False) if not a call site.
+        def _parse_block(lines, i):
+            j = i
+            # Skip blanks/comments. Stop on labels (control-flow targets
+            # inside a run break the run).
+            while j < len(lines):
+                s = lines[j].strip()
+                if not s or s.startswith(';'):
+                    j += 1
+                    continue
+                if s.endswith(':'):
+                    return (0, None, None, False)
+                break
+            if j >= len(lines):
+                return (0, None, None, False)
+            # Optional `ldi $a, LITERAL` (no ;!keep — that's a marker
+            # used elsewhere; literal arg-set never carries it).
+            arg_value = 0
+            arg_present = False
+            s = lines[j].strip()
+            m_a = _re_b.match(
+                r'ldi\s+\$a\s*,\s*(\S+?)\s*(?:;.*)?$', s)
+            if m_a and ';!keep' not in lines[j]:
+                tok = m_a.group(1)
+                try:
+                    arg_value = int(tok, 0) & 0xFF
+                except ValueError:
+                    return (0, None, None, False)
+                arg_present = True
+                j += 1
+                while j < len(lines):
+                    s2 = lines[j].strip()
+                    if not s2 or s2.startswith(';'):
+                        j += 1
+                        continue
+                    if s2.endswith(':'):
+                        return (0, None, None, False)
+                    break
+                if j >= len(lines):
+                    return (0, None, None, False)
+            # Required `ldi $b, ID ;!keep`.
+            s = lines[j].strip()
+            m_b = _re_b.match(
+                r'ldi\s+\$b\s*,\s*(\d+)\s*;!keep\s*$', s)
+            if not m_b:
+                return (0, None, None, False)
+            helper_id = int(m_b.group(1)) & 0xFF
+            j += 1
+            while j < len(lines):
+                s2 = lines[j].strip()
+                if not s2 or s2.startswith(';'):
+                    j += 1
+                    continue
+                if s2.endswith(':'):
+                    return (0, None, None, False)
+                break
+            if j >= len(lines):
+                return (0, None, None, False)
+            # Required `jal __cold_call`.
+            s = lines[j].strip()
+            if s != 'jal __cold_call':
+                return (0, None, None, False)
+            j += 1
+            return (j - i, helper_id, arg_value, arg_present)
+
+        # Two-pass: (a) scan all code, plan bundles; (b) if any, emit
+        # __cold_run_list and rewrite.
+        def _plan(lines):
+            """Returns list of (start_idx, n_consumed, run_entries)."""
+            plans = []
+            i = 0
+            while i < len(lines):
+                run = []
+                cur = i
+                consumed = 0
+                while True:
+                    n, hid, arg, _ = _parse_block(lines, cur)
+                    if n == 0:
+                        break
+                    run.append((hid, arg))
+                    consumed += n
+                    cur += n
+                if len(run) >= 2:
+                    plans.append((i, consumed, run))
+                    i += consumed
+                elif len(run) == 1:
+                    # Single block — skip past it
+                    n, _h, _a, _p = _parse_block(lines, i)
+                    i += n
+                else:
+                    i += 1
+            return plans
+
+        main_plans = _plan(self.code)
+        body_plans = []
+        for entry in self.cold_function_bodies:
+            cold_id, fname, body, sz, addr = entry
+            body_plans.append((cold_id, fname, body, _plan(body), sz, addr))
+
+        total_runs = len(main_plans) + sum(len(p[3]) for p in body_plans)
+        if total_runs == 0:
+            return
+
+        # Register __cold_run_list as a cold helper. Its id is the next
+        # available; ee64 placement happens after re-pack below.
+        runlist_body = self._cold_run_list_body()
+        runlist_size = _measure_asm_bytes(runlist_body)
+        runlist_id = len(self.cold_helpers)
+
+        # If __cold_run_list grows the slot, the dispatcher (__cold_call /
+        # __cold_load_helper) — already emitted by _emit_i2c_helpers with
+        # the OLD slot_base — has stale `ldi $a/$b, OLD_BASE` references.
+        # We patch them post-emit. Capture the old value here.
+        _old_slot_base = self.cold_slot_base
+
+        # List bytes go in page 3 immediately after the metadata table.
+        # Table size = 3 * (n_helpers_after_runlist_added).
+        list_base = COLD_TABLE_BASE + 3 * (runlist_id + 1)
+        list_offset = 0
+        list_data = []  # (page3_addr, byte_value)
+
+        def _alloc_list(entries):
+            nonlocal list_offset
+            addr = list_base + list_offset
+            for k, (hid, arg) in enumerate(entries):
+                list_data.append((addr + 2 * k, hid))
+                list_data.append((addr + 2 * k + 1, arg))
+            list_data.append((addr + 2 * len(entries), 0xFF))
+            list_offset += 2 * len(entries) + 1
+            return addr
+
+        def _apply_plans(lines, plans):
+            if not plans:
+                return list(lines)
+            out = []
+            i = 0
+            plan_idx = 0
+            while i < len(lines):
+                if (plan_idx < len(plans)
+                        and i == plans[plan_idx][0]):
+                    _start, n, run = plans[plan_idx]
+                    addr = _alloc_list(run)
+                    out.append(f'\tldi $a,{addr}')
+                    out.append(f'\tldi $b,{runlist_id} ;!keep')
+                    out.append('\tjal __cold_call')
+                    i += n
+                    plan_idx += 1
+                else:
+                    out.append(lines[i])
+                    i += 1
+            return out
+
+        # Apply plans to main and to each cold body.
+        self.code = _apply_plans(self.code, main_plans)
+
+        new_bodies = []
+        for cold_id, fname, body, plans, _osz, _oa in body_plans:
+            new_body = _apply_plans(body, plans)
+            new_bodies.append((cold_id, fname, new_body))
+
+        # Re-pack ee64: bundling shrinks bodies, addresses shift.
+        # Append __cold_run_list at the end (its id was set above so
+        # all `ldi $b, runlist_id` references match).
+        self.ee64_alloc = 0
+        self.cold_helpers = []
+        new_function_bodies = []
+        for cold_id, fname, new_body in new_bodies:
+            new_size = _measure_asm_bytes(new_body)
+            if new_size > COLD_SLOT_BYTES:
+                raise Exception(
+                    f"cold helper '{fname}' is {new_size}B after "
+                    f"call-list bundling; exceeds slot size "
+                    f"{COLD_SLOT_BYTES}B.")
+            new_addr = self.ee64_alloc
+            self.cold_helpers.append(
+                (cold_id, new_addr, new_size, fname))
+            new_function_bodies.append(
+                (cold_id, fname, new_body, new_size, new_addr))
+            self.ee64_alloc += new_size
+        # Append __cold_run_list at runlist_id.
+        runlist_addr = self.ee64_alloc
+        self.cold_helpers.append(
+            (runlist_id, runlist_addr, runlist_size, '_cold_run_list'))
+        new_function_bodies.append(
+            (runlist_id, '_cold_run_list', runlist_body,
+             runlist_size, runlist_addr))
+        self.ee64_alloc += runlist_size
+        self.cold_function_bodies = new_function_bodies
+
+        # Right-size slot to new max (may have shrunk or grown).
+        self.cold_slot_size = max(
+            (sz for _id, _a, sz, _n in self.cold_helpers), default=0)
+        if self.cold_slot_size > 0:
+            self.cold_slot_base = 256 - self.cold_slot_size
+
+        # Patch the dispatcher's hardcoded slot_base if it changed.
+        # __cold_call has `ldi $a, OLD; jal_r` (the slot-jump). The
+        # bulk-read loop in __cold_load_helper has `ldi $b, OLD` (the
+        # destination address for the bulk write). Both must match
+        # the new slot_base.
+        if self.cold_slot_base != _old_slot_base:
+            old_a = f'\tldi $a,{_old_slot_base}'
+            old_b = f'\tldi $b,{_old_slot_base}'
+            new_a = f'\tldi $a,{self.cold_slot_base}'
+            new_b = f'\tldi $b,{self.cold_slot_base}'
+            for i in range(len(self.code) - 1):
+                cur = self.code[i].rstrip('\n')
+                nxt = self.code[i + 1].strip()
+                # __cold_call: `ldi $a, OLD` immediately followed by jal_r.
+                if cur == old_a and nxt == 'jal_r':
+                    self.code[i] = new_a
+                # __cold_load_helper: `ldi $b, OLD` followed by a label
+                # like `.clh_r2c…:`. The pattern is unique within the
+                # dispatcher; main code never emits this combination
+                # (the slot is private to the cold tier).
+                elif (cur == old_b
+                      and nxt.startswith('.clh_r2c')):
+                    self.code[i] = new_b
+
+        # Stash list data for emission alongside the metadata table.
+        self._cold_list_data = list_data
+        self._cold_list_base = list_base
+
+        import sys as _bcl_sys
+        n_main = len(main_plans)
+        n_body = sum(len(p[3]) for p in body_plans)
+        print(f"  Cold-call bundle: {n_main} run(s) in main, "
+              f"{n_body} run(s) in cold bodies; emitted "
+              f"__cold_run_list ({runlist_size}B) at id={runlist_id}",
+              file=_bcl_sys.stderr)
 
     def _emit_i2c_helpers(self):
         """Emit I2C/LCD helper subroutines if any lcd_cmd/lcd_char builtins were used.

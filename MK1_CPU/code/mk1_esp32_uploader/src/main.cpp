@@ -2888,9 +2888,18 @@ static void writeEepromData(const uint8_t* data, int size) {
 // invoking this — see UPLOAD handler.
 
 static void writeEe64Data(const uint8_t* data, int size) {
-    // 32-byte pages. AT24C512 supports up to 128 but the asmBuf would
-    // overflow with 128 inlined `ldi/jal` pairs.
-    static const int PAGE_SZ = 32;
+    // 8-byte pages. AT24C512 supports up to 128 per write, but each
+    // inlined byte costs 8 B in the assembled shim (ldi+jal+tst+jnz);
+    // with ~140 B of fixed prologue+epilogue+__sb the shim fills the
+    // 256 B MK1 code page at PAGE_SZ ≈ 15. Anything larger truncates
+    // silently — `uploadToMK1` only sends the first 256 B, so the
+    // tail (often the __sb routine itself) is missing and every
+    // `jal __sb` lands in zero-padded memory. Symptom: ee64 stays
+    // empty after upload, cold helpers run garbage from the slot.
+    // 8 keeps a wider safety margin and avoids per-page edge-case
+    // races observed at 12 (specific bytes near page edges
+    // intermittently mis-write on AT24C512 even after ack-poll).
+    static const int PAGE_SZ = 8;
     // CRITICAL: snapshot `data` to a local mirror BEFORE the per-page
     // loop. Each iteration's `assembler.assemble(asmBuf)` calls
     // `memset(&result, 0, sizeof(result))` to clear stale state, and
