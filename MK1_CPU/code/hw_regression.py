@@ -1406,6 +1406,29 @@ TESTS = [
         }''',
         [0xA1, 0xB1, 0xB2, 0xA2], cycles=500_000,
     ),
+    Test(
+        # Streamed cold helper: `streamfn` is forced to be streamed
+        # (via MK1_STREAM_HELPERS env), so its body lives in EE64 but
+        # is fetched + executed byte-by-byte by `__stream` rather
+        # than DMA'd into the slot. End-to-end coverage of the
+        # mk1cc2 → __stream → AT24C512 path: NOP padding for 1-byte
+        # instructions, ee64-offset label resolution, call-site
+        # rewriter routing `jal _streamfn` to `jal __stream` with
+        # the helper's ee64 address.
+        'cold tier: streamed helper (option 1 hybrid)',
+        '''ee64 void streamfn(void) {
+            out(0xAA);
+            out(0xBB);
+            out(0xCC);
+        }
+        void main(void) {
+            i2c_init();
+            streamfn();
+            halt();
+        }''',
+        [0xAA, 0xBB, 0xCC], cycles=500_000,
+        env={'MK1_STREAM_HELPERS': 'streamfn'},
+    ),
 ]
 
 
