@@ -58,6 +58,7 @@ static void startOIMonitor();
 static void stopOIMonitor();
 static int readDS3231Temp();
 static int readDS3231Reg(uint8_t reg);
+static int readAt24c512(int offset, int count, uint8_t* out);
 static bool updateBootLCD(int tempC, bool rtcSet, uint8_t hourBcd, uint8_t minBcd);
 static void loadAsmResultForUpload(const AsmResult& r);
 static int runUploadedUntilFirstOut(int maxCycles);
@@ -1220,6 +1221,69 @@ static bool runUploadedUntilHalt(int maxCycles) {
     busSetOutput();
     enableOutput();
     return halted;
+}
+
+// runUploadedCaptureOIs: manual-clock execution that captures every OI
+// event into the supplied buffer and stops at first HLT. Returns the
+// number of OI events captured (clamped to bufSize). Used by READ_CHIP
+// where the shim emits the read bytes via `out` and then halts.
+static int runUploadedCaptureOIs(int maxCycles, uint8_t* buf, int bufSize) {
+    disableClock();
+    resetPulse();
+    enableCU();
+
+    stopCustomClock();
+    detachOIMonitorForManualRun();
+
+    int oiGpio = digitalPinToGPIONumber(PIN_OI);
+    if (oiGpio < 0) oiGpio = PIN_OI;
+    uint32_t oiMask = 1 << oiGpio;
+
+    busSetInput();
+    disableOutput();
+    digitalWrite(PIN_DIR, LOW);
+    enableOutput();
+
+    int clkGpio = digitalPinToGPIONumber(PIN_CLK);
+    uint32_t clkMask = 1 << clkGpio;
+    pinMode(PIN_CLK, OUTPUT);
+    digitalWrite(PIN_CLK, LOW);
+
+    int captured = 0;
+    bool prevOi = false;     // edge-detect: only latch on rising edge
+    for (int i = 0; i < maxCycles; i++) {
+        if ((i & 0x3FFF) == 0) yield();
+        GPIO.out_w1ts = clkMask;
+        delayMicroseconds(1);
+        uint32_t g1 = GPIO.in;
+        bool oi1 = (g1 & oiMask) != 0;
+        if (oi1 && !prevOi && captured < bufSize) {
+            buf[captured++] = decodeBus(g1);
+        }
+        prevOi = oi1;
+        if (i > 4 && hltOpcodeObserved(g1)) {
+            GPIO.out_w1tc = clkMask;
+            break;
+        }
+        GPIO.out_w1tc = clkMask;
+        delayMicroseconds(1);
+        uint32_t g2 = GPIO.in;
+        bool oi2 = (g2 & oiMask) != 0;
+        if (oi2 && !prevOi && captured < bufSize) {
+            buf[captured++] = decodeBus(g2);
+        }
+        prevOi = oi2;
+        if (i > 4 && hltOpcodeObserved(g2)) {
+            break;
+        }
+    }
+
+    pinMode(PIN_CLK, INPUT);
+    disableOutput();
+    digitalWrite(PIN_DIR, HIGH);
+    busSetOutput();
+    enableOutput();
+    return captured;
 }
 
 // ── Web handlers ─────────────────────────────────────────────────────
@@ -2487,6 +2551,29 @@ static void handleSerialCommand(const String& line) {
         }
         Serial.println();
     }
+    else if (line.startsWith("READ_CHIP:")) {
+        // READ_CHIP:offset,count — random-read `count` bytes directly from
+        // AT24C512 at byte address `offset`, return as space-separated hex.
+        // Bypasses the cold dispatcher; talks I²C via a generated MK1 shim.
+        // Ground-truth probe of what's actually on the chip.
+        //
+        // SIDE EFFECT: overwrites whatever user program was last UPLOAD'd
+        // (the read shim runs from page 0). Re-upload after inspection.
+        int comma = line.indexOf(',', 10);
+        int off = line.substring(10, comma > 0 ? comma : line.length()).toInt();
+        int cnt = comma > 0 ? line.substring(comma + 1).toInt() : 16;
+        if (cnt < 1) cnt = 1;
+        if (cnt > 64) cnt = 64;
+        if (off < 0) off = 0;
+        if (off >= EE64_SIZE) off = EE64_SIZE - 1;
+        uint8_t buf[64];
+        int got = readAt24c512(off, cnt, buf);
+        for (int i = 0; i < got; i++) {
+            if (i) Serial.print(' ');
+            Serial.printf("%02X", buf[i]);
+        }
+        Serial.println();
+    }
     else if (line.startsWith("RUNLOG:")) {
         // RUNLOG:cycles,us[,halt[,maxoi]] — run cycles cycles, capture OI
         // events. Halt detection is optional (HLT bodge signal is noisy
@@ -3270,6 +3357,142 @@ static int readDS3231Reg(uint8_t reg) {
     loadAsmResultForUpload(r);
     uploadToMK1(uploadBuf, uploadSize);
     return runUploadedUntilFirstOut(50000);
+}
+
+// readAt24c512: random-read `count` bytes from chip[offset..offset+count-1]
+// directly via a generated MK1 shim. Returns number of bytes read into `out`
+// (clamped to count). Used by the READ_CHIP debug command — does NOT go
+// through the cold dispatcher, so it's a ground-truth probe of what's
+// actually on the AT24C512.
+//
+// Side effect: overwrites the user program's uploadBuf (the shim runs from
+// page 0). Caller is responsible for re-uploading the user program after
+// inspecting the chip.
+static int readAt24c512(int offset, int count, uint8_t* out) {
+    if (count <= 0) return 0;
+    if (count > 64) count = 64;     // hard cap (matches OI capture practical size)
+    char asmBuf[3072];
+    int pos = snprintf(asmBuf, sizeof(asmBuf),
+        "; READ_CHIP offset=0x%04X count=%d (auto-generated)\n"
+        "    ldi $d, 0\n"
+        ".dly:\n"
+        "    dec\n"
+        "    jnz .dly\n"
+        "    clr $a\n"
+        "    exw 0 0\n"
+        "    ddrb_imm 0x00\n"
+        "    clr $a\n"
+        "    exw 0 3\n"
+        // Random-read setup: START + 0xA0 + addr_hi + addr_lo
+        "    ddrb_imm 0x03\n"
+        "    ddrb_imm 0x01\n"
+        "    ddrb_imm 0x00\n"
+        "    jal __i2c_st\n"
+        "    ldi $a, 0xA0\n"
+        "    jal __i2c_sb\n"
+        "    ldi $a, %d\n"     // addr_hi
+        "    jal __i2c_sb\n"
+        "    ldi $a, %d\n"     // addr_lo
+        "    jal __i2c_sb\n"
+        // Repeated start + read mode addr
+        "    ddrb_imm 0x00\n"
+        "    ddrb_imm 0x01\n"
+        "    ddrb_imm 0x03\n"
+        "    ldi $a, 0xA1\n"
+        "    jal __i2c_sb\n"
+        "    ldi $c, %d\n",    // count
+        offset, count, (offset >> 8) & 0xFF, offset & 0xFF, count);
+    // Per-byte read loop. After each `out`, the bus needs an ACK/NACK
+    // clock for the next byte (or final NACK to terminate). Last byte
+    // gets a NACK; every prior byte gets an ACK.
+    pos += snprintf(asmBuf + pos, sizeof(asmBuf) - pos,
+        ".rloop:\n"
+        "    jal __i2c_rb\n"
+        "    out\n"
+        "    decc\n"
+        "    jz .rdone\n"
+        // ACK clock for next byte (master pulls SDA low during 9th tick)
+        "    ddrb_imm 0x03\n"
+        "    ddrb_imm 0x01\n"
+        "    ddrb_imm 0x03\n"
+        "    ddrb_imm 0x02\n"
+        "    j .rloop\n"
+        ".rdone:\n"
+        // NACK + STOP
+        "    ddrb_imm 0x00\n"
+        "    ddrb_imm 0x02\n"
+        "    ddrb_imm 0x03\n"
+        "    ddrb_imm 0x01\n"
+        "    ddrb_imm 0x00\n"
+        "    hlt\n");
+    // Helpers — same byte-for-byte routines as the kernel/firmware shims.
+    pos += snprintf(asmBuf + pos, sizeof(asmBuf) - pos,
+        "__i2c_st:\n"
+        "    exrw 2\n"
+        "    ddrb_imm 0x01\n"
+        "    ddrb_imm 0x03\n"
+        "    ret\n"
+        "__i2c_sb:\n"
+        "    mov $a, $d\n"
+        "    ldi $b, 8\n"
+        ".isb:\n"
+        "    mov $d, $a\n"
+        "    tst 0x80\n"
+        "    jnz .isbh\n"
+        "    ddrb_imm 0x03\n"
+        "    ddrb_imm 0x01\n"
+        "    ddrb_imm 0x03\n"
+        "    j .isbn\n"
+        ".isbh:\n"
+        "    ddrb_imm 0x02\n"
+        "    ddrb_imm 0x00\n"
+        "    ddrb_imm 0x02\n"
+        ".isbn:\n"
+        "    sll\n"
+        "    mov $a, $d\n"
+        "    decb\n"
+        "    jnz .isb\n"
+        "    ddrb_imm 0x02\n"
+        "    ddrb_imm 0x00\n"
+        "    exrw 0\n"
+        "    ddrb_imm 0x02\n"
+        "    ret\n"
+        "__i2c_rb:\n"
+        "    ldi $b, 0\n"
+        "    ldi $d, 8\n"
+        ".rb:\n"
+        "    sllb\n"
+        "    ddrb_imm 0x00\n"
+        "    exrw 0\n"
+        "    exrw 0\n"
+        "    tst 0x01\n"
+        "    jz .rz\n"
+        "    incb\n"
+        ".rz:\n"
+        "    ddrb_imm 0x02\n"
+        "    decd\n"
+        "    jnz .rb\n"
+        "    mov $b, $a\n"
+        "    ret\n");
+
+    if (pos < 0 || pos >= (int)sizeof(asmBuf)) {
+        Serial.println("READ_CHIP shim truncated");
+        return 0;
+    }
+
+    assembler.assemble(asmBuf);
+    const AsmResult& r = assembler.result;
+    if (r.error_count != 0) {
+        Serial.println("READ_CHIP shim assembly failed");
+        return 0;
+    }
+
+    loadAsmResultForUpload(r);
+    uploadToMK1(uploadBuf, uploadSize);
+
+    // Allow plenty of cycles: per byte ~ 200 cycles for I²C bit-bang +
+    // overhead; 64 bytes × 200 ≈ 12 800. 50 000 is generous.
+    return runUploadedCaptureOIs(50000, out, count);
 }
 
 static bool bcdByteValid(uint8_t v, uint8_t maxVal) {
