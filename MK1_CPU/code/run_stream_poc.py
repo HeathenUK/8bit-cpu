@@ -36,13 +36,39 @@ for i in range(0, len(payload), 4096):
     time.sleep(0.05)
 print('asm:', drain_until_json(ser, 3.0))
 
+# Dump ee64 RAM BEFORE upload
+ser.reset_input_buffer()
+ser.write(b'DUMP_EE64:0,32\n')
+hl = b''
+end = time.time() + 3.0
+while time.time() < end:
+    if ser.in_waiting:
+        b = ser.read(1)
+        if b == b'\n': break
+        hl += b
+    else: time.sleep(0.05)
+print('ee64 pre-upload:', hl.decode(errors='replace').strip())
+
 ser.write(b'UPLOAD\n')
 print('upload:', drain_until_json(ser, 15.0))
 time.sleep(1.5)
 
 ser.reset_input_buffer()
-ser.write(b'READ_CHIP:0,8\n')
-# READ_CHIP returns hex line then JSON; drain the hex first
+ser.write(b'DUMP_EE64:0,32\n')
+hex_line = b''
+end = time.time() + 5.0
+while time.time() < end:
+    if ser.in_waiting:
+        b = ser.read(1)
+        if b == b'\n':
+            break
+        hex_line += b
+    else:
+        time.sleep(0.05)
+print('ee64 RAM:', hex_line.decode(errors='replace').strip())
+
+ser.reset_input_buffer()
+ser.write(b'READ_CHIP:0,32\n')
 hex_line = b''
 end = time.time() + 5.0
 while time.time() < end:
@@ -54,7 +80,6 @@ while time.time() < end:
     else:
         time.sleep(0.05)
 print('chip:', hex_line.decode(errors='replace').strip())
-# Then drain the {"ok":true} that follows
 drain_until_json(ser, 2.0)
 
 ser.reset_input_buffer()
@@ -67,6 +92,29 @@ for i in range(0, len(payload), 4096):
 print('asm2:', drain_until_json(ser, 3.0))
 ser.write(b'UPLOAD\n')
 print('upload2:', drain_until_json(ser, 15.0))
+time.sleep(1.5)
+
+# Verify chip after re-upload
+ser.reset_input_buffer()
+ser.write(b'READ_CHIP:0,32\n')
+hl = b''
+end = time.time() + 5.0
+while time.time() < end:
+    if ser.in_waiting:
+        b = ser.read(1)
+        if b == b'\n': break
+        hl += b
+    else: time.sleep(0.05)
+print('chip after upload2:', hl.decode(errors='replace').strip())
+drain_until_json(ser, 2.0)
+
+# Re-upload AGAIN to see if multiple uploads stabilize the chip
+for i in range(0, len(payload), 4096):
+    ser.write(payload[i:i + 4096])
+    time.sleep(0.05)
+print('asm3:', drain_until_json(ser, 3.0))
+ser.write(b'UPLOAD\n')
+print('upload3:', drain_until_json(ser, 15.0))
 time.sleep(1.5)
 
 ser.reset_input_buffer()

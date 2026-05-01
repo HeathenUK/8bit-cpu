@@ -2888,7 +2888,7 @@ static void writeEepromData(const uint8_t* data, int size) {
 // invoking this — see UPLOAD handler.
 
 static void writeEe64Data(const uint8_t* data, int size) {
-    // 8-byte pages. AT24C512 supports up to 128 per write, but each
+    // 4-byte pages. AT24C512 supports up to 128 per write, but each
     // inlined byte costs 8 B in the assembled shim (ldi+jal+tst+jnz);
     // with ~140 B of fixed prologue+epilogue+__sb the shim fills the
     // 256 B MK1 code page at PAGE_SZ ≈ 15. Anything larger truncates
@@ -2896,10 +2896,15 @@ static void writeEe64Data(const uint8_t* data, int size) {
     // tail (often the __sb routine itself) is missing and every
     // `jal __sb` lands in zero-padded memory. Symptom: ee64 stays
     // empty after upload, cold helpers run garbage from the slot.
-    // 8 holds 25/25 hw_regression reliably; smaller (4/6) shifts
+    // 8 holds 25/25 hw_regression reliably; smaller (4/2) shifts
     // flakiness to other tests rather than eliminating it (chip
-    // write reliability is sensitive to page layout boundaries
-    // hitting specific byte positions in the helper bodies).
+    // write reliability is sensitive to specific byte positions
+    // / values within a page on this AT24C512). PAGE_SZ=4 makes
+    // the streamer PoC reliable but breaks caller-arg+retval
+    // through dispatcher; we keep 8 as the conservative default
+    // and accept that streamer PoC bytes 0..1 may need a single
+    // upload retry to settle. Production streamer integration
+    // should add a write-verify pass.
     static const int PAGE_SZ = 8;
     // CRITICAL: snapshot `data` to a local mirror BEFORE the per-page
     // loop. Each iteration's `assembler.assemble(asmBuf)` calls
