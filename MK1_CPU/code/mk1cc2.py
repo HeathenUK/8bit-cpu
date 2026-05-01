@@ -1571,6 +1571,66 @@ class MK1CodeGen:
                 elif isinstance(sub, tuple):
                     self._find_vars_in_expr(sub, used)
 
+    def _wrap_main_in_synthetic_ee64(self, functions):
+        """Phase 4: wrap `main`'s body in a synthetic `_synth_main_body`
+        function tagged ee64. Main becomes a one-line shim that calls
+        the synthetic, then halts (defensive — body usually halts itself).
+
+        Triggered by the outer auto-cold loop when Phase 2.5 / 3 exhaust
+        their promotions and the program still overflows. The downstream
+        compile path treats `_synth_main_body` exactly like a source
+        `ee64 void f(...)` declaration: it gets compiled as a cold
+        function, its body gets put in the AT24C512 image, and main's
+        call site gets rewritten to `ldi $b,id; jal __cold_call`.
+
+        If body is too big for the cold slot (COLD_SLOT_BYTES), the
+        existing slot-size check in cold-function compilation will
+        raise — caller can fall back to leaving main resident.
+
+        No-op if main isn't found or the synthetic name is already
+        present (avoids double-wrapping if the pass somehow re-runs).
+        """
+        SYNTH_NAME = '_synth_main_body'
+        # Find main and check we haven't already wrapped.
+        main_idx = None
+        for i, fn in enumerate(functions):
+            if fn[0] == 'main':
+                main_idx = i
+            if fn[0] == SYNTH_NAME:
+                return functions   # already wrapped
+        if main_idx is None:
+            return functions       # no main, nothing to wrap
+
+        main_name, main_params, main_body, main_ret = functions[main_idx]
+        # Synthetic function: same body as main, void return. Will be
+        # tagged ee64 below so the cold-function compilation path
+        # captures it.
+        synth_fn = (SYNTH_NAME, [], main_body, 'void')
+        self.cold_function_names.add(SYNTH_NAME)
+        # New main: just `_synth_main_body();` and a defensive halt.
+        new_main_body = ('block', [
+            ('expr_stmt', ('call', SYNTH_NAME, [])),
+            ('expr_stmt', ('call', 'halt', [])),
+        ])
+        new_main_fn = (main_name, main_params, new_main_body, main_ret)
+
+        out = []
+        for i, fn in enumerate(functions):
+            if i == main_idx:
+                out.append(new_main_fn)
+            else:
+                out.append(fn)
+        # Append synthetic at the end so it's emitted after main and
+        # other warm functions; cold-fn compilation collects it via
+        # `cold_function_names` membership.
+        out.append(synth_fn)
+        # Update func_params / func_bodies so subsequent passes see
+        # the synthetic. (compile() does its own pass over `functions`
+        # to build these — but `_alias_builtin_compatible_functions`
+        # and `_simplify_function_bodies` may already have read the
+        # original; be defensive.)
+        return out
+
     def _auto_split_functions(self, functions):
         """Split functions spanning I2C + LCD domains into separate phases.
         Also splits main when it has the same transition — the tail becomes
@@ -2762,6 +2822,19 @@ class MK1CodeGen:
         # partitioner couldn't place because they exceed the overlay
         # slot. Treated identically to source-level `ee64` tags.
         self.cold_function_names |= getattr(self, '_auto_cold_user_fns', set())
+
+        # Phase 4: Auto main-body extraction. When the outer auto-cold
+        # loop has exhausted its other promotions and the program still
+        # overflows, set `_extract_main_body=True` and re-compile with
+        # main's body wrapped in a synthetic `_synth_main_body` cold
+        # function. The synthetic gets auto-promoted to ee64 by the
+        # standard cold-function path (same code that handles
+        # source-level `ee64 void f(...)` and Phase 1 auto-cold).
+        # Effect: main shrinks to a single `cold_call(synth_id)`,
+        # freeing kernel-page bytes for dispatcher infrastructure
+        # plus the cold slot.
+        if getattr(self, '_extract_main_body', False):
+            functions = self._wrap_main_in_synthetic_ee64(functions)
 
         self.page3_globals = {}  # name → page 3 address (for overflow arrays)
         self.page3_alloc = 0
@@ -15233,7 +15306,8 @@ def main():
     with open(args.input) as f: source = f.read()
 
     def _prepare_compile(prefer_delay_cal_init=False, capture_log=False,
-                         auto_cold_fns=None, force_cold_helpers=None):
+                         auto_cold_fns=None, force_cold_helpers=None,
+                         extract_main_body=False):
         gen = MK1CodeGen(optimize=args.optimize)
         # Stash the in-flight gen so the exception handler can recover
         # `_matcher_fires` even on compile failure (populated during
@@ -15244,6 +15318,8 @@ def main():
             gen._auto_cold_user_fns = set(auto_cold_fns)
         if force_cold_helpers:
             gen._force_cold_helpers = set(force_cold_helpers)
+        if extract_main_body:
+            gen._extract_main_body = True
         if hasattr(args, 'eeprom') and args.eeprom:
             gen.eeprom_mode = True
             gen.eeprom_base = args.eeprom_base
@@ -15695,12 +15771,15 @@ def main():
                 _force_helpers.add(_n)
     _MAX_AUTO_COLD = 16
     _prefer_dc = True
+    _extract_main_body_tried = False
+    _extract_main_body_disabled = False
     while True:
         try:
             gen, asm, lines, _code_bytes_try, _init_limit_try, _compile_log = _prepare_compile(
                 prefer_delay_cal_init=_prefer_dc, capture_log=True,
                 auto_cold_fns=_auto_cold,
-                force_cold_helpers=_force_helpers)
+                force_cold_helpers=_force_helpers,
+                extract_main_body=_extract_main_body_tried)
             # Init-extract overflow: redo with delay_cal as overlay.
             if (_code_bytes_try > _init_limit_try and _prefer_dc):
                 import sys as _retry_sys
@@ -15756,10 +15835,47 @@ def main():
                           file=_p3_sys.stderr)
                     _force_helpers.add(_p3_pick)
                     continue
+            # Phase 4: main-body extraction. Last-resort auto-cold —
+            # when Phase 2.5 / 3 have exhausted helper candidates and
+            # the program still overflows, wrap main's body in a
+            # synthetic ee64 function and re-compile. The synthetic
+            # gets cold-promoted by the standard ee64 pathway, main
+            # shrinks to a one-line shim, and the kernel-page budget
+            # gains back the bytes that were main's body.
+            #
+            # Only fires when cold tier is already active (auto-cold
+            # has run) and the program is still overflowing — i.e.
+            # this is the SECOND wave of wins after helper promotion
+            # plateaus. Doesn't fire spontaneously for programs that
+            # fit cleanly without it.
+            if (_cold_active and _overflow
+                    and not _extract_main_body_tried
+                    and not _extract_main_body_disabled):
+                import sys as _p4_sys
+                print(f"  Auto-cold (main-body): wrapping main's body "
+                      f"in synthetic _synth_main_body cold helper",
+                      file=_p4_sys.stderr)
+                _extract_main_body_tried = True
+                continue
             break
         except Exception as _e:
             _msg = str(_e)
             _total = len(_auto_cold) + len(_force_helpers)
+            # Phase 4 may produce a synthetic _synth_main_body that
+            # exceeds the cold slot. Disable the extraction and
+            # re-raise on next iteration if needed; the program
+            # falls back to its pre-extraction overflow report.
+            if (_extract_main_body_tried
+                    and "'_synth_main_body'" in _msg
+                    and 'exceeds slot' in _msg):
+                import sys as _p4r_sys
+                print(f"  Auto-cold (main-body): synthetic body too "
+                      f"large for slot; reverting to no-extraction "
+                      f"compile",
+                      file=_p4r_sys.stderr)
+                _extract_main_body_tried = False
+                _extract_main_body_disabled = True
+                continue
             if 'wrap into kernel' not in _msg or _total >= _MAX_AUTO_COLD:
                 _emit_partial_metrics(getattr(_prepare_compile, '_last_gen', None), _msg)
                 raise
