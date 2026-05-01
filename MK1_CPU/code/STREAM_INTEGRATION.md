@@ -190,30 +190,111 @@ streamed helper's `org` doesn't truncate uploaded code.
 
 ---
 
-## Hardware reliability caveat
+## Hardware reliability — fixed (commits aa3a956 + earlier)
 
-The AT24C512 chip-write reliability on this specific board is
-sensitive to byte values and positions within a written page. The
-streamer PoC's first two bytes (`0xD1 0xAA`) consistently mis-write
-to `0xD0 0xA0` (single-bit corruption) at the firmware's current
-`PAGE_SZ=8`. `PAGE_SZ=4` clears the streamer issue but breaks the
-`caller-arg + retval` regression test. We keep `PAGE_SZ=8` and
-accept that streamed programs may need a write-verify pass at
-upload time:
+The AT24C512 on this board occasionally mis-writes specific
+(byte_value, byte_position) pairs even after every byte has been
+ACK'd by the chip during the page write transaction. Empirically
+(20-trial characterisation): ~60% of single-page uploads succeed
+first try, ~40% need 1+ retries, max observed is 4 retries. This
+is firmware/host-level reliability, not a software bug.
 
-```
-write_page(addr, bytes)
-verify = read_chip(addr, len(bytes))
-while verify != bytes:
-    write_page(addr, bytes)
-    verify = read_chip(addr, len(bytes))
-```
+**Fix shipped:**
 
-This adds ~50 ms per page on retry but makes cold tier byte-exact.
-Right move for production. Implementation lives in
-`writeEe64Data` in firmware.
+1. Firmware `writeEe64Data` PAGE_SZ → 1. Single-byte page writes
+   sidestep mid-page latch state — each byte is its own complete
+   I²C transaction.
+2. Host-side verify-retry in `assemble_upload`:
+     ASM → capture expected ee64 from RAM (DUMP_EE64) →
+     UPLOAD → READ_CHIP → memcmp → retry up to 8× on mismatch.
+3. New firmware `UPLOAD_NOCHIP` command: after verify success the
+   verify path's READ_CHIP shim has overwritten uploadBuf with
+   the read shim, so we re-stage the user program via ASM and
+   push it to MK1 RAM via UPLOAD_NOCHIP — without re-writing
+   the chip (which could re-introduce corruption that we'd then
+   need to verify-retry all over again).
+
+Result: hw_regression 25/25 stable; streamer PoC byte-exact.
 
 ---
+
+## Why conditional branches aren't in `stream_poc.asm` itself
+
+The standalone PoC's I²C primitives + main + j/jal/ret dispatcher
+already use the full 256 B code page. Adding the conditional-
+branch bundling logic (peek-ahead, 4-opcode dispatch, slot-rebuild,
+`.branch_taken` handler) needs an additional ~50 B that isn't
+available in the standalone PoC.
+
+The right time to land conditional branches is **at compiler
+integration**, because the compiler's runtime kernel ALREADY
+emits `__i2c_sb` and `__i2c_rb` for cold-tier dispatch. Once the
+streamer is integrated, those primitives are SHARED — they don't
+need to be in the streamer PoC's standalone footprint. That frees
+~54 B (the size of `__i2c_sb` + `__i2c_rb`), which is more than
+enough for the bundling handler.
+
+**The conditional-branch implementation in the integrated path:**
+
+After the regular 2-byte instruction is written to the slot but
+BEFORE jal_r-ing into it, peek the next chip byte:
+
+```asm
+.do_normal:
+    ; ... write current insn to slot[251..252], slot[253] = ret ...
+    jal __i2c_rb            ; A = peeked next opcode
+    cmpi 0x37 ; jz .bundle  ; jc
+    cmpi 0x3F ; jz .bundle  ; jz
+    cmpi 0xCA ; jz .bundle  ; jnc
+    cmpi 0xCE ; jz .bundle  ; jnz
+    ; not a branch — just exec current insn alone
+    jal __i2c_stop
+    j .outer
+
+.bundle:
+    ; A = branch opcode. slot[253] = branch_op, slot[254] =
+    ; .branch_taken_addr (so on TAKEN the branch jumps to streamer
+    ; code; on NOT TAKEN it falls through to slot[255] = ret).
+    ldi $b, 253
+    istc_inc                 ; slot[253] = A
+    jal __ack
+    jal __i2c_rb             ; A = branch target byte
+    push_b
+    ldi $b, BR_TGT_P3
+    iderefp3                 ; save target to page3
+    pop_b
+    ldi $a, .branch_taken
+    istc_inc                 ; slot[254] = .branch_taken_addr
+    ; (slot[255] = 0x6C set once at __stream entry)
+    jal __ack
+    jal __vpc_add2           ; vpc += 2 more (4 total for the bundle)
+    ldi $a, 251
+    jal_r
+    mov $a, $a ;!keep
+    ; branch NOT taken → here
+    j .fetch
+
+.branch_taken:
+    ; restore vpc from saved target, re-seek
+    ldi $a, BR_TGT_P3
+    derefp3
+    ldi $b, VPC_LO_P3
+    iderefp3
+    jal __i2c_stop
+    j .outer
+```
+
+This was implemented and the assembled standalone size came out at
+~280 B — over the 256 B page limit. With the I²C primitives
+already-resident from the kernel, it fits cleanly in code-0.
+
+**Compiler-side requirement that goes with this:** every conditional
+branch in a streamed body must be IMMEDIATELY preceded by its
+flag-setter — no chip-byte-reads between them — because the
+streamer relies on bundling them in slot[251..255] for a single
+atomic exec. The MK1 compiler already emits this pattern for
+loops (`dec; jnz`) and conditionals (`cmpi X; jz`), so no new
+codegen is needed.
 
 ## What's NOT in scope
 

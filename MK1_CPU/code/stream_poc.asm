@@ -3,14 +3,20 @@
 ; Features (verified on hardware):
 ;   - Linear 2-byte instructions
 ;   - Unconditional jump (`j target`) — close I²C, re-seek
-;   - Indirect call to kernel (`jal kernel_addr`)
-;   - `ret` (0x6C) — terminate
+;   - Indirect call to kernel (`jal kernel_addr`) — runs kernel function
+;     in code-0; streamer suspends I²C, runs the call, reopens at vpc+2
+;   - `ret` (0x6C) — terminates streamed function
 ;
-; Conditional branches (jz / jnz / jc / jnc) are handled by the
-; full streamer in __stream_full below; this base version is the
-; minimum kernel for verifying the architecture works end-to-end.
+; Conditional branch design (NOT in this PoC kernel; documented in
+; STREAM_INTEGRATION.md and demonstrated below as compile-time
+; lowering). The conditional-branch streamer fits in ~280 B but
+; this PoC's I²C primitives + main + dispatcher use the full 256 B
+; code page on their own. Production integration solves it by
+; sharing __i2c_sb / __i2c_rb with the compiler's kernel (which
+; already emits them) — those become "free" for the streamer to
+; call, freeing ~50 B for the conditional-branch handler.
 ;
-; Slot at code[252..254]:  [opcode, operand, ret(0x6C)] — jal_r 252.
+; Slot at code[252..254]: [opcode, operand, ret(0x6C)] — jal_r 252.
 ; State (page 3): vpc_lo at page3[0xE0].
 
 VPC_LO_P3   = 0xE0
@@ -31,8 +37,8 @@ _main:
 
 __stream:
 	ldi $b,VPC_LO_P3
-	iderefp3              ; page3[VPC_LO_P3] = vpc_lo
-	; Pre-seed slot[254] = 0x6C (ret)
+	iderefp3
+	; slot[254] = ret (set once)
 	ldi $b,254
 	ldi $a,0x6C
 	istc_inc
@@ -63,7 +69,7 @@ __stream:
 	jz .do_jmp
 	cmpi 0xAC
 	jz .do_jal
-	j .do_normal
+	; Default: regular 2-byte instruction
 
 .do_normal:
 	jal __ack
@@ -75,7 +81,7 @@ __stream:
 	pop_b
 	istc_inc
 	jal __ack
-	jal __vpc_add2        ; vpc += 2 (track natural chip-pointer advance)
+	jal __vpc_add2
 	ldi $a,252
 	jal_r
 	mov $a,$a ;!keep
@@ -86,16 +92,16 @@ __stream:
 	jal __i2c_rb
 	mov $b,$a
 	ldi $b,VPC_LO_P3
-	iderefp3              ; vpc = target
+	iderefp3
 	jal __i2c_stop
 	j .outer
 
 .do_jal:
 	jal __ack
 	jal __i2c_rb
-	mov $b,$a             ; A = kernel target
-	push_b                ; save target
-	jal __vpc_add2        ; vpc += 2 (past the jal so .outer re-seeks correctly)
+	mov $b,$a
+	push_b
+	jal __vpc_add2
 	jal __i2c_stop
 	pop_b
 	mov $b,$a
