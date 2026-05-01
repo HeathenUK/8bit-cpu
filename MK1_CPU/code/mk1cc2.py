@@ -1571,64 +1571,130 @@ class MK1CodeGen:
                 elif isinstance(sub, tuple):
                     self._find_vars_in_expr(sub, used)
 
-    def _wrap_main_in_synthetic_ee64(self, functions):
-        """Phase 4: wrap `main`'s body in a synthetic `_synth_main_body`
-        function tagged ee64. Main becomes a one-line shim that calls
-        the synthetic, then halts (defensive — body usually halts itself).
+    def _wrap_main_in_synthetic_ee64(self, functions, n_chunks=1):
+        """Phase 4: wrap `main`'s body in `n_chunks` synthetic ee64
+        functions, each tagged for cold-tier promotion. Main becomes a
+        sequence of `_synth_main_body_K()` calls plus a defensive halt.
 
-        Triggered by the outer auto-cold loop when Phase 2.5 / 3 exhaust
-        their promotions and the program still overflows. The downstream
-        compile path treats `_synth_main_body` exactly like a source
-        `ee64 void f(...)` declaration: it gets compiled as a cold
-        function, its body gets put in the AT24C512 image, and main's
-        call site gets rewritten to `ldi $b,id; jal __cold_call`.
+        n_chunks=1 (the default): one synthetic with the entire body —
+        what the outer auto-cold loop tries first.
 
-        If body is too big for the cold slot (COLD_SLOT_BYTES), the
-        existing slot-size check in cold-function compilation will
-        raise — caller can fall back to leaving main resident.
+        n_chunks>1: lift all top-level `('local', ...)` declarations
+        in main's body to globals (so values flow across chunk
+        boundaries), then split the remaining statements into N
+        contiguous chunks of similar count. Each chunk becomes
+        `_synth_main_body_K`. Locals declared inside nested blocks
+        (if/while/etc.) are unaffected — they live entirely within
+        whichever chunk owns the surrounding block.
 
-        No-op if main isn't found or the synthetic name is already
-        present (avoids double-wrapping if the pass somehow re-runs).
+        Doesn't handle:
+          - Local arrays (`('local_arr', ...)`) — left in place; if
+            referenced across chunks, splitting will fail at compile
+            time and the outer loop will fall back.
+          - Splits inside nested control flow — only top-level stmt
+            boundaries are considered.
+
+        If a chunk's compiled body still exceeds COLD_SLOT_BYTES, the
+        existing slot-size check raises and the outer loop bumps
+        n_chunks until it fits or hits a cap.
+
+        No-op if main isn't found or any `_synth_main_body*` already
+        present (avoids double-wrapping if the pass re-runs).
         """
-        SYNTH_NAME = '_synth_main_body'
+        SYNTH_BASE = '_synth_main_body'
         # Find main and check we haven't already wrapped.
         main_idx = None
         for i, fn in enumerate(functions):
             if fn[0] == 'main':
                 main_idx = i
-            if fn[0] == SYNTH_NAME:
+            if fn[0].startswith(SYNTH_BASE):
                 return functions   # already wrapped
         if main_idx is None:
             return functions       # no main, nothing to wrap
 
         main_name, main_params, main_body, main_ret = functions[main_idx]
-        # Synthetic function: same body as main, void return. Will be
-        # tagged ee64 below so the cold-function compilation path
-        # captures it.
-        synth_fn = (SYNTH_NAME, [], main_body, 'void')
-        self.cold_function_names.add(SYNTH_NAME)
-        # New main: just `_synth_main_body();` and a defensive halt.
-        new_main_body = ('block', [
-            ('expr_stmt', ('call', SYNTH_NAME, [])),
-            ('expr_stmt', ('call', 'halt', [])),
-        ])
+        if main_body[0] != 'block':
+            return functions
+        stmts = list(main_body[1])
+
+        if n_chunks <= 1:
+            # Single-chunk path: body untouched, one synthetic.
+            synth_name = SYNTH_BASE
+            synth_fn = (synth_name, [], main_body, 'void')
+            self.cold_function_names.add(synth_name)
+            new_main_body = ('block', [
+                ('expr_stmt', ('call', synth_name, [])),
+                ('expr_stmt', ('call', 'halt', [])),
+            ])
+            new_main_fn = (main_name, main_params, new_main_body, main_ret)
+            out = []
+            for i, fn in enumerate(functions):
+                out.append(new_main_fn if i == main_idx else fn)
+            out.append(synth_fn)
+            return out
+
+        # Multi-chunk path: promote top-level locals to globals.
+        # Pulled-out declarations turn into:
+        #   (a) An entry in `_synth_promoted_globals` (consumed by
+        #       compile() right after this transform — see hook).
+        #   (b) An `('expr_stmt', assign-init)` left in the chunk if
+        #       the decl had an initializer (so the global gets
+        #       initialized at runtime in the same place).
+        promoted = []
+        body_stmts = []
+        for s in stmts:
+            if s[0] == 'local':
+                _, name, init, typ = s
+                if name not in {p[0] for p in promoted}:
+                    promoted.append((name, 0, 'ram'))
+                if init is not None:
+                    # Keep the initializer as an assignment statement
+                    # so codegen still runs it at the original spot.
+                    body_stmts.append(
+                        ('expr_stmt', ('assign', '=', ('var', name), init)))
+            else:
+                body_stmts.append(s)
+
+        # Stash promoted globals on self so compile() can consume them
+        # before any per-function compilation runs. (We can't mutate
+        # the parser's `globals_` list from here; this is the
+        # documented hand-off.)
+        self._synth_promoted_globals = promoted
+
+        # Even split by statement count.
+        total = len(body_stmts)
+        chunk_sz = max(1, (total + n_chunks - 1) // n_chunks)
+        chunks = []
+        for ci in range(n_chunks):
+            start = ci * chunk_sz
+            end = min(start + chunk_sz, total)
+            if start >= end:
+                continue
+            chunks.append(body_stmts[start:end])
+        if len(chunks) < 2:
+            # Degenerate split — fall back to single-chunk path.
+            return self._wrap_main_in_synthetic_ee64(functions, n_chunks=1)
+
+        # Build the synthetic functions and the new main.
+        synth_fns = []
+        new_main_stmts = []
+        for ci, chunk_stmts in enumerate(chunks):
+            sname = f'{SYNTH_BASE}_{ci}'
+            self.cold_function_names.add(sname)
+            synth_fns.append((sname, [], ('block', chunk_stmts), 'void'))
+            new_main_stmts.append(('expr_stmt', ('call', sname, [])))
+        # Defensive halt — usually one of the chunks ends in halt() but
+        # if the body lacked a terminating halt, keep main from running
+        # off into garbage.
+        new_main_stmts.append(('expr_stmt', ('call', 'halt', [])))
+
+        new_main_body = ('block', new_main_stmts)
         new_main_fn = (main_name, main_params, new_main_body, main_ret)
 
         out = []
         for i, fn in enumerate(functions):
-            if i == main_idx:
-                out.append(new_main_fn)
-            else:
-                out.append(fn)
-        # Append synthetic at the end so it's emitted after main and
-        # other warm functions; cold-fn compilation collects it via
-        # `cold_function_names` membership.
-        out.append(synth_fn)
-        # Update func_params / func_bodies so subsequent passes see
-        # the synthetic. (compile() does its own pass over `functions`
-        # to build these — but `_alias_builtin_compatible_functions`
-        # and `_simplify_function_bodies` may already have read the
-        # original; be defensive.)
+            out.append(new_main_fn if i == main_idx else fn)
+        out.extend(synth_fns)
         return out
 
     def _auto_split_functions(self, functions):
@@ -2834,7 +2900,22 @@ class MK1CodeGen:
         # freeing kernel-page bytes for dispatcher infrastructure
         # plus the cold slot.
         if getattr(self, '_extract_main_body', False):
-            functions = self._wrap_main_in_synthetic_ee64(functions)
+            n_chunks = getattr(self, '_extract_main_body_chunks', 1)
+            functions = self._wrap_main_in_synthetic_ee64(
+                functions, n_chunks=n_chunks)
+            # Multi-chunk path lifts main's locals to globals so values
+            # flow across chunk boundaries. Merge those into the
+            # parser's `globals_` list before allocation runs below.
+            promoted = getattr(self, '_synth_promoted_globals', [])
+            if promoted:
+                # Avoid duplicate names if user code already has a same-
+                # named global.
+                existing = {g[0] for g in globals_}
+                for name, init, storage in promoted:
+                    if name in existing:
+                        continue
+                    globals_.append((name, init, storage))
+                    existing.add(name)
 
         self.page3_globals = {}  # name → page 3 address (for overflow arrays)
         self.page3_alloc = 0
@@ -15307,7 +15388,7 @@ def main():
 
     def _prepare_compile(prefer_delay_cal_init=False, capture_log=False,
                          auto_cold_fns=None, force_cold_helpers=None,
-                         extract_main_body=False):
+                         extract_main_body=False, extract_main_chunks=1):
         gen = MK1CodeGen(optimize=args.optimize)
         # Stash the in-flight gen so the exception handler can recover
         # `_matcher_fires` even on compile failure (populated during
@@ -15320,6 +15401,7 @@ def main():
             gen._force_cold_helpers = set(force_cold_helpers)
         if extract_main_body:
             gen._extract_main_body = True
+            gen._extract_main_body_chunks = max(1, int(extract_main_chunks))
         if hasattr(args, 'eeprom') and args.eeprom:
             gen.eeprom_mode = True
             gen.eeprom_base = args.eeprom_base
@@ -15471,6 +15553,58 @@ def main():
             if name in present and name not in already_helper:
                 return name
         return None
+
+    def _phase25_compute_kernel_bytes(g, asm_lines):
+        """Tally bytes in the kernel section of the assembled output.
+        Mirrors `_phase25_pick_overflow_helper`'s walk so the auto-cold
+        loop's overflow check matches what the picker would see."""
+        init_extr = getattr(g, '_init_extraction_done', False)
+        overlay_mode = hasattr(g, '_overlay_kernel_size')
+        two_byte = {'ldsp', 'ldsp_b', 'stsp', 'push_imm', 'jal',
+                    'jc', 'jz', 'jnc', 'jnz', 'j', 'ldi', 'cmp',
+                    'addi', 'subi', 'andi', 'ori', 'ld', 'st',
+                    'ldp3', 'stp3', 'ocall', 'tst', 'out_imm',
+                    'cmpi', 'ddrb_imm', 'ddra_imm', 'ora_imm',
+                    'orb_imm'}
+
+        def _is_kernel_section(s):
+            if init_extr or overlay_mode:
+                return ('section page3_kernel' in s
+                        or 'section page3_code' in s)
+            return ('section code' in s
+                    and 'data_code' not in s
+                    and 'stack_code' not in s
+                    and 'page3_code' not in s)
+
+        # Default starting section: 'kernel' for flat mode, 'init' for
+        # init-extraction / overlay (because the implicit pre-marker
+        # bytes are stage-1 init code there).
+        in_kernel = (not init_extr and not overlay_mode)
+        kernel_bytes = 0
+        for line in asm_lines:
+            s = line.strip()
+            if 'section ' in s or s.strip().startswith('org '):
+                in_kernel = _is_kernel_section(s)
+                continue
+            if not in_kernel:
+                continue
+            if not s or s.endswith(':') or s.startswith(';'):
+                continue
+            mn = s.split()[0]
+            if mn == 'byte':
+                kernel_bytes += 1
+            elif mn == 'cmp':
+                parts = s.split()
+                kernel_bytes += 1 if (len(parts) > 1 and parts[1].startswith('$')) else 2
+            elif mn == 'ddrb2_imm':
+                kernel_bytes += 3
+            elif mn == 'ddrb3_imm':
+                kernel_bytes += 4
+            elif mn in two_byte:
+                kernel_bytes += 2
+            else:
+                kernel_bytes += 1
+        return kernel_bytes
 
     def _phase25_pick_overflow_helper(g, asm_lines, already_helper, already_user):
         """Phase 2.5: detect post-compile runtime kernel overflow and pick
@@ -15773,13 +15907,16 @@ def main():
     _prefer_dc = True
     _extract_main_body_tried = False
     _extract_main_body_disabled = False
+    _extract_main_chunks = 1
+    _MAX_EXTRACT_CHUNKS = 4
     while True:
         try:
             gen, asm, lines, _code_bytes_try, _init_limit_try, _compile_log = _prepare_compile(
                 prefer_delay_cal_init=_prefer_dc, capture_log=True,
                 auto_cold_fns=_auto_cold,
                 force_cold_helpers=_force_helpers,
-                extract_main_body=_extract_main_body_tried)
+                extract_main_body=_extract_main_body_tried,
+                extract_main_chunks=_extract_main_chunks)
             # Init-extract overflow: redo with delay_cal as overlay.
             if (_code_bytes_try > _init_limit_try and _prefer_dc):
                 import sys as _retry_sys
@@ -15822,7 +15959,18 @@ def main():
             # spontaneously enable cold tier on programs that fit
             # comfortably in their existing mode.
             _cold_active = bool(_force_helpers or _auto_cold)
-            _overflow = ('CODE OVERFLOW' in (_compile_log or '')
+            # Direct overflow check: walk asm `lines` and tally kernel-
+            # section bytes vs `256 - cold_slot_size` (or 250 in flat
+            # mode without a cold slot). The compile_log captures only
+            # stderr emitted DURING gen.compile(), but the
+            # `!! CODE OVERFLOW` warning prints after the auto-cold
+            # loop finishes — so checking for it in _compile_log
+            # always misses. This direct check fires the same way
+            # the final report does.
+            _kernel_bytes = _phase25_compute_kernel_bytes(gen, lines)
+            _max_code = (256 - getattr(gen, 'cold_slot_size', 0)) \
+                if getattr(gen, 'cold_slot_size', 0) > 0 else 250
+            _overflow = (_kernel_bytes > _max_code
                          or _code_bytes_try > _init_limit_try)
             if (_cold_active and _overflow
                     and len(_auto_cold) + len(_force_helpers) < _MAX_AUTO_COLD):
@@ -15849,14 +15997,40 @@ def main():
             # plateaus. Doesn't fire spontaneously for programs that
             # fit cleanly without it.
             if (_cold_active and _overflow
-                    and not _extract_main_body_tried
                     and not _extract_main_body_disabled):
-                import sys as _p4_sys
-                print(f"  Auto-cold (main-body): wrapping main's body "
-                      f"in synthetic _synth_main_body cold helper",
-                      file=_p4_sys.stderr)
-                _extract_main_body_tried = True
-                continue
+                if not _extract_main_body_tried:
+                    import sys as _p4_sys
+                    print(f"  Auto-cold (main-body): wrapping main's body "
+                          f"in synthetic _synth_main_body cold helper",
+                          file=_p4_sys.stderr)
+                    _extract_main_body_tried = True
+                    continue
+                # Already tried single-chunk; the runtime kernel still
+                # overflows but the synthetic itself fit (no slot-
+                # overflow exception). Splitting reduces the largest
+                # cold helper, shrinks the slot, grows the runtime
+                # budget — BUT ONLY if the synthetic IS the largest.
+                # If something else (e.g. __i2c_stream, __delay_cal)
+                # dominates the slot, splitting just adds main-side
+                # cold_call overhead without shrinking the slot, and
+                # makes overflow worse. Skip the split in that case.
+                if _extract_main_chunks < _MAX_EXTRACT_CHUNKS:
+                    _cold_helpers = getattr(gen, 'cold_helpers', [])
+                    _largest = max(
+                        _cold_helpers,
+                        key=lambda h: h[2],
+                        default=None)
+                    _largest_is_synth = (
+                        _largest is not None
+                        and 'synth_main_body' in _largest[3])
+                    if _largest_is_synth:
+                        _extract_main_chunks += 1
+                        import sys as _p4i_sys
+                        print(f"  Auto-cold (main-body): still overflowing; "
+                              f"splitting synthetic into "
+                              f"{_extract_main_chunks} chunks",
+                              file=_p4i_sys.stderr)
+                        continue
             break
         except Exception as _e:
             _msg = str(_e)
@@ -15866,15 +16040,30 @@ def main():
             # re-raise on next iteration if needed; the program
             # falls back to its pre-extraction overflow report.
             if (_extract_main_body_tried
-                    and "'_synth_main_body'" in _msg
+                    and "'_synth_main_body" in _msg
                     and 'exceeds slot' in _msg):
+                # Slot overflow on the synthetic. If there's room to
+                # split further, bump the chunk count and retry —
+                # multiple smaller chunks may individually fit even
+                # when one big one didn't. Cap at _MAX_EXTRACT_CHUNKS
+                # so a fundamentally-too-big main eventually surfaces
+                # as the original overflow report instead of cycling.
+                if _extract_main_chunks < _MAX_EXTRACT_CHUNKS:
+                    _extract_main_chunks += 1
+                    import sys as _p4s_sys
+                    print(f"  Auto-cold (main-body): synthetic body "
+                          f"too large for slot; retrying with "
+                          f"{_extract_main_chunks}-chunk split",
+                          file=_p4s_sys.stderr)
+                    continue
                 import sys as _p4r_sys
                 print(f"  Auto-cold (main-body): synthetic body too "
-                      f"large for slot; reverting to no-extraction "
-                      f"compile",
+                      f"large for slot even at {_MAX_EXTRACT_CHUNKS} "
+                      f"chunks; reverting to no-extraction compile",
                       file=_p4r_sys.stderr)
                 _extract_main_body_tried = False
                 _extract_main_body_disabled = True
+                _extract_main_chunks = 1
                 continue
             if 'wrap into kernel' not in _msg or _total >= _MAX_AUTO_COLD:
                 _emit_partial_metrics(getattr(_prepare_compile, '_last_gen', None), _msg)
