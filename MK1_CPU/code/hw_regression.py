@@ -106,6 +106,19 @@ def assemble_upload(ser, asm_text, timeout=15):
         ser.readline()
     except Exception:
         pass
+    # Chip settle delay: AT24C512 stays write-busy for hundreds of ms
+    # after the upload shim's last page write. The cold-tier dispatcher
+    # in the user program does no ack-polling on its first I²C read; if
+    # the chip is still busy, the address-set NACKs silently and the
+    # chip serves bytes from its internal sequential-read counter
+    # instead of the requested address — slot loads with the wrong
+    # bytes, program runs garbage. Empirically: 0.1 s is too short
+    # (READ_CHIP returns offset-by-N bytes); 0.5 s is reliable.
+    # (Dispatcher-side ack-poll is an alternative fix but currently
+    # destabilises caller-arg+retval programs for reasons not yet
+    # localised — see WORKLOG 2026-05-01 entry. This delay is the
+    # narrow workaround until that's resolved.)
+    time.sleep(0.5)
     return True
 
 
@@ -1180,6 +1193,35 @@ TESTS = [
             halt();
         }''',
         [55], cycles=500_000,
+    ),
+    Test(
+        # Cold-from-cold (chain) end-to-end. `a` calls `b` from inside
+        # its body — verifies the dispatcher's chain-reload epilogue
+        # (cmpi 0xFF / jz cc_done / jal __cold_load_helper) puts the
+        # caller's bytes back into the slot before its `ret` lands on
+        # what would otherwise be the callee's leftover bytes.
+        #
+        # Long-standing WORKLOG entry called this "the (2) chain bug"
+        # but it was actually a combination of (a) standalone tests
+        # at us=0 dropping OI samples and (b) the assemble_upload chip-
+        # settle race fixed in this commit. The dispatcher's chain
+        # logic itself is correct; this test locks it in.
+        'cold tier: cold-from-cold chain (a calls b)',
+        '''ee64 void b(void) {
+            out(0xB1);
+            out(0xB2);
+        }
+        ee64 void a(void) {
+            out(0xA1);
+            b();
+            out(0xA2);
+        }
+        void main(void) {
+            i2c_init();
+            a();
+            halt();
+        }''',
+        [0xA1, 0xB1, 0xB2, 0xA2], cycles=500_000,
     ),
 ]
 
