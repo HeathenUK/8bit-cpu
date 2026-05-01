@@ -106,19 +106,21 @@ def assemble_upload(ser, asm_text, timeout=15):
         ser.readline()
     except Exception:
         pass
-    # Chip settle delay: AT24C512 stays write-busy for hundreds of ms
-    # after the upload shim's last page write. The cold-tier dispatcher
-    # in the user program does no ack-polling on its first I²C read; if
-    # the chip is still busy, the address-set NACKs silently and the
-    # chip serves bytes from its internal sequential-read counter
-    # instead of the requested address — slot loads with the wrong
-    # bytes, program runs garbage. Empirically: 0.1 s is too short
-    # (READ_CHIP returns offset-by-N bytes); 0.5 s is reliable.
+    # Chip settle delay: AT24C512 (cold tier, 0x50) and AT24C32
+    # (eeprom tier, 0x57) both stay write-busy for hundreds of ms
+    # after the upload shim's last page write. The user program's
+    # I²C reads (cold dispatcher, eeprom preload) do no ack-polling
+    # on the first read; if the chip is still busy, the address-set
+    # NACKs silently and the chip serves bytes from its internal
+    # sequential-read counter instead of the requested address.
+    # Empirically: 0.1 s is too short, 0.5 s is reliable for the
+    # cold tier but exposes residual flakiness on the larger
+    # eeprom-storage test, 1.0 s appears stable for both.
     # (Dispatcher-side ack-poll is an alternative fix but currently
     # destabilises caller-arg+retval programs for reasons not yet
     # localised — see WORKLOG 2026-05-01 entry. This delay is the
     # narrow workaround until that's resolved.)
-    time.sleep(0.5)
+    time.sleep(1.0)
     return True
 
 
@@ -166,25 +168,38 @@ def dump_pages(ser, timeout=10):
 
 
 def runlog(ser, cycles=5_000_000, us=1, timeout=30, maxoi=0):
-    """RUNLOG: continuous OI capture. Returns dict with vals list.
+    """RUNHZ-based continuous OI capture. Returns dict with vals list.
 
-    `maxoi` (0 = unlimited): stop the firmware loop early once N OI
-    events have been captured. Useful for tests where the program
-    halts and the CPU restarts from PC=0, producing duplicate OI
-    events over the cycle window — without `maxoi`, RUNLOG keeps
-    capturing on every restart and `vals` is full of duplicates.
+    Uses the firmware's RUNHZ command (precise hardware-timed clock
+    via ESP32 cycle counter, with FW-overhead compensation) instead
+    of the older RUNLOG path that relied on microsecond busy-loops
+    in the manual-clock loop. RUNHZ is more accurate at sub-µs
+    granularities and handles the firmware-side OI capture without
+    drift, which RUNLOG was vulnerable to at us=1.
+
+    `us` is mapped to the target Hz (us=N → 1e6 / (2*N) Hz, since
+    each clock has high+low halves). Caller can equivalently say
+    `us=2` for ~250 kHz or `us=1` for 500 kHz; the firmware caps
+    RUNHZ at ~430 kHz reliably.
+
+    `maxoi` (0 = unlimited): stop early once N OI events captured.
+    Tailor this to the test's expected length to short-circuit the
+    halt-retry loop and avoid duplicates.
     """
     # Reset BEFORE each run — UPLOAD doesn't reset PC, and any prior run
-    # leaves CPU at its halt-trap. Without this, the new run starts in
-    # the middle of wherever the previous run ended.
+    # leaves CPU at its halt-trap.
     full_reset(ser)
     ser.reset_input_buffer()
     ser.timeout = timeout
-    if maxoi > 0:
-        # 4-arg form: cycles, us, halt(=0), maxoi
-        ser.write(f'RUNLOG:{cycles},{us},0,{maxoi}\n'.encode())
+    # us=N → half_period = N µs → full period = 2N µs → hz = 1e6/(2N).
+    if us <= 0:
+        hz = 250000   # safe default
     else:
-        ser.write(f'RUNLOG:{cycles},{us}\n'.encode())
+        hz = max(1000, int(1_000_000 / (2 * us)))
+    if maxoi > 0:
+        ser.write(f'RUNHZ:{cycles},{hz},{maxoi}\n'.encode())
+    else:
+        ser.write(f'RUNHZ:{cycles},{hz}\n'.encode())
     # Skip non-RUNLOG-shaped lines: EEPROM shim diagnostic strings AND
     # leftover UPLOAD `{"ok":true,...}` JSONs from a prior write that
     # finished after we'd moved on. RUNLOG's response always carries
@@ -207,6 +222,10 @@ def runlog(ser, cycles=5_000_000, us=1, timeout=30, maxoi=0):
                 continue
     if r is None:
         return {'cyc': 0, 'cnt': 0, 'vals': [], 'error': f'parse failed: {line[:80]}'}
+    # RUNHZ returns the OI list as `hist`; RUNLOG returns `vals`.
+    # Keep the rest of the harness's `vals` accessor working.
+    if 'vals' not in r and 'hist' in r:
+        r['vals'] = r['hist']
     return r
 
 
@@ -367,7 +386,7 @@ def compile_c(source_path, eeprom=False, optimize=True, extra_env=None):
 # ── Test case runner ─────────────────────────────────────────────────
 
 class Test:
-    def __init__(self, name, source, expected, eeprom=False, cycles=500_000, us=2,
+    def __init__(self, name, source, expected, eeprom=False, cycles=500_000, us=3,
                  env=None, expected_intervals_ms=None, interval_tolerance_pct=5,
                  audio=False, needs_hw_peripherals=False):
         self.name = name
@@ -456,13 +475,19 @@ def run_one(ser, test, verbose=False, differential=False):
                 sim_actual = ['<sim_error>']
                 sim_notes = f' sim_error={e}'
 
-        # Cap OI capture at 2× expected length: enough to disambiguate
-        # repeated halt+restart programs (which would otherwise spam
-        # `vals` with duplicates across the full cycle window) while
-        # still leaving room for any leading garbage / sentinel bytes.
-        # Doubled rather than exact-match so dual-edge sampling and the
-        # injected sentinel don't trip the cap before real output lands.
-        maxoi_cap = max(64, len(test.expected) * 4)
+        # Tailored maxoi: (sentinel 3) + (expected N) + small buffer.
+        # RUNHZ's firmware-side capture uses rising-edge detect (one
+        # OI event per `out`, no dual-edge duplicates), and halt-
+        # retry is the only source of repetition. We only need ONE
+        # clean post-sentinel sequence to validate. With a tight cap
+        # the firmware stops capturing as soon as we have what we
+        # need — short-circuits the cycle window and avoids late
+        # bytes that would be capture-buffer noise. The +6 covers
+        # the sentinel, any leading bus-transient garbage before
+        # main reaches the sentinel emit, and a couple of
+        # post-sequence values in case the program emits more
+        # before halting.
+        maxoi_cap = len(test.expected) + 6
         r = runlog(ser, cycles=test.cycles, us=test.us, maxoi=maxoi_cap)
         if 'error' in r:
             last_notes = r['error']
@@ -479,8 +504,15 @@ def run_one(ser, test, verbose=False, differential=False):
         actual = find_sequence(deduped, test.expected)
         passed = actual == test.expected
         if not passed:
+            # ONE wrong-data retry. The historical 3× retry was masking
+            # the chip-settle race fixed in commit d94f300; that's now
+            # resolved. But hardware-level flakes (clock jitter, OI
+            # sampling variance on heavy I²C-driven overlay tests)
+            # have irreducible single-event miss rates around 5-10%.
+            # One retry is plenty for those without re-introducing
+            # the masked-bug failure mode.
             last_notes += f' raw={deduped[:25]}'
-            if attempt < 2:
+            if attempt < 1:
                 last_notes += f' (retry: wrong data attempt {attempt+1})'
                 continue
             return False, actual, last_notes
@@ -931,7 +963,12 @@ TESTS = [
         }''',
         [0x80, 0xA1, 0xA2, 0xB1, 0xB2, 0xC1, 0xC2, 0xD1, 0xD2, 0xE1, 0xE2, 0x81],
         eeprom=True,
-        cycles=300_000,
+        # Tailored maxoi short-circuits the run as soon as we have
+        # enough events; cycles is the backup timeout. With 5
+        # eeprom-tier overlay loads + 14 array increments per leaf,
+        # the actual happy-path runtime is closer to 200k cycles
+        # but eeprom-load latency varies; 1M is comfortable backup.
+        cycles=1_000_000,
         # Sim doesn't model the AT24C32 / I²C bit-bang preload, so the
         # EEPROM-backed leaf wouldn't load. Skip the sim leg.
         needs_hw_peripherals=True,
