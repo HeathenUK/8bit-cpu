@@ -60,24 +60,56 @@ def full_reset(ser):
     ser.timeout = old_timeout
 
 
-def assemble_upload(ser, asm_text, timeout=15):
-    """ASM: + UPLOAD. Returns True on success."""
-    full_reset(ser)
+def _read_chip_bytes(ser, offset, count, timeout=8.0):
+    """Issue READ_CHIP:offset,count to firmware; return list of bytes
+    (or None on failure). Drains both the hex-line response and the
+    `{"ok":true}` JSON that follows."""
+    ser.reset_input_buffer()
+    ser.write(f'READ_CHIP:{offset},{count}\n'.encode())
+    end = time.time() + timeout
+    hex_line = b''
+    while time.time() < end:
+        if ser.in_waiting:
+            b = ser.read(1)
+            if b == b'\n':
+                break
+            hex_line += b
+        else:
+            time.sleep(0.05)
+    line = hex_line.decode(errors='replace').strip()
+    toks = line.split()
+    out = []
+    for t in toks:
+        if len(t) == 2:
+            try:
+                out.append(int(t, 16))
+            except ValueError:
+                pass
+    # Drain the trailing "{ok:true}" or similar JSON
+    end = time.time() + 2.0
+    while time.time() < end:
+        if ser.in_waiting:
+            try:
+                ser.readline()
+            except Exception:
+                break
+        else:
+            time.sleep(0.05)
+    return out if len(out) == count else None
+
+
+def _do_asm(ser, asm_text, timeout=15):
+    """Just the ASM step. Returns ee64_size on success, None on failure."""
     esc = asm_text.replace('\n', '\\n')
     payload = f'ASM:{esc}\n'.encode()
     CHUNK = 4096
     if len(payload) > CHUNK:
         for i in range(0, len(payload), CHUNK):
-            ser.write(payload[i:i+CHUNK])
+            ser.write(payload[i:i + CHUNK])
             time.sleep(0.05)
     else:
         ser.write(payload)
     ser.timeout = timeout
-    # Skip non-JSON diagnostic lines (e.g. "EEPROM shim page 0x0100: ..."
-    # that the firmware streams during EEPROM writes from a PRIOR test's
-    # UPLOAD — they arrive at the host serial buffer slightly later than
-    # the prior UPLOAD's JSON response and end up first-in-line for the
-    # next ASM read). Loop until we get a `{...}` line or hit timeout.
     r = None
     raw_reply = b''
     for _ in range(20):
@@ -94,34 +126,145 @@ def assemble_upload(ser, asm_text, timeout=15):
                 break
             except Exception:
                 continue
-    if r is None:
-        print(f'    ASM parse error: no JSON in response; last raw={raw_reply[:200]!r}', file=sys.stderr)
-        return False
-    if not r.get('ok'):
+    if r is None or not r.get('ok'):
         print(f'    ASM failed: {r}', file=sys.stderr)
-        return False
+        return None
+    return int(r.get('ee64', 0) or 0)
+
+
+def _do_upload(ser, has_chip_data, timeout=60):
+    """The UPLOAD step. Waits for the JSON ack."""
     ser.reset_input_buffer()
     ser.write(b'UPLOAD\n')
-    try:
-        ser.readline()
-    except Exception:
-        pass
-    # Chip settle delay: AT24C512 (cold tier, 0x50) and AT24C32
-    # (eeprom tier, 0x57) both stay write-busy for hundreds of ms
-    # after the upload shim's last page write. The user program's
-    # I²C reads (cold dispatcher, eeprom preload) do no ack-polling
-    # on the first read; if the chip is still busy, the address-set
-    # NACKs silently and the chip serves bytes from its internal
-    # sequential-read counter instead of the requested address.
-    # Empirically: 0.1 s is too short, 0.5 s is reliable for the
-    # cold tier but exposes residual flakiness on the larger
-    # eeprom-storage test, 1.0 s appears stable for both.
-    # (Dispatcher-side ack-poll is an alternative fix but currently
-    # destabilises caller-arg+retval programs for reasons not yet
-    # localised — see WORKLOG 2026-05-01 entry. This delay is the
-    # narrow workaround until that's resolved.)
-    time.sleep(1.0)
-    return True
+    upload_timeout = timeout if has_chip_data else 5.0
+    end = time.time() + upload_timeout
+    while time.time() < end:
+        try:
+            line = ser.readline().decode(errors='replace').strip()
+        except Exception:
+            break
+        if not line:
+            continue
+        if line.startswith('{'):
+            try:
+                rr = json.loads(line)
+                return bool(rr.get('ok'))
+            except Exception:
+                continue
+    return False
+
+
+def _read_ee64_from_ram(ser, count, timeout=5.0):
+    """Read `count` bytes of assembled ee64 from the ESP32's RAM
+    cache (DUMP_EE64 — chip-independent, returns the source-of-truth
+    bytes that UPLOAD just wrote to the chip)."""
+    ser.reset_input_buffer()
+    ser.write(f'DUMP_EE64:0,{count}\n'.encode())
+    end = time.time() + timeout
+    hex_line = b''
+    while time.time() < end:
+        if ser.in_waiting:
+            b = ser.read(1)
+            if b == b'\n':
+                break
+            hex_line += b
+        else:
+            time.sleep(0.05)
+    toks = hex_line.decode(errors='replace').strip().split()
+    out = []
+    for t in toks:
+        if len(t) == 2:
+            try:
+                out.append(int(t, 16))
+            except ValueError:
+                pass
+    return out if len(out) == count else None
+
+
+def assemble_upload(ser, asm_text, timeout=15, max_retries=8):
+    """ASM: + UPLOAD with byte-exact chip-verify retry.
+
+    After each UPLOAD, the host issues READ_CHIP for the ee64 region
+    and compares against the assembler's emitted ee64 bytes. On
+    mismatch, the whole ASM + UPLOAD is re-issued. Returns True only
+    after byte-exact match (or after `max_retries` is exhausted, in
+    which case it returns False so the caller can fail the test).
+
+    The retry is needed because the AT24C512 on this board
+    occasionally mis-writes specific (byte_value, byte_position)
+    combinations even after every byte was ACKed by the chip during
+    the page write — see the streamer PoC notes (`0xD1 0xAA → 0xD0
+    0xA0`). Re-running the write generally settles the chip; a few
+    pathological byte combinations may need 3+ attempts.
+    """
+    full_reset(ser)
+
+    # First pass: ASM + capture expected ee64 from RAM (BEFORE UPLOAD,
+    # because UPLOAD's internal shim assemblies clobber assembler.result.ee64)
+    ee64_size = _do_asm(ser, asm_text, timeout=timeout)
+    if ee64_size is None:
+        return False
+    expected_ee64 = None
+    if ee64_size > 0:
+        expected_ee64 = _read_ee64_from_ram(ser, ee64_size)
+        if expected_ee64 is None:
+            print(f'    DUMP_EE64 failed (size={ee64_size})',
+                  file=sys.stderr)
+            return False
+
+    for attempt in range(max_retries):
+        if attempt > 0:
+            # Re-ASM to repopulate uploadBuf and ee64 source
+            ee64_size_check = _do_asm(ser, asm_text, timeout=timeout)
+            if ee64_size_check != ee64_size:
+                print(f'    ASM size mismatch on retry: {ee64_size_check} vs {ee64_size}',
+                      file=sys.stderr)
+                return False
+        if not _do_upload(ser, ee64_size > 0, timeout=60):
+            print(f'    UPLOAD failed attempt {attempt}', file=sys.stderr)
+            continue
+        time.sleep(1.0)  # chip settle for write cycle
+        if ee64_size == 0:
+            return True  # no chip bytes to verify
+        chip_bytes = _read_chip_bytes(ser, 0, ee64_size)
+        if chip_bytes is None:
+            print(f'    READ_CHIP failed; retry {attempt}',
+                  file=sys.stderr)
+            continue
+        if chip_bytes == expected_ee64:
+            # Chip is byte-exact. But READ_CHIP overwrote uploadBuf
+            # with its read shim, so re-stage the user program in
+            # uploadBuf via one more ASM. (We don't need another
+            # UPLOAD since the chip is already correct — the next
+            # RUN/RUNHZ command in the test driver will issue its
+            # own RESET+upload via uploadToMK1 against uploadBuf.)
+            ee64_size_again = _do_asm(ser, asm_text, timeout=timeout)
+            if ee64_size_again != ee64_size:
+                print(f'    Final ASM size mismatch: {ee64_size_again} vs {ee64_size}',
+                      file=sys.stderr)
+                return False
+            # Re-upload program to MK1 (firmware's UPLOAD also re-writes
+            # ee64; chip already correct so this is just slow not wrong)
+            if not _do_upload(ser, has_chip_data=True, timeout=60):
+                print('    Final UPLOAD failed', file=sys.stderr)
+                return False
+            time.sleep(1.0)
+            return True
+        first_bad = next(
+            (i for i in range(ee64_size)
+             if chip_bytes[i] != expected_ee64[i]),
+            -1,
+        )
+        if attempt == 0 or attempt == max_retries - 1:
+            print(f'    ee64 verify mismatch attempt {attempt}: '
+                  f'idx {first_bad} want=0x{expected_ee64[first_bad]:02X} '
+                  f'got=0x{chip_bytes[first_bad]:02X} — retrying',
+                  file=sys.stderr)
+        time.sleep(0.2 + attempt * 0.1)
+
+    print(f'    ee64 verify FAILED after {max_retries} retries',
+          file=sys.stderr)
+    return False
 
 
 def dump_pages(ser, timeout=10):

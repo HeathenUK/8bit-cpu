@@ -2888,24 +2888,15 @@ static void writeEepromData(const uint8_t* data, int size) {
 // invoking this — see UPLOAD handler.
 
 static void writeEe64Data(const uint8_t* data, int size) {
-    // 4-byte pages. AT24C512 supports up to 128 per write, but each
-    // inlined byte costs 8 B in the assembled shim (ldi+jal+tst+jnz);
-    // with ~140 B of fixed prologue+epilogue+__sb the shim fills the
-    // 256 B MK1 code page at PAGE_SZ ≈ 15. Anything larger truncates
-    // silently — `uploadToMK1` only sends the first 256 B, so the
-    // tail (often the __sb routine itself) is missing and every
-    // `jal __sb` lands in zero-padded memory. Symptom: ee64 stays
-    // empty after upload, cold helpers run garbage from the slot.
-    // 8 holds 25/25 hw_regression reliably; smaller (4/2) shifts
-    // flakiness to other tests rather than eliminating it (chip
-    // write reliability is sensitive to specific byte positions
-    // / values within a page on this AT24C512). PAGE_SZ=4 makes
-    // the streamer PoC reliable but breaks caller-arg+retval
-    // through dispatcher; we keep 8 as the conservative default
-    // and accept that streamer PoC bytes 0..1 may need a single
-    // upload retry to settle. Production streamer integration
-    // should add a write-verify pass.
-    static const int PAGE_SZ = 8;
+    // 1-byte page writes. AT24C512 supports up to 128 per write, but
+    // multi-byte page writes on this board exhibit deterministic
+    // byte mis-write at specific (offset, value) combinations even
+    // with the protocol's per-byte ACK. Single-byte page writes
+    // sidestep that — each byte is its own complete I²C transaction
+    // (START + SLA+W + addr_hi + addr_lo + 1 byte + STOP). Slower
+    // (~5 ms write cycle per byte vs 5 ms per ≤128-byte page), but
+    // verifies byte-exact via the host's READ_CHIP retry.
+    static const int PAGE_SZ = 1;
     // CRITICAL: snapshot `data` to a local mirror BEFORE the per-page
     // loop. Each iteration's `assembler.assemble(asmBuf)` calls
     // `memset(&result, 0, sizeof(result))` to clear stale state, and
@@ -2923,6 +2914,8 @@ static void writeEe64Data(const uint8_t* data, int size) {
     Serial.printf("EE64 write start: size=%d src[0]=%d src[%d]=%d\n",
         size, size > 0 ? data[0] : 0, size - 1, size > 0 ? data[size - 1] : 0);
 
+    static char asmBuf[3072];   // shared across pages — saves stack
+
     for (int offset = 0; offset < size; offset += PAGE_SZ) {
         int pageLen = size - offset;
         if (pageLen > PAGE_SZ) pageLen = PAGE_SZ;
@@ -2930,7 +2923,6 @@ static void writeEe64Data(const uint8_t* data, int size) {
         int addrHi = (offset >> 8) & 0xFF;
         int addrLo = offset & 0xFF;
 
-        char asmBuf[3072];
         int pos = 0;
         pos += snprintf(asmBuf + pos, sizeof(asmBuf) - pos,
             "; EE64 page write at 0x%04X (%d bytes)\n"
@@ -3074,6 +3066,7 @@ static void writeEe64Data(const uint8_t* data, int size) {
         digitalWrite(PIN_CLK, LOW);
 
         for (int i = 0; i < 100000; i++) {
+            if ((i & 0x3FFF) == 0) yield();   // feed task watchdog
             GPIO.out_w1ts = clkMask;
             delayMicroseconds(1);
             GPIO.out_w1tc = clkMask;
@@ -3085,6 +3078,7 @@ static void writeEe64Data(const uint8_t* data, int size) {
         busSetOutput();
         enableOutput();
         disableClock();
+
     }
 }
 
@@ -3386,7 +3380,8 @@ static int readDS3231Reg(uint8_t reg) {
 static int readAt24c512(int offset, int count, uint8_t* out) {
     if (count <= 0) return 0;
     if (count > 64) count = 64;     // hard cap (matches OI capture practical size)
-    char asmBuf[3072];
+    static char asmBuf[3072];   // static to avoid stack pressure when called
+                                // from inside writeEe64Data's verify loop
     int pos = snprintf(asmBuf, sizeof(asmBuf),
         "; READ_CHIP offset=0x%04X count=%d (auto-generated)\n"
         "    ldi $d, 0\n"
