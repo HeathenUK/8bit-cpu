@@ -132,11 +132,16 @@ def _do_asm(ser, asm_text, timeout=15):
     return int(r.get('ee64', 0) or 0)
 
 
-def _do_upload(ser, has_chip_data, timeout=60):
-    """The UPLOAD step. Waits for the JSON ack."""
+def _do_upload(ser, has_chip_data, timeout=60, nochip=False):
+    """The UPLOAD step. Waits for the JSON ack.
+
+    nochip=True uses UPLOAD_NOCHIP (skip EEPROM/EE64 chip writes,
+    just push uploadBuf to MK1 RAM). Used by the verify-retry path
+    after the chip has already been verified byte-exact.
+    """
     ser.reset_input_buffer()
-    ser.write(b'UPLOAD\n')
-    upload_timeout = timeout if has_chip_data else 5.0
+    ser.write(b'UPLOAD_NOCHIP\n' if nochip else b'UPLOAD\n')
+    upload_timeout = 5.0 if nochip else (timeout if has_chip_data else 5.0)
     end = time.time() + upload_timeout
     while time.time() < end:
         try:
@@ -232,23 +237,21 @@ def assemble_upload(ser, asm_text, timeout=15, max_retries=8):
                   file=sys.stderr)
             continue
         if chip_bytes == expected_ee64:
-            # Chip is byte-exact. But READ_CHIP overwrote uploadBuf
-            # with its read shim, so re-stage the user program in
-            # uploadBuf via one more ASM. (We don't need another
-            # UPLOAD since the chip is already correct — the next
-            # RUN/RUNHZ command in the test driver will issue its
-            # own RESET+upload via uploadToMK1 against uploadBuf.)
+            # Chip is byte-exact. READ_CHIP overwrote uploadBuf with
+            # its read shim, so re-stage the user program via ASM,
+            # then UPLOAD_NOCHIP to push it to MK1 RAM without
+            # re-writing the chip (re-writing would risk introducing
+            # fresh corruption that we'd then need to verify-retry
+            # all over again).
             ee64_size_again = _do_asm(ser, asm_text, timeout=timeout)
             if ee64_size_again != ee64_size:
                 print(f'    Final ASM size mismatch: {ee64_size_again} vs {ee64_size}',
                       file=sys.stderr)
                 return False
-            # Re-upload program to MK1 (firmware's UPLOAD also re-writes
-            # ee64; chip already correct so this is just slow not wrong)
-            if not _do_upload(ser, has_chip_data=True, timeout=60):
-                print('    Final UPLOAD failed', file=sys.stderr)
+            if not _do_upload(ser, has_chip_data=False, nochip=True):
+                print('    Final UPLOAD_NOCHIP failed', file=sys.stderr)
                 return False
-            time.sleep(1.0)
+            time.sleep(0.2)
             return True
         first_bad = next(
             (i for i in range(ee64_size)

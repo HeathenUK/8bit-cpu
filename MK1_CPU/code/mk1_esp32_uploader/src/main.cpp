@@ -1951,6 +1951,19 @@ static void handleSerialCommand(const String& line) {
         else
             Serial.println("{\"ok\":true}");
     }
+    else if (line == "UPLOAD_NOCHIP") {
+        // UPLOAD_NOCHIP — push uploadBuf to MK1 RAM but skip the
+        // EEPROM/EE64 chip writes. Used by host-side verify-retry:
+        // after the chip has been independently verified byte-exact,
+        // we want to re-stage the user program into uploadBuf (via
+        // a fresh ASM, since READ_CHIP overwrote uploadBuf during
+        // verify) and ship it to MK1 — without re-writing the chip,
+        // because the chip is already correct and any further write
+        // could re-introduce corruption.
+        if (uploadSize == 0) { Serial.println("{\"ok\":false}"); return; }
+        uploadToMK1(uploadBuf, uploadSize);
+        Serial.println("{\"ok\":true}");
+    }
     else if (line.startsWith("RUN:")) {
         // RUN:cycles,us[,nops] — run N cycles at us half-period
         // If us=0 and nops specified: use tight NOP loop for sub-µs delay
